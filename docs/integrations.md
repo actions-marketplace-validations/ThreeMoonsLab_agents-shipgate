@@ -12,16 +12,43 @@ name: Agents Shipgate
 on:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   agents-shipgate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-      - uses: ThreeMoonsLab/agents-shipgate@v0.1.0
+      - id: agents-shipgate
+        uses: ThreeMoonsLab/agents-shipgate@v0.1.0
         with:
           config: shipgate.yaml
           ci_mode: advisory
 ```
+
+To post PR comments, set:
+
+```yaml
+permissions:
+  contents: read
+  pull-requests: write
+
+with:
+  pr_comment: "true"
+```
+
+Action outputs:
+
+| Output | Meaning |
+| --- | --- |
+| `status` | Report summary status, such as `release_blockers_detected`. |
+| `critical_count` | Unsuppressed critical finding count. |
+| `high_count` | Unsuppressed high finding count. |
+| `medium_count` | Unsuppressed medium finding count. |
+| `report_json` | Path to `report.json`. |
+| `report_markdown` | Path to `report.md`. |
+| `exit_code` | Agents Shipgate CLI exit code. |
 
 For source-only testing in this repository:
 

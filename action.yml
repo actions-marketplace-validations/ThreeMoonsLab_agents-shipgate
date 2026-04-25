@@ -1,5 +1,10 @@
 name: Agents Shipgate
 description: Run Agents Shipgate release-readiness scan.
+author: ThreeMoonsLab
+
+branding:
+  icon: shield
+  color: blue
 
 inputs:
   config:
@@ -10,6 +15,10 @@ inputs:
     required: false
     default: advisory
     description: advisory or strict.
+  fail_on:
+    required: false
+    default: ""
+    description: Optional comma-separated severities that fail CI, for example critical,high.
   output_dir:
     required: false
     default: agents-shipgate-reports
@@ -31,6 +40,29 @@ inputs:
     default: ""
     description: Optional Agents Shipgate PyPI version to install. Empty installs this action source.
 
+outputs:
+  status:
+    description: Agents Shipgate summary status.
+    value: ${{ steps.report_outputs.outputs.status }}
+  critical_count:
+    description: Number of unsuppressed critical findings.
+    value: ${{ steps.report_outputs.outputs.critical_count }}
+  high_count:
+    description: Number of unsuppressed high findings.
+    value: ${{ steps.report_outputs.outputs.high_count }}
+  medium_count:
+    description: Number of unsuppressed medium findings.
+    value: ${{ steps.report_outputs.outputs.medium_count }}
+  report_json:
+    description: Path to the generated JSON report.
+    value: ${{ steps.report_outputs.outputs.report_json }}
+  report_markdown:
+    description: Path to the generated Markdown report.
+    value: ${{ steps.report_outputs.outputs.report_markdown }}
+  exit_code:
+    description: Agents Shipgate CLI exit code.
+    value: ${{ steps.scan.outputs.exit_code }}
+
 runs:
   using: composite
   steps:
@@ -51,17 +83,65 @@ runs:
         fi
 
     - name: Run Agents Shipgate
+      id: scan
       shell: bash
       env:
         CONFIG: ${{ inputs.config }}
         CI_MODE: ${{ inputs.ci_mode }}
+        FAIL_ON: ${{ inputs.fail_on }}
         OUTPUT_DIR: ${{ inputs.output_dir }}
       run: |
-        agents-shipgate scan \
-          --config "${CONFIG}" \
-          --ci-mode "${CI_MODE}" \
-          --out "${OUTPUT_DIR}" \
+        args=(
+          scan
+          --config "${CONFIG}"
+          --ci-mode "${CI_MODE}"
+          --out "${OUTPUT_DIR}"
           --format markdown,json
+        )
+        if [ -n "${FAIL_ON}" ]; then
+          args+=(--fail-on "${FAIL_ON}")
+        fi
+        set +e
+        agents-shipgate "${args[@]}"
+        exit_code=$?
+        echo "exit_code=${exit_code}" >> "${GITHUB_OUTPUT}"
+        exit 0
+
+    - name: Extract Agents Shipgate outputs
+      id: report_outputs
+      if: ${{ always() }}
+      shell: bash
+      env:
+        OUTPUT_DIR: ${{ inputs.output_dir }}
+      run: |
+        python - <<'PY'
+        import json
+        import os
+        from pathlib import Path
+
+        output_dir = Path(os.environ.get("OUTPUT_DIR") or "agents-shipgate-reports")
+        report_json = output_dir / "report.json"
+        report_markdown = output_dir / "report.md"
+        summary = {}
+        if report_json.exists():
+            with report_json.open(encoding="utf-8") as handle:
+                summary = (json.load(handle).get("summary") or {})
+
+        def clean(value: object) -> str:
+            return str(value or "").replace("\r", "").replace("\n", "")
+
+        values = {
+            "status": summary.get("status", ""),
+            "critical_count": summary.get("critical_count", 0),
+            "high_count": summary.get("high_count", 0),
+            "medium_count": summary.get("medium_count", 0),
+            "report_json": report_json,
+            "report_markdown": report_markdown,
+        }
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            for key, value in values.items():
+                output.write(f"{key}={clean(value)}\n")
+        PY
 
     - name: Upload Agents Shipgate report
       if: ${{ always() && inputs.upload_artifact == 'true' }}
@@ -69,6 +149,7 @@ runs:
       with:
         name: agents-shipgate-report
         path: ${{ inputs.output_dir }}/
+        if-no-files-found: warn
 
     - name: Comment on pull request
       if: ${{ always() && inputs.pr_comment == 'true' && github.event_name == 'pull_request' }}
@@ -113,3 +194,10 @@ runs:
             issue_number: context.issue.number,
             body
           });
+
+    - name: Apply Agents Shipgate exit code
+      if: ${{ always() && steps.scan.outputs.exit_code != '' && steps.scan.outputs.exit_code != '0' }}
+      shell: bash
+      env:
+        EXIT_CODE: ${{ steps.scan.outputs.exit_code }}
+      run: exit "${EXIT_CODE}"

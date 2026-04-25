@@ -1,6 +1,5 @@
 # Agents Shipgate
 
-![Tests](https://img.shields.io/badge/tests-passing-brightgreen)
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![Python](https://img.shields.io/badge/python-%3E%3D3.12-blue)
 
@@ -104,13 +103,28 @@ See [Trust model](docs/trust-model.md) and [Security policy](SECURITY.md) for th
 The action installs from the tagged source by default, so it can be used before PyPI publication once the GitHub repository and tag exist:
 
 ```yaml
-- uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-- uses: ThreeMoonsLab/agents-shipgate@v0.1.0
-  with:
-    config: shipgate.yaml
-    ci_mode: advisory
-    output_dir: agents-shipgate-reports
+name: Agents Shipgate
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  agents-shipgate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - id: agents-shipgate
+        uses: ThreeMoonsLab/agents-shipgate@v0.1.0
+        with:
+          config: shipgate.yaml
+          ci_mode: advisory
+          output_dir: agents-shipgate-reports
 ```
+
+For PR comments, add `pull-requests: write` and set `pr_comment: "true"`. The action exposes `status`, `critical_count`, `high_count`, `medium_count`, `report_json`, `report_markdown`, and `exit_code` outputs for downstream workflow steps.
 
 Set `shipgate_version` only after the package is published to PyPI.
 

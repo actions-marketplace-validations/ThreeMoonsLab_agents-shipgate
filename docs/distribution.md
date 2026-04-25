@@ -26,3 +26,11 @@ install a published PyPI version.
 - Submit `ThreeMoonsLab/agents-shipgate` to GitHub Marketplace after the first tagged release.
 - Create a small landing page with install instructions, trust model, and findings gallery.
 - Consider a local-only playground later; do not accept private customer manifests into a hosted service without a separate privacy review.
+
+## Marketplace Repository Constraint
+
+GitHub Marketplace action repositories must keep a single action metadata file at
+the repository root and must not contain workflow files in the action repository.
+For that reason this repo does not keep `.github/workflows/*` CI files on the
+published branch. Run release validation locally or from a separate/internal CI
+repository before tagging a Marketplace release.
