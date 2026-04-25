@@ -1,0 +1,192 @@
+from __future__ import annotations
+
+from collections import defaultdict
+from pathlib import Path
+
+from agents_shipgate.core.findings import SEVERITY_ORDER
+from agents_shipgate.core.models import Finding, ReadinessReport
+
+
+DISCLAIMER = (
+    "Agents Shipgate is an advisory release-readiness scanner. It does not certify "
+    "agent safety or compliance. Findings are based on static configuration, declared "
+    "policies, tool schemas, and optional SDK metadata. Runtime behavior, actual tool "
+    "routing, and output interpretation are not verified in v0.1."
+)
+
+
+def write_markdown_report(report: ReadinessReport, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(render_markdown_report(report), encoding="utf-8")
+
+
+def render_markdown_report(report: ReadinessReport) -> str:
+    lines: list[str] = []
+    summary = report.summary
+    lines.extend(
+        [
+            "# Agents Shipgate Report",
+            "",
+            f"Project: {_safe_markdown_text(report.project.get('name'))}",
+            f"Agent: {_safe_markdown_text(report.agent.get('name'))}",
+            f"Target: {_safe_markdown_text(report.environment.get('target'))}",
+            "",
+            _result_line(report),
+            f"Status: {_human_status(summary.status)}",
+            f"Critical: {summary.critical_count}",
+            f"High: {summary.high_count}",
+            f"Medium: {summary.medium_count}",
+            f"Low: {summary.low_count}",
+            f"Suppressed: {summary.suppressed_count}",
+            f"Evidence coverage: {summary.evidence_coverage}",
+            f"Human review: {'recommended' if summary.human_review_recommended else 'not required'}",
+            "",
+        ]
+    )
+    _append_top_findings(lines, report.findings)
+    _append_recommended_actions(lines, report.recommended_actions)
+    _append_source_warnings(lines, report)
+    _append_tool_surface(lines, report)
+    _append_findings_by_category(lines, report.findings)
+    _append_inventory(lines, report)
+    lines.extend(["", "## Disclaimer", "", DISCLAIMER, ""])
+    return "\n".join(lines)
+
+
+def _append_top_findings(lines: list[str], findings: list[Finding]) -> None:
+    active = sorted(
+        [
+            finding
+            for finding in findings
+            if not finding.suppressed and finding.severity in {"critical", "high"}
+        ],
+        key=lambda finding: (SEVERITY_ORDER[finding.severity], finding.check_id),
+    )
+    lines.extend(["## Top Findings", ""])
+    if not active:
+        lines.extend(["No critical or high findings.", ""])
+        return
+    for index, finding in enumerate(active[:5], start=1):
+        lines.append(f"{index}. {_safe_markdown_text(finding.title)}")
+        lines.append(f"   Evidence: {_compact_evidence(finding.evidence)}")
+        lines.append(f"   Recommendation: {_safe_markdown_text(finding.recommendation)}")
+        lines.append("")
+
+
+def _append_recommended_actions(lines: list[str], actions: list[str]) -> None:
+    lines.extend(["## Recommended Next Actions", ""])
+    if not actions:
+        lines.extend(["No action required from static findings.", ""])
+        return
+    for action in actions:
+        lines.append(f"- {_safe_markdown_text(action)}")
+    lines.append("")
+
+
+def _append_source_warnings(lines: list[str], report: ReadinessReport) -> None:
+    if not report.source_warnings:
+        return
+    lines.extend(["## Source Warnings", ""])
+    for warning in report.source_warnings:
+        lines.append(f"- {_safe_markdown_text(warning)}")
+    lines.append("")
+
+
+def _append_tool_surface(lines: list[str], report: ReadinessReport) -> None:
+    surface = report.tool_surface
+    lines.extend(
+        [
+            "## Tool Surface Summary",
+            "",
+            f"- Total tools: {surface.total_tools}",
+            f"- High-risk tools: {surface.high_risk_tools}",
+            f"- Wildcard tools: {surface.wildcard_tools}",
+            f"- Missing descriptions: {surface.missing_descriptions}",
+            f"- Sources: {', '.join(f'{key}={value}' for key, value in surface.sources.items()) or 'none'}",
+            "",
+        ]
+    )
+
+
+def _append_findings_by_category(lines: list[str], findings: list[Finding]) -> None:
+    lines.extend(["## Findings By Category", ""])
+    if not findings:
+        lines.extend(["No findings.", ""])
+        return
+    grouped: dict[str, list[Finding]] = defaultdict(list)
+    for finding in findings:
+        grouped[finding.category].append(finding)
+    for category in sorted(grouped):
+        lines.append(f"### {category.replace('_', ' ').title()}")
+        lines.append("")
+        for finding in sorted(
+            grouped[category],
+            key=lambda item: (SEVERITY_ORDER[item.severity], item.check_id, item.tool_name or ""),
+        ):
+            suppressed = " (suppressed)" if finding.suppressed else ""
+            target = f" [{_safe_markdown_text(finding.tool_name)}]" if finding.tool_name else ""
+            lines.append(
+                f"- {finding.severity.upper()}: {finding.check_id}{target}{suppressed} - "
+                f"{_safe_markdown_text(finding.title)}"
+            )
+            if finding.suppressed and finding.suppression_reason:
+                lines.append(f"  Suppression: {_safe_markdown_text(finding.suppression_reason)}")
+        lines.append("")
+
+
+def _append_inventory(lines: list[str], report: ReadinessReport) -> None:
+    lines.extend(["## Appendix: Normalized Tool Inventory", ""])
+    if not report.tool_inventory:
+        lines.extend(["No tools were enumerated.", ""])
+        return
+    lines.append("| Tool | Source | Risk Tags | Risk Confidence | Auth Scopes | Owner |")
+    lines.append("| --- | --- | --- | --- | --- | --- |")
+    for tool in report.tool_inventory:
+        name = _table_cell(tool.get("name") or "-")
+        source_type = _table_cell(tool.get("source_type") or "-")
+        risk_tags = _table_cell(", ".join(tool.get("risk_tags") or []) or "-")
+        risk_confidence = _table_cell(_risk_confidence_summary(tool.get("risk_tag_confidence")) or "-")
+        scopes = _table_cell(", ".join(tool.get("auth_scopes") or []) or "-")
+        owner = _table_cell(tool.get("owner") or "-")
+        lines.append(
+            f"| {name} | {source_type} | {risk_tags} | {risk_confidence} | {scopes} | {owner} |"
+        )
+    lines.append("")
+
+
+def _human_status(status: str) -> str:
+    return status.replace("_", " ").capitalize()
+
+
+def _compact_evidence(evidence: dict[str, object]) -> str:
+    parts = []
+    for key, value in evidence.items():
+        parts.append(_safe_markdown_text(f"{key}={value}"))
+    return "; ".join(parts) or "static metadata"
+
+
+def _table_cell(value: object) -> str:
+    return _safe_markdown_text(value)
+
+
+def _risk_confidence_summary(value: object) -> str:
+    if not isinstance(value, dict):
+        return ""
+    return ", ".join(f"{tag}={confidence}" for tag, confidence in value.items())
+
+
+def _result_line(report: ReadinessReport) -> str:
+    active = [finding for finding in report.findings if not finding.suppressed]
+    total_tools = report.tool_surface.total_tools
+    if not active:
+        return f"Result: PASS - no static findings across {total_tools} tools."
+    if report.summary.critical_count:
+        return "Result: BLOCKED - release blockers detected."
+    return "Result: REVIEW - static findings require human review."
+
+
+def _safe_markdown_text(value: object) -> str:
+    text = "" if value is None else str(value)
+    for char in ("\\", "`", "[", "]", "(", ")", "|"):
+        text = text.replace(char, f"\\{char}")
+    return text

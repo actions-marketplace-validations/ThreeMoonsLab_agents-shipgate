@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agents-shipgate"
+version = "0.1.0"
+description = "Manifest-first release readiness scanner for agent tool surfaces."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+authors = [
+  { name = "Agents Shipgate Contributors" }
+]
+dependencies = [
+  "pydantic>=2.7,<3",
+  "pyyaml>=6.0.1,<7",
+  "typer>=0.12,<1",
+]
+
+[project.urls]
+Homepage = "https://github.com/ThreeMoonsLab/agents-shipgate"
+Repository = "https://github.com/ThreeMoonsLab/agents-shipgate"
+Issues = "https://github.com/ThreeMoonsLab/agents-shipgate/issues"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+]
+
+[project.scripts]
+agents-shipgate = "agents_shipgate.cli.main:app"
+
+[project.entry-points."agents_shipgate.checks"]
+inventory = "agents_shipgate.checks.inventory:run"
+documentation = "agents_shipgate.checks.documentation:run"
+schema = "agents_shipgate.checks.schema:run"
+auth = "agents_shipgate.checks.auth:run"
+manifest_scope = "agents_shipgate.checks.manifest_scope:run"
+policy = "agents_shipgate.checks.policy:run"
+side_effects = "agents_shipgate.checks.side_effects:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agents_shipgate"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

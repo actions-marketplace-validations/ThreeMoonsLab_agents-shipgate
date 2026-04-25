@@ -1,0 +1,115 @@
+name: Agents Shipgate
+description: Run Agents Shipgate release-readiness scan.
+
+inputs:
+  config:
+    required: false
+    default: shipgate.yaml
+    description: Path to shipgate.yaml.
+  ci_mode:
+    required: false
+    default: advisory
+    description: advisory or strict.
+  output_dir:
+    required: false
+    default: agents-shipgate-reports
+    description: Output directory for reports.
+  upload_artifact:
+    required: false
+    default: "true"
+    description: Upload reports as a workflow artifact.
+  pr_comment:
+    required: false
+    default: "false"
+    description: Post a short PR comment when running on pull_request.
+  github_token:
+    required: false
+    default: ""
+    description: Token for optional PR comments.
+  shipgate_version:
+    required: false
+    default: ""
+    description: Optional Agents Shipgate PyPI version to install. Empty installs this action source.
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      with:
+        python-version: "3.12"
+
+    - name: Install Agents Shipgate
+      shell: bash
+      env:
+        SHIPGATE_VERSION: ${{ inputs.shipgate_version }}
+      run: |
+        if [ -n "${SHIPGATE_VERSION}" ]; then
+          python -m pip install "agents-shipgate==${SHIPGATE_VERSION}"
+        else
+          python -m pip install "${GITHUB_ACTION_PATH}"
+        fi
+
+    - name: Run Agents Shipgate
+      shell: bash
+      env:
+        CONFIG: ${{ inputs.config }}
+        CI_MODE: ${{ inputs.ci_mode }}
+        OUTPUT_DIR: ${{ inputs.output_dir }}
+      run: |
+        agents-shipgate scan \
+          --config "${CONFIG}" \
+          --ci-mode "${CI_MODE}" \
+          --out "${OUTPUT_DIR}" \
+          --format markdown,json
+
+    - name: Upload Agents Shipgate report
+      if: ${{ always() && inputs.upload_artifact == 'true' }}
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: agents-shipgate-report
+        path: ${{ inputs.output_dir }}/
+
+    - name: Comment on pull request
+      if: ${{ always() && inputs.pr_comment == 'true' && github.event_name == 'pull_request' }}
+      uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+      env:
+        OUTPUT_DIR: ${{ inputs.output_dir }}
+      with:
+        github-token: ${{ inputs.github_token || github.token }}
+        script: |
+          const fs = require("fs");
+          const path = require("path");
+          const reportPath = path.join(process.env.OUTPUT_DIR || "agents-shipgate-reports", "report.json");
+          if (!fs.existsSync(reportPath)) {
+            core.warning(`Agents Shipgate report not found at ${reportPath}`);
+            return;
+          }
+          const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
+          const summary = report.summary || {};
+          const escapeMarkdown = (value) =>
+            String(value || "")
+              .replace(/\\/g, "\\\\")
+              .replace(/([\[\]\(\)`*_{}#+\-.!|>])/g, "\\$1");
+          const top = (report.findings || [])
+            .filter((finding) => !finding.suppressed && ["critical", "high"].includes(finding.severity))
+            .slice(0, 3)
+            .map((finding, index) => `${index + 1}. ${escapeMarkdown(finding.title || finding.check_id)}`)
+            .join("\n");
+          const body = [
+            "## Agents Shipgate",
+            "",
+            `Status: ${summary.status || "unknown"}`,
+            `Critical: ${summary.critical_count || 0} · High: ${summary.high_count || 0} · Medium: ${summary.medium_count || 0}`,
+            `Human review: ${summary.human_review_recommended ? "recommended" : "not required"}`,
+            "",
+            top ? `Top findings:\n${top}` : "No critical or high findings.",
+            "",
+            "Full report: `agents-shipgate-report` artifact."
+          ].join("\n");
+          await github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+            body
+          });
