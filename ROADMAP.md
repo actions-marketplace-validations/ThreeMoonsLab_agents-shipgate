@@ -6,6 +6,8 @@
 - Stabilize JSON report compatibility and finding fingerprints.
 - Add baseline save/apply workflow.
 - Harden OpenAPI parsing through property-based tests and fuzzing.
+- Add MCP fuzzing, plugin-loader tests, coverage reporting, and YAML resource-limit tests.
+- Add SBOM generation, release signing, and dependency audit checks.
 - Expand manifest-aware checks.
 
 ## v0.3
@@ -19,5 +21,4 @@
 
 - Add external policy/check packs.
 - Add richer SDK adapters.
-- Publish signed releases, SBOMs, and container images.
-
+- Revisit container image distribution if demand appears and the image has CI coverage.

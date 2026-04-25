@@ -4,6 +4,7 @@ import re
 
 from agents_shipgate.checks.base import tool_finding
 from agents_shipgate.core.context import ScanContext
+from agents_shipgate.core.risk_hints import is_high_risk_tool, is_write_tool
 
 
 SECRET_PATTERNS = [
@@ -19,7 +20,7 @@ INJECTION_PATTERNS = [
     re.compile(r"(?i)ignore (all )?(previous|prior) instructions"),
     re.compile(r"(?i)(ignore|override|replace).{0,40}(system prompt|developer message|instructions)"),
     re.compile(r"(?i)(system prompt|developer message).{0,40}(ignore|override|replace)"),
-    re.compile(r"(?i)you are now"),
+    re.compile(r"(?i)you are now (a|the) (system|developer|admin|root)"),
 ]
 
 
@@ -41,29 +42,33 @@ def run(context: ScanContext):
                     context=context,
                 )
             )
-        if _contains_secret_like_text(description):
+        secret_matches = _secret_like_matches(description)
+        if secret_matches:
+            severity = _heuristic_security_severity(tool, secret_matches)
             findings.append(
                 tool_finding(
                     tool=tool,
                     check_id="SHIP-DOC-SECRET-IN-DESCRIPTION",
                     title=f"{tool.name} description appears to contain a secret",
-                    severity="high",
+                    severity=severity,
                     category="security",
-                    evidence={"matched": "secret-like pattern"},
-                    confidence="high",
+                    evidence={"matched": secret_matches},
+                    confidence="high" if severity == "high" else "medium",
                     recommendation=f"Remove secret-like values from the {tool.name} description and rotate any exposed credentials.",
                     context=context,
                 )
             )
-        if _contains_injection_like_text(description):
+        injection_matches = _injection_like_matches(description)
+        if injection_matches:
+            severity = _heuristic_security_severity(tool, injection_matches)
             findings.append(
                 tool_finding(
                     tool=tool,
                     check_id="SHIP-DOC-INJECTION-RISK",
                     title=f"{tool.name} description contains instruction-like text",
-                    severity="high",
+                    severity=severity,
                     category="security",
-                    evidence={"matched": "prompt-injection-like pattern"},
+                    evidence={"matched": injection_matches},
                     confidence="medium",
                     recommendation=f"Rewrite the {tool.name} description as capability metadata, not instructions to the model.",
                     context=context,
@@ -72,14 +77,18 @@ def run(context: ScanContext):
     return findings
 
 
-def _contains_secret_like_text(description: str) -> bool:
-    if any(pattern.search(description) for pattern in SECRET_PATTERNS):
-        return True
+def _secret_like_matches(description: str) -> list[str]:
+    matches: list[str] = []
+    for pattern in SECRET_PATTERNS:
+        if pattern.search(description):
+            matches.append(pattern.pattern)
     match = LABELED_SECRET_PATTERN.search(description)
     if not match:
-        return False
+        return matches
     value = match.group(2)
-    return _looks_like_secret_value(value)
+    if _looks_like_secret_value(value):
+        matches.append("labeled_secret_value")
+    return matches
 
 
 def _looks_like_secret_value(value: str) -> bool:
@@ -91,5 +100,15 @@ def _looks_like_secret_value(value: str) -> bool:
     return has_alpha and has_digit and has_secret_alphabet
 
 
-def _contains_injection_like_text(description: str) -> bool:
-    return any(pattern.search(description) for pattern in INJECTION_PATTERNS)
+def _injection_like_matches(description: str) -> list[str]:
+    return [
+        pattern.pattern
+        for pattern in INJECTION_PATTERNS
+        if pattern.search(description)
+    ]
+
+
+def _heuristic_security_severity(tool, matches: list[str]) -> str:
+    if len(matches) > 1 and (is_write_tool(tool) or is_high_risk_tool(tool)):
+        return "high"
+    return "medium"

@@ -41,6 +41,24 @@ def load_structured_file(path: Path) -> Any:
         raise InputParseError(f"Unable to parse input file {path}: {exc}") from exc
 
 
+def load_text_file(path: Path) -> str:
+    if not path.exists():
+        raise InputParseError(f"Input file not found: {path}")
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise InputParseError(f"Unable to inspect input file {path}: {exc}") from exc
+    if size > MAX_INPUT_FILE_BYTES:
+        raise InputParseError(
+            f"Input file too large: {path} is {size} bytes; "
+            f"maximum is {MAX_INPUT_FILE_BYTES} bytes"
+        )
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise InputParseError(f"Unable to read input file {path}: {exc}") from exc
+
+
 def stable_tool_id(name: str) -> str:
     return f"tool:{name}"
 

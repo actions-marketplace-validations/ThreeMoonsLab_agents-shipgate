@@ -5,8 +5,8 @@ These items require release infrastructure, registry credentials, domains, or Gi
 ## Package Channels
 
 - Publish `agents-shipgate` to PyPI.
-- Publish a pinned GitHub Action release tag such as `v0.1.0`.
-- Publish a container image such as `ghcr.io/threemoonslab/agents-shipgate:0.1.0`.
+- Publish a pinned GitHub Action release tag such as `v0.2.0`.
+- Evaluate a container image later only if it has an exercised build-and-test path.
 - Evaluate Homebrew once CLI usage warrants it.
 
 The GitHub Action can install from its tagged source before PyPI publication. A
@@ -17,9 +17,15 @@ install a published PyPI version.
 
 - Generate SBOMs for release artifacts.
 - Sign release artifacts with Sigstore.
+- Publish to PyPI through Trusted Publishing from `.github/workflows/release.yml`.
 - Keep GitHub Actions pinned by SHA.
 - Use Dependabot for Python and GitHub Actions updates.
 - Add a lockfile for release and dev dependency builds once packaging workflow is finalized.
+
+PyPI release prerequisite: configure the `agents-shipgate` PyPI project with a
+Trusted Publisher for this repository, workflow `.github/workflows/release.yml`,
+environment `pypi`, and the tag-triggered release job before pushing a public
+release tag.
 
 ## Marketplace And Site
 
@@ -27,10 +33,9 @@ install a published PyPI version.
 - Create a small landing page with install instructions, trust model, and findings gallery.
 - Consider a local-only playground later; do not accept private customer manifests into a hosted service without a separate privacy review.
 
-## Marketplace Repository Constraint
+## Marketplace Repository Notes
 
-GitHub Marketplace action repositories must keep a single action metadata file at
-the repository root and must not contain workflow files in the action repository.
-For that reason this repo does not keep `.github/workflows/*` CI files on the
-published branch. Run release validation locally or from a separate/internal CI
-repository before tagging a Marketplace release.
+The repository keeps a root `action.yml` for GitHub Marketplace publication and
+a minimal `.github/workflows/ci.yml` for project validation plus a tag-triggered
+release workflow. The action remains a composite action; there is no Docker
+action entrypoint in v0.2.

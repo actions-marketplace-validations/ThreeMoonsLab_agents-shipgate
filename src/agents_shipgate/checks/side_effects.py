@@ -7,7 +7,9 @@ from agents_shipgate.core.risk_hints import has_risk_tag, is_effectively_read_on
 
 def run(context: ScanContext):
     findings = []
-    policy_tools = context.manifest.policies.idempotency_tools()
+    policy_tools = set(context.manifest.policies.idempotency_tools())
+    if context.api_artifacts:
+        policy_tools.update(context.api_artifacts.idempotency_tools())
     for tool in context.tools:
         if is_effectively_read_only(tool):
             continue

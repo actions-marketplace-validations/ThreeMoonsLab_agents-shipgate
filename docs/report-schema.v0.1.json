@@ -271,13 +271,64 @@
       "type": "object"
     }
   },
-  "$id": "https://agents-shipgate.local/schemas/report-schema.v0.1.json",
+  "$id": "https://github.com/ThreeMoonsLab/agents-shipgate/schemas/report-schema.v0.1.json",
   "additionalProperties": true,
   "properties": {
     "agent": {
       "additionalProperties": true,
       "title": "Agent",
       "type": "object"
+    },
+    "api_surface": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "model_config_present": {
+              "type": "boolean"
+            },
+            "policy_rule_count": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "prompt_file_count": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "response_format_count": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "test_case_count": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tool_file_count": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "trace_sample_count": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "prompt_file_count",
+            "tool_file_count",
+            "response_format_count",
+            "model_config_present",
+            "test_case_count",
+            "trace_sample_count",
+            "policy_rule_count"
+          ],
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Api Surface"
     },
     "environment": {
       "additionalProperties": true,
@@ -417,7 +468,8 @@
   "title": "Agents Shipgate Readiness Report v0.1",
   "type": "object",
   "x-compatibility": {
-    "contract": "JSON keys are stable within v0.1. Check IDs and finding fingerprints are stable identifiers for identical inputs. Severity defaults may change only with documented release notes.",
-    "schema_version": "0.1"
+    "check_ids": "Built-in check IDs are stable public identifiers.",
+    "schema_version": "0.1",
+    "stability": "Keys are intended to be stable within the 0.1 report line; additive fields may be introduced."
   }
 }

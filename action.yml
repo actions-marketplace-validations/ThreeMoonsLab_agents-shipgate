@@ -19,6 +19,14 @@ inputs:
     required: false
     default: ""
     description: Optional comma-separated severities that fail CI, for example critical,high.
+  baseline:
+    required: false
+    default: ""
+    description: Optional local baseline JSON path. Strict mode fails only on new findings.
+  baseline_mode:
+    required: false
+    default: new-findings
+    description: Baseline comparison mode. v0.2 supports new-findings.
   output_dir:
     required: false
     default: agents-shipgate-reports
@@ -53,6 +61,9 @@ outputs:
   medium_count:
     description: Number of unsuppressed medium findings.
     value: ${{ steps.report_outputs.outputs.medium_count }}
+  baseline_new_count:
+    description: Number of new findings when a baseline is used.
+    value: ${{ steps.report_outputs.outputs.baseline_new_count }}
   report_json:
     description: Path to the generated JSON report.
     value: ${{ steps.report_outputs.outputs.report_json }}
@@ -89,6 +100,8 @@ runs:
         CONFIG: ${{ inputs.config }}
         CI_MODE: ${{ inputs.ci_mode }}
         FAIL_ON: ${{ inputs.fail_on }}
+        BASELINE: ${{ inputs.baseline }}
+        BASELINE_MODE: ${{ inputs.baseline_mode }}
         OUTPUT_DIR: ${{ inputs.output_dir }}
       run: |
         args=(
@@ -100,6 +113,9 @@ runs:
         )
         if [ -n "${FAIL_ON}" ]; then
           args+=(--fail-on "${FAIL_ON}")
+        fi
+        if [ -n "${BASELINE}" ]; then
+          args+=(--baseline "${BASELINE}" --baseline-mode "${BASELINE_MODE}")
         fi
         set +e
         agents-shipgate "${args[@]}"
@@ -123,9 +139,12 @@ runs:
         report_json = output_dir / "report.json"
         report_markdown = output_dir / "report.md"
         summary = {}
+        baseline = {}
         if report_json.exists():
             with report_json.open(encoding="utf-8") as handle:
-                summary = (json.load(handle).get("summary") or {})
+                payload = json.load(handle)
+                summary = payload.get("summary") or {}
+                baseline = payload.get("baseline") or {}
 
         def clean(value: object) -> str:
             return str(value or "").replace("\r", "").replace("\n", "")
@@ -135,6 +154,7 @@ runs:
             "critical_count": summary.get("critical_count", 0),
             "high_count": summary.get("high_count", 0),
             "medium_count": summary.get("medium_count", 0),
+            "baseline_new_count": baseline.get("new_count", 0),
             "report_json": report_json,
             "report_markdown": report_markdown,
         }
@@ -172,12 +192,16 @@ runs:
             String(value || "")
               .replace(/\\/g, "\\\\")
               .replace(/([\[\]\(\)`*_{}#+\-.!|>])/g, "\\$1");
+          const truncate = (value, limit) => {
+            const text = String(value || "");
+            return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+          };
           const top = (report.findings || [])
             .filter((finding) => !finding.suppressed && ["critical", "high"].includes(finding.severity))
             .slice(0, 3)
-            .map((finding, index) => `${index + 1}. ${escapeMarkdown(finding.title || finding.check_id)}`)
+            .map((finding, index) => `${index + 1}. ${escapeMarkdown(truncate(finding.title || finding.check_id, 240))}`)
             .join("\n");
-          const body = [
+          const body = truncate([
             "## Agents Shipgate",
             "",
             `Status: ${summary.status || "unknown"}`,
@@ -187,7 +211,7 @@ runs:
             top ? `Top findings:\n${top}` : "No critical or high findings.",
             "",
             "Full report: `agents-shipgate-report` artifact."
-          ].join("\n");
+          ].join("\n"), 6000);
           await github.rest.issues.createComment({
             owner: context.repo.owner,
             repo: context.repo.repo,

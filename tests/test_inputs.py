@@ -69,7 +69,7 @@ def test_mcp_loader_accepts_array_root(tmp_path):
     assert [tool.name for tool in loaded.tools] == ["support.lookup"]
 
 
-def test_mcp_wildcard_with_tools_warns_and_uses_wildcard(tmp_path):
+def test_mcp_wildcard_with_tools_is_rejected(tmp_path):
     tools_path = tmp_path / "tools.json"
     tools_path.write_text(
         """
@@ -83,13 +83,15 @@ def test_mcp_wildcard_with_tools_warns_and_uses_wildcard(tmp_path):
         encoding="utf-8",
     )
 
-    loaded = load_mcp_tools(
-        ToolSourceConfig(id="wildcard_tools", type="mcp", path="tools.json"),
-        tmp_path,
-    )
-
-    assert [tool.name for tool in loaded.tools] == ["wildcard_tools.*"]
-    assert any("explicit tools are ignored" in warning for warning in loaded.warnings)
+    try:
+        load_mcp_tools(
+            ToolSourceConfig(id="wildcard_tools", type="mcp", path="tools.json"),
+            tmp_path,
+        )
+    except InputParseError as exc:
+        assert "wildcard tool exposure and an explicit tools array" in str(exc)
+    else:
+        raise AssertionError("expected wildcard plus explicit tools to be rejected")
 
 
 def test_mcp_loader_warns_on_duplicate_and_non_conventional_names(tmp_path):
@@ -307,6 +309,7 @@ paths:
     )
 
     assert loaded.tools[0].input_schema == {"$ref": "file:///etc/passwd"}
+    assert any("Unresolved OpenAPI $ref" in warning for warning in loaded.warnings)
 
 
 def test_openapi_operation_parse_error_is_fatal(tmp_path):
@@ -345,6 +348,26 @@ def test_load_structured_file_rejects_large_inputs(tmp_path):
         assert "Input file too large" in str(exc)
     else:
         raise AssertionError("Expected InputParseError")
+
+
+def test_yaml_alias_input_stays_within_loader_contract(tmp_path):
+    input_path = tmp_path / "aliases.yaml"
+    input_path.write_text(
+        """
+base: &base
+  name: support.lookup
+  description: Look up support metadata.
+tools:
+  - *base
+  - *base
+""",
+        encoding="utf-8",
+    )
+
+    payload = load_structured_file(input_path)
+
+    assert isinstance(payload, dict)
+    assert len(payload["tools"]) == 2
 
 
 def test_openai_sdk_static_handles_defaults_kwonly_and_name_override(tmp_path):

@@ -11,7 +11,7 @@ DISCLAIMER = (
     "Agents Shipgate is an advisory release-readiness scanner. It does not certify "
     "agent safety or compliance. Findings are based on static configuration, declared "
     "policies, tool schemas, and optional SDK metadata. Runtime behavior, actual tool "
-    "routing, and output interpretation are not verified in v0.1."
+    "routing, and output interpretation are not verified."
 )
 
 
@@ -44,9 +44,11 @@ def render_markdown_report(report: ReadinessReport) -> str:
         ]
     )
     _append_top_findings(lines, report.findings)
+    _append_baseline(lines, report)
     _append_recommended_actions(lines, report.recommended_actions)
     _append_source_warnings(lines, report)
     _append_tool_surface(lines, report)
+    _append_api_surface(lines, report)
     _append_findings_by_category(lines, report.findings)
     _append_inventory(lines, report)
     lines.extend(["", "## Disclaimer", "", DISCLAIMER, ""])
@@ -83,6 +85,23 @@ def _append_recommended_actions(lines: list[str], actions: list[str]) -> None:
     lines.append("")
 
 
+def _append_baseline(lines: list[str], report: ReadinessReport) -> None:
+    if not report.baseline:
+        return
+    baseline = report.baseline
+    lines.extend(
+        [
+            "## Baseline",
+            "",
+            f"- Path: {_safe_markdown_text(baseline.path)}",
+            f"- Matched findings: {baseline.matched_count}",
+            f"- New findings: {baseline.new_count}",
+            f"- Resolved findings: {baseline.resolved_count}",
+            "",
+        ]
+    )
+
+
 def _append_source_warnings(lines: list[str], report: ReadinessReport) -> None:
     if not report.source_warnings:
         return
@@ -108,6 +127,26 @@ def _append_tool_surface(lines: list[str], report: ReadinessReport) -> None:
     )
 
 
+def _append_api_surface(lines: list[str], report: ReadinessReport) -> None:
+    if not report.api_surface:
+        return
+    surface = report.api_surface
+    lines.extend(
+        [
+            "## OpenAI API Surface Summary",
+            "",
+            f"- Prompt files: {surface.get('prompt_file_count', 0)}",
+            f"- Tool files: {surface.get('tool_file_count', 0)}",
+            f"- Response formats: {surface.get('response_format_count', 0)}",
+            f"- Model config present: {surface.get('model_config_present', False)}",
+            f"- Test cases: {surface.get('test_case_count', 0)}",
+            f"- Trace samples: {surface.get('trace_sample_count', 0)}",
+            f"- Policy rule files: {surface.get('policy_rule_count', 0)}",
+            "",
+        ]
+    )
+
+
 def _append_findings_by_category(lines: list[str], findings: list[Finding]) -> None:
     lines.extend(["## Findings By Category", ""])
     if not findings:
@@ -124,9 +163,10 @@ def _append_findings_by_category(lines: list[str], findings: list[Finding]) -> N
             key=lambda item: (SEVERITY_ORDER[item.severity], item.check_id, item.tool_name or ""),
         ):
             suppressed = " (suppressed)" if finding.suppressed else ""
+            baseline = f" ({finding.baseline_status})" if finding.baseline_status else ""
             target = f" [{_safe_markdown_text(finding.tool_name)}]" if finding.tool_name else ""
             lines.append(
-                f"- {finding.severity.upper()}: {finding.check_id}{target}{suppressed} - "
+                f"- {finding.severity.upper()}: {finding.check_id}{target}{suppressed}{baseline} - "
                 f"{_safe_markdown_text(finding.title)}"
             )
             if finding.suppressed and finding.suppression_reason:

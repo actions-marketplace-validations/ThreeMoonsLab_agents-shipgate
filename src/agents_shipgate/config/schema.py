@@ -38,14 +38,6 @@ class AgentConfig(BaseModel):
     instructions_preview: str | None = None
     prohibited_actions: list[str] = Field(default_factory=list)
 
-    @model_validator(mode="after")
-    def require_scope_text(self) -> AgentConfig:
-        if not self.declared_purpose and not self.instructions_preview:
-            raise ValueError(
-                "agent.declared_purpose or agent.instructions_preview is required"
-            )
-        return self
-
 
 class EnvironmentConfig(BaseModel):
     model_config = STRICT_MODEL_CONFIG
@@ -70,6 +62,101 @@ class ToolSourceConfig(BaseModel):
         if self.type in {"mcp", "openapi"} and not self.path:
             raise ValueError(f"tool source {self.id!r} requires path")
         return self
+
+
+class ArtifactPathConfig(BaseModel):
+    model_config = STRICT_MODEL_CONFIG
+
+    path: str
+    optional: bool = False
+
+
+class NamedArtifactPathConfig(ArtifactPathConfig):
+    name: str | None = None
+    downstream_critical_fields: list[str] = Field(default_factory=list)
+
+
+def _parse_artifact_entries(value: Any) -> list[ArtifactPathConfig]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise TypeError("artifact entries must be a list")
+    entries: list[ArtifactPathConfig] = []
+    for item in value:
+        if isinstance(item, str):
+            entries.append(ArtifactPathConfig(path=item))
+        elif isinstance(item, dict):
+            entries.append(ArtifactPathConfig.model_validate(item))
+        else:
+            raise TypeError("artifact entries must be strings or objects")
+    return entries
+
+
+def _parse_named_artifact_entries(value: Any) -> list[NamedArtifactPathConfig]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise TypeError("artifact entries must be a list")
+    entries: list[NamedArtifactPathConfig] = []
+    for item in value:
+        if isinstance(item, str):
+            entries.append(NamedArtifactPathConfig(path=item))
+        elif isinstance(item, dict):
+            entries.append(NamedArtifactPathConfig.model_validate(item))
+        else:
+            raise TypeError("artifact entries must be strings or objects")
+    return entries
+
+
+class OpenAIApiConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    prompt_files: list[str] = Field(default_factory=list)
+    tools: list[ArtifactPathConfig] = Field(default_factory=list)
+    function_schemas: list[NamedArtifactPathConfig] = Field(default_factory=list)
+    response_formats: list[NamedArtifactPathConfig] = Field(default_factory=list)
+    api_model_config: ArtifactPathConfig | None = Field(default=None, alias="model_config")
+    test_cases: list[ArtifactPathConfig] = Field(default_factory=list)
+    trace_samples: list[ArtifactPathConfig] = Field(default_factory=list)
+    policy_rules: list[ArtifactPathConfig] = Field(default_factory=list)
+
+    @field_validator("prompt_files", mode="before")
+    @classmethod
+    def parse_prompt_files(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise TypeError("prompt_files must be a list")
+        files: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                files.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("path"), str):
+                files.append(item["path"])
+            else:
+                raise TypeError("prompt_files entries must be strings or objects with path")
+        return files
+
+    @field_validator("tools", "test_cases", "trace_samples", "policy_rules", mode="before")
+    @classmethod
+    def parse_artifacts(cls, value: Any) -> list[ArtifactPathConfig]:
+        return _parse_artifact_entries(value)
+
+    @field_validator("function_schemas", "response_formats", mode="before")
+    @classmethod
+    def parse_named_artifacts(cls, value: Any) -> list[NamedArtifactPathConfig]:
+        return _parse_named_artifact_entries(value)
+
+    @field_validator("api_model_config", mode="before")
+    @classmethod
+    def parse_model_config(cls, value: Any) -> ArtifactPathConfig | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return ArtifactPathConfig(path=value)
+        if isinstance(value, dict):
+            return ArtifactPathConfig.model_validate(value)
+        raise TypeError("model_config must be a string path or object with path")
 
 
 class PolicyToolEntry(BaseModel):
@@ -194,7 +281,8 @@ class AgentsShipgateManifest(BaseModel):
     project: ProjectConfig
     agent: AgentConfig
     environment: EnvironmentConfig
-    tool_sources: list[ToolSourceConfig]
+    tool_sources: list[ToolSourceConfig] = Field(default_factory=list)
+    openai_api: OpenAIApiConfig | None = None
     policies: PoliciesConfig = Field(default_factory=PoliciesConfig)
     permissions: PermissionsConfig = Field(default_factory=PermissionsConfig)
     risk_overrides: RiskOverridesConfig = Field(default_factory=RiskOverridesConfig)
@@ -203,14 +291,20 @@ class AgentsShipgateManifest(BaseModel):
     ci: CiConfig = Field(default_factory=CiConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
 
-    @field_validator("tool_sources")
-    @classmethod
-    def require_tool_sources(
-        cls, value: list[ToolSourceConfig]
-    ) -> list[ToolSourceConfig]:
-        if not value:
-            raise ValueError("tool_sources must contain at least one source")
-        return value
+    @model_validator(mode="after")
+    def require_sources_and_scope_text(self) -> AgentsShipgateManifest:
+        if not self.tool_sources and self.openai_api is None:
+            raise ValueError("At least one of tool_sources or openai_api is required")
+        if (
+            not self.agent.declared_purpose
+            and not self.agent.instructions_preview
+            and not (self.openai_api and self.openai_api.prompt_files)
+        ):
+            raise ValueError(
+                "agent.declared_purpose, agent.instructions_preview, "
+                "or openai_api.prompt_files is required"
+            )
+        return self
 
     def severity_overrides(self) -> dict[str, Severity]:
         return {

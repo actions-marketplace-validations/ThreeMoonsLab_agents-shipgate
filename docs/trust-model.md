@@ -23,11 +23,12 @@ By default Agents Shipgate does not:
 - OpenAPI `$ref` resolution only follows internal JSON pointers beginning with `#/`.
 - `file://`, `http://`, and other external `$ref` values are left as inert schema values.
 - OpenAI Agents SDK enrichment uses `ast.parse` only. It does not import or execute Python modules.
+- `openai_api` artifacts are local prompt, JSON, YAML, or JSONL files. Agents Shipgate parses them locally and does not call OpenAI APIs, validate model availability, estimate pricing, or execute traces.
 - Third-party check plugins are disabled by default. Setting `AGENTS_SHIPGATE_ENABLE_PLUGINS=1` opts into importing and running installed plugin entry points.
 
 ## Failure Policy
 
-Declared input sources should fail closed when parsing cannot complete. Required source parse errors return CLI exit code `3`. Optional source parse errors are recorded as source warnings and the scan continues.
+Declared input sources should fail closed when parsing cannot complete. Required source parse errors return CLI exit code `3`. Optional source parse errors are recorded as source warnings and the scan continues. Policy gate failures use exit code `20`, keeping them distinct from configuration (`2`), input parsing (`3`), and internal (`4`) errors.
 
 ## Known Limits
 

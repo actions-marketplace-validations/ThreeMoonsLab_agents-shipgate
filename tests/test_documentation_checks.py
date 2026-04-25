@@ -40,6 +40,7 @@ def test_secret_check_flags_secret_like_labeled_value():
     findings = run(_context_for_tool(tool))
 
     assert [finding.check_id for finding in findings] == ["SHIP-DOC-SECRET-IN-DESCRIPTION"]
+    assert findings[0].severity == "medium"
 
 
 def test_injection_check_does_not_flag_benign_term_mentions():
@@ -54,3 +55,15 @@ def test_injection_check_does_not_flag_benign_term_mentions():
 
     assert [finding.check_id for finding in findings] == []
 
+
+def test_injection_check_does_not_flag_benign_you_are_now_phrase():
+    tool = Tool(
+        id="tool:docs",
+        name="docs",
+        source_type="mcp",
+        description="You are now ready to fetch order details after authentication.",
+    )
+
+    findings = run(_context_for_tool(tool))
+
+    assert [finding.check_id for finding in findings] == []

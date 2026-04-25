@@ -1,0 +1,697 @@
+{
+  "schema_version": "0.1",
+  "report_schema_version": "0.2",
+  "run_id": "agents_shipgate_20556254789e3a38",
+  "project": {
+    "name": "simple-openai-api-agent",
+    "owner": "support-platform"
+  },
+  "agent": {
+    "id": "agent:simple-openai-api-agent/api-refund-assistant",
+    "name": "api-refund-assistant",
+    "source": {
+      "source": "manifest"
+    },
+    "instructions": {
+      "value_preview": "You are a support refund assistant.\n\nYou should only advise the support representative and prepare a draft response. Do not take action on the customer's account.\n",
+      "source": "openai_api_prompt_files",
+      "confidence": "high"
+    },
+    "declared_purpose": [],
+    "prohibited_actions": [
+      "issue refund without approval",
+      "send customer email without confirmation"
+    ],
+    "tools": [
+      "create_refund",
+      "send_customer_email"
+    ],
+    "handoffs": [],
+    "guardrails": {
+      "input": "unknown",
+      "output": "unknown",
+      "tool": "unknown",
+      "source": "unknown"
+    },
+    "extraction": {
+      "method": "config_assisted",
+      "confidence": "medium",
+      "missing_fields": [
+        "runtime_traces"
+      ],
+      "dynamic_fields": []
+    }
+  },
+  "environment": {
+    "target": "production_like"
+  },
+  "summary": {
+    "status": "warnings_detected",
+    "critical_count": 0,
+    "high_count": 15,
+    "medium_count": 5,
+    "low_count": 0,
+    "info_count": 0,
+    "suppressed_count": 0,
+    "human_review_recommended": true,
+    "evidence_coverage": "static"
+  },
+  "tool_surface": {
+    "total_tools": 2,
+    "high_risk_tools": 2,
+    "sources": {
+      "openai_api": 2
+    },
+    "wildcard_tools": 0,
+    "missing_descriptions": 0
+  },
+  "api_surface": {
+    "prompt_file_count": 1,
+    "tool_file_count": 1,
+    "response_format_count": 1,
+    "model_config_present": true,
+    "test_case_count": 1,
+    "trace_sample_count": 1,
+    "policy_rule_count": 1
+  },
+  "baseline": null,
+  "findings": [
+    {
+      "id": "fp_c2d773062468ceac",
+      "fingerprint": "fp_c2d773062468ceac",
+      "check_id": "SHIP-SCHEMA-MISSING-BOUNDS",
+      "title": "create_refund.amount has no maximum bound",
+      "severity": "high",
+      "category": "schema",
+      "tool_id": "tool:create_refund",
+      "tool_name": "create_refund",
+      "agent_id": "agent:simple-openai-api-agent/api-refund-assistant",
+      "evidence": {
+        "parameter": "amount",
+        "type": "number"
+      },
+      "confidence": "high",
+      "source": {
+        "type": "openai_api",
+        "ref": "tools/openai-tools.json#0",
+        "location": null
+      },
+      "recommendation": "Add a maximum bound to create_refund.amount or document an equivalent limit in the tool policy.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_07538ba8f9532359",
+      "fingerprint": "fp_07538ba8f9532359",
+      "check_id": "SHIP-SCHEMA-BROAD-FREE-TEXT",
+      "title": "send_customer_email accepts broad free-form action input",
+      "severity": "high",
+      "category": "schema",
+      "tool_id": "tool:send_customer_email",
+      "tool_name": "send_customer_email",
+      "agent_id": "agent:simple-openai-api-agent/api-refund-assistant",
+      "evidence": {
+        "parameter": "message",
+        "type": "string"
+      },
+      "confidence": "medium",
+      "source": {
+        "type": "openai_api",
+        "ref": "tools/openai-tools.json#1",
+        "location": null
+      },
+      "recommendation": "Constrain send_customer_email.message with an enum, structured schema, or narrower field-specific parameters.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_58b3202c0a4d9793",
+      "fingerprint": "fp_58b3202c0a4d9793",
+      "check_id": "SHIP-AUTH-MISSING-SCOPE",
+      "title": "create_refund lacks declared auth scopes",
+      "severity": "high",
+      "category": "auth",
+      "tool_id": "tool:create_refund",
+      "tool_name": "create_refund",
+      "agent_id": "agent:simple-openai-api-agent/api-refund-assistant",
+      "evidence": {
+        "risk_tags": [
+          "write",
+          "financial_action"
+        ]
+      },
+      "confidence": "medium",
+      "source": {
+        "type": "openai_api",
+        "ref": "tools/openai-tools.json#0",
+        "location": null
+      },
+      "recommendation": "Declare auth scopes for create_refund in OpenAPI, MCP metadata, or the manifest before release review.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_45ef3ff3ce2cf187",
+      "fingerprint": "fp_45ef3ff3ce2cf187",
+      "check_id": "SHIP-AUTH-MISSING-SCOPE",
+      "title": "send_customer_email lacks declared auth scopes",
+      "severity": "high",
+      "category": "auth",
+      "tool_id": "tool:send_customer_email",
+      "tool_name": "send_customer_email",
+      "agent_id": "agent:simple-openai-api-agent/api-refund-assistant",
+      "evidence": {
+        "risk_tags": [
+          "write",
+          "customer_communication",
+          "external_write"
+        ]
+      },
+      "confidence": "medium",
+      "source": {
+        "type": "openai_api",
+        "ref": "tools/openai-tools.json#1",
+        "location": null
+      },
+      "recommendation": "Declare auth scopes for send_customer_email in OpenAPI, MCP metadata, or the manifest before release review.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_a8a615b5a4f2597b",
+      "fingerprint": "fp_a8a615b5a4f2597b",
+      "check_id": "SHIP-SCOPE-PROHIBITED-TOOL-PRESENT",
+      "title": "create_refund appears to overlap with a prohibited action",
+      "severity": "high",
+      "category": "scope",
+      "tool_id": "tool:create_refund",
+      "tool_name": "create_refund",
+      "agent_id": "agent:simple-openai-api-agent/api-refund-assistant",
+      "evidence": {
+        "prohibited_action": "issue refund without approval",
+        "risk_tags": [
+          "financial_action",
+          "write"
+        ]
+      },
+      "confidence": "medium",
+      "source": {
+        "type": "openai_api",
+        "ref": "tools/openai-tools.json#0",
+        "location": null
+      },
+      "recommendation": "Remove create_refund, narrow its policy, or revise prohibited_actions so the manifest and tool surface do not contradict each other.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_cf260ff7c72d64b7",
+      "fingerprint": "fp_cf260ff7c72d64b7",
+      "check_id": "SHIP-SCOPE-PROHIBITED-TOOL-PRESENT",
+      "title": "send_customer_email appears to overlap with a prohibited action",
+      "severity": "high",
+      "category": "scope",
+      "tool_id": "tool:send_customer_email",
+      "tool_name": "send_customer_email",
+      "agent_id": "agent:simple-openai-api-agent/api-refund-assistant",
+      "evidence": {
+        "prohibited_action": "send customer email without confirmation",
+        "risk_tags": [
+          "customer_communication",
+          "external_write",
+          "write"
+        ]
+      },
+      "confidence": "medium",
+      "source": {
+        "type": "openai_api",
+        "ref": "tools/openai-tools.json#1",
+        "location": null
+      },
+      "recommendation": "Remove send_customer_email, narrow its policy, or revise prohibited_actions so the manifest and tool surface do not contradict each other.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_e9d63903757dfe07",
+      "fingerprint": "fp_e9d63903757dfe07",
+      "check_id": "SHIP-SIDEFX-IDEMPOTENCY-MISSING",
+      "title": "create_refund lacks idempotency evidence",
+      "severity": "high",
+      "category": "side_effects",
+      "tool_id": "tool:create_refund",
+      "tool_name": "create_refund",
+      "agent_id": "agent:simple-openai-api-agent/api-refund-assistant",
+      "evidence": {
+        "risk_tags": [
+          "financial_action",
+          "write"
+        ],
+        "retry_policy_known": false
+      },
+      "confidence": "medium",
+      "source": {
+        "type": "openai_api",
+        "ref": "tools/openai-tools.json#0",
+        "location": null
+      },
+      "recommendation": "Add an idempotency key, idempotent annotation, or declared idempotency policy for create_refund.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_4466eb2871434dc5",
+      "fingerprint": "fp_4466eb2871434dc5",
+      "check_id": "SHIP-SIDEFX-IDEMPOTENCY-MISSING",
+      "title": "send_customer_email lacks idempotency evidence",
+      "severity": "high",
+      "category": "side_effects",
+      "tool_id": "tool:send_customer_email",
+      "tool_name": "send_customer_email",
+      "agent_id": "agent:simple-openai-api-agent/api-refund-assistant",
+      "evidence": {
+        "risk_tags": [
+          "customer_communication",
+          "external_write",
+          "write"
+        ],
+        "retry_policy_known": false
+      },
+      "confidence": "medium",
+      "source": {
+        "type": "openai_api",
+        "ref": "tools/openai-tools.json#1",
+        "location": null
+      },
+      "recommendation": "Add an idempotency key, idempotent annotation, or declared idempotency policy for send_customer_email.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_9675d1799680d81d",
+      "fingerprint": "fp_9675d1799680d81d",
+      "check_id": "SHIP-API-FUNCTION-SCHEMA-STRICTNESS",
+      "title": "create_refund function schema is not strict enough",
+      "severity": "high",
+      "category": "api",
+      "tool_id": "tool:create_refund",
+      "tool_name": "create_refund",
+      "agent_id": "agent:simple-openai-api-agent/api-refund-assistant",
+      "evidence": {
+        "issues": [
+          "missing_strict_true",
+          "additional_properties_not_false",
+          "properties_missing_from_required:amount,reason",
+          "risky_field_unbounded:amount"
+        ],
+        "risk_tags": [
+          "financial_action",
+          "write"
+        ]
+      },
+      "confidence": "high",
+      "source": {
+        "type": "openai_api",
+        "ref": "tools/openai-tools.json#0",
+        "location": null
+      },
+      "recommendation": "Make create_refund a strict function schema: object parameters, additionalProperties=false, complete required list, and bounded risky fields.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_29e718b3bbde0e7d",
+      "fingerprint": "fp_29e718b3bbde0e7d",
+      "check_id": "SHIP-API-FUNCTION-SCHEMA-STRICTNESS",
+      "title": "send_customer_email function schema is not strict enough",
+      "severity": "high",
+      "category": "api",
+      "tool_id": "tool:send_customer_email",
+      "tool_name": "send_customer_email",
+      "agent_id": "agent:simple-openai-api-agent/api-refund-assistant",
+      "evidence": {
+        "issues": [
+          "broad_free_text:message"
+        ],
+        "risk_tags": [
+          "customer_communication",
+          "external_write",
+          "write"
+        ]
+      },
+      "confidence": "high",
+      "source": {
+        "type": "openai_api",
+        "ref": "tools/openai-tools.json#1",
+        "location": null
+      },
+      "recommendation": "Make send_customer_email a strict function schema: object parameters, additionalProperties=false, complete required list, and bounded risky fields.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_64f825faa751b7f8",
+      "fingerprint": "fp_64f825faa751b7f8",
+      "check_id": "SHIP-API-STRUCTURED-OUTPUT-READINESS",
+      "title": "Response format schemas/refund_decision.schema.json is under-specified",
+      "severity": "medium",
+      "category": "api",
+      "tool_id": null,
+      "tool_name": null,
+      "agent_id": "agent:simple-openai-api-agent/api-refund-assistant",
+      "evidence": {
+        "path": "schemas/refund_decision.schema.json",
+        "issues": [
+          "additional_properties_not_false",
+          "missing_refusal_needs_review_or_error_field",
+          "missing_enum:decision"
+        ],
+        "downstream_critical_fields": [
+          "decision",
+          "refund_amount"
+        ]
+      },
+      "confidence": "medium",
+      "source": {
+        "type": "manifest",
+        "ref": "shipgate.yaml",
+        "location": null
+      },
+      "recommendation": "Tighten the structured output schema with enums, needs_review/refusal/error modeling, and declared critical fields.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_1b64e136ace3472a",
+      "fingerprint": "fp_1b64e136ace3472a",
+      "check_id": "SHIP-API-PROMPT-TOOL-SCOPE-MISMATCH",
+      "title": "Prompt says read-only or advise-only while write/high-risk tools are enabled",
+      "severity": "high",
+      "category": "api",
+      "tool_id": null,
+      "tool_name": null,
+      "agent_id": "agent:simple-openai-api-agent/api-refund-assistant",
+      "evidence": {
+        "tools": [
+          "create_refund",
+          "send_customer_email"
+        ]
+      },
+      "confidence": "high",
+      "source": {
+        "type": "manifest",
+        "ref": "shipgate.yaml",
+        "location": null
+      },
+      "recommendation": "Align prompt scope with enabled tools or remove write/high-risk tools.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_1b64e136ace3472a_2",
+      "fingerprint": "fp_1b64e136ace3472a",
+      "check_id": "SHIP-API-PROMPT-TOOL-SCOPE-MISMATCH",
+      "title": "Prompt lacks approval/confirmation language for high-risk tools",
+      "severity": "medium",
+      "category": "api",
+      "tool_id": null,
+      "tool_name": null,
+      "agent_id": "agent:simple-openai-api-agent/api-refund-assistant",
+      "evidence": {
+        "tools": [
+          "create_refund",
+          "send_customer_email"
+        ]
+      },
+      "confidence": "medium",
+      "source": {
+        "type": "manifest",
+        "ref": "shipgate.yaml",
+        "location": null
+      },
+      "recommendation": "Add prompt instructions requiring human approval and explicit confirmation before financial, destructive, or external customer actions.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_d8c28e6c9b1785d5",
+      "fingerprint": "fp_d8c28e6c9b1785d5",
+      "check_id": "SHIP-API-OPERATIONAL-READINESS",
+      "title": "OpenAI API flow lacks timeout metadata",
+      "severity": "medium",
+      "category": "api",
+      "tool_id": null,
+      "tool_name": null,
+      "agent_id": "agent:simple-openai-api-agent/api-refund-assistant",
+      "evidence": {
+        "high_risk_tools": [
+          "create_refund",
+          "send_customer_email"
+        ]
+      },
+      "confidence": "medium",
+      "source": {
+        "type": "manifest",
+        "ref": "shipgate.yaml",
+        "location": null
+      },
+      "recommendation": "Declare tool-call timeout metadata for high-risk OpenAI API flows.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_47846217e396b5bc",
+      "fingerprint": "fp_47846217e396b5bc",
+      "check_id": "SHIP-API-OPERATIONAL-READINESS",
+      "title": "create_refund lacks success/failure output modeling",
+      "severity": "medium",
+      "category": "api",
+      "tool_id": "tool:create_refund",
+      "tool_name": "create_refund",
+      "agent_id": "agent:simple-openai-api-agent/api-refund-assistant",
+      "evidence": {
+        "tool_output_schemas": [
+          "send_customer_email"
+        ]
+      },
+      "confidence": "medium",
+      "source": {
+        "type": "openai_api",
+        "ref": "tools/openai-tools.json#0",
+        "location": null
+      },
+      "recommendation": "Declare success_fields and failure_fields for create_refund in openai_api policy rules.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_929f3a870d670d11",
+      "fingerprint": "fp_929f3a870d670d11",
+      "check_id": "SHIP-API-OPERATIONAL-READINESS",
+      "title": "create_refund may be retried without idempotency evidence",
+      "severity": "high",
+      "category": "api",
+      "tool_id": "tool:create_refund",
+      "tool_name": "create_refund",
+      "agent_id": "agent:simple-openai-api-agent/api-refund-assistant",
+      "evidence": {
+        "retry_policy": {
+          "max_attempts": 2
+        },
+        "risk_tags": [
+          "financial_action",
+          "write"
+        ]
+      },
+      "confidence": "high",
+      "source": {
+        "type": "openai_api",
+        "ref": "tools/openai-tools.json#0",
+        "location": null
+      },
+      "recommendation": "Add idempotency evidence for create_refund or avoid retrying this side effect.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_c62079c0d92b6bd2",
+      "fingerprint": "fp_c62079c0d92b6bd2",
+      "check_id": "SHIP-API-OPERATIONAL-READINESS",
+      "title": "send_customer_email may be retried without idempotency evidence",
+      "severity": "high",
+      "category": "api",
+      "tool_id": "tool:send_customer_email",
+      "tool_name": "send_customer_email",
+      "agent_id": "agent:simple-openai-api-agent/api-refund-assistant",
+      "evidence": {
+        "retry_policy": {
+          "max_attempts": 2
+        },
+        "risk_tags": [
+          "customer_communication",
+          "external_write",
+          "write"
+        ]
+      },
+      "confidence": "high",
+      "source": {
+        "type": "openai_api",
+        "ref": "tools/openai-tools.json#1",
+        "location": null
+      },
+      "recommendation": "Add idempotency evidence for send_customer_email or avoid retrying this side effect.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_ab52aef3baaa1526",
+      "fingerprint": "fp_ab52aef3baaa1526",
+      "check_id": "SHIP-API-OPERATIONAL-READINESS",
+      "title": "Trace sample shows create_refund without approval",
+      "severity": "medium",
+      "category": "api",
+      "tool_id": null,
+      "tool_name": null,
+      "agent_id": "agent:simple-openai-api-agent/api-refund-assistant",
+      "evidence": {
+        "tool_name": "create_refund",
+        "approved": false
+      },
+      "confidence": "medium",
+      "source": {
+        "type": "manifest",
+        "ref": "shipgate.yaml",
+        "location": null
+      },
+      "recommendation": "Require approval before calling create_refund.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_d9059d0c1f3540af",
+      "fingerprint": "fp_d9059d0c1f3540af",
+      "check_id": "SHIP-MANIFEST-HIGH-RISK-OWNER-MISSING",
+      "title": "create_refund is high-risk but has no owner",
+      "severity": "high",
+      "category": "manifest",
+      "tool_id": "tool:create_refund",
+      "tool_name": "create_refund",
+      "agent_id": "agent:simple-openai-api-agent/api-refund-assistant",
+      "evidence": {
+        "environment": "production_like",
+        "risk_tags": [
+          "financial_action",
+          "write"
+        ]
+      },
+      "confidence": "high",
+      "source": {
+        "type": "openai_api",
+        "ref": "tools/openai-tools.json#0",
+        "location": null
+      },
+      "recommendation": "Declare an owner for each high-risk production tool in risk_overrides.tools.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_a95adeb6338f8b3e",
+      "fingerprint": "fp_a95adeb6338f8b3e",
+      "check_id": "SHIP-MANIFEST-HIGH-RISK-OWNER-MISSING",
+      "title": "send_customer_email is high-risk but has no owner",
+      "severity": "high",
+      "category": "manifest",
+      "tool_id": "tool:send_customer_email",
+      "tool_name": "send_customer_email",
+      "agent_id": "agent:simple-openai-api-agent/api-refund-assistant",
+      "evidence": {
+        "environment": "production_like",
+        "risk_tags": [
+          "customer_communication",
+          "external_write",
+          "write"
+        ]
+      },
+      "confidence": "high",
+      "source": {
+        "type": "openai_api",
+        "ref": "tools/openai-tools.json#1",
+        "location": null
+      },
+      "recommendation": "Declare an owner for each high-risk production tool in risk_overrides.tools.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    }
+  ],
+  "recommended_actions": [
+    "Make create_refund a strict function schema: object parameters, additionalProperties=false, complete required list, and bounded risky fields.",
+    "Make send_customer_email a strict function schema: object parameters, additionalProperties=false, complete required list, and bounded risky fields.",
+    "Add idempotency evidence for create_refund or avoid retrying this side effect.",
+    "Add idempotency evidence for send_customer_email or avoid retrying this side effect.",
+    "Align prompt scope with enabled tools or remove write/high-risk tools.",
+    "Declare auth scopes for create_refund in OpenAPI, MCP metadata, or the manifest before release review.",
+    "Declare auth scopes for send_customer_email in OpenAPI, MCP metadata, or the manifest before release review.",
+    "Declare an owner for each high-risk production tool in risk_overrides.tools."
+  ],
+  "generated_reports": {
+    "markdown": "expected/report.md",
+    "json": "expected/report.json"
+  },
+  "tool_inventory": [
+    {
+      "name": "create_refund",
+      "source_type": "openai_api",
+      "source_ref": "tools/openai-tools.json#0",
+      "risk_tags": [
+        "financial_action",
+        "write"
+      ],
+      "risk_tag_confidence": {
+        "financial_action": "high",
+        "write": "medium"
+      },
+      "auth_scopes": [],
+      "owner": null,
+      "confidence": "high"
+    },
+    {
+      "name": "send_customer_email",
+      "source_type": "openai_api",
+      "source_ref": "tools/openai-tools.json#1",
+      "risk_tags": [
+        "customer_communication",
+        "external_write",
+        "write"
+      ],
+      "risk_tag_confidence": {
+        "customer_communication": "high",
+        "external_write": "high",
+        "write": "medium"
+      },
+      "auth_scopes": [],
+      "owner": null,
+      "confidence": "high"
+    }
+  ],
+  "source_warnings": []
+}

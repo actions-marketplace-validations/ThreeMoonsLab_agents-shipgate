@@ -3,6 +3,7 @@ from __future__ import annotations
 from difflib import get_close_matches
 import glob
 import json
+import logging
 from pathlib import Path
 
 import typer
@@ -11,6 +12,7 @@ from agents_shipgate import __version__
 from agents_shipgate.cli.discovery import discover_manifest_paths, render_manifest_template
 from agents_shipgate.cli.scan import inspect_sources, run_scan
 from agents_shipgate.checks.registry import check_catalog
+from agents_shipgate.core.baseline import write_baseline
 from agents_shipgate.core.errors import ConfigError, InputParseError, AgentsShipgateError
 from agents_shipgate.core.findings import SEVERITY_ORDER
 from agents_shipgate.core.logging import configure_logging
@@ -21,6 +23,9 @@ app = typer.Typer(
     help="Manifest-first release readiness scanner for agent tool surfaces.",
     no_args_is_help=True,
 )
+baseline_app = typer.Typer(help="Manage local finding baselines.")
+app.add_typer(baseline_app, name="baseline")
+logger = logging.getLogger(__name__)
 
 
 @app.callback()
@@ -65,10 +70,20 @@ def scan(
         "--fail-on",
         help="Comma-separated severities that fail CI, for example critical,high.",
     ),
+    baseline: Path | None = typer.Option(
+        None,
+        "--baseline",
+        help="Path to a local baseline JSON. Strict mode fails only on new findings.",
+    ),
+    baseline_mode: str = typer.Option(
+        "new-findings",
+        "--baseline-mode",
+        help="Baseline comparison mode. v0.2 supports new-findings only.",
+    ),
     deep_import: bool = typer.Option(
         False,
         "--deep-import",
-        help="Deferred in v0.1. Explicit import execution is not supported yet.",
+        help="Deferred. Explicit import execution is not supported yet.",
     ),
     verbose: bool = typer.Option(False, "--verbose", help="Show debug extraction details."),
 ) -> None:
@@ -87,6 +102,8 @@ def scan(
                 formats=parsed_formats,
                 ci_mode=ci_mode,
                 fail_on=parsed_fail_on,
+                baseline_path=baseline,
+                baseline_mode=baseline_mode,
                 deep_import=deep_import,
                 verbose=verbose,
             )
@@ -98,6 +115,8 @@ def scan(
             formats=parsed_formats,
             ci_mode=ci_mode,
             fail_on=parsed_fail_on,
+            baseline=baseline,
+            baseline_mode=baseline_mode,
             deep_import=deep_import,
             verbose=verbose,
         )
@@ -113,6 +132,8 @@ def scan(
     except typer.Exit:
         raise
     except Exception as exc:  # noqa: BLE001 - CLI boundary.
+        if verbose:
+            logger.exception("unhandled exception")
         typer.echo(f"Internal error: {exc}", err=True)
         raise typer.Exit(4) from exc
 
@@ -211,11 +232,67 @@ def doctor(
                 f"- {source['id']} ({source['type']}): {source['tool_count']} tools"
                 + (f"; sample={source['sample_tool']}" if source["sample_tool"] else "")
             )
+        if payload.get("api_surface"):
+            api_surface = payload["api_surface"]
+            typer.echo(
+                "OpenAI API artifacts: "
+                f"prompts={api_surface.get('prompt_file_count', 0)}, "
+                f"tool_files={api_surface.get('tool_file_count', 0)}, "
+                f"response_formats={api_surface.get('response_format_count', 0)}, "
+                f"test_cases={api_surface.get('test_case_count', 0)}, "
+                f"traces={api_surface.get('trace_sample_count', 0)}, "
+                f"policy_files={api_surface.get('policy_rule_count', 0)}"
+            )
+        if payload.get("baseline"):
+            baseline = payload["baseline"]
+            typer.echo(
+                "Baseline: "
+                f"{baseline.get('default_path')} "
+                f"({'present' if baseline.get('present') else 'not found'})"
+            )
         if payload["warnings"]:
             typer.echo("Warnings:")
             for warning in payload["warnings"]:
                 typer.echo(f"- {warning}")
         typer.echo("")
+
+
+@baseline_app.command("save")
+def baseline_save(
+    config: Path = typer.Option(
+        Path("shipgate.yaml"),
+        "--config",
+        "-c",
+        help="Manifest path used to create the baseline.",
+    ),
+    out: Path = typer.Option(
+        Path(".agents-shipgate/baseline.json"),
+        "--out",
+        help="Baseline JSON path to write.",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", help="Enable debug logs."),
+) -> None:
+    """Save active unsuppressed findings as the current accepted baseline."""
+    try:
+        configure_logging(verbose=verbose)
+        report, _ = run_scan(
+            config_path=config,
+            formats=["json"],
+            ci_mode="advisory",
+            verbose=verbose,
+        )
+        baseline = write_baseline(report, out)
+    except ConfigError as exc:
+        typer.echo(f"Config error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    except InputParseError as exc:
+        typer.echo(f"Input parsing error: {exc}", err=True)
+        raise typer.Exit(3) from exc
+    except AgentsShipgateError as exc:
+        typer.echo(f"Agents Shipgate error: {exc}", err=True)
+        raise typer.Exit(4) from exc
+    typer.echo(f"Wrote {out}")
+    typer.echo(f"Findings saved: {len(baseline.findings)}")
 
 
 def _parse_formats(value: str) -> list[str]:
@@ -261,10 +338,12 @@ def _run_multi_scan(
     formats: list[str],
     ci_mode: str | None,
     fail_on: list[str] | None,
+    baseline: Path | None,
+    baseline_mode: str,
     deep_import: bool,
     verbose: bool,
 ) -> int:
-    typer.echo(f"Agents Shipgate v0.1")
+    typer.echo(f"Agents Shipgate {__version__}")
     typer.echo(f"Scanning {len(config_paths)} manifests")
     typer.echo("")
     exit_code = 0
@@ -278,6 +357,8 @@ def _run_multi_scan(
             formats=formats,
             ci_mode=ci_mode,
             fail_on=fail_on,
+            baseline_path=baseline,
+            baseline_mode=baseline_mode,
             deep_import=deep_import,
             verbose=verbose,
         )
@@ -298,7 +379,7 @@ def _safe_output_name(config_path: Path) -> str:
 
 def _print_cli_summary(report, ci_mode: str, exit_code: int, *, verbose: bool = False) -> None:
     summary = report.summary
-    typer.echo("Agents Shipgate v0.1")
+    typer.echo(f"Agents Shipgate {__version__}")
     typer.echo("")
     typer.echo(f"Project: {report.project.get('name')}")
     typer.echo(f"Agent: {report.agent.get('name')}")
@@ -310,6 +391,13 @@ def _print_cli_summary(report, ci_mode: str, exit_code: int, *, verbose: bool = 
     typer.echo(f"Medium: {summary.medium_count}")
     typer.echo(f"Human review: {'recommended' if summary.human_review_recommended else 'not required'}")
     typer.echo(f"Evidence coverage: {summary.evidence_coverage}")
+    if report.baseline:
+        typer.echo(
+            "Baseline: "
+            f"matched={report.baseline.matched_count}, "
+            f"new={report.baseline.new_count}, "
+            f"resolved={report.baseline.resolved_count}"
+        )
     if verbose:
         typer.echo(f"Tool count: {report.tool_surface.total_tools}")
         typer.echo(f"Source warnings: {len(report.source_warnings)}")

@@ -21,8 +21,11 @@ CONFIRMATION_TAGS = {
 
 def run(context: ScanContext):
     findings = []
-    approval_tools = context.manifest.policies.approval_tools()
-    confirmation_tools = context.manifest.policies.confirmation_tools()
+    approval_tools = set(context.manifest.policies.approval_tools())
+    confirmation_tools = set(context.manifest.policies.confirmation_tools())
+    if context.api_artifacts:
+        approval_tools.update(context.api_artifacts.approval_tools())
+        confirmation_tools.update(context.api_artifacts.confirmation_tools())
     for tool in context.tools:
         if is_effectively_read_only(tool):
             continue

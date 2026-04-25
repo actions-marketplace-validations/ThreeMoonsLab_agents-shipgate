@@ -26,12 +26,12 @@ def load_mcp_tools(source: ToolSourceConfig, base_dir: Path) -> LoadedToolSource
     elif isinstance(data, dict):
         raw_tools = data.get("tools")
         if data.get("wildcard") is True or raw_tools == "*":
-            wildcard_warnings = ["MCP source declares wildcard tool exposure"]
             if isinstance(raw_tools, list) and raw_tools:
-                wildcard_warnings.append(
+                raise InputParseError(
                     "MCP source declares wildcard tool exposure and an explicit tools "
-                    "array; wildcard precedence is used and explicit tools are ignored"
+                    f"array: {path}. Use wildcard exposure or explicit tools, not both."
                 )
+            wildcard_warnings = ["MCP source declares wildcard tool exposure"]
             wildcard = Tool(
                 id=stable_tool_id(f"{source.id}.*"),
                 name=f"{source.id}.*",

@@ -5,7 +5,7 @@
 
 **The pre-flight check your agent release is missing.**
 
-Agents Shipgate is an **Agent Release Gate**: a static, manifest-first scanner that catches risky agent tool configurations at PR time. It reads `shipgate.yaml`, local MCP tool exports, local OpenAPI specs, and optional OpenAI Agents SDK AST metadata, then writes Markdown and JSON reports for release review.
+Agents Shipgate is an **Agent Release Gate**: a static, manifest-first scanner that catches risky agent tool configurations at PR time. It reads `shipgate.yaml`, local MCP tool exports, local OpenAPI specs, simple OpenAI API prompt/tool/schema artifacts, and optional OpenAI Agents SDK AST metadata, then writes Markdown and JSON reports for release review.
 
 An agent release gate is the static, manifest-based pre-flight check that runs on agent PRs before promotion to staging or production. Today, most agent teams ship without one.
 
@@ -17,7 +17,7 @@ The bundled support-refund fixture demonstrates the kind of release risks Agents
 ## Agents Shipgate
 
 Status: Release blockers detected
-Critical: 2 - High: 13 - Medium: 1
+Critical: 2 - High: 14 - Medium: 2
 Human review: recommended
 
 Top findings:
@@ -45,19 +45,27 @@ Top findings:
 
 Use Agents Shipgate as a [GitHub Action](#github-action) on every PR, or run the CLI locally.
 
-Install from source (PyPI publication is on the [roadmap](ROADMAP.md)):
+Install from a source checkout:
 
 ```bash
-python -m pip install "git+https://github.com/ThreeMoonsLab/agents-shipgate@v0.1.0"
+python -m pip install -e ".[dev]"
 agents-shipgate init --workspace . --write
 agents-shipgate doctor --config shipgate.yaml
 agents-shipgate scan --config shipgate.yaml
 ```
 
-Try the bundled fixture from a source checkout:
+Or install directly from GitHub until the PyPI package is published:
+
+```bash
+python -m pip install "git+https://github.com/ThreeMoonsLab/agents-shipgate@main"
+```
+
+Try the bundled fixture:
 
 ```bash
 agents-shipgate scan --config samples/support_refund_agent/shipgate.yaml
+agents-shipgate scan --config samples/simple_openai_api_agent/shipgate.yaml
+agents-shipgate scan --config samples/clean_read_only_agent/shipgate.yaml
 ```
 
 ## CI Behavior
@@ -68,10 +76,19 @@ CI is advisory by default:
 agents-shipgate scan --config shipgate.yaml --ci-mode advisory
 ```
 
-Strict mode exits with code `1` only when unsuppressed critical findings exist:
+Strict mode exits with code `20` only when unsuppressed critical findings exist.
+Configuration, input parsing, and internal tool errors use `2`, `3`, and `4` respectively:
 
 ```bash
 agents-shipgate scan --config shipgate.yaml --ci-mode strict
+```
+
+For existing projects, save the current reviewed findings as a local baseline and
+fail strict CI only on new unsuppressed findings:
+
+```bash
+agents-shipgate baseline save --config shipgate.yaml --out .agents-shipgate/baseline.json
+agents-shipgate scan --config shipgate.yaml --baseline .agents-shipgate/baseline.json --ci-mode strict
 ```
 
 Teams can override severities and CI failure thresholds:
@@ -98,11 +115,11 @@ ci:
 
 Agents Shipgate is a static, manifest-first scanner. It is intentionally narrow:
 
-- It does not run agents, call tools, or invoke LLMs.
+- It does not run agents, call tools, invoke LLMs, or verify model availability.
 - It does not verify runtime behavior, latency, prompt quality, or routing decisions.
 - It does not replace dynamic security testing or human security review of the underlying systems.
-- It only inspects what is declared in `shipgate.yaml`, local OpenAPI specs, MCP exports, and optional SDK AST metadata; tools that are not declared are not scanned.
-- v0.1 is pre-1.0; the JSON report schema may change before v1.0.
+- It only inspects what is declared in `shipgate.yaml`, local OpenAPI specs, MCP exports, simple OpenAI API artifacts, and optional SDK AST metadata; tools that are not declared are not scanned.
+- The manifest remains `version: "0.1"` in v0.2 so existing configs keep working. Reports add `report_schema_version: "0.2"` while preserving the v0.1 payload keys.
 
 See [ROADMAP.md](ROADMAP.md) for what is planned next.
 
@@ -114,7 +131,7 @@ See [Trust model](docs/trust-model.md) and [Security policy](SECURITY.md) for th
 
 ## GitHub Action
 
-The action installs Agents Shipgate from its tagged source, so no PyPI publication is required to use it. Pin to a tag, set `permissions: contents: read`, and run on `pull_request`:
+The action can run from `main` during pre-release or from a pinned tag after a release. Set `permissions: contents: read` and run on `pull_request`:
 
 ```yaml
 name: Agents Shipgate
@@ -131,7 +148,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - id: agents-shipgate
-        uses: ThreeMoonsLab/agents-shipgate@v0.1.0
+        uses: ThreeMoonsLab/agents-shipgate@main
         with:
           config: shipgate.yaml
           ci_mode: advisory
@@ -140,9 +157,9 @@ jobs:
 
 For PR comments, add `pull-requests: write` to the job's `permissions` and set `pr_comment: "true"`.
 
-Inputs: `config`, `ci_mode` (`advisory` or `strict`), `fail_on`, `output_dir`, `upload_artifact`, `pr_comment`, `github_token`, `shipgate_version`.
+Inputs: `config`, `ci_mode` (`advisory` or `strict`), `fail_on`, `baseline`, `baseline_mode`, `output_dir`, `upload_artifact`, `pr_comment`, `github_token`, `shipgate_version`.
 
-Outputs: `status`, `critical_count`, `high_count`, `medium_count`, `report_json`, `report_markdown`, `exit_code`.
+Outputs: `status`, `critical_count`, `high_count`, `medium_count`, `baseline_new_count`, `report_json`, `report_markdown`, `exit_code`.
 
 Once Agents Shipgate is published to PyPI, set `shipgate_version` to install a pinned PyPI release instead of the action source.
 
@@ -157,8 +174,10 @@ If hosted dashboards, SSO, org-wide baselines, approval workflows, or trace-base
 - [Agent Release Gate category](docs/category.md)
 - [Manifest v0.1](docs/manifest-v0.1.md)
 - [Check catalog](docs/checks.md)
+- [Baseline workflow](docs/baseline.md)
+- [JSON report schema v0.2](docs/report-schema.v0.2.json)
 - [Trust model](docs/trust-model.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Integration recipes](docs/integrations.md)
 - [Distribution plan](docs/distribution.md)
-- [JSON report schema](docs/report-schema.v0.1.json)
+- [JSON report schema v0.1](docs/report-schema.v0.1.json)

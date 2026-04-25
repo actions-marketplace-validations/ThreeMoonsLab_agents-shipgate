@@ -1,0 +1,13 @@
+{
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "decision": {
+      "type": "string"
+    },
+    "refund_amount": {
+      "type": "number"
+    }
+  },
+  "required": ["decision"]
+}

@@ -7,8 +7,8 @@ Target: production_like
 Result: BLOCKED - release blockers detected.
 Status: Release blockers detected
 Critical: 2
-High: 13
-Medium: 1
+High: 14
+Medium: 2
 Low: 0
 Suppressed: 0
 Evidence coverage: mixed
@@ -45,7 +45,7 @@ Human review: recommended
 - Add the required scopes for support.search_kb to permissions.scopes or narrow the tool's declared auth requirements.
 - Add the required scopes for gmail.send_customer_email to permissions.scopes or narrow the tool's declared auth requirements.
 - Replace wildcard tool exposure with an explicit tool allowlist before release review.
-- Declare a user confirmation policy for stripe.create_refund or remove this action from the release.
+- Declare an owner for each high-risk production tool in risk_overrides.tools.
 
 ## Source Warnings
 
@@ -71,6 +71,11 @@ Human review: recommended
 ### Inventory
 
 - HIGH: SHIP-INVENTORY-WILDCARD-TOOLS [wildcard_mcp_tools.*] - Wildcard tool exposure declared
+
+### Manifest
+
+- HIGH: SHIP-MANIFEST-HIGH-RISK-OWNER-MISSING [shopify.cancel_order] - shopify.cancel_order is high-risk but has no owner
+- MEDIUM: SHIP-MANIFEST-UNUSED-SCOPE - Manifest declares unused permission scope zendesk:tickets:read
 
 ### Policy
 
@@ -111,4 +116,4 @@ Human review: recommended
 
 ## Disclaimer
 
-Agents Shipgate is an advisory release-readiness scanner. It does not certify agent safety or compliance. Findings are based on static configuration, declared policies, tool schemas, and optional SDK metadata. Runtime behavior, actual tool routing, and output interpretation are not verified in v0.1.
+Agents Shipgate is an advisory release-readiness scanner. It does not certify agent safety or compliance. Findings are based on static configuration, declared policies, tool schemas, and optional SDK metadata. Runtime behavior, actual tool routing, and output interpretation are not verified.

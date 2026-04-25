@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 Severity = Literal["info", "low", "medium", "high", "critical"]
 Confidence = Literal["low", "medium", "high"]
+BaselineStatus = Literal["new", "matched", "resolved"]
 
 
 def parse_severity(value: str) -> Severity:
@@ -126,6 +127,7 @@ class Finding(BaseModel):
     recommendation: str
     suppressed: bool = False
     suppression_reason: str | None = None
+    baseline_status: BaselineStatus | None = None
 
 
 class ReportSummary(BaseModel):
@@ -148,16 +150,92 @@ class ToolSurfaceSummary(BaseModel):
     missing_descriptions: int = 0
 
 
+class BaselineSummary(BaseModel):
+    path: str
+    matched_count: int = 0
+    new_count: int = 0
+    resolved_count: int = 0
+
+
+class ApiResponseFormat(BaseModel):
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    path: str
+    name: str | None = None
+    strict: bool | None = None
+    json_schema: dict[str, Any] = Field(default_factory=dict, alias="schema")
+    downstream_critical_fields: list[str] = Field(default_factory=list)
+
+
+class OpenAIApiArtifacts(BaseModel):
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    prompt_files: list[str] = Field(default_factory=list)
+    prompt_text: str | None = None
+    tool_files: list[str] = Field(default_factory=list)
+    response_formats: list[ApiResponseFormat] = Field(default_factory=list)
+    model_config_path: str | None = None
+    model_settings: dict[str, Any] = Field(default_factory=dict, alias="model_config")
+    test_case_files: list[str] = Field(default_factory=list)
+    test_cases: list[dict[str, Any]] = Field(default_factory=list)
+    trace_sample_files: list[str] = Field(default_factory=list)
+    trace_samples: list[dict[str, Any]] = Field(default_factory=list)
+    policy_rule_files: list[str] = Field(default_factory=list)
+    policy_rules: dict[str, Any] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
+
+    def approval_tools(self) -> set[str]:
+        return set(_string_list(self.policy_rules.get("approval_required")))
+
+    def confirmation_tools(self) -> set[str]:
+        return set(_string_list(self.policy_rules.get("confirmation_required")))
+
+    def idempotency_tools(self) -> set[str]:
+        return set(_string_list(self.policy_rules.get("idempotency_required")))
+
+    def retry_policy(self) -> dict[str, Any]:
+        value = self.policy_rules.get("retry_policy")
+        if isinstance(value, dict):
+            return value
+        value = self.model_settings.get("retry_policy")
+        return value if isinstance(value, dict) else {}
+
+    def timeouts(self) -> dict[str, Any]:
+        value = self.policy_rules.get("timeouts")
+        if isinstance(value, dict):
+            return value
+        value = self.model_settings.get("timeouts")
+        return value if isinstance(value, dict) else {}
+
+    def tool_output_schemas(self) -> dict[str, Any]:
+        value = self.policy_rules.get("tool_output_schemas")
+        return value if isinstance(value, dict) else {}
+
+    def surface_summary(self) -> dict[str, Any]:
+        return {
+            "prompt_file_count": len(self.prompt_files),
+            "tool_file_count": len(self.tool_files),
+            "response_format_count": len(self.response_formats),
+            "model_config_present": bool(self.model_config_path),
+            "test_case_count": len(self.test_cases),
+            "trace_sample_count": len(self.trace_samples),
+            "policy_rule_count": len(self.policy_rule_files),
+        }
+
+
 class ReadinessReport(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     schema_version: str = "0.1"
+    report_schema_version: str = "0.2"
     run_id: str
     project: dict[str, Any]
     agent: dict[str, Any]
     environment: dict[str, Any]
     summary: ReportSummary
     tool_surface: ToolSurfaceSummary
+    api_surface: dict[str, Any] | None = None
+    baseline: BaselineSummary | None = None
     findings: list[Finding] = Field(default_factory=list)
     recommended_actions: list[str] = Field(default_factory=list)
     generated_reports: dict[str, str] = Field(default_factory=dict)
@@ -182,3 +260,9 @@ class CheckMetadata(BaseModel):
     evidence_fields: list[str] = Field(default_factory=list)
     recommendation: str | None = None
     docs_url: str | None = None
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]

@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - id: agents-shipgate
-        uses: ThreeMoonsLab/agents-shipgate@v0.1.0
+        uses: ThreeMoonsLab/agents-shipgate@v0.2.0
         with:
           config: shipgate.yaml
           ci_mode: advisory

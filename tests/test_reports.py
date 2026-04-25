@@ -1,13 +1,18 @@
 from pathlib import Path
 import json
 
+from jsonschema import validate
+
 from agents_shipgate.cli.scan import run_scan
 from agents_shipgate.report.markdown import render_markdown_report
 
 
 SAMPLE = Path("samples/support_refund_agent/shipgate.yaml")
 EXPECTED_MARKDOWN = Path("samples/support_refund_agent/expected/report.md")
+OPENAI_API_SAMPLE = Path("samples/simple_openai_api_agent/shipgate.yaml")
+OPENAI_API_EXPECTED_MARKDOWN = Path("samples/simple_openai_api_agent/expected/report.md")
 REPORT_SCHEMA = Path("docs/report-schema.v0.1.json")
+REPORT_SCHEMA_V02 = Path("docs/report-schema.v0.2.json")
 
 
 def test_sample_markdown_report_matches_golden(tmp_path):
@@ -21,6 +26,20 @@ def test_sample_markdown_report_matches_golden(tmp_path):
     actual = (tmp_path / "report.md").read_text(encoding="utf-8")
     actual = actual.replace(str(Path.cwd()), "<REPO>")
     expected = EXPECTED_MARKDOWN.read_text(encoding="utf-8")
+
+    assert actual == expected
+
+
+def test_openai_api_markdown_report_matches_golden(tmp_path):
+    run_scan(
+        config_path=OPENAI_API_SAMPLE,
+        output_dir=tmp_path,
+        formats=["markdown", "json"],
+        ci_mode="advisory",
+    )
+
+    actual = (tmp_path / "report.md").read_text(encoding="utf-8")
+    expected = OPENAI_API_EXPECTED_MARKDOWN.read_text(encoding="utf-8")
 
     assert actual == expected
 
@@ -40,6 +59,8 @@ def test_json_report_contains_integration_contract_keys(tmp_path):
     assert "severity" in payload["findings"][0]
     assert "fingerprint" in payload["findings"][0]
     assert "tool_inventory" in payload
+    assert payload["schema_version"] == "0.1"
+    assert payload["report_schema_version"] == "0.2"
 
 
 def test_report_paths_use_absolute_path_when_output_escapes_manifest_base(tmp_path):
@@ -83,6 +104,25 @@ def test_json_schema_is_published():
     assert {"name", "source_type", "risk_tags", "confidence"} <= set(
         inventory_item["required"]
     )
+    api_surface = schema["properties"]["api_surface"]["anyOf"][0]
+    assert {
+        "prompt_file_count",
+        "tool_file_count",
+        "response_format_count",
+        "model_config_present",
+    } <= set(api_surface["required"])
+
+
+def test_json_report_validates_against_v02_schema(tmp_path):
+    report, _ = run_scan(
+        config_path=SAMPLE,
+        output_dir=tmp_path,
+        formats=["json"],
+        ci_mode="advisory",
+    )
+    schema = json.loads(REPORT_SCHEMA_V02.read_text(encoding="utf-8"))
+
+    validate(instance=report.model_dump(mode="json"), schema=schema)
 
 
 def test_markdown_escapes_user_controlled_tool_metadata(tmp_path):

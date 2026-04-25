@@ -75,6 +75,27 @@ def _add_automatic_hints(tool: Tool) -> None:
     text = f"{tool.name} {tool.description or ''}".lower()
     method = str(tool.annotations.get("httpMethod") or "").upper()
 
+    if tool.source_type == "openai_api" and any(
+        word in text for word in ["get", "list", "lookup", "search", "status", "preview"]
+    ):
+        _add_hint(tool, "read_only", "openai_api_keyword", "medium", {})
+    if tool.source_type == "openai_api" and any(
+        word in text
+        for word in [
+            "create",
+            "update",
+            "write",
+            "send",
+            "refund",
+            "cancel",
+            "delete",
+            "remove",
+            "charge",
+            "issue",
+        ]
+    ):
+        _add_hint(tool, "write", "openai_api_keyword", "medium", {})
+
     if tool.source_type == "sdk_function" and "preview" in text and not method:
         _add_hint(tool, "read_only", "keyword", "high", {"preview_only": True})
     if tool.annotations.get("readOnlyHint") is True:

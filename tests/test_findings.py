@@ -83,6 +83,32 @@ def test_finding_fingerprint_is_stable_across_severity_override():
     assert finding.evidence["default_severity"] == "medium"
 
 
+def test_finding_fingerprint_sorts_list_evidence_values():
+    first = Finding(
+        check_id="SHIP-SCOPE-PROHIBITED-TOOL-PRESENT",
+        title="Tool overlaps prohibited action",
+        severity="high",
+        category="scope",
+        tool_name="tool_a",
+        evidence={"risk_tags": ["write", "financial_action"]},
+        recommendation="Fix A.",
+    )
+    second = Finding(
+        check_id="SHIP-SCOPE-PROHIBITED-TOOL-PRESENT",
+        title="Tool overlaps prohibited action",
+        severity="high",
+        category="scope",
+        tool_name="tool_a",
+        evidence={"risk_tags": ["financial_action", "write"]},
+        recommendation="Fix A.",
+    )
+
+    assign_finding_ids([first])
+    assign_finding_ids([second])
+
+    assert first.fingerprint == second.fingerprint
+
+
 def test_evidence_coverage_ignores_suppression_count():
     finding = Finding(
         check_id="SHIP-A",

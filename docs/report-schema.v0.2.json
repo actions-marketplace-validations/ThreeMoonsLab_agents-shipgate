@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ThreeMoonsLab/agents-shipgate/docs/report-schema.v0.2.json",
+  "title": "Agents Shipgate Readiness Report v0.2",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "report_schema_version",
+    "run_id",
+    "project",
+    "agent",
+    "environment",
+    "summary",
+    "tool_surface",
+    "findings",
+    "recommended_actions",
+    "generated_reports",
+    "tool_inventory",
+    "source_warnings"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "0.1"
+    },
+    "report_schema_version": {
+      "const": "0.2"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "project": {
+      "type": "object"
+    },
+    "agent": {
+      "type": "object"
+    },
+    "environment": {
+      "type": "object"
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "status",
+        "critical_count",
+        "high_count",
+        "medium_count",
+        "low_count",
+        "info_count",
+        "suppressed_count",
+        "human_review_recommended",
+        "evidence_coverage"
+      ],
+      "additionalProperties": true
+    },
+    "baseline": {
+      "type": ["object", "null"],
+      "required": ["path", "matched_count", "new_count", "resolved_count"],
+      "additionalProperties": true
+    },
+    "tool_surface": {
+      "type": "object"
+    },
+    "api_surface": {
+      "type": ["object", "null"]
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "fingerprint",
+          "check_id",
+          "title",
+          "severity",
+          "category",
+          "evidence",
+          "confidence",
+          "recommendation",
+          "suppressed",
+          "baseline_status"
+        ],
+        "additionalProperties": true
+      }
+    },
+    "recommended_actions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "generated_reports": {
+      "type": "object"
+    },
+    "tool_inventory": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "source_type", "risk_tags", "auth_scopes", "confidence"],
+        "additionalProperties": true
+      }
+    },
+    "source_warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

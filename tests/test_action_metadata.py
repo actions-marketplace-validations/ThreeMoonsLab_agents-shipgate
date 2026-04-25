@@ -25,9 +25,14 @@ def test_action_has_marketplace_metadata_and_outputs():
     assert data["name"] == "Agents Shipgate"
     assert data["author"] == "ThreeMoonsLab"
     assert data["branding"] == {"icon": "shield", "color": "blue"}
-    assert {"status", "critical_count", "high_count", "report_json", "exit_code"} <= set(
-        data["outputs"]
-    )
+    assert {
+        "status",
+        "critical_count",
+        "high_count",
+        "baseline_new_count",
+        "report_json",
+        "exit_code",
+    } <= set(data["outputs"])
 
 
 def test_action_preserves_reports_before_applying_exit_code():
@@ -38,9 +43,27 @@ def test_action_preserves_reports_before_applying_exit_code():
     assert "Apply Agents Shipgate exit code" in text
     assert "steps.scan.outputs.exit_code" in text
     assert "FAIL_ON: ${{ inputs.fail_on }}" in text
+    assert "BASELINE: ${{ inputs.baseline }}" in text
 
 
-def test_marketplace_action_repo_has_no_workflow_files():
+def test_action_pr_comment_truncates_user_controlled_text():
+    text = Path("action.yml").read_text(encoding="utf-8")
+
+    assert "const truncate =" in text
+    assert "truncate(finding.title || finding.check_id, 240)" in text
+    assert "].join(\"\\n\"), 6000)" in text
+
+
+def test_marketplace_action_repo_has_ci_and_release_workflows():
     workflow_dir = Path(".github/workflows")
 
-    assert not workflow_dir.exists() or list(workflow_dir.glob("*")) == []
+    assert workflow_dir.exists()
+    assert {path.name for path in workflow_dir.glob("*")} == {"ci.yml", "release.yml"}
+
+
+def test_release_workflow_uses_release_security_steps():
+    text = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
+
+    assert "uv publish --trusted-publishing always" in text
+    assert "sigstore sign" in text
+    assert "cyclonedx-py environment" in text

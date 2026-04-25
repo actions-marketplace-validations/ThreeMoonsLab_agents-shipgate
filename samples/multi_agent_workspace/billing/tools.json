@@ -1,0 +1,22 @@
+{
+  "tools": [
+    {
+      "name": "billing.refund_preview",
+      "description": "Prepare a refund preview for human review.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "amount": {
+            "type": "number",
+            "maximum": 500
+          }
+        },
+        "required": ["amount"],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "idempotentHint": true
+      }
+    }
+  ]
+}

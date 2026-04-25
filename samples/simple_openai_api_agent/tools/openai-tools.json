@@ -1,0 +1,46 @@
+{
+  "tools": [
+    {
+      "type": "function",
+      "name": "create_refund",
+      "description": "Create a refund for a customer payment.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "payment_id": {
+            "type": "string",
+            "description": "Payment identifier."
+          },
+          "amount": {
+            "type": "number",
+            "description": "Refund amount."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Free-form refund reason."
+          }
+        },
+        "required": ["payment_id"]
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "send_customer_email",
+        "description": "Send an external customer email.",
+        "strict": true,
+        "parameters": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "customer_id": {"type": "string"},
+            "message": {"type": "string"}
+          },
+          "required": ["customer_id", "message"]
+        }
+      }
+    }
+  ]
+}

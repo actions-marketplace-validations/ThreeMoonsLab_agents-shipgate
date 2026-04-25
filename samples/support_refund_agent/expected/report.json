@@ -1,0 +1,751 @@
+{
+  "schema_version": "0.1",
+  "report_schema_version": "0.2",
+  "run_id": "agents_shipgate_d4ef813d28d8a3c2",
+  "project": {
+    "name": "support-refund-agent",
+    "owner": "support-platform",
+    "repo": "github.com/acme/support-refund-agent"
+  },
+  "agent": {
+    "id": "agent:support-refund-agent/refund-assistant",
+    "name": "refund-assistant",
+    "source": {
+      "type": "openai-agents",
+      "language": "python",
+      "entrypoint": "agents/refund_agent.py",
+      "object": "refund_agent",
+      "static_extract": true,
+      "deep_import": false
+    },
+    "instructions": {
+      "value_preview": null,
+      "source": "dynamic_unknown",
+      "confidence": "medium"
+    },
+    "declared_purpose": [
+      "answer refund policy questions",
+      "prepare refund requests for human review",
+      "update support ticket notes"
+    ],
+    "prohibited_actions": [
+      "issue refund without approval",
+      "cancel order without explicit confirmation",
+      "send external email without preview"
+    ],
+    "tools": [
+      "refund_status_lookup",
+      "stripe.create_refund",
+      "shopify.cancel_order",
+      "zendesk.update_ticket",
+      "support.search_kb",
+      "gmail.send_customer_email",
+      "wildcard_mcp_tools.*",
+      "send_email_preview"
+    ],
+    "handoffs": [],
+    "guardrails": {
+      "input": "unknown",
+      "output": "unknown",
+      "tool": "unknown",
+      "source": "unknown"
+    },
+    "extraction": {
+      "method": "config_assisted",
+      "confidence": "medium",
+      "missing_fields": [
+        "runtime_traces"
+      ],
+      "dynamic_fields": []
+    }
+  },
+  "environment": {
+    "target": "production_like",
+    "promotion_from": "staging",
+    "promotion_to": "production_like"
+  },
+  "summary": {
+    "status": "release_blockers_detected",
+    "critical_count": 2,
+    "high_count": 14,
+    "medium_count": 2,
+    "low_count": 0,
+    "info_count": 0,
+    "suppressed_count": 0,
+    "human_review_recommended": true,
+    "evidence_coverage": "mixed"
+  },
+  "tool_surface": {
+    "total_tools": 8,
+    "high_risk_tools": 3,
+    "sources": {
+      "mcp": 3,
+      "openapi": 4,
+      "sdk_function": 1
+    },
+    "wildcard_tools": 1,
+    "missing_descriptions": 0
+  },
+  "api_surface": null,
+  "baseline": null,
+  "findings": [
+    {
+      "id": "fp_fc02d8ecd30f2578",
+      "fingerprint": "fp_fc02d8ecd30f2578",
+      "check_id": "SHIP-INVENTORY-WILDCARD-TOOLS",
+      "title": "Wildcard tool exposure declared",
+      "severity": "high",
+      "category": "inventory",
+      "tool_id": "tool:wildcard_mcp_tools.*",
+      "tool_name": "wildcard_mcp_tools.*",
+      "agent_id": "agent:support-refund-agent/refund-assistant",
+      "evidence": {
+        "source_id": "wildcard_mcp_tools",
+        "source_ref": ".agents-shipgate/wildcard-tools.json"
+      },
+      "confidence": "high",
+      "source": {
+        "type": "mcp",
+        "ref": ".agents-shipgate/wildcard-tools.json",
+        "location": null
+      },
+      "recommendation": "Replace wildcard tool exposure with an explicit tool allowlist before release review.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_ab60b01cb53cfcbe",
+      "fingerprint": "fp_ab60b01cb53cfcbe",
+      "check_id": "SHIP-SCHEMA-MISSING-BOUNDS",
+      "title": "stripe.create_refund.amount has no maximum bound",
+      "severity": "high",
+      "category": "schema",
+      "tool_id": "tool:stripe.create_refund",
+      "tool_name": "stripe.create_refund",
+      "agent_id": "agent:support-refund-agent/refund-assistant",
+      "evidence": {
+        "parameter": "amount",
+        "type": "number"
+      },
+      "confidence": "high",
+      "source": {
+        "type": "openapi",
+        "ref": "specs/support-tools.openapi.yaml#/paths/~1refunds/post",
+        "location": null
+      },
+      "recommendation": "Add a maximum bound to stripe.create_refund.amount or document an equivalent limit in the tool policy.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_ff2f028953d1c220",
+      "fingerprint": "fp_ff2f028953d1c220",
+      "check_id": "SHIP-SCHEMA-BROAD-FREE-TEXT",
+      "title": "zendesk.update_ticket accepts broad free-form action input",
+      "severity": "high",
+      "category": "schema",
+      "tool_id": "tool:zendesk.update_ticket",
+      "tool_name": "zendesk.update_ticket",
+      "agent_id": "agent:support-refund-agent/refund-assistant",
+      "evidence": {
+        "parameter": "updates",
+        "type": "object"
+      },
+      "confidence": "medium",
+      "source": {
+        "type": "openapi",
+        "ref": "specs/support-tools.openapi.yaml#/paths/~1tickets~1{ticket_id}/patch",
+        "location": null
+      },
+      "recommendation": "Constrain zendesk.update_ticket.updates with an enum, structured schema, or narrower field-specific parameters.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_acd63b899d49aa1c",
+      "fingerprint": "fp_acd63b899d49aa1c",
+      "check_id": "SHIP-SCHEMA-BROAD-FREE-TEXT",
+      "title": "gmail.send_customer_email accepts broad free-form action input",
+      "severity": "high",
+      "category": "schema",
+      "tool_id": "tool:gmail.send_customer_email",
+      "tool_name": "gmail.send_customer_email",
+      "agent_id": "agent:support-refund-agent/refund-assistant",
+      "evidence": {
+        "parameter": "body",
+        "type": "string"
+      },
+      "confidence": "medium",
+      "source": {
+        "type": "mcp",
+        "ref": ".agents-shipgate/mcp-tools.json",
+        "location": null
+      },
+      "recommendation": "Constrain gmail.send_customer_email.body with an enum, structured schema, or narrower field-specific parameters.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_85f8513ad72cd9ea",
+      "fingerprint": "fp_85f8513ad72cd9ea",
+      "check_id": "SHIP-SCHEMA-FREEFORM-OUTPUT",
+      "title": "send_email_preview returns free-form text output",
+      "severity": "medium",
+      "category": "schema",
+      "tool_id": "tool:send_email_preview",
+      "tool_name": "send_email_preview",
+      "agent_id": "agent:support-refund-agent/refund-assistant",
+      "evidence": {
+        "output_schema": {
+          "type": "string"
+        }
+      },
+      "confidence": "medium",
+      "source": {
+        "type": "sdk_function",
+        "ref": "agents/refund_agent.py",
+        "location": "agents/refund_agent.py:4"
+      },
+      "recommendation": "Prefer a structured output schema for send_email_preview, especially when output is later passed back into model context.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_d27325cbdbbf5483",
+      "fingerprint": "fp_d27325cbdbbf5483",
+      "check_id": "SHIP-AUTH-MANIFEST-BROAD-SCOPE",
+      "title": "Manifest declares broad permission scopes",
+      "severity": "high",
+      "category": "auth",
+      "tool_id": null,
+      "tool_name": null,
+      "agent_id": "agent:support-refund-agent/refund-assistant",
+      "evidence": {
+        "scopes": [
+          "stripe:*"
+        ]
+      },
+      "confidence": "high",
+      "source": {
+        "type": "manifest",
+        "ref": "shipgate.yaml",
+        "location": null
+      },
+      "recommendation": "Replace broad manifest permission scopes with the narrowest scopes needed for this release.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_83852fbd6b440524",
+      "fingerprint": "fp_83852fbd6b440524",
+      "check_id": "SHIP-AUTH-SCOPE-COVERAGE-MISSING",
+      "title": "shopify.cancel_order requires scopes not declared in the manifest",
+      "severity": "high",
+      "category": "auth",
+      "tool_id": "tool:shopify.cancel_order",
+      "tool_name": "shopify.cancel_order",
+      "agent_id": "agent:support-refund-agent/refund-assistant",
+      "evidence": {
+        "tool_scopes": [
+          "shopify:orders:write"
+        ],
+        "manifest_scopes": [
+          "zendesk:tickets:read",
+          "zendesk:tickets:write",
+          "stripe:*"
+        ],
+        "missing_scopes": [
+          "shopify:orders:write"
+        ]
+      },
+      "confidence": "high",
+      "source": {
+        "type": "openapi",
+        "ref": "specs/support-tools.openapi.yaml#/paths/~1orders~1{order_id}~1cancel/post",
+        "location": null
+      },
+      "recommendation": "Add the required scopes for shopify.cancel_order to permissions.scopes or narrow the tool's declared auth requirements.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_d8e6d1865dae97cc",
+      "fingerprint": "fp_d8e6d1865dae97cc",
+      "check_id": "SHIP-AUTH-SCOPE-COVERAGE-MISSING",
+      "title": "support.search_kb requires scopes not declared in the manifest",
+      "severity": "high",
+      "category": "auth",
+      "tool_id": "tool:support.search_kb",
+      "tool_name": "support.search_kb",
+      "agent_id": "agent:support-refund-agent/refund-assistant",
+      "evidence": {
+        "tool_scopes": [
+          "support:kb:read"
+        ],
+        "manifest_scopes": [
+          "zendesk:tickets:read",
+          "zendesk:tickets:write",
+          "stripe:*"
+        ],
+        "missing_scopes": [
+          "support:kb:read"
+        ]
+      },
+      "confidence": "high",
+      "source": {
+        "type": "mcp",
+        "ref": ".agents-shipgate/mcp-tools.json",
+        "location": null
+      },
+      "recommendation": "Add the required scopes for support.search_kb to permissions.scopes or narrow the tool's declared auth requirements.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_1f6cfd6b7daa9b7c",
+      "fingerprint": "fp_1f6cfd6b7daa9b7c",
+      "check_id": "SHIP-AUTH-SCOPE-COVERAGE-MISSING",
+      "title": "gmail.send_customer_email requires scopes not declared in the manifest",
+      "severity": "high",
+      "category": "auth",
+      "tool_id": "tool:gmail.send_customer_email",
+      "tool_name": "gmail.send_customer_email",
+      "agent_id": "agent:support-refund-agent/refund-assistant",
+      "evidence": {
+        "tool_scopes": [
+          "gmail:send"
+        ],
+        "manifest_scopes": [
+          "zendesk:tickets:read",
+          "zendesk:tickets:write",
+          "stripe:*"
+        ],
+        "missing_scopes": [
+          "gmail:send"
+        ]
+      },
+      "confidence": "high",
+      "source": {
+        "type": "mcp",
+        "ref": ".agents-shipgate/mcp-tools.json",
+        "location": null
+      },
+      "recommendation": "Add the required scopes for gmail.send_customer_email to permissions.scopes or narrow the tool's declared auth requirements.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_12985c36a06026de",
+      "fingerprint": "fp_12985c36a06026de",
+      "check_id": "SHIP-SCOPE-PROHIBITED-TOOL-PRESENT",
+      "title": "stripe.create_refund appears to overlap with a prohibited action",
+      "severity": "high",
+      "category": "scope",
+      "tool_id": "tool:stripe.create_refund",
+      "tool_name": "stripe.create_refund",
+      "agent_id": "agent:support-refund-agent/refund-assistant",
+      "evidence": {
+        "prohibited_action": "issue refund without approval",
+        "risk_tags": [
+          "external_write",
+          "financial_action",
+          "write"
+        ]
+      },
+      "confidence": "medium",
+      "source": {
+        "type": "openapi",
+        "ref": "specs/support-tools.openapi.yaml#/paths/~1refunds/post",
+        "location": null
+      },
+      "recommendation": "Remove stripe.create_refund, narrow its policy, or revise prohibited_actions so the manifest and tool surface do not contradict each other.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_e090c62e390e70ab",
+      "fingerprint": "fp_e090c62e390e70ab",
+      "check_id": "SHIP-SCOPE-PROHIBITED-TOOL-PRESENT",
+      "title": "gmail.send_customer_email appears to overlap with a prohibited action",
+      "severity": "high",
+      "category": "scope",
+      "tool_id": "tool:gmail.send_customer_email",
+      "tool_name": "gmail.send_customer_email",
+      "agent_id": "agent:support-refund-agent/refund-assistant",
+      "evidence": {
+        "prohibited_action": "send external email without preview",
+        "risk_tags": [
+          "customer_communication",
+          "external_write"
+        ]
+      },
+      "confidence": "medium",
+      "source": {
+        "type": "mcp",
+        "ref": ".agents-shipgate/mcp-tools.json",
+        "location": null
+      },
+      "recommendation": "Remove gmail.send_customer_email, narrow its policy, or revise prohibited_actions so the manifest and tool surface do not contradict each other.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_f092940f62fbb012",
+      "fingerprint": "fp_f092940f62fbb012",
+      "check_id": "SHIP-POLICY-APPROVAL-MISSING",
+      "title": "stripe.create_refund lacks a declared approval policy",
+      "severity": "critical",
+      "category": "policy",
+      "tool_id": "tool:stripe.create_refund",
+      "tool_name": "stripe.create_refund",
+      "agent_id": "agent:support-refund-agent/refund-assistant",
+      "evidence": {
+        "risk_tags": [
+          "external_write",
+          "financial_action",
+          "write"
+        ],
+        "policy_match": null
+      },
+      "confidence": "high",
+      "source": {
+        "type": "openapi",
+        "ref": "specs/support-tools.openapi.yaml#/paths/~1refunds/post",
+        "location": null
+      },
+      "recommendation": "Declare an approval policy for stripe.create_refund or remove this tool from the release.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_a62ca2fd9a68a1d1",
+      "fingerprint": "fp_a62ca2fd9a68a1d1",
+      "check_id": "SHIP-POLICY-CONFIRMATION-MISSING",
+      "title": "stripe.create_refund lacks a declared confirmation policy",
+      "severity": "high",
+      "category": "policy",
+      "tool_id": "tool:stripe.create_refund",
+      "tool_name": "stripe.create_refund",
+      "agent_id": "agent:support-refund-agent/refund-assistant",
+      "evidence": {
+        "risk_tags": [
+          "external_write",
+          "financial_action",
+          "write"
+        ],
+        "policy_match": null
+      },
+      "confidence": "high",
+      "source": {
+        "type": "openapi",
+        "ref": "specs/support-tools.openapi.yaml#/paths/~1refunds/post",
+        "location": null
+      },
+      "recommendation": "Declare a user confirmation policy for stripe.create_refund or remove this action from the release.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_8e08a4fe6b0917f6",
+      "fingerprint": "fp_8e08a4fe6b0917f6",
+      "check_id": "SHIP-POLICY-CONFIRMATION-MISSING",
+      "title": "gmail.send_customer_email lacks a declared confirmation policy",
+      "severity": "high",
+      "category": "policy",
+      "tool_id": "tool:gmail.send_customer_email",
+      "tool_name": "gmail.send_customer_email",
+      "agent_id": "agent:support-refund-agent/refund-assistant",
+      "evidence": {
+        "risk_tags": [
+          "customer_communication",
+          "external_write"
+        ],
+        "policy_match": null
+      },
+      "confidence": "high",
+      "source": {
+        "type": "mcp",
+        "ref": ".agents-shipgate/mcp-tools.json",
+        "location": null
+      },
+      "recommendation": "Declare a user confirmation policy for gmail.send_customer_email or remove this action from the release.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_dac8011e14c53777",
+      "fingerprint": "fp_dac8011e14c53777",
+      "check_id": "SHIP-SIDEFX-IDEMPOTENCY-MISSING",
+      "title": "stripe.create_refund lacks idempotency evidence",
+      "severity": "critical",
+      "category": "side_effects",
+      "tool_id": "tool:stripe.create_refund",
+      "tool_name": "stripe.create_refund",
+      "agent_id": "agent:support-refund-agent/refund-assistant",
+      "evidence": {
+        "risk_tags": [
+          "external_write",
+          "financial_action",
+          "write"
+        ],
+        "retry_policy_known": true
+      },
+      "confidence": "high",
+      "source": {
+        "type": "openapi",
+        "ref": "specs/support-tools.openapi.yaml#/paths/~1refunds/post",
+        "location": null
+      },
+      "recommendation": "Add an idempotency key, idempotent annotation, or declared idempotency policy for stripe.create_refund.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_0f8aaa912d589cf0",
+      "fingerprint": "fp_0f8aaa912d589cf0",
+      "check_id": "SHIP-SIDEFX-IDEMPOTENCY-MISSING",
+      "title": "gmail.send_customer_email lacks idempotency evidence",
+      "severity": "high",
+      "category": "side_effects",
+      "tool_id": "tool:gmail.send_customer_email",
+      "tool_name": "gmail.send_customer_email",
+      "agent_id": "agent:support-refund-agent/refund-assistant",
+      "evidence": {
+        "risk_tags": [
+          "customer_communication",
+          "external_write"
+        ],
+        "retry_policy_known": false
+      },
+      "confidence": "medium",
+      "source": {
+        "type": "mcp",
+        "ref": ".agents-shipgate/mcp-tools.json",
+        "location": null
+      },
+      "recommendation": "Add an idempotency key, idempotent annotation, or declared idempotency policy for gmail.send_customer_email.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_fd2577850cef1f87",
+      "fingerprint": "fp_fd2577850cef1f87",
+      "check_id": "SHIP-MANIFEST-HIGH-RISK-OWNER-MISSING",
+      "title": "shopify.cancel_order is high-risk but has no owner",
+      "severity": "high",
+      "category": "manifest",
+      "tool_id": "tool:shopify.cancel_order",
+      "tool_name": "shopify.cancel_order",
+      "agent_id": "agent:support-refund-agent/refund-assistant",
+      "evidence": {
+        "environment": "production_like",
+        "risk_tags": [
+          "destructive",
+          "write"
+        ]
+      },
+      "confidence": "high",
+      "source": {
+        "type": "openapi",
+        "ref": "specs/support-tools.openapi.yaml#/paths/~1orders~1{order_id}~1cancel/post",
+        "location": null
+      },
+      "recommendation": "Declare an owner for each high-risk production tool in risk_overrides.tools.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    },
+    {
+      "id": "fp_39b9ae878f343d1b",
+      "fingerprint": "fp_39b9ae878f343d1b",
+      "check_id": "SHIP-MANIFEST-UNUSED-SCOPE",
+      "title": "Manifest declares unused permission scope zendesk:tickets:read",
+      "severity": "medium",
+      "category": "manifest",
+      "tool_id": null,
+      "tool_name": null,
+      "agent_id": "agent:support-refund-agent/refund-assistant",
+      "evidence": {
+        "scope": "zendesk:tickets:read",
+        "tool_scopes": [
+          "gmail:send",
+          "shopify:orders:write",
+          "stripe:refunds:write",
+          "support:kb:read",
+          "zendesk:tickets:write"
+        ]
+      },
+      "confidence": "medium",
+      "source": {
+        "type": "manifest",
+        "ref": "shipgate.yaml",
+        "location": null
+      },
+      "recommendation": "Remove unused manifest scopes or add tool metadata showing why they are required.",
+      "suppressed": false,
+      "suppression_reason": null,
+      "baseline_status": null
+    }
+  ],
+  "recommended_actions": [
+    "Declare an approval policy for stripe.create_refund or remove this tool from the release.",
+    "Add an idempotency key, idempotent annotation, or declared idempotency policy for stripe.create_refund.",
+    "Replace broad manifest permission scopes with the narrowest scopes needed for this release.",
+    "Add the required scopes for shopify.cancel_order to permissions.scopes or narrow the tool's declared auth requirements.",
+    "Add the required scopes for support.search_kb to permissions.scopes or narrow the tool's declared auth requirements.",
+    "Add the required scopes for gmail.send_customer_email to permissions.scopes or narrow the tool's declared auth requirements.",
+    "Replace wildcard tool exposure with an explicit tool allowlist before release review.",
+    "Declare an owner for each high-risk production tool in risk_overrides.tools."
+  ],
+  "generated_reports": {
+    "markdown": "expected/report.md",
+    "json": "expected/report.json"
+  },
+  "tool_inventory": [
+    {
+      "name": "gmail.send_customer_email",
+      "source_type": "mcp",
+      "source_ref": ".agents-shipgate/mcp-tools.json",
+      "risk_tags": [
+        "customer_communication",
+        "external_write"
+      ],
+      "risk_tag_confidence": {
+        "customer_communication": "medium",
+        "external_write": "medium"
+      },
+      "auth_scopes": [
+        "gmail:send"
+      ],
+      "owner": "support-platform",
+      "confidence": "high"
+    },
+    {
+      "name": "refund_status_lookup",
+      "source_type": "openapi",
+      "source_ref": "specs/support-tools.openapi.yaml#/paths/~1refunds~1{payment_id}~1status/get",
+      "risk_tags": [
+        "read_only"
+      ],
+      "risk_tag_confidence": {
+        "read_only": "high"
+      },
+      "auth_scopes": [],
+      "owner": null,
+      "confidence": "high"
+    },
+    {
+      "name": "send_email_preview",
+      "source_type": "sdk_function",
+      "source_ref": "agents/refund_agent.py",
+      "risk_tags": [
+        "read_only"
+      ],
+      "risk_tag_confidence": {
+        "read_only": "high"
+      },
+      "auth_scopes": [],
+      "owner": null,
+      "confidence": "medium"
+    },
+    {
+      "name": "shopify.cancel_order",
+      "source_type": "openapi",
+      "source_ref": "specs/support-tools.openapi.yaml#/paths/~1orders~1{order_id}~1cancel/post",
+      "risk_tags": [
+        "destructive",
+        "write"
+      ],
+      "risk_tag_confidence": {
+        "destructive": "high",
+        "write": "high"
+      },
+      "auth_scopes": [
+        "shopify:orders:write"
+      ],
+      "owner": null,
+      "confidence": "high"
+    },
+    {
+      "name": "stripe.create_refund",
+      "source_type": "openapi",
+      "source_ref": "specs/support-tools.openapi.yaml#/paths/~1refunds/post",
+      "risk_tags": [
+        "external_write",
+        "financial_action",
+        "write"
+      ],
+      "risk_tag_confidence": {
+        "external_write": "high",
+        "financial_action": "high",
+        "write": "high"
+      },
+      "auth_scopes": [
+        "stripe:refunds:write"
+      ],
+      "owner": "payments-platform",
+      "confidence": "high"
+    },
+    {
+      "name": "support.search_kb",
+      "source_type": "mcp",
+      "source_ref": ".agents-shipgate/mcp-tools.json",
+      "risk_tags": [
+        "read_only"
+      ],
+      "risk_tag_confidence": {
+        "read_only": "high"
+      },
+      "auth_scopes": [
+        "support:kb:read"
+      ],
+      "owner": "support-platform",
+      "confidence": "high"
+    },
+    {
+      "name": "wildcard_mcp_tools.*",
+      "source_type": "mcp",
+      "source_ref": ".agents-shipgate/wildcard-tools.json",
+      "risk_tags": [],
+      "risk_tag_confidence": {},
+      "auth_scopes": [],
+      "owner": null,
+      "confidence": "high"
+    },
+    {
+      "name": "zendesk.update_ticket",
+      "source_type": "openapi",
+      "source_ref": "specs/support-tools.openapi.yaml#/paths/~1tickets~1{ticket_id}/patch",
+      "risk_tags": [
+        "write"
+      ],
+      "risk_tag_confidence": {
+        "write": "high"
+      },
+      "auth_scopes": [
+        "zendesk:tickets:write"
+      ],
+      "owner": null,
+      "confidence": "high"
+    }
+  ],
+  "source_warnings": [
+    "MCP source declares wildcard tool exposure"
+  ]
+}

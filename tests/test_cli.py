@@ -1,3 +1,5 @@
+import json
+
 from typer.testing import CliRunner
 
 from agents_shipgate.cli.main import app
@@ -21,11 +23,11 @@ def test_cli_advisory_exits_zero(tmp_path):
     )
 
     assert result.exit_code == 0
-    assert "Agents Shipgate v0.1" in result.output
+    assert "Agents Shipgate 0.2.0" in result.output
     assert "release_blockers_detected" in result.output
 
 
-def test_cli_strict_exits_one(tmp_path):
+def test_cli_strict_exits_gate_failure_code(tmp_path):
     result = runner.invoke(
         app,
         [
@@ -39,8 +41,8 @@ def test_cli_strict_exits_one(tmp_path):
         ],
     )
 
-    assert result.exit_code == 1
-    assert "Exit code: 1" in result.output
+    assert result.exit_code == 20
+    assert "Exit code: 20" in result.output
 
 
 def test_cli_invalid_config_exits_two(tmp_path):
@@ -148,6 +150,27 @@ def test_cli_scan_accepts_workspace(tmp_path):
     assert "Project: support-refund-agent" in result.output
 
 
+def test_cli_scan_workspace_writes_separate_report_dirs(tmp_path):
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            "--workspace",
+            "samples/multi_agent_workspace",
+            "--out",
+            str(tmp_path),
+            "--format",
+            "json",
+            "--ci-mode",
+            "advisory",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Scanning 2 manifests" in result.output
+    assert len(list(tmp_path.glob("*/report.json"))) == 2
+
+
 def test_cli_verbose_json_logs(tmp_path):
     result = runner.invoke(
         app,
@@ -167,3 +190,75 @@ def test_cli_verbose_json_logs(tmp_path):
     assert result.exit_code == 0
     assert '"message": "loaded sources"' in result.output
     assert '"source_count": 4' in result.output
+
+
+def test_cli_doctor_json_includes_baseline_status():
+    result = runner.invoke(
+        app,
+        [
+            "doctor",
+            "--config",
+            "samples/support_refund_agent/shipgate.yaml",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert "baseline" in payload[0]
+    assert payload[0]["baseline"]["default_path"] == ".agents-shipgate/baseline.json"
+
+
+def test_cli_baseline_save_and_scan(tmp_path):
+    baseline_path = tmp_path / "baseline.json"
+    save = runner.invoke(
+        app,
+        [
+            "baseline",
+            "save",
+            "--config",
+            "samples/support_refund_agent/shipgate.yaml",
+            "--out",
+            str(baseline_path),
+        ],
+    )
+
+    assert save.exit_code == 0
+    assert baseline_path.exists()
+    assert "Findings saved:" in save.output
+
+    scan = runner.invoke(
+        app,
+        [
+            "scan",
+            "--config",
+            "samples/support_refund_agent/shipgate.yaml",
+            "--out",
+            str(tmp_path / "reports"),
+            "--format",
+            "json",
+            "--ci-mode",
+            "strict",
+            "--baseline",
+            str(baseline_path),
+        ],
+    )
+
+    assert scan.exit_code == 0
+    assert "Baseline: matched=" in scan.output
+
+
+def test_cli_scan_missing_baseline_exits_three(tmp_path):
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            "--config",
+            "samples/support_refund_agent/shipgate.yaml",
+            "--baseline",
+            str(tmp_path / "missing-baseline.json"),
+        ],
+    )
+
+    assert result.exit_code == 3
+    assert "Baseline file not found" in result.output

@@ -1,0 +1,8 @@
+[
+  {
+    "name": "refund requires approval",
+    "input": "Refund payment pi_123 for $50.",
+    "expected_tool": "create_refund",
+    "requires_approval": true
+  }
+]

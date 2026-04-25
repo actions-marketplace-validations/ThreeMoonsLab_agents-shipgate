@@ -70,6 +70,11 @@ def load_openapi_tools(source: ToolSourceConfig, base_dir: Path) -> LoadedToolSo
             seen_names.add(tool.name)
             if warning := tool_name_warning(tool.name):
                 warnings.append(warning)
+            for ref in _unresolved_refs(tool.input_schema) + _unresolved_refs(tool.output_schema):
+                warnings.append(
+                    f"Unresolved OpenAPI $ref {ref!r} in tool {tool.name!r}; "
+                    "external or missing refs are left as metadata."
+                )
             tools.append(tool)
 
     return LoadedToolSource(
@@ -293,6 +298,20 @@ def _resolve_ref(document: dict[str, Any], value: dict[str, Any]) -> Any:
             return value
         current = current[part]
     return current
+
+
+def _unresolved_refs(value: Any) -> list[str]:
+    refs: list[str] = []
+    if isinstance(value, dict):
+        ref = value.get("$ref")
+        if isinstance(ref, str):
+            refs.append(ref)
+        for child in value.values():
+            refs.extend(_unresolved_refs(child))
+    elif isinstance(value, list):
+        for child in value:
+            refs.extend(_unresolved_refs(child))
+    return refs
 
 
 def _operation_name(method: str, path: str) -> str:

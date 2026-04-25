@@ -1,0 +1,14 @@
+approval_required:
+  - create_refund
+confirmation_required:
+  - send_customer_email
+retry_policy:
+  max_attempts: 2
+tool_output_schemas:
+  send_customer_email:
+    success_fields:
+      - message_id
+      - status
+    failure_fields:
+      - error_code
+      - message

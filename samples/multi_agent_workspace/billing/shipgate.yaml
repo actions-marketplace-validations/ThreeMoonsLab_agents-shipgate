@@ -1,0 +1,21 @@
+version: "0.1"
+
+project:
+  name: workspace-billing-agent
+
+agent:
+  name: billing-reviewer
+  declared_purpose:
+    - prepare billing review requests
+
+environment:
+  target: local
+
+tool_sources:
+  - id: billing_tools
+    type: mcp
+    path: tools.json
+
+policies:
+  require_approval_for_tools:
+    - billing.refund_preview

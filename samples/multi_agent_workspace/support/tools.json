@@ -1,0 +1,14 @@
+{
+  "tools": [
+    {
+      "name": "support.ticket_lookup",
+      "description": "Look up support ticket metadata.",
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "auth": {
+        "scopes": ["support:read"]
+      }
+    }
+  ]
+}

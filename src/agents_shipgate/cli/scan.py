@@ -10,6 +10,7 @@ from agents_shipgate.checks.registry import run_checks
 from agents_shipgate.ci.exit_policy import exit_code_for_report
 from agents_shipgate.ci.github_summary import write_github_step_summary
 from agents_shipgate.config.loader import load_manifest
+from agents_shipgate.core.baseline import apply_baseline, load_baseline
 from agents_shipgate.core.context import ScanContext
 from agents_shipgate.core.errors import ConfigError, InputParseError
 from agents_shipgate.core.findings import (
@@ -19,10 +20,18 @@ from agents_shipgate.core.findings import (
     build_report,
     tool_inventory,
 )
-from agents_shipgate.core.models import Agent, LoadedToolSource, ReadinessReport, Tool, parse_severity
+from agents_shipgate.core.models import (
+    Agent,
+    LoadedToolSource,
+    OpenAIApiArtifacts,
+    ReadinessReport,
+    Tool,
+    parse_severity,
+)
 from agents_shipgate.core.risk_hints import enrich_tools_with_risk_hints
 from agents_shipgate.inputs.mcp import load_mcp_tools
 from agents_shipgate.inputs.openapi import load_openapi_tools
+from agents_shipgate.inputs.openai_api import load_openai_api_artifacts
 from agents_shipgate.inputs.openai_sdk_static import load_openai_sdk_static_tools
 from agents_shipgate.report.json_report import write_json_report
 from agents_shipgate.report.markdown import write_markdown_report
@@ -37,13 +46,15 @@ def run_scan(
     formats: list[str] | None = None,
     ci_mode: str | None = None,
     fail_on: list[str] | None = None,
+    baseline_path: Path | None = None,
+    baseline_mode: str = "new-findings",
     deep_import: bool = False,
     verbose: bool = False,
 ) -> tuple[ReadinessReport, int]:
     if deep_import:
-        raise ConfigError("Deep import is intentionally deferred for v0.1 and is not supported.")
+        raise ConfigError("Deep import is intentionally deferred and is not supported.")
 
-    manifest = load_manifest(config_path)
+    manifest = load_manifest(config_path).model_copy(deep=True)
     if ci_mode:
         manifest.ci.mode = ci_mode
     if fail_on is not None:
@@ -52,9 +63,14 @@ def run_scan(
         manifest.output.directory = str(output_dir)
     if formats:
         manifest.output.formats = formats
+    if baseline_mode != "new-findings":
+        raise ConfigError("--baseline-mode currently supports only new-findings")
 
     base_dir = config_path.resolve().parent
     loaded_sources = _load_sources(manifest, base_dir, verbose=verbose)
+    api_source, api_artifacts = load_openai_api_artifacts(manifest.openai_api, base_dir)
+    if api_source:
+        loaded_sources.append(api_source)
     logger.debug(
         "loaded sources",
         extra={
@@ -88,29 +104,45 @@ def run_scan(
             ]
         },
     )
-    agent = _build_agent(manifest, tools)
+    agent = _build_agent(manifest, tools, api_artifacts)
     context = ScanContext(
         manifest=manifest,
         agent=agent,
         tools=tools,
         config_path=config_path.resolve(),
+        api_artifacts=api_artifacts,
     )
     findings = run_checks(context)
     assign_finding_ids(findings)
     apply_severity_overrides(findings, manifest.severity_overrides())
     apply_suppressions(findings, manifest.checks.ignore)
+    baseline_summary = None
+    if baseline_path:
+        baseline_file = load_baseline(baseline_path)
+        baseline_summary = apply_baseline(
+            findings,
+            baseline_file,
+            display_path=_relative_display_path(baseline_path, base_dir),
+        )
     logger.debug(
         "checks completed",
         extra={
             "agents_shipgate_finding_count": len(findings),
-            "agents_shipgate_suppressed_count": sum(1 for finding in findings if finding.suppressed),
+            "agents_shipgate_suppressed_count": sum(
+                1 for finding in findings if finding.suppressed
+            ),
         },
     )
 
     out_dir = (base_dir / manifest.output.directory).resolve()
     generated_paths = _planned_generated_paths(out_dir, manifest.output.formats)
     report = build_report(
-        run_id=_run_id(manifest, tools, findings, warnings),
+        run_id=_run_id(
+            manifest,
+            tools,
+            findings,
+            api_surface=api_artifacts.surface_summary() if api_artifacts else None,
+        ),
         manifest=manifest,
         agent=agent.model_dump(exclude_none=True),
         environment=manifest.environment.model_dump(exclude_none=True),
@@ -121,6 +153,8 @@ def run_scan(
             for key, path in generated_paths.items()
         },
         source_warnings=warnings,
+        api_surface=api_artifacts.surface_summary() if api_artifacts else None,
+        baseline=baseline_summary,
     )
     _write_reports(report, generated_paths, manifest.output.formats)
     write_github_step_summary(report)
@@ -128,6 +162,7 @@ def run_scan(
         report,
         manifest.ci.mode,
         fail_on=manifest.ci.fail_on,
+        new_findings_only=baseline_summary is not None,
     )
 
 
@@ -135,6 +170,9 @@ def inspect_sources(*, config_path: Path, verbose: bool = False) -> dict[str, ob
     manifest = load_manifest(config_path)
     base_dir = config_path.resolve().parent
     loaded_sources = _load_sources(manifest, base_dir, verbose=verbose)
+    api_source, api_artifacts = load_openai_api_artifacts(manifest.openai_api, base_dir)
+    if api_source:
+        loaded_sources.append(api_source)
     tools, duplicate_warnings = _flatten_and_deduplicate_tools(loaded_sources)
     warnings = [warning for loaded in loaded_sources for warning in loaded.warnings]
     warnings.extend(duplicate_warnings)
@@ -153,6 +191,8 @@ def inspect_sources(*, config_path: Path, verbose: bool = False) -> dict[str, ob
             }
             for source in loaded_sources
         ],
+        "api_surface": api_artifacts.surface_summary() if api_artifacts else None,
+        "baseline": _default_baseline_status(base_dir),
         "warnings": warnings,
     }
 
@@ -212,22 +252,32 @@ def _flatten_and_deduplicate_tools(
 
 def _source_priority(tool: Tool) -> int:
     return {
+        "openai_api": 40,
         "openapi": 30,
         "mcp": 20,
         "sdk_function": 10,
     }.get(tool.source_type, 0)
 
 
-def _build_agent(manifest, tools: list[Tool]) -> Agent:
+def _build_agent(
+    manifest, tools: list[Tool], api_artifacts: OpenAIApiArtifacts | None = None
+) -> Agent:
     sdk = manifest.agent.sdk
+    instructions_preview = manifest.agent.instructions_preview
+    instruction_source = "config" if instructions_preview else "dynamic_unknown"
+    instruction_confidence = "high" if instructions_preview else "medium"
+    if not instructions_preview and api_artifacts and api_artifacts.prompt_text:
+        instructions_preview = api_artifacts.prompt_text[:500]
+        instruction_source = "openai_api_prompt_files"
+        instruction_confidence = "high"
     return Agent(
         id=f"agent:{manifest.project.name}/{manifest.agent.name}",
         name=manifest.agent.name,
         source=sdk.model_dump(exclude_none=True) if sdk else {"source": "manifest"},
         instructions={
-            "value_preview": manifest.agent.instructions_preview,
-            "source": "config" if manifest.agent.instructions_preview else "dynamic_unknown",
-            "confidence": "high" if manifest.agent.instructions_preview else "medium",
+            "value_preview": instructions_preview,
+            "source": instruction_source,
+            "confidence": instruction_confidence,
         },
         declared_purpose=manifest.agent.declared_purpose,
         prohibited_actions=manifest.agent.prohibited_actions,
@@ -274,19 +324,36 @@ def _relative_display_path(path: Path, base_dir: Path) -> str:
     return rel
 
 
-def _run_id(manifest, tools: list[Tool], findings, warnings: list[str]) -> str:
+def _run_id(
+    manifest,
+    tools: list[Tool],
+    findings,
+    api_surface: dict[str, object] | None = None,
+) -> str:
     payload = {
         "project": manifest.project.model_dump(mode="json", exclude_none=False),
         "agent_name": manifest.agent.name,
         "environment": manifest.environment.model_dump(mode="json", exclude_none=False),
         "tool_inventory": tool_inventory(tools),
         "findings": [
-            finding.model_dump(mode="json", exclude={"id"}, exclude_none=False)
+            finding.model_dump(
+                mode="json",
+                exclude={"id", "baseline_status"},
+                exclude_none=False,
+            )
             for finding in findings
         ],
-        "source_warnings": warnings,
+        "api_surface": api_surface,
     }
     digest = hashlib.sha256(
         json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()[:16]
     return f"agents_shipgate_{digest}"
+
+
+def _default_baseline_status(base_dir: Path) -> dict[str, object]:
+    path = base_dir / ".agents-shipgate" / "baseline.json"
+    return {
+        "default_path": _relative_display_path(path, base_dir),
+        "present": path.exists(),
+    }

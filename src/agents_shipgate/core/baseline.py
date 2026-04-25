@@ -1,0 +1,114 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from agents_shipgate.core.errors import InputParseError
+from agents_shipgate.core.models import BaselineSummary, Finding, ReadinessReport, Severity
+
+
+BASELINE_SCHEMA_VERSION = "0.2"
+
+
+class BaselineFinding(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    fingerprint: str
+    check_id: str
+    tool_name: str | None = None
+    severity: Severity
+    title: str
+
+
+class BaselineFile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["0.2"] = BASELINE_SCHEMA_VERSION
+    project: dict[str, object] = Field(default_factory=dict)
+    agent: dict[str, object] = Field(default_factory=dict)
+    created_at: str
+    source_report_run_id: str
+    findings: list[BaselineFinding] = Field(default_factory=list)
+
+
+def baseline_from_report(report: ReadinessReport) -> BaselineFile:
+    return BaselineFile(
+        project=report.project,
+        agent=report.agent,
+        created_at=_utc_now(),
+        source_report_run_id=report.run_id,
+        findings=[
+            BaselineFinding(
+                fingerprint=finding.fingerprint or finding.id or "",
+                check_id=finding.check_id,
+                tool_name=finding.tool_name,
+                severity=finding.severity,
+                title=finding.title,
+            )
+            for finding in _active_findings(report.findings)
+            if finding.fingerprint or finding.id
+        ],
+    )
+
+
+def write_baseline(report: ReadinessReport, path: Path) -> BaselineFile:
+    baseline = baseline_from_report(report)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        baseline.model_dump_json(indent=2, exclude_none=False) + "\n",
+        encoding="utf-8",
+    )
+    return baseline
+
+
+def load_baseline(path: Path) -> BaselineFile:
+    if not path.exists():
+        raise InputParseError(f"Baseline file not found: {path}")
+    try:
+        return BaselineFile.model_validate_json(path.read_text(encoding="utf-8"))
+    except (OSError, ValidationError, ValueError) as exc:
+        raise InputParseError(f"Invalid baseline file {path}: {exc}") from exc
+
+
+def apply_baseline(
+    findings: list[Finding],
+    baseline: BaselineFile,
+    *,
+    display_path: str,
+) -> BaselineSummary:
+    baseline_fingerprints = {
+        finding.fingerprint for finding in baseline.findings if finding.fingerprint
+    }
+    current_active_fingerprints: set[str] = set()
+    matched = 0
+    new = 0
+    for finding in findings:
+        if finding.suppressed:
+            continue
+        fingerprint = finding.fingerprint or finding.id
+        if not fingerprint:
+            continue
+        current_active_fingerprints.add(fingerprint)
+        if fingerprint in baseline_fingerprints:
+            finding.baseline_status = "matched"
+            matched += 1
+        else:
+            finding.baseline_status = "new"
+            new += 1
+    return BaselineSummary(
+        path=display_path,
+        matched_count=matched,
+        new_count=new,
+        resolved_count=len(baseline_fingerprints - current_active_fingerprints),
+    )
+
+
+def _active_findings(findings: list[Finding]) -> list[Finding]:
+    return [finding for finding in findings if not finding.suppressed]
+
+
+def _utc_now() -> str:
+    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")

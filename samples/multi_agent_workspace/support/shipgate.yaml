@@ -1,0 +1,21 @@
+version: "0.1"
+
+project:
+  name: workspace-support-agent
+
+agent:
+  name: support-reader
+  declared_purpose:
+    - read support ticket metadata
+
+environment:
+  target: local
+
+tool_sources:
+  - id: support_tools
+    type: mcp
+    path: tools.json
+
+permissions:
+  scopes:
+    - support:read

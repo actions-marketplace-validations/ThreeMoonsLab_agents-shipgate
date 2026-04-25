@@ -1,0 +1,48 @@
+version: "0.1"
+
+project:
+  name: simple-openai-api-agent
+  owner: support-platform
+
+agent:
+  name: api-refund-assistant
+  prohibited_actions:
+    - issue refund without approval
+    - send customer email without confirmation
+
+environment:
+  target: production_like
+
+openai_api:
+  prompt_files:
+    - prompts/support_refund.md
+
+  tools:
+    - path: tools/openai-tools.json
+
+  response_formats:
+    - path: schemas/refund_decision.schema.json
+      downstream_critical_fields:
+        - decision
+        - refund_amount
+
+  model_config:
+    path: openai-config.json
+
+  test_cases:
+    - path: tests/openai-api-cases.json
+
+  trace_samples:
+    - path: traces/sample.jsonl
+
+  policy_rules:
+    - path: policies/openai-api-policy.yaml
+
+ci:
+  mode: advisory
+
+output:
+  directory: agents-shipgate-reports
+  formats:
+    - markdown
+    - json

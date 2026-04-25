@@ -5,7 +5,7 @@ import json
 from collections import Counter
 
 from agents_shipgate.config.schema import AgentsShipgateManifest, SuppressionConfig
-from agents_shipgate.core.models import Finding, ReadinessReport, ReportSummary, Severity, Tool, ToolSurfaceSummary
+from agents_shipgate.core.models import BaselineSummary, Finding, ReadinessReport, ReportSummary, Severity, Tool, ToolSurfaceSummary
 from agents_shipgate.core.risk_hints import is_high_risk_tool, risk_tags
 
 
@@ -123,6 +123,8 @@ def build_report(
     findings: list[Finding],
     generated_reports: dict[str, str],
     source_warnings: list[str] | None = None,
+    api_surface: dict[str, object] | None = None,
+    baseline: BaselineSummary | None = None,
 ) -> ReadinessReport:
     return ReadinessReport(
         run_id=run_id,
@@ -131,6 +133,8 @@ def build_report(
         environment=environment,
         summary=summarize_findings(findings, tools),
         tool_surface=summarize_tool_surface(tools),
+        api_surface=api_surface,
+        baseline=baseline,
         findings=findings,
         recommended_actions=recommended_actions(findings),
         generated_reports=generated_reports,
@@ -161,12 +165,29 @@ def finding_fingerprint(finding: Finding) -> str:
     identity = {
         "check_id": finding.check_id,
         "tool_name": finding.tool_name,
-        "evidence": finding.evidence,
+        "evidence": _canonicalize_for_fingerprint(finding.evidence),
     }
     digest = hashlib.sha256(
         json.dumps(identity, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()[:16]
     return f"fp_{digest}"
+
+
+def _canonicalize_for_fingerprint(value):
+    if isinstance(value, dict):
+        return {
+            key: _canonicalize_for_fingerprint(value[key])
+            for key in sorted(value)
+        }
+    if isinstance(value, list):
+        items = [_canonicalize_for_fingerprint(item) for item in value]
+        return sorted(
+            items,
+            key=lambda item: json.dumps(item, sort_keys=True, default=str),
+        )
+    if isinstance(value, tuple | set):
+        return _canonicalize_for_fingerprint(list(value))
+    return value
 
 
 def _risk_tag_confidence(tool: Tool, min_confidence: str) -> dict[str, str]:
