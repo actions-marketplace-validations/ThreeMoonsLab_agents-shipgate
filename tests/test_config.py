@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from agents_shipgate.config.loader import load_manifest
+from agents_shipgate.config.loader import KNOWN_MANIFEST_FIELDS, load_manifest
 from agents_shipgate.core.errors import ConfigError
 
 SAMPLE = Path("samples/support_refund_agent/shipgate.yaml")
@@ -68,6 +68,41 @@ tool_sources:
 
     with pytest.raises(ConfigError, match="Did you mean declared_purpose"):
         load_manifest(manifest_path)
+
+
+def test_misplaced_known_field_does_not_suggest_itself(tmp_path):
+    manifest_path = tmp_path / "shipgate.yaml"
+    manifest_path.write_text(
+        """
+version: "0.1"
+project:
+  name: misplaced
+agent:
+  name: misplaced-agent
+declared_purpose:
+  - misplaced at the wrong nesting level
+environment:
+  target: local
+tool_sources:
+  - id: tools
+    type: mcp
+    path: tools.json
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError) as info:
+        load_manifest(manifest_path)
+    message = str(info.value)
+    assert "declared_purpose" in message
+    assert "Did you mean declared_purpose" not in message
+
+
+def test_known_manifest_fields_are_derived_from_schema():
+    assert "function_schemas" in KNOWN_MANIFEST_FIELDS
+    assert "policy_rules" in KNOWN_MANIFEST_FIELDS
+    assert "model_config" in KNOWN_MANIFEST_FIELDS
+    assert "check_severity_overrides" in KNOWN_MANIFEST_FIELDS
 
 
 def test_missing_default_config_points_to_init_command(tmp_path, monkeypatch):
