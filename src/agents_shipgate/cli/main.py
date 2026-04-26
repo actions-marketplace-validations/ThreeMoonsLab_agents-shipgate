@@ -22,6 +22,7 @@ app = typer.Typer(
     name="agents-shipgate",
     help="Manifest-first release readiness scanner for agent tool surfaces.",
     no_args_is_help=True,
+    invoke_without_command=True,
 )
 baseline_app = typer.Typer(help="Manage local finding baselines.")
 app.add_typer(baseline_app, name="baseline")

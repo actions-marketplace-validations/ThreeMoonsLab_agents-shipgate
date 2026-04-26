@@ -90,6 +90,13 @@ def test_cli_list_checks_outputs_catalog():
     assert "SHIP-POLICY-APPROVAL-MISSING" in result.output
 
 
+def test_cli_version_outputs_version():
+    result = runner.invoke(app, ["--version"])
+
+    assert result.exit_code == 0
+    assert result.output.strip() == "Agents Shipgate 0.2.0"
+
+
 def test_cli_scan_help_hides_deferred_flags():
     result = runner.invoke(app, ["scan", "--help"])
 

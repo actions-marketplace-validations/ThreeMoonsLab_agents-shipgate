@@ -45,7 +45,14 @@ Top findings:
 
 Use Agents Shipgate as a [GitHub Action](#github-action) on every PR, or run the CLI locally.
 
-Install from a source checkout:
+Install the published package:
+
+```bash
+python -m pip install agents-shipgate
+agents-shipgate --version
+```
+
+Install from a source checkout when developing locally:
 
 ```bash
 python -m pip install -e ".[dev]"
@@ -54,7 +61,7 @@ agents-shipgate doctor --config shipgate.yaml
 agents-shipgate scan --config shipgate.yaml
 ```
 
-Or install directly from GitHub until the PyPI package is published:
+Or install directly from GitHub when testing the latest unreleased source:
 
 ```bash
 python -m pip install "git+https://github.com/ThreeMoonsLab/agents-shipgate@main"
@@ -131,7 +138,7 @@ See [Trust model](docs/trust-model.md) and [Security policy](SECURITY.md) for th
 
 ## GitHub Action
 
-The action can run from `main` during pre-release or from a pinned tag after a release. Set `permissions: contents: read` and run on `pull_request`:
+Use a pinned release tag for CI. Set `permissions: contents: read` and run on `pull_request`:
 
 ```yaml
 name: Agents Shipgate
@@ -148,7 +155,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - id: agents-shipgate
-        uses: ThreeMoonsLab/agents-shipgate@main
+        uses: ThreeMoonsLab/agents-shipgate@v0.2.0
         with:
           config: shipgate.yaml
           ci_mode: advisory
@@ -161,7 +168,7 @@ Inputs: `config`, `ci_mode` (`advisory` or `strict`), `fail_on`, `baseline`, `ba
 
 Outputs: `status`, `critical_count`, `high_count`, `medium_count`, `baseline_new_count`, `report_json`, `report_markdown`, `exit_code`.
 
-Once Agents Shipgate is published to PyPI, set `shipgate_version` to install a pinned PyPI release instead of the action source.
+Set `shipgate_version` to install a pinned PyPI release instead of the action source when your workflow requires package/version parity.
 
 ## Pricing And Open Source Stance
 

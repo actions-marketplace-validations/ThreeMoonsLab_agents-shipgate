@@ -3,8 +3,8 @@
 ## GitHub Actions
 
 The public Marketplace wrapper is planned for the first tagged release. The
-action installs from its tagged source by default; set `shipgate_version` only
-after the package is published to PyPI.
+action installs from its tagged source by default; set `shipgate_version` when
+you want the action to install a pinned PyPI package version.
 
 ```yaml
 name: Agents Shipgate
@@ -75,7 +75,7 @@ AGENTS_SHIPGATE_LOG_FORMAT=json agents-shipgate scan --config shipgate.yaml --ve
 agents-shipgate:
   image: python:3.12
   script:
-    - python -m pip install -e ".[dev]"  # replace with pip install agents-shipgate after PyPI publication
+    - python -m pip install agents-shipgate
     - agents-shipgate scan --config shipgate.yaml --ci-mode advisory
   artifacts:
     paths:
@@ -91,7 +91,7 @@ jobs:
       - image: cimg/python:3.12
     steps:
       - checkout
-      - run: python -m pip install -e ".[dev]" # replace with pip install agents-shipgate after PyPI publication
+      - run: python -m pip install agents-shipgate
       - run: agents-shipgate scan --config shipgate.yaml --ci-mode advisory
 ```
 
@@ -100,7 +100,7 @@ jobs:
 ```groovy
 stage('Agents Shipgate') {
   steps {
-    sh 'python -m pip install -e ".[dev]"' // replace with pip install agents-shipgate after PyPI publication
+    sh 'python -m pip install agents-shipgate'
     sh 'agents-shipgate scan --config shipgate.yaml --ci-mode advisory'
     archiveArtifacts artifacts: 'agents-shipgate-reports/**', allowEmptyArchive: true
   }
