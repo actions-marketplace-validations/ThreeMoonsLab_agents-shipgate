@@ -1,7 +1,7 @@
 {
   "schema_version": "0.1",
-  "report_schema_version": "0.2",
-  "run_id": "agents_shipgate_20556254789e3a38",
+  "report_schema_version": "0.3",
+  "run_id": "agents_shipgate_c344bb0fd473341d",
   "project": {
     "name": "simple-openai-api-agent",
     "owner": "support-platform"
@@ -74,6 +74,7 @@
     "trace_sample_count": 1,
     "policy_rule_count": 1
   },
+  "frameworks": {},
   "baseline": null,
   "findings": [
     {
@@ -138,8 +139,8 @@
       "agent_id": "agent:simple-openai-api-agent/api-refund-assistant",
       "evidence": {
         "risk_tags": [
-          "write",
-          "financial_action"
+          "financial_action",
+          "write"
         ]
       },
       "confidence": "medium",
@@ -165,9 +166,9 @@
       "agent_id": "agent:simple-openai-api-agent/api-refund-assistant",
       "evidence": {
         "risk_tags": [
-          "write",
           "customer_communication",
-          "external_write"
+          "external_write",
+          "write"
         ]
       },
       "confidence": "medium",
@@ -393,7 +394,7 @@
       "baseline_status": null
     },
     {
-      "id": "fp_1b64e136ace3472a",
+      "id": "fp_1b64e136ace3472a_dacf6678",
       "fingerprint": "fp_1b64e136ace3472a",
       "check_id": "SHIP-API-PROMPT-TOOL-SCOPE-MISMATCH",
       "title": "Prompt says read-only or advise-only while write/high-risk tools are enabled",
@@ -420,7 +421,7 @@
       "baseline_status": null
     },
     {
-      "id": "fp_1b64e136ace3472a_2",
+      "id": "fp_1b64e136ace3472a_fe9f9e46",
       "fingerprint": "fp_1b64e136ace3472a",
       "check_id": "SHIP-API-PROMPT-TOOL-SCOPE-MISMATCH",
       "title": "Prompt lacks approval/confirmation language for high-risk tools",
@@ -657,6 +658,7 @@
     "markdown": "expected/report.md",
     "json": "expected/report.json"
   },
+  "loaded_plugins": [],
   "tool_inventory": [
     {
       "name": "create_refund",

@@ -1,7 +1,7 @@
 {
   "schema_version": "0.1",
-  "report_schema_version": "0.2",
-  "run_id": "agents_shipgate_d4ef813d28d8a3c2",
+  "report_schema_version": "0.3",
+  "run_id": "agents_shipgate_42a625b68c0df0a8",
   "project": {
     "name": "support-refund-agent",
     "owner": "support-platform",
@@ -87,6 +87,7 @@
     "missing_descriptions": 0
   },
   "api_surface": null,
+  "frameworks": {},
   "baseline": null,
   "findings": [
     {
@@ -208,7 +209,7 @@
       "source": {
         "type": "sdk_function",
         "ref": "agents/refund_agent.py",
-        "location": "agents/refund_agent.py:4"
+        "location": "agents/refund_agent.py:5"
       },
       "recommendation": "Prefer a structured output schema for send_email_preview, especially when output is later passed back into model context.",
       "suppressed": false,
@@ -617,6 +618,7 @@
     "markdown": "expected/report.md",
     "json": "expected/report.json"
   },
+  "loaded_plugins": [],
   "tool_inventory": [
     {
       "name": "gmail.send_customer_email",
