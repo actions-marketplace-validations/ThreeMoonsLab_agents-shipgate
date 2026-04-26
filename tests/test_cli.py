@@ -1,9 +1,10 @@
 import json
+from pathlib import Path
 
 from typer.testing import CliRunner
 
-from agents_shipgate.cli.main import app
-
+from agents_shipgate.checks import registry
+from agents_shipgate.cli.main import _safe_output_name, app
 
 runner = CliRunner()
 
@@ -89,6 +90,41 @@ def test_cli_list_checks_outputs_catalog():
     assert "SHIP-POLICY-APPROVAL-MISSING" in result.output
 
 
+def test_cli_scan_help_hides_deferred_flags():
+    result = runner.invoke(app, ["scan", "--help"])
+
+    assert result.exit_code == 0
+    assert "--deep-import" not in result.output
+    assert "--baseline-mode" not in result.output
+
+
+def test_cli_scan_no_plugins_forces_plugins_off(monkeypatch, tmp_path):
+    class FakeEntryPoint:
+        value = "acme_shipgate_checks:run"
+
+        def load(self):
+            raise AssertionError("plugin should not be loaded")
+
+    monkeypatch.setattr(registry, "entry_points", lambda group: [FakeEntryPoint()])
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            "--config",
+            "samples/clean_read_only_agent/shipgate.yaml",
+            "--out",
+            str(tmp_path),
+            "--format",
+            "json",
+            "--no-plugins",
+        ],
+        env={"AGENTS_SHIPGATE_ENABLE_PLUGINS": "1"},
+    )
+
+    assert result.exit_code == 0
+
+
 def test_cli_explain_outputs_check_details():
     result = runner.invoke(app, ["explain", "SHIP-POLICY-APPROVAL-MISSING"])
 
@@ -169,6 +205,77 @@ def test_cli_scan_workspace_writes_separate_report_dirs(tmp_path):
     assert result.exit_code == 0
     assert "Scanning 2 manifests" in result.output
     assert len(list(tmp_path.glob("*/report.json"))) == 2
+
+
+def test_cli_scan_workspace_continues_after_config_error(tmp_path):
+    workspace = tmp_path / "workspace"
+    valid = workspace / "valid"
+    invalid = workspace / "invalid"
+    valid.mkdir(parents=True)
+    invalid.mkdir()
+    (valid / "tools.json").write_text(
+        """
+{
+  "tools": [
+    {
+      "name": "docs.lookup",
+      "description": "Look up internal documentation metadata.",
+      "annotations": {"readOnlyHint": true}
+    }
+  ]
+}
+""",
+        encoding="utf-8",
+    )
+    (valid / "shipgate.yaml").write_text(
+        """
+version: "0.1"
+project:
+  name: valid-workspace
+agent:
+  name: valid-agent
+  declared_purpose:
+    - read documentation
+environment:
+  target: local
+tool_sources:
+  - id: tools
+    type: mcp
+    path: tools.json
+""",
+        encoding="utf-8",
+    )
+    (invalid / "shipgate.yaml").write_text("version: '0.1'\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            "--workspace",
+            str(workspace),
+            "--out",
+            str(tmp_path / "reports"),
+            "--format",
+            "json",
+            "--ci-mode",
+            "advisory",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "valid/shipgate.yaml: no_release_blockers_detected" in result.output
+    assert "invalid/shipgate.yaml: config_error" in result.output
+    assert len(list((tmp_path / "reports").glob("*/report.json"))) == 1
+
+
+def test_safe_output_name_normalizes_unsafe_segments():
+    output_name = _safe_output_name(Path("../../etc/passwd/shipgate.yaml"))
+
+    assert output_name
+    assert "/" not in output_name
+    assert "\\" not in output_name
+    assert ":" not in output_name
+    assert ".." not in output_name
 
 
 def test_cli_verbose_json_logs(tmp_path):
