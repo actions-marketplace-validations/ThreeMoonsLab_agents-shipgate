@@ -42,6 +42,14 @@ tool_sources:
     type: openai_agents_sdk
     path: agent.py
     optional: true
+  - id: langchain_agent
+    type: langchain
+    path: agents/langchain_agent.py
+    optional: true
+  - id: crewai_agent
+    type: crewai
+    path: agents/crew.py
+    optional: true
 
 openai_api:
   prompt_files:
@@ -55,6 +63,14 @@ openai_api:
   test_cases:
     - path: tests/refund_cases.json
 
+langchain:
+  tool_inventories:
+    - path: inventories/langchain-tools.json
+
+crewai:
+  tool_inventories:
+    - path: inventories/crewai-tools.json
+
 permissions:
   scopes:
     - refunds:write
@@ -67,7 +83,7 @@ policies:
     - tool: issue_refund
       reason: financial action
   require_confirmation_for_tools:
-    - send_customer_email
+    - tool: send_customer_email
   require_idempotency_for_tools:
     - tool: issue_refund
       reason: avoid double refunds on retry
