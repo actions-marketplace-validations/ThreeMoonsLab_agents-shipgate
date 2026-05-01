@@ -14,6 +14,7 @@ from agents_shipgate.core.baseline import apply_baseline, load_baseline
 from agents_shipgate.core.context import ScanContext
 from agents_shipgate.core.errors import ConfigError, InputParseError
 from agents_shipgate.core.findings import (
+    annotate_remediation,
     apply_severity_overrides,
     apply_suppressions,
     assign_finding_ids,
@@ -168,7 +169,21 @@ def run_scan(
     apply_severity_overrides(findings, manifest.severity_overrides())
     apply_suppressions(findings, manifest.checks.ignore)
     if suggest_patches:
-        _attach_patches(findings, manifest, config_path)
+        _attach_patches(
+            findings,
+            manifest,
+            config_path,
+            plugins_enabled=plugins_enabled,
+        )
+    # v0.7: annotate every finding (regardless of --suggest-patches) with
+    # the four remediation fields. When patches are present they're
+    # derived from those; otherwise the per-check CheckMetadata seeds
+    # the values. Built with the scan's actual plugin setting so
+    # serialization never re-loads plugins.
+    annotate_remediation(
+        findings,
+        _check_metadata_lookup(plugins_enabled=plugins_enabled),
+    )
     baseline_summary = None
     if baseline_path:
         baseline_file = load_baseline(baseline_path)
@@ -506,10 +521,33 @@ def _relative_display_path(path: Path, base_dir: Path) -> str:
     return rel
 
 
+def _check_metadata_lookup(
+    *, plugins_enabled: bool | None
+) -> dict:
+    """Build a {check_id: CheckMetadata} lookup honoring the scan's
+    actual plugin setting. Used by ``annotate_remediation`` so the
+    serialized report's per-finding remediation fields reflect the
+    catalog the scan was run against.
+
+    Avoids the late-stage plugin-loading hazard: by passing the lookup
+    *into* annotation, we never call ``check_catalog()`` at write time
+    where ``AGENTS_SHIPGATE_ENABLE_PLUGINS=1`` could re-load plugins
+    even for ``--no-plugins`` scans.
+    """
+    from agents_shipgate.checks.registry import check_catalog
+
+    return {
+        check.id: check
+        for check in check_catalog(plugins_enabled=plugins_enabled)
+    }
+
+
 def _attach_patches(
     findings: list,
     manifest,
     config_path: Path,
+    *,
+    plugins_enabled: bool | None,
 ) -> None:
     """Attach Patch objects to unsuppressed findings (per v0.6 plan §3).
 
@@ -520,6 +558,13 @@ def _attach_patches(
     a generator exists, ManualPatch otherwise). Findings without
     --suggest-patches keep ``patches=None`` (per C4) and are filtered
     out of the JSON by ``report_json_payload``.
+
+    Per the v0.7 PR 3 review: ``plugins_enabled`` is forwarded into
+    ``check_catalog`` so the recommendation lookup honors the scan's
+    explicit ``--no-plugins`` flag even when ``AGENTS_SHIPGATE_ENABLE_PLUGINS=1``
+    is set in the environment. Without this, the patch-attachment path
+    would load third-party plugin entry points before
+    ``annotate_remediation`` ran with its plugin-safe lookup.
     """
     from agents_shipgate.checks.patches import (
         PatchContext,
@@ -529,7 +574,7 @@ def _attach_patches(
 
     recommendation_lookup = {
         check.id: check.recommendation
-        for check in check_catalog()
+        for check in check_catalog(plugins_enabled=plugins_enabled)
         if check.recommendation
     }
     context = PatchContext(
@@ -559,10 +604,22 @@ def _run_id(
         "findings": [
             finding.model_dump(
                 mode="json",
-                # Exclude `patches` (per C11): it's a derived enrichment,
-                # not an input to the scan. Including it would shift
-                # run_id whenever --suggest-patches is toggled.
-                exclude={"id", "baseline_status", "patches"},
+                # Exclude derived-enrichment fields (per C11 + v0.7
+                # review finding 2): patches and the four remediation
+                # fields are computed AFTER the input surface is
+                # known, so they MUST NOT enter the run_id hash. Two
+                # scans of the same workspace must produce the same
+                # run_id whether `--suggest-patches` is set or not, and
+                # whether v0.7 metadata is present or not.
+                exclude={
+                    "id",
+                    "baseline_status",
+                    "patches",
+                    "autofix_safe",
+                    "requires_human_review",
+                    "suggested_patch_kind",
+                    "docs_url",
+                },
                 exclude_none=False,
             )
             for finding in findings
