@@ -60,6 +60,7 @@ def run_scan(
     policy_pack_paths: list[Path] | None = None,
     plugins_enabled: bool | None = None,
     verbose: bool = False,
+    suggest_patches: bool = False,
 ) -> tuple[ReadinessReport, int]:
     if deep_import:
         raise ConfigError("Deep import is intentionally deferred and is not supported.")
@@ -166,6 +167,8 @@ def run_scan(
     assign_finding_ids(findings)
     apply_severity_overrides(findings, manifest.severity_overrides())
     apply_suppressions(findings, manifest.checks.ignore)
+    if suggest_patches:
+        _attach_patches(findings, manifest, config_path)
     baseline_summary = None
     if baseline_path:
         baseline_file = load_baseline(baseline_path)
@@ -204,6 +207,7 @@ def run_scan(
             frameworks=frameworks_surface,
         ),
         manifest=manifest,
+        manifest_dir=str(config_path.resolve().parent),
         agent=agent.model_dump(exclude_none=True),
         environment=manifest.environment.model_dump(exclude_none=True),
         tools=tools,
@@ -502,6 +506,43 @@ def _relative_display_path(path: Path, base_dir: Path) -> str:
     return rel
 
 
+def _attach_patches(
+    findings: list,
+    manifest,
+    config_path: Path,
+) -> None:
+    """Attach Patch objects to unsuppressed findings (per v0.6 plan §3).
+
+    Suppressed findings are intentionally skipped — apply-patches must
+    not mutate entries the user marked ignored.
+
+    Coverage rule: every active finding gets ≥ 1 patch (non-manual when
+    a generator exists, ManualPatch otherwise). Findings without
+    --suggest-patches keep ``patches=None`` (per C4) and are filtered
+    out of the JSON by ``report_json_payload``.
+    """
+    from agents_shipgate.checks.patches import (
+        PatchContext,
+        generate_patches_for_finding,
+    )
+    from agents_shipgate.checks.registry import check_catalog
+
+    recommendation_lookup = {
+        check.id: check.recommendation
+        for check in check_catalog()
+        if check.recommendation
+    }
+    context = PatchContext(
+        manifest=manifest,
+        manifest_path=config_path,
+        recommendation_lookup=recommendation_lookup,
+    )
+    for finding in findings:
+        if finding.suppressed:
+            continue
+        finding.patches = generate_patches_for_finding(context, finding)
+
+
 def _run_id(
     manifest,
     tools: list[Tool],
@@ -518,7 +559,10 @@ def _run_id(
         "findings": [
             finding.model_dump(
                 mode="json",
-                exclude={"id", "baseline_status"},
+                # Exclude `patches` (per C11): it's a derived enrichment,
+                # not an input to the scan. Including it would shift
+                # run_id whenever --suggest-patches is toggled.
+                exclude={"id", "baseline_status", "patches"},
                 exclude_none=False,
             )
             for finding in findings

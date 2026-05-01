@@ -5,11 +5,14 @@ Run from the repo root:
     python scripts/generate_schemas.py
 
 Writes:
-- docs/manifest-v0.1.json   (from agents_shipgate.config.schema)
-- docs/checks.json          (from agents-shipgate list-checks --json)
+- docs/manifest-v0.1.json       (from agents_shipgate.config.schema)
+- docs/checks.json              (from agents-shipgate list-checks --json)
+- docs/report-schema.v0.6.json  (from agents_shipgate.core.models.ReadinessReport)
 
 CI calls this script and asserts the working tree is clean afterward, so
-out-of-date generated files fail the build.
+out-of-date generated files fail the build — drift protection for any
+field changes on Finding (e.g., patches) or ReadinessReport
+(e.g., manifest_dir).
 """
 
 from __future__ import annotations
@@ -45,6 +48,188 @@ def write_manifest_schema() -> None:
     print(f"Wrote {target.relative_to(REPO_ROOT)}")
 
 
+def write_report_schema() -> None:
+    """Generate docs/report-schema.v0.<minor>.json from the Pydantic
+    ReadinessReport model.
+
+    The minor version is derived from ``ReadinessReport.report_schema_version``
+    so a schema bump is one-step: change the default in models.py and rerun
+    this script. CI's clean-tree assertion catches any field drift.
+
+    Post-processing preserves v0.5's stable public contract (additive only):
+    - ``schema_version`` and ``report_schema_version`` keep their version
+      constants (Pydantic emits them as plain strings with defaults).
+    - ``required`` keeps the v0.5 list of fields that consumers depend on,
+      regardless of whether the Pydantic model marks them as having
+      defaults. Optional v0.6 additions (``manifest_dir``, per-finding
+      ``patches``) stay optional.
+    """
+    from agents_shipgate.core.models import ReadinessReport
+
+    schema = ReadinessReport.model_json_schema()
+    minor = ReadinessReport.model_fields["report_schema_version"].default
+    title = f"Agents Shipgate Readiness Report v{minor}"
+    schema_id = (
+        "https://raw.githubusercontent.com/ThreeMoonsLab/agents-shipgate/"
+        f"main/docs/report-schema.v{minor}.json"
+    )
+    schema["$id"] = schema_id
+    schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
+    schema["title"] = title
+    schema["description"] = (
+        "JSON Schema for the Agents Shipgate Tool-Use Readiness Report. "
+        "Generated from agents_shipgate.core.models.ReadinessReport with "
+        "post-processing to preserve the v0.5 public contract. "
+        "Do not edit by hand."
+    )
+    # Preserve v0.5's stable required list. Optional v0.6 additions
+    # (manifest_dir, per-finding patches) are not added here, so they stay
+    # optional for additive consumers.
+    schema["required"] = sorted(
+        [
+            "schema_version",
+            "report_schema_version",
+            "run_id",
+            "project",
+            "agent",
+            "environment",
+            "summary",
+            "tool_surface",
+            "frameworks",
+            "findings",
+            "recommended_actions",
+            "generated_reports",
+            "loaded_policy_packs",
+            "loaded_plugins",
+            "tool_inventory",
+            "source_warnings",
+        ]
+    )
+    # Preserve version constants. Pydantic emits these as plain strings
+    # with `default`, but consumers may validate `const` against the
+    # actual report shape.
+    properties = schema.setdefault("properties", {})
+    properties["schema_version"] = {"const": "0.1"}
+    properties["report_schema_version"] = {"const": minor}
+
+    # Preserve nested v0.5 required lists. Pydantic auto-generation marks
+    # only fields without defaults as required, but consumers depend on
+    # several optional-with-default fields being present in every report.
+    # Optional v0.6 additions (Finding.patches) intentionally stay
+    # optional — additive only.
+    defs = schema.setdefault("$defs", {})
+    if "Finding" in defs:
+        defs["Finding"]["required"] = sorted(
+            [
+                "id",
+                "fingerprint",
+                "check_id",
+                "title",
+                "severity",
+                "category",
+                "evidence",
+                "confidence",
+                "recommendation",
+                "suppressed",
+                "baseline_status",
+            ]
+        )
+    if "LoadedPolicyPack" in defs:
+        defs["LoadedPolicyPack"]["required"] = sorted(
+            ["id", "name", "path", "rule_count"]
+        )
+
+    # tool_inventory[] and loaded_plugins[] are typed as
+    # ``list[dict[str, Any]]`` on the model, so Pydantic emits item
+    # schemas without per-item required lists. v0.5 documented these
+    # required keys; preserve them.
+    if "tool_inventory" in properties and properties["tool_inventory"].get("type") == "array":
+        properties["tool_inventory"]["items"] = {
+            "type": "object",
+            "additionalProperties": True,
+            "required": sorted(
+                ["name", "source_type", "risk_tags", "auth_scopes", "confidence"]
+            ),
+        }
+    if "loaded_plugins" in properties and properties["loaded_plugins"].get("type") == "array":
+        properties["loaded_plugins"]["items"] = {
+            "type": "object",
+            "additionalProperties": True,
+            "required": sorted(
+                ["name", "value", "distribution", "version", "check_id"]
+            ),
+        }
+
+    # frameworks.{google_adk,langchain,crewai} surface counts. These are
+    # also list[dict[str, Any]]-shaped at the model level; v0.5 enumerated
+    # the per-framework count keys that consumers check.
+    frameworks_property = properties.setdefault(
+        "frameworks", {"type": "object", "additionalProperties": True}
+    )
+    frameworks_property.setdefault("type", "object")
+    frameworks_property["additionalProperties"] = True
+    frameworks_sub = frameworks_property.setdefault("properties", {})
+    frameworks_sub["google_adk"] = {
+        "type": "object",
+        "additionalProperties": True,
+        "required": sorted(
+            [
+                "python_entrypoint_count",
+                "agent_config_count",
+                "agent_count",
+                "function_tool_count",
+                "long_running_tool_count",
+                "toolset_count",
+                "dynamic_toolset_count",
+                "callback_count",
+                "plugin_count",
+                "sub_agent_count",
+                "eval_file_count",
+                "trace_sample_count",
+                "tool_inventory_file_count",
+                "warnings",
+            ]
+        ),
+    }
+    frameworks_sub["langchain"] = {
+        "type": "object",
+        "additionalProperties": True,
+        "required": sorted(
+            [
+                "python_entrypoint_count",
+                "function_tool_count",
+                "structured_tool_count",
+                "tool_node_count",
+                "agent_tool_binding_count",
+                "dynamic_tool_surface_count",
+                "tool_inventory_file_count",
+                "warnings",
+            ]
+        ),
+    }
+    frameworks_sub["crewai"] = {
+        "type": "object",
+        "additionalProperties": True,
+        "required": sorted(
+            [
+                "python_entrypoint_count",
+                "agent_count",
+                "crew_count",
+                "function_tool_count",
+                "class_tool_count",
+                "prebuilt_tool_count",
+                "dynamic_tool_surface_count",
+                "tool_inventory_file_count",
+                "warnings",
+            ]
+        ),
+    }
+
+    target = DOCS / f"report-schema.v{minor}.json"
+    target.write_text(json.dumps(schema, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"Wrote {target.relative_to(REPO_ROOT)}")
+
+
 def write_checks_catalog() -> None:
     from agents_shipgate.checks.registry import check_catalog
 
@@ -69,6 +254,7 @@ def main() -> int:
     DOCS.mkdir(parents=True, exist_ok=True)
     write_manifest_schema()
     write_checks_catalog()
+    write_report_schema()
     return 0
 
 
