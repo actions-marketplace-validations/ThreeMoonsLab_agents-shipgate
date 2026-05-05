@@ -7,7 +7,9 @@ Run from the repo root:
 Writes:
 - docs/manifest-v0.1.json       (from agents_shipgate.config.schema)
 - docs/checks.json              (from agents-shipgate list-checks --json)
-- docs/report-schema.v0.6.json  (from agents_shipgate.core.models.ReadinessReport)
+- docs/report-schema.v0.<minor>.json
+                                (from agents_shipgate.core.models.ReadinessReport;
+                                 minor derived from report_schema_version default)
 
 CI calls this script and asserts the working tree is clean afterward, so
 out-of-date generated files fail the build — drift protection for any
@@ -82,9 +84,12 @@ def write_report_schema() -> None:
         "post-processing to preserve the v0.5 public contract. "
         "Do not edit by hand."
     )
-    # Preserve v0.5's stable required list. Optional v0.6 additions
-    # (manifest_dir, per-finding patches) are not added here, so they stay
-    # optional for additive consumers.
+    # Preserve v0.5's stable required list, plus v0.8 additions.
+    # Optional intermediate additions (manifest_dir, per-finding patches)
+    # are not added here, so they stay optional for additive consumers.
+    # `release_decision` is required at v0.8: every emitted report has it
+    # (build_report always populates it). Marking it required at the
+    # schema level catches drift early.
     schema["required"] = sorted(
         [
             "schema_version",
@@ -94,6 +99,7 @@ def write_report_schema() -> None:
             "agent",
             "environment",
             "summary",
+            "release_decision",
             "tool_surface",
             "frameworks",
             "findings",
@@ -111,6 +117,14 @@ def write_report_schema() -> None:
     properties = schema.setdefault("properties", {})
     properties["schema_version"] = {"const": "0.1"}
     properties["report_schema_version"] = {"const": minor}
+    # v0.8: tighten release_decision to a direct $ref. The Pydantic
+    # model declares `release_decision: ReleaseDecision | None = None`
+    # so older test fixtures and SARIF-only callers can construct
+    # minimal reports — but every emitted report has it populated.
+    # Without this override the schema would emit
+    # `anyOf: [ReleaseDecision, null]`, which would let `null` pass
+    # validation and silently violate the v0.8 contract.
+    properties["release_decision"] = {"$ref": "#/$defs/ReleaseDecision"}
 
     # Preserve nested v0.5 required lists. Pydantic auto-generation marks
     # only fields without defaults as required, but consumers depend on
@@ -137,6 +151,54 @@ def write_report_schema() -> None:
     if "LoadedPolicyPack" in defs:
         defs["LoadedPolicyPack"]["required"] = sorted(
             ["id", "name", "path", "rule_count"]
+        )
+
+    # v0.8 release_decision: pin required keys so consumers can rely on
+    # the full block being present (Pydantic only marks fields without
+    # defaults as required, but our consumers depend on the whole shape).
+    if "ReleaseDecision" in defs:
+        defs["ReleaseDecision"]["required"] = sorted(
+            [
+                "decision",
+                "reason",
+                "blockers",
+                "review_items",
+                "evidence_coverage",
+                "baseline_delta",
+                "fail_policy",
+            ]
+        )
+    if "ReleaseDecisionItem" in defs:
+        # Pin the full v0.8 contract documented in STABILITY.md. `id`,
+        # `fingerprint`, and `baseline_status` are nullable in the model
+        # but every emitted item carries them — requiring the key to be
+        # present (value may be null) lets agent/CI consumers rely on
+        # the documented shape without conditional key checks.
+        defs["ReleaseDecisionItem"]["required"] = sorted(
+            ["id", "fingerprint", "check_id", "severity", "title", "baseline_status"]
+        )
+    if "EvidenceCoverageDecision" in defs:
+        defs["EvidenceCoverageDecision"]["required"] = sorted(
+            [
+                "level",
+                "human_review_recommended",
+                "source_warning_count",
+                "low_confidence_tool_count",
+            ]
+        )
+    if "BaselineDelta" in defs:
+        defs["BaselineDelta"]["required"] = sorted(
+            ["enabled", "matched_count", "new_count", "resolved_count"]
+        )
+    if "FailPolicy" in defs:
+        defs["FailPolicy"]["required"] = sorted(
+            [
+                "ci_mode",
+                "fail_on",
+                "new_findings_only",
+                "would_fail_ci",
+                "exit_code",
+            ]
         )
 
     # tool_inventory[] and loaded_plugins[] are typed as

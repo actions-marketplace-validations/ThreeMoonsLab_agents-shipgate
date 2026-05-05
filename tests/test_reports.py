@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import pytest
 from jsonschema import validate
 
 from agents_shipgate.cli.scan import run_scan
@@ -19,6 +20,7 @@ REPORT_SCHEMA_V02 = Path("docs/report-schema.v0.2.json")
 REPORT_SCHEMA_V04 = Path("docs/report-schema.v0.4.json")
 REPORT_SCHEMA_V06 = Path("docs/report-schema.v0.6.json")
 REPORT_SCHEMA_V07 = Path("docs/report-schema.v0.7.json")
+REPORT_SCHEMA_V08 = Path("docs/report-schema.v0.8.json")
 
 
 def test_sample_markdown_report_matches_golden(tmp_path):
@@ -96,7 +98,13 @@ def test_json_report_contains_integration_contract_keys(tmp_path):
     assert "loaded_plugins" in payload
     assert payload["loaded_plugins"] == []
     assert payload["schema_version"] == "0.1"
-    assert payload["report_schema_version"] == "0.7"
+    assert payload["report_schema_version"] == "0.8"
+    assert "release_decision" in payload
+    assert payload["release_decision"]["decision"] in {
+        "blocked",
+        "review_required",
+        "passed",
+    }
     assert "frameworks" in payload
     assert "loaded_policy_packs" in payload
 
@@ -151,11 +159,9 @@ def test_json_schema_is_published():
     } <= set(api_surface["required"])
 
 
-def test_json_report_validates_against_v07_schema(tmp_path):
-    """v0.7 schema is additive over v0.6: adds the four optional
-    per-finding remediation fields (`autofix_safe`,
-    `requires_human_review`, `suggested_patch_kind`, `docs_url`).
-    Pre-existing required fields keep their shape."""
+def test_json_report_validates_against_v08_schema(tmp_path):
+    """v0.8 schema adds top-level required `release_decision`. Emitted
+    reports must validate against the v0.8 schema."""
     from agents_shipgate.report.json_report import report_json_payload
 
     report, _ = run_scan(
@@ -164,9 +170,18 @@ def test_json_report_validates_against_v07_schema(tmp_path):
         formats=["json"],
         ci_mode="advisory",
     )
-    schema = json.loads(REPORT_SCHEMA_V07.read_text(encoding="utf-8"))
+    schema = json.loads(REPORT_SCHEMA_V08.read_text(encoding="utf-8"))
 
     validate(instance=report_json_payload(report), schema=schema)
+
+
+def test_v07_schema_file_is_frozen():
+    """v0.7 schema file stays parseable and pinned to const "0.7".
+    Catches accidental edits or regeneration overwrites of frozen
+    schemas."""
+    schema = json.loads(REPORT_SCHEMA_V07.read_text(encoding="utf-8"))
+    assert schema["properties"]["report_schema_version"] == {"const": "0.7"}
+    assert "release_decision" not in schema.get("required", [])
 
 
 def test_v07_schema_preserves_nested_required_lists():
@@ -236,6 +251,88 @@ def test_v07_schema_preserves_nested_required_lists():
     )
     assert "agent_count" in google_adk_required
     assert "dynamic_toolset_count" in google_adk_required
+
+
+def test_v08_schema_requires_release_decision():
+    """Top-level required must include `release_decision` and the
+    ReleaseDecision $def must require all leaf blocks. Catches drift
+    between the model and the published v0.8 contract."""
+    schema = json.loads(REPORT_SCHEMA_V08.read_text(encoding="utf-8"))
+    assert "release_decision" in schema["required"]
+    assert schema["properties"]["report_schema_version"] == {"const": "0.8"}
+    # The Pydantic model declares `release_decision: ReleaseDecision | None`
+    # for test-helper convenience, but the published schema must NOT allow
+    # null — every emitted v0.8 report has a populated release_decision.
+    assert schema["properties"]["release_decision"] == {
+        "$ref": "#/$defs/ReleaseDecision"
+    }
+
+    decision_required = set(schema["$defs"]["ReleaseDecision"]["required"])
+    assert decision_required == {
+        "decision",
+        "reason",
+        "blockers",
+        "review_items",
+        "evidence_coverage",
+        "baseline_delta",
+        "fail_policy",
+    }
+    fail_policy_required = set(schema["$defs"]["FailPolicy"]["required"])
+    assert fail_policy_required == {
+        "ci_mode",
+        "fail_on",
+        "new_findings_only",
+        "would_fail_ci",
+        "exit_code",
+    }
+    evidence_required = set(
+        schema["$defs"]["EvidenceCoverageDecision"]["required"]
+    )
+    assert evidence_required == {
+        "level",
+        "human_review_recommended",
+        "source_warning_count",
+        "low_confidence_tool_count",
+    }
+    # STABILITY.md guarantees the full v0.8 contract on each item: id,
+    # fingerprint, check_id, severity, title, baseline_status. The
+    # nullable ones (id/fingerprint/baseline_status) must still appear
+    # as keys so consumers can read them without conditional checks.
+    item_required = set(schema["$defs"]["ReleaseDecisionItem"]["required"])
+    assert item_required == {
+        "id",
+        "fingerprint",
+        "check_id",
+        "severity",
+        "title",
+        "baseline_status",
+    }
+
+
+def test_v08_schema_rejects_null_release_decision(tmp_path):
+    """A v0.8 payload with `release_decision: null` MUST fail validation.
+    Regression for the original schema which emitted
+    `anyOf: [ReleaseDecision, null]` and silently accepted null."""
+    import jsonschema
+
+    from agents_shipgate.report.json_report import report_json_payload
+
+    report, _ = run_scan(
+        config_path=SAMPLE,
+        output_dir=tmp_path,
+        formats=["json"],
+        ci_mode="advisory",
+    )
+    schema = json.loads(REPORT_SCHEMA_V08.read_text(encoding="utf-8"))
+    payload = report_json_payload(report)
+
+    # Sanity: real payload validates.
+    validate(instance=payload, schema=schema)
+
+    # Tamper: setting release_decision to null must be rejected.
+    payload["release_decision"] = None
+    with pytest.raises(jsonschema.ValidationError):
+        validate(instance=payload, schema=schema)
 
 
 def test_json_report_omits_patches_key_when_not_suggested(tmp_path):
@@ -365,4 +462,9 @@ tool_sources:
         ci_mode="advisory",
     )
 
-    assert "Result: PASS - no static findings across 1 tools." in render_markdown_report(report)
+    # v0.8: the legacy "Result: PASS ..." line was removed in favor of
+    # the leading Release Decision block. A clean scan with high-confidence
+    # tools yields decision=passed.
+    markdown = render_markdown_report(report)
+    assert "## Release Decision" in markdown
+    assert "Decision: passed" in markdown
