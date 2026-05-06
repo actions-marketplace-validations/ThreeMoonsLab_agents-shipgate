@@ -5,7 +5,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from agents_shipgate.core.findings import SEVERITY_ORDER
-from agents_shipgate.core.models import Finding, ReadinessReport
+from agents_shipgate.core.models import DeclaredIntention, Finding, ReadinessReport
 
 DISCLAIMER = (
     "Agents Shipgate is an advisory release-readiness scanner. It does not certify "
@@ -31,6 +31,12 @@ MARKDOWN_ESCAPE_CHARS = (
     "<",
     ">",
 )
+CAPABILITY_DIFF_MARKDOWN_LIMITS = {
+    "intentions": 3,
+    "capabilities": 5,
+    "misalignments": 5,
+    "scenarios": 5,
+}
 
 
 def write_markdown_report(report: ReadinessReport, path: Path) -> None:
@@ -69,6 +75,7 @@ def render_markdown_report(report: ReadinessReport) -> str:
         ]
     )
     _append_top_findings(lines, report.findings)
+    _append_capability_intent_diff(lines, report)
     _append_baseline(lines, report)
     _append_recommended_actions(lines, report.recommended_actions)
     _append_source_warnings(lines, report)
@@ -165,6 +172,122 @@ def _append_top_findings(lines: list[str], findings: list[Finding]) -> None:
         lines.append(f"   Evidence: {_compact_evidence(finding.evidence)}")
         lines.append(f"   Recommendation: {_safe_markdown_text(finding.recommendation)}")
         lines.append("")
+
+
+def _append_capability_intent_diff(
+    lines: list[str],
+    report: ReadinessReport,
+) -> None:
+    lines.extend(["## Capability <-> Intent Diff", ""])
+    if not report.misalignments:
+        lines.extend(
+            [
+                "No capability/intent misalignments detected from static evidence.",
+                "",
+            ]
+        )
+        return
+
+    lines.extend(["Agent intent:", ""])
+    if report.declared_intentions:
+        visible_intentions, hidden_intention_count = _capability_diff_intentions(
+            report.declared_intentions
+        )
+        for intention in visible_intentions:
+            tags = ", ".join(intention.intent_tags) if intention.intent_tags else "none"
+            lines.append(
+                f"- {_safe_markdown_text(intention.kind)}: "
+                f"{_safe_markdown_text(_truncate_text(intention.text))} "
+                f"(tags: {_safe_markdown_text(tags)})"
+            )
+        if hidden_intention_count:
+            lines.append(f"- {hidden_intention_count} more in report.json")
+    else:
+        lines.append("- No declared intentions captured.")
+    lines.append("")
+
+    lines.extend(["Actual capabilities:", ""])
+    if report.capability_facts:
+        for fact in report.capability_facts[: CAPABILITY_DIFF_MARKDOWN_LIMITS["capabilities"]]:
+            tags = ", ".join(fact.risk_tags) if fact.risk_tags else "none"
+            lines.append(
+                f"- {_safe_markdown_text(fact.tool_name)}: "
+                f"capability={_safe_markdown_text(fact.capability)}, "
+                f"risk={_safe_markdown_text(tags)}, "
+                f"control={_safe_markdown_text(fact.control_status)}"
+            )
+        _append_more_line(
+            lines,
+            len(report.capability_facts),
+            CAPABILITY_DIFF_MARKDOWN_LIMITS["capabilities"],
+        )
+    else:
+        lines.append("- No high-risk or gap-referenced capabilities selected.")
+    lines.append("")
+
+    lines.extend(["Policy/control gaps:", ""])
+    for misalignment in report.misalignments[: CAPABILITY_DIFF_MARKDOWN_LIMITS["misalignments"]]:
+        tool = f" [{misalignment.tool_name}]" if misalignment.tool_name else ""
+        lines.append(
+            f"- {misalignment.severity.upper()} {_safe_markdown_text(misalignment.kind)}"
+            f"{_safe_markdown_text(tool)}: {_safe_markdown_text(misalignment.gap)}"
+        )
+        lines.append(
+            "  Requires: "
+            f"{_safe_markdown_text(misalignment.policy_requirement)}"
+        )
+        lines.append(
+            "  Release implication: "
+            f"{_safe_markdown_text(misalignment.release_implication)}"
+        )
+    _append_more_line(
+        lines,
+        len(report.misalignments),
+        CAPABILITY_DIFF_MARKDOWN_LIMITS["misalignments"],
+    )
+    lines.append("")
+
+    lines.extend(["Release implication:", ""])
+    consequence = report.release_consequence
+    if consequence is None:
+        lines.append("- No release consequence recorded.")
+    else:
+        lines.append(f"- Decision: {_safe_markdown_text(consequence.decision)}")
+        lines.append(f"- {_safe_markdown_text(consequence.summary)}")
+    lines.append("")
+
+    lines.extend(["Next validation:", ""])
+    if report.suggested_scenarios:
+        for scenario in report.suggested_scenarios[: CAPABILITY_DIFF_MARKDOWN_LIMITS["scenarios"]]:
+            lines.append(
+                f"- {_safe_markdown_text(scenario.title)}: "
+                f"{_safe_markdown_text(scenario.expected_control)}"
+            )
+        _append_more_line(
+            lines,
+            len(report.suggested_scenarios),
+            CAPABILITY_DIFF_MARKDOWN_LIMITS["scenarios"],
+        )
+    else:
+        lines.append("- No additional validation scenarios suggested.")
+    lines.append("")
+
+
+def _append_more_line(lines: list[str], total: int, limit: int) -> None:
+    if total > limit:
+        lines.append(f"- {total - limit} more in report.json")
+
+
+def _capability_diff_intentions(
+    intentions: list[DeclaredIntention],
+) -> tuple[list[DeclaredIntention], int]:
+    prohibited = [item for item in intentions if item.kind == "prohibited_action"]
+    instruction_preview = [item for item in intentions if item.kind == "instruction_preview"]
+    declared = [item for item in intentions if item.kind == "declared_purpose"]
+    declared_limit = CAPABILITY_DIFF_MARKDOWN_LIMITS["intentions"]
+    visible = prohibited + declared[:declared_limit] + instruction_preview
+    hidden = max(0, len(declared) - declared_limit)
+    return visible, hidden
 
 
 def _append_recommended_actions(lines: list[str], actions: list[str]) -> None:
@@ -410,3 +533,10 @@ def _safe_markdown_text(value: object) -> str:
     text = re.sub(r"(?m)^(\s*)-", r"\1\\-", text)
     text = re.sub(r"(?m)^(\s*\d+)\.", r"\1\\.", text)
     return text
+
+
+def _truncate_text(value: str, limit: int = 220) -> str:
+    value = " ".join(value.split())
+    if len(value) <= limit:
+        return value
+    return f"{value[: limit - 3]}..."

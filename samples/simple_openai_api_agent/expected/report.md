@@ -70,6 +70,52 @@ Fail policy: ci_mode=advisory, fail_on=[none], new_findings_only=false, would_fa
    Evidence: retry\_policy=\{'max\_attempts': 2\}; risk\_tags=\['customer\_communication', 'external\_write', 'write'\]
    Recommendation: Add idempotency evidence for send\_customer\_email or avoid retrying this side effect.
 
+## Capability <-> Intent Diff
+
+Agent intent:
+
+- prohibited\_action: issue refund without approval (tags: financial\_action)
+- prohibited\_action: send customer email without confirmation (tags: external\_write, customer\_communication)
+- instruction\_preview: You are a support refund assistant. You should only advise the support representative and prepare a draft response. Do not take action on the customer's account. (tags: financial\_action)
+
+Actual capabilities:
+
+- create\_refund: capability=financial\_action, risk=financial\_action, write, control=missing
+- send\_customer\_email: capability=external\_write, risk=customer\_communication, external\_write, write, control=missing
+
+Policy/control gaps:
+
+- HIGH control\_missing \[create\_refund\]: create\_refund.amount has no maximum bound.
+  Requires: Risky numeric parameters must declare a maximum or equivalent limit.
+  Release implication: Release reviewers cannot verify blast-radius limits.
+- HIGH control\_missing \[create\_refund\]: create\_refund function schema is not strict enough.
+  Requires: API function schemas must be strict enough for reliable tool calls.
+  Release implication: The model may send ambiguous or overbroad tool arguments.
+- HIGH control\_missing \[create\_refund\]: create\_refund is high-risk but has no owner.
+  Requires: Manifest metadata must match the active release surface.
+  Release implication: Release review metadata is incomplete or stale.
+- HIGH control\_missing \[create\_refund\]: create\_refund lacks idempotency evidence.
+  Requires: Risky write tools need idempotency evidence before retryable release.
+  Release implication: Retries could duplicate financial, destructive, or external effects.
+- HIGH control\_missing \[send\_customer\_email\]: send\_customer\_email lacks idempotency evidence.
+  Requires: Risky write tools need idempotency evidence before retryable release.
+  Release implication: Retries could duplicate financial, destructive, or external effects.
+- 18 more in report.json
+
+Release implication:
+
+- Decision: review\_required
+- 20 release-relevant finding\(s\) require release review before shipping.
+
+Next validation:
+
+- Tool schema boundary check: The tool accepts bounded structured inputs and returns structured outputs where needed.
+- High-risk tool validation case: A declared test or review scenario covers the high-risk tool path.
+- Retry behavior for risky write: Retries use idempotency evidence or the side effect is not retried.
+- Prompt and tool-surface alignment: The agent instructions match the enabled write and high-risk capabilities.
+- Prohibited-action guard: The prohibited action is blocked, removed, or covered by the stated control.
+- 2 more in report.json
+
 ## Recommended Next Actions
 
 - Make create\_refund a strict function schema: object parameters, additionalProperties=false, complete required list, and bounded risky fields.

@@ -44,6 +44,11 @@ In `agents-shipgate-reports/report.json`, the following are guaranteed:
 - `release_decision.{decision, reason, blockers, review_items, evidence_coverage, baseline_delta, fail_policy}` (v0.8+)
 - `release_decision.fail_policy.{ci_mode, fail_on, new_findings_only, would_fail_ci, exit_code}`
 - `release_decision.blockers[].{id, fingerprint, check_id, severity, title, baseline_status}` and `release_decision.review_items[].{id, fingerprint, check_id, severity, title, baseline_status}` (reference-only — both arrays share the same item shape; full Finding payload is in `findings[]`)
+- `capability_facts[].{id, tool_name, source_type, source_ref, capability, risk_tags, auth_scopes, owner, included_reason, control_status, related_findings}` (v0.9+)
+- `declared_intentions[].{id, kind, text, source, intent_tags}` (v0.9+)
+- `misalignments[].{id, kind, severity, tool_name, capability_refs, intention_refs, finding_refs, policy_requirement, gap, release_implication}` (v0.9+)
+- `release_consequence.{decision, summary, blocker_misalignment_count, review_misalignment_count, fail_policy}` (v0.9+)
+- `suggested_scenarios[].{id, scenario_type, title, given, expected_control, source_misalignments, source_findings}` (v0.9+)
 - `summary.{critical_count, high_count, medium_count, low_count, info_count, suppressed_count, status, human_review_recommended}`
 - `findings[].{id, fingerprint, check_id, severity, category, title, recommendation, suppressed}`
 - `findings[].tool_name` (string or null)
@@ -122,6 +127,7 @@ The body content of these files may change to reflect new prompts; the entry-poi
 These are not stable — assume they may grow but not shrink:
 
 - **Risk-tag taxonomy.** New tags may appear (e.g. `infrastructure_change`, `code_execution`). Existing tags' meanings will not change.
+- **`capability_facts[].capability` vocabulary.** Values are an open vocabulary seeded from risk tags plus review sentinels such as `wildcard_tool_surface` and `unknown`.
 - **Report `frameworks.{name}` blocks.** New framework summaries (e.g. `frameworks.langchain`) may appear.
 - **Manifest fields.** New optional fields under existing sections.
 - **Check default severities.** May tighten over time. To pin a severity for your repo, use `checks.severity_overrides`.
