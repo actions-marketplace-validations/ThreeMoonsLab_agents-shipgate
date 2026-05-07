@@ -31,6 +31,28 @@
 - Add `agents-shipgate scenario suggest` (target: `0.9.1`), a YAML export that
   fans out `report.json.suggested_scenarios[]` into concrete
   per-finding/per-tool dynamic validation steps.
+- Added ranked next-action diagnostics: `detect --json` and `doctor --json`
+  now emit `diagnostics: [...]` and `next_actions: [...]` blocks alongside
+  the existing single-string `next_action` field. Coding-agent callers can
+  recover from common first-run failures (missing manifest, zero tools,
+  unresolved `CHANGE_ME`, missing source files, MCP/OpenAPI artifact-only
+  workspaces, dynamic toolsets, production targets without permissions, and
+  three negative-control cases) without consulting human-facing docs. Errors
+  emitted under `AGENTS_SHIPGATE_AGENT_MODE=1` carry the same `next_actions`
+  array. Diagnostic catalog and schema in [docs/diagnostics.md](docs/diagnostics.md).
+- Behavior change: when a required `tool_sources[].path` does not
+  resolve (file missing OR resolves outside the manifest directory),
+  `agents-shipgate doctor --json` exits **0** with
+  `unresolved_sources: [...]` and a `SHIP-DIAG-MISSING-SOURCE-FILE`
+  diagnostic so an agent gets a routable next action. The non-JSON
+  `agents-shipgate doctor` form prints the same diagnostic in
+  human-readable form and exits **3** so interactive users still see a
+  loud failure. `agents-shipgate scan` is unchanged — it still raises
+  `InputParseError(3)` on the same condition regardless of `--json`.
+- `DetectResult` gains a `workspace_signals` block (Python file count,
+  `pyproject.toml`/`requirements.txt` presence, conventional dir hits) used
+  by the new diagnostic resolvers to discriminate negative-control cases.
+  The block is additive; existing fields are unchanged.
 
 ## 0.8.0 - 2026-05-05
 

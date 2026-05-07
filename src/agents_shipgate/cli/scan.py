@@ -359,6 +359,21 @@ def run_scan(
 def inspect_sources(*, config_path: Path, verbose: bool = False) -> dict[str, object]:
     manifest = load_manifest(config_path)
     base_dir = config_path.resolve().parent
+    unresolved_sources = _resolve_source_paths(manifest, base_dir, config_path)
+    if unresolved_sources:
+        # Drop unresolved-required sources from the manifest before loading
+        # so doctor returns a structured payload with `unresolved_sources`
+        # instead of raising InputParseError. scan() does not use this path
+        # — its `_load_sources` call is unchanged and still raises.
+        unresolved_ids = {entry["id"] for entry in unresolved_sources}
+        manifest = manifest.model_copy(
+            update={
+                "tool_sources": [
+                    src for src in manifest.tool_sources
+                    if src.id not in unresolved_ids
+                ]
+            }
+        )
     loaded_sources = _load_sources(manifest, base_dir, verbose=verbose)
     framework_result = load_framework_artifacts(manifest, base_dir)
     adk_artifacts = framework_result.adk_artifacts
@@ -415,7 +430,82 @@ def inspect_sources(*, config_path: Path, verbose: bool = False) -> dict[str, ob
         "policy_packs": [pack.model_dump(mode="json") for pack in policy_packs.loaded],
         "baseline": _default_baseline_status(base_dir),
         "warnings": warnings,
+        "unresolved_sources": unresolved_sources,
+        "manifest_summary": {
+            "environment_target": manifest.environment.target,
+            "has_permissions": bool(
+                manifest.permissions.scopes or manifest.permissions.credential_mode
+            ),
+            "has_policies": bool(
+                manifest.policies.require_approval_for_tools
+                or manifest.policies.require_confirmation_for_tools
+                or manifest.policies.require_idempotency_for_tools
+            ),
+            "scope_count": len(manifest.permissions.scopes),
+        },
     }
+
+
+def _resolve_source_paths(
+    manifest, base_dir: Path, config_path: Path
+) -> list[dict[str, object]]:
+    """Return required tool_sources whose declared path is unusable.
+
+    Two failure modes are flagged so doctor can surface them as a
+    ``SHIP-DIAG-MISSING-SOURCE-FILE`` diagnostic instead of crashing in
+    a downstream loader:
+
+    - ``reason="missing"`` — the file does not exist.
+    - ``reason="outside_manifest_dir"`` — the file exists but escapes the
+      manifest's containment boundary (loaders mirror this check and
+      would raise ``InputParseError``).
+
+    Optional sources are not reported here — the existing
+    ``_load_sources`` flow handles them with a warning. Returned entries
+    carry the source id, the declared path string, the 1-indexed line
+    number in the manifest text where the path appears (best-effort),
+    and the failure reason.
+    """
+    unresolved: list[dict[str, object]] = []
+    try:
+        manifest_text = config_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        manifest_text = ""
+    text_lines = manifest_text.splitlines()
+    base_resolved = base_dir.resolve()
+    for source in manifest.tool_sources:
+        if source.optional:
+            continue
+        if source.path is None:
+            continue
+        raw_path = Path(source.path)
+        candidate = (
+            raw_path if raw_path.is_absolute() else base_resolved / raw_path
+        ).resolve()
+        if not candidate.exists():
+            reason = "missing"
+        else:
+            try:
+                candidate.relative_to(base_resolved)
+            except ValueError:
+                reason = "outside_manifest_dir"
+            else:
+                continue
+        line_no: int | None = None
+        needle = f"path: {source.path}"
+        for index, line in enumerate(text_lines, start=1):
+            if needle in line:
+                line_no = index
+                break
+        unresolved.append(
+            {
+                "id": source.id,
+                "declared_path": source.path,
+                "line": line_no,
+                "reason": reason,
+            }
+        )
+    return unresolved
 
 
 def _load_sources(manifest, base_dir: Path, *, verbose: bool) -> list[LoadedToolSource]:

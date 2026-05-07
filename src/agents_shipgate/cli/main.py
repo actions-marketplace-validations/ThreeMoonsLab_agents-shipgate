@@ -15,6 +15,13 @@ from agents_shipgate.checks.registry import check_catalog
 from agents_shipgate.cli.agent_mode import emit_agent_mode_error as _emit_agent_mode_error
 from agents_shipgate.cli.apply_patches import apply_patches as _apply_patches_command
 from agents_shipgate.cli.detect import detect as _detect_command
+from agents_shipgate.cli.diagnostics import (
+    NextAction,
+    diagnose_doctor,
+    diagnose_invalid_manifest,
+    diagnose_missing_manifest,
+    top_next_actions,
+)
 from agents_shipgate.cli.discovery import (
     detect_workspace,
     discover_manifest_paths,
@@ -22,6 +29,7 @@ from agents_shipgate.cli.discovery import (
     render_manifest_template,
     write_ci_workflow,
 )
+from agents_shipgate.cli.discovery.placeholders import collect_placeholders
 from agents_shipgate.cli.evidence_packet import evidence_packet as _evidence_packet_command
 from agents_shipgate.cli.fixture import fixture_app
 from agents_shipgate.cli.scan import inspect_sources, run_scan
@@ -171,6 +179,10 @@ def scan(
     verbose: bool = typer.Option(False, "--verbose", help="Show debug extraction details."),
 ) -> None:
     """Run a static release-readiness scan."""
+    # Parse CLI options first, in their own try block. ConfigError raised
+    # here is about flag values, not the manifest — emitting a manifest
+    # diagnostic ("edit shipgate.yaml") would route the agent to the
+    # wrong fix.
     try:
         configure_logging(verbose=verbose)
         parsed_formats = _parse_formats(formats)
@@ -178,6 +190,29 @@ def scan(
         if ci_mode and ci_mode not in {"advisory", "strict"}:
             raise ConfigError("--ci-mode must be advisory or strict")
         parsed_fail_on = _parse_fail_on(fail_on)
+    except ConfigError as exc:
+        typer.echo(f"Config error: {exc}", err=True)
+        guidance = (
+            "Fix the invalid CLI flag value referenced in the error and "
+            "re-run scan."
+        )
+        _emit_agent_mode_error(
+            "config_error",
+            message=str(exc),
+            next_action=guidance,
+            next_actions=[
+                NextAction(
+                    kind="review",
+                    why=guidance,
+                    expects=(
+                        "Re-run with a flag value the option parser accepts."
+                    ),
+                ).model_dump(mode="json")
+            ],
+        )
+        raise typer.Exit(2) from exc
+
+    try:
         config_paths = _resolve_config_paths(config=config, workspace=workspace)
         if len(config_paths) == 1:
             report, exit_code = run_scan(
@@ -218,23 +253,53 @@ def scan(
         )
     except ConfigError as exc:
         typer.echo(f"Config error: {exc}", err=True)
+        diagnostics = _diagnose_config_error(
+            config=config, workspace=workspace, exc=exc
+        )
+        flattened = top_next_actions(diagnostics)
         _emit_agent_mode_error(
             "config_error",
             message=str(exc),
-            next_action="agents-shipgate init --workspace . --write",
+            next_action=flattened[0].to_legacy_string(),
+            next_actions=[a.model_dump(mode="json") for a in flattened],
         )
         raise typer.Exit(2) from exc
     except InputParseError as exc:
         typer.echo(f"Input parsing error: {exc}", err=True)
+        guidance = (
+            "Inspect the file referenced in the error; ensure it exists, "
+            "is valid, and resolves under the manifest directory."
+        )
         _emit_agent_mode_error(
             "input_parse_error",
             message=str(exc),
-            next_action="Inspect the file referenced in the error; ensure it exists, is valid, and resolves under the manifest directory.",
+            next_action=guidance,
+            next_actions=[
+                NextAction(
+                    kind="review",
+                    why=guidance,
+                    expects=(
+                        "Referenced file is present, parseable, and inside "
+                        "the manifest directory."
+                    ),
+                ).model_dump(mode="json")
+            ],
         )
         raise typer.Exit(3) from exc
     except AgentsShipgateError as exc:
         typer.echo(f"Agents Shipgate error: {exc}", err=True)
-        _emit_agent_mode_error("other_error", message=str(exc))
+        guidance = (
+            "Re-run with --verbose for a stack trace, then file an issue if "
+            "the error is not actionable."
+        )
+        _emit_agent_mode_error(
+            "other_error",
+            message=str(exc),
+            next_action=guidance,
+            next_actions=[
+                NextAction(kind="review", why=guidance).model_dump(mode="json")
+            ],
+        )
         raise typer.Exit(4) from exc
     except typer.Exit:
         raise
@@ -242,7 +307,18 @@ def scan(
         if verbose:
             logger.exception("unhandled exception")
         typer.echo(f"Internal error: {exc}", err=True)
-        _emit_agent_mode_error("internal_error", message=str(exc))
+        guidance = (
+            "Re-run with --verbose for a stack trace; this is a bug — please "
+            "file an issue."
+        )
+        _emit_agent_mode_error(
+            "internal_error",
+            message=str(exc),
+            next_action=guidance,
+            next_actions=[
+                NextAction(kind="review", why=guidance).model_dump(mode="json")
+            ],
+        )
         raise typer.Exit(4) from exc
 
     raise typer.Exit(exit_code)
@@ -291,6 +367,19 @@ def explain(
             check_id=check_id,
             suggestion=suggestion,
             next_action="agents-shipgate list-checks --json",
+            next_actions=[
+                NextAction(
+                    kind="command",
+                    command="agents-shipgate list-checks --json",
+                    why=(
+                        "Enumerate the full check catalog so the agent can "
+                        "match by id."
+                    ),
+                    expects=(
+                        "JSON array of CheckMetadata objects with stable ids."
+                    ),
+                ).model_dump(mode="json")
+            ],
         )
         raise typer.Exit(2)
     if json_output:
@@ -355,7 +444,7 @@ def init(
 
     if minimal:
         template = render_manifest_template(workspace_resolved)
-        placeholders = _collect_placeholders(template)
+        placeholders = collect_placeholders(template)
         auto_detected: dict[str, object] = {}
         next_action_create = (
             "Replace placeholders, then run: agents-shipgate scan -c shipgate.yaml"
@@ -373,9 +462,23 @@ def init(
                 "internal_error",
                 message=f"Generated manifest failed validation: {exc}",
                 next_action="agents-shipgate init --minimal",
+                next_actions=[
+                    NextAction(
+                        kind="command",
+                        command="agents-shipgate init --minimal",
+                        why=(
+                            "Auto-detected manifest failed schema validation. "
+                            "Fall back to the legacy CHANGE_ME-heavy template."
+                        ),
+                        expects=(
+                            "shipgate.yaml renders with placeholder fields "
+                            "you fill in manually."
+                        ),
+                    ).model_dump(mode="json")
+                ],
             )
             raise typer.Exit(4) from exc
-        placeholders = _collect_placeholders(template)
+        placeholders = collect_placeholders(template)
         # Mirror the template's selection logic so JSON output never claims
         # a name that the YAML left as CHANGE_ME. Per v0.6 reviewer
         # feedback: workspace_dir is a candidate but NOT chosen for
@@ -425,7 +528,21 @@ def init(
             _emit_agent_mode_error(
                 "config_already_exists",
                 path=str(target),
-                next_action=f"Edit {target} directly or remove it before running init --write.",
+                next_action=f"Edit {target}",
+                next_actions=[
+                    NextAction(
+                        kind="edit",
+                        path=str(target),
+                        why=(
+                            f"{target} already exists. Edit it directly or "
+                            "remove it before re-running init --write."
+                        ),
+                        expects=(
+                            "Manifest reflects the desired tool sources, "
+                            "agent declared_purpose, and policies."
+                        ),
+                    ).model_dump(mode="json")
+                ],
             )
         else:
             target.write_text(template, encoding="utf-8")
@@ -499,36 +616,6 @@ def _validate_manifest_text(text: str) -> None:
     AgentsShipgateManifest.model_validate(data)
 
 
-def _collect_placeholders(template: str) -> list[dict[str, str]]:
-    """Find ``CHANGE_ME`` markers in the rendered template and return their
-    YAML-pointer-ish locations so an agent can fix them programmatically."""
-    placeholders: list[dict[str, str]] = []
-    section_path: list[str] = []
-    last_indent = -1
-    for line in template.splitlines():
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        indent = len(line) - len(line.lstrip())
-        # Adjust the path stack to match indentation level.
-        while section_path and last_indent >= indent:
-            section_path.pop()
-            last_indent -= 2
-        stripped = line.strip()
-        if stripped.endswith(":") and "CHANGE_ME" not in stripped:
-            section_path.append(stripped[:-1])
-            last_indent = indent
-            continue
-        if "CHANGE_ME" in line:
-            key = stripped.split(":", 1)[0].lstrip("- ").strip()
-            placeholders.append(
-                {
-                    "path": ".".join([*section_path, key] if key else section_path) or "<root>",
-                    "current": "CHANGE_ME",
-                }
-            )
-    return placeholders
-
-
 @app.command()
 def doctor(
     config: str = typer.Option("shipgate.yaml", "--config", "-c", help="Path or quoted glob."),
@@ -540,19 +627,99 @@ def doctor(
     try:
         configure_logging(verbose=verbose)
         paths = _resolve_config_paths(config=config, workspace=workspace)
-        payloads = [inspect_sources(config_path=path, verbose=verbose) for path in paths]
     except ConfigError as exc:
+        # Discovery itself failed — no candidate manifest exists.
         typer.echo(f"Config error: {exc}", err=True)
+        diagnostics = _diagnose_config_error(
+            config=config, workspace=workspace, exc=exc
+        )
+        flattened = top_next_actions(diagnostics)
         _emit_agent_mode_error(
             "config_error",
             message=str(exc),
-            next_action="agents-shipgate init --workspace . --write",
+            next_action=flattened[0].to_legacy_string(),
+            next_actions=[a.model_dump(mode="json") for a in flattened],
         )
         raise typer.Exit(2) from exc
+    payloads: list[dict[str, object]] = []
+    try:
+        for path in paths:
+            try:
+                payloads.append(inspect_sources(config_path=path, verbose=verbose))
+            except ConfigError as exc:
+                # A specific discovered manifest failed to load. If the
+                # file exists, route the agent to edit it directly
+                # (INVALID-MANIFEST) — `init` refuses to overwrite, so
+                # MISSING-MANIFEST's detect/init hint would loop. If
+                # the file is genuinely absent (only possible in the
+                # bare ``-c missing.yaml`` path, since discovery and
+                # globbing only yield existing files), fall through to
+                # the missing-manifest dispatch.
+                typer.echo(f"Config error: {exc}", err=True)
+                if path.is_file():
+                    diagnostics = diagnose_invalid_manifest(
+                        path, message=str(exc)
+                    )
+                else:
+                    diagnostics = _diagnose_config_error(
+                        config=str(path), workspace=None, exc=exc
+                    )
+                flattened = top_next_actions(diagnostics)
+                _emit_agent_mode_error(
+                    "config_error",
+                    message=str(exc),
+                    next_action=flattened[0].to_legacy_string(),
+                    next_actions=[
+                        a.model_dump(mode="json") for a in flattened
+                    ],
+                )
+                raise typer.Exit(2) from exc
+    except typer.Exit:
+        raise
     except InputParseError as exc:
         typer.echo(f"Input parsing error: {exc}", err=True)
-        _emit_agent_mode_error("input_parse_error", message=str(exc))
+        guidance = (
+            "Inspect the file referenced in the error; ensure it exists, "
+            "is valid, and resolves under the manifest directory."
+        )
+        _emit_agent_mode_error(
+            "input_parse_error",
+            message=str(exc),
+            next_action=guidance,
+            next_actions=[
+                NextAction(
+                    kind="review",
+                    why=guidance,
+                    expects=(
+                        "Referenced file is present, parseable, and inside "
+                        "the manifest directory."
+                    ),
+                ).model_dump(mode="json")
+            ],
+        )
         raise typer.Exit(3) from exc
+    enriched_payloads: list[dict[str, object]] = []
+    for path, payload in zip(paths, payloads, strict=True):
+        try:
+            manifest_text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            manifest_text = ""
+        placeholders = collect_placeholders(manifest_text)
+        diagnostics = diagnose_doctor(
+            payload,
+            manifest_path=path,
+            manifest_text=manifest_text,
+            placeholders=placeholders,
+        )
+        flattened = top_next_actions(diagnostics)
+        enriched = dict(payload)
+        enriched["diagnostics"] = [d.model_dump(mode="json") for d in diagnostics]
+        enriched["next_actions"] = [a.model_dump(mode="json") for a in flattened]
+        enriched["next_action"] = (
+            flattened[0].to_legacy_string() if flattened else ""
+        )
+        enriched_payloads.append(enriched)
+    payloads = enriched_payloads
     if json_output:
         typer.echo(json.dumps(payloads, indent=2, sort_keys=True))
         return
@@ -618,7 +785,42 @@ def doctor(
             typer.echo("Warnings:")
             for warning in payload["warnings"]:
                 typer.echo(f"- {warning}")
+        if payload.get("unresolved_sources"):
+            typer.echo("Unresolved required sources:")
+            config_name = Path(str(payload["config"])).name
+            for entry in payload["unresolved_sources"]:
+                line = entry.get("line")
+                location = (
+                    f"{config_name}:{line}" if line is not None else config_name
+                )
+                typer.echo(
+                    f"- {entry['id']} -> {entry['declared_path']!r} "
+                    f"(declared at {location})"
+                )
+        diagnostics = payload.get("diagnostics") or []
+        if diagnostics:
+            typer.echo("Diagnostics:")
+            for diag in diagnostics:
+                typer.echo(
+                    f"- [{diag['severity']}] {diag['id']}: {diag['title']}"
+                )
+                if diag["next_actions"]:
+                    action = diag["next_actions"][0]
+                    kind = action["kind"]
+                    if kind == "command":
+                        typer.echo(f"    next: {action['command']}")
+                    elif kind == "edit":
+                        typer.echo(f"    edit: {action['path']}")
+                    elif kind == "stop":
+                        typer.echo(f"    stop: {action['why']}")
+                    else:
+                        typer.echo(f"    review: {action['why']}")
         typer.echo("")
+    # Restore pre-PR loud-failure for humans on the missing-required-source
+    # case. JSON consumers (agents) get exit 0 + unresolved_sources earlier in
+    # this function and route on the structured diagnostic instead.
+    if any(payload.get("unresolved_sources") for payload in payloads):
+        raise typer.Exit(3)
 
 
 @baseline_app.command("save")
@@ -710,6 +912,95 @@ def _resolve_config_paths(*, config: str, workspace: Path | None) -> list[Path]:
     if not paths:
         raise ConfigError("No shipgate.yaml files matched")
     return paths
+
+
+def _missing_manifest_workspace(
+    *, config: str, workspace: Path | None
+) -> Path:
+    """Pick the workspace path used by the missing-manifest diagnostic.
+
+    Routes recovery to the directory the user pointed scan/doctor at
+    (``-c <path>`` or ``--workspace <dir>``), not whichever directory
+    they happen to be invoking the CLI from. For glob inputs, walks the
+    path components and uses the longest non-glob prefix — so an
+    invocation like ``scan -c /tmp/repo/*/shipgate.yaml`` from another
+    cwd still routes the agent to ``/tmp/repo``.
+    """
+    if workspace is not None:
+        return workspace.resolve()
+    if any(char in config for char in "*?[]"):
+        return _glob_non_glob_prefix(config)
+    config_path = Path(config)
+    parent = config_path.parent
+    if not str(parent) or str(parent) == ".":
+        return Path.cwd()
+    # `Path.resolve()` works on non-existent paths — and the manifest
+    # parent often exists even when the manifest itself is missing.
+    return parent.resolve()
+
+
+def _glob_non_glob_prefix(config: str) -> Path:
+    """Return the longest leading path component sequence with no glob
+    metacharacters, falling back to ``cwd`` for purely-relative globs.
+    """
+    parts = Path(config).parts
+    safe: list[str] = []
+    for part in parts:
+        if any(char in part for char in "*?[]"):
+            break
+        safe.append(part)
+    if not safe:
+        return Path.cwd()
+    candidate = Path(*safe)
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    return candidate.resolve()
+
+
+def _candidate_manifest_paths(
+    *, config: str, workspace: Path | None
+) -> list[Path]:
+    """Enumerate the manifest paths the user pointed scan/doctor at.
+
+    Mirrors ``_resolve_config_paths`` but does not raise — it's called
+    from inside the ``ConfigError`` handler, where re-raising would
+    obscure the original failure. Returns an empty list when nothing
+    resolves; the dispatcher then falls back to ``MISSING-MANIFEST``.
+    """
+    try:
+        if workspace is not None:
+            return list(discover_manifest_paths(workspace))
+        if any(char in config for char in "*?[]"):
+            return sorted(Path(p) for p in glob.glob(config, recursive=True))
+        return [Path(config)]
+    except Exception:  # noqa: BLE001 — diagnostic dispatch must not fail
+        return []
+
+
+def _diagnose_config_error(
+    *, config: str, workspace: Path | None, exc: ConfigError
+) -> list:
+    """Pick the right diagnostic for a ``ConfigError``.
+
+    ``ConfigError`` covers two distinct failure shapes:
+    - the manifest file does not exist (``MISSING-MANIFEST``)
+    - one or more candidate manifest files exist but the loader rejected
+      them — invalid YAML, schema validation failure, unsupported
+      version (``INVALID-MANIFEST``)
+
+    Disambiguate by walking every candidate path the CLI invocation
+    points at (direct ``-c <file>``, ``--workspace`` discovery, or a
+    glob pattern). If any candidate is a real file, the loader is
+    choking on it — emit ``INVALID-MANIFEST`` for that file.
+    """
+    for candidate in _candidate_manifest_paths(
+        config=config, workspace=workspace
+    ):
+        if candidate.is_file():
+            return diagnose_invalid_manifest(candidate, message=str(exc))
+    return diagnose_missing_manifest(
+        _missing_manifest_workspace(config=config, workspace=workspace)
+    )
 
 
 def _run_multi_scan(
