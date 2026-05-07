@@ -9,6 +9,9 @@
   certify readiness.
 - Added four `SHIP-EVIDENCE-*` checks. Existing baselines may surface these as
   new findings after upgrade when a manifest opts into `validation:`.
+- Add `agents-shipgate scenario suggest` (target: `0.9.1`), a YAML export that
+  fans out `report.json.suggested_scenarios[]` into concrete
+  per-finding/per-tool dynamic validation steps.
 
 ## 0.8.0 - 2026-05-05
 
