@@ -223,6 +223,8 @@ The full schema is at [`docs/report-schema.v0.10.json`](docs/report-schema.v0.10
 
 **Release gating signal**: prefer `release_decision.decision` (`"blocked" | "review_required" | "passed"`) over `summary.status`. The new field is **baseline-aware** — a baseline-matched critical surfaces in `release_decision.review_items` (accepted debt), not `release_decision.blockers`. `summary.status` stays baseline-blind for v0.7 compatibility, so a baseline-matched-only critical produces both `summary.status = "release_blockers_detected"` AND `release_decision.decision = "review_required"` (intentional divergence — see [STABILITY.md](STABILITY.md#release_decisiondecision-vs-summarystatus)).
 
+For a step-by-step reader's primer with anti-patterns and concrete code rewrites, see [`docs/report-reading-for-agents.md`](docs/report-reading-for-agents.md).
+
 ### Task 3 · Suppress a finding with a reason
 
 ```yaml
@@ -383,6 +385,8 @@ Exit codes (stable):
 
 ## What you can't do (intentionally)
 
+This section is the **CLI's** invariants. For the **agent's** behavioral boundary — what an agent driving Shipgate may assert in PR comments and review summaries — see [`docs/agent-autofix-boundary.md`](docs/agent-autofix-boundary.md).
+
 - The CLI does not modify user code; it only reads.
 - The CLI does not connect to MCP servers; it reads exported JSON only.
 - Tool sources outside the manifest directory are rejected (path traversal containment).
@@ -418,7 +422,13 @@ PR templates, and advisory CI. Use
 [`docs/agent-adoption-harness.md`](docs/agent-adoption-harness.md) to evaluate
 whether coding agents discover and use Shipgate without being prompted by name.
 
-Claude Code: a `/shipgate` slash command lives at [`.claude/commands/shipgate.md`](.claude/commands/shipgate.md), and an auto-discoverable skill lives at [`skills/agents-shipgate/`](skills/agents-shipgate/) (named `agents-shipgate` to avoid colliding with the slash command — Claude Code lets a same-named skill preempt a command). The skill bundles the recipes in [`skills/agents-shipgate/prompts/`](skills/agents-shipgate/prompts/) and a starter advisory CI workflow at [`skills/agents-shipgate/ci-recipes/advisory-pr-comment.yml`](skills/agents-shipgate/ci-recipes/advisory-pr-comment.yml); when you change anything in [`prompts/`](prompts/) or `examples/github-actions/01-advisory-pr-comment.yml`, sync the bundled copy. To install both surfaces into your own agent project, see [`docs/agents/use-with-claude-code.md`](docs/agents/use-with-claude-code.md).
+### Editor / agent integrations
+
+Per-agent install guides for dropping Shipgate into your own agent project:
+
+- [`docs/agents/use-with-claude-code.md`](docs/agents/use-with-claude-code.md) — install the `/shipgate` slash command and `agents-shipgate` auto-discoverable skill. Source surfaces ship at [`.claude/commands/shipgate.md`](.claude/commands/shipgate.md) and [`skills/agents-shipgate/`](skills/agents-shipgate/) (named `agents-shipgate` to avoid colliding with the slash command — Claude Code lets a same-named skill preempt a command). The skill bundles the recipes in [`skills/agents-shipgate/prompts/`](skills/agents-shipgate/prompts/) and a starter advisory CI workflow at [`skills/agents-shipgate/ci-recipes/advisory-pr-comment.yml`](skills/agents-shipgate/ci-recipes/advisory-pr-comment.yml); when you change anything in [`prompts/`](prompts/) or `examples/github-actions/01-advisory-pr-comment.yml`, sync the bundled copy.
+- [`docs/agents/use-with-codex.md`](docs/agents/use-with-codex.md) — drop the canonical `AGENTS.md` snippet (from [`docs/target-repo-agent-snippets.md`](docs/target-repo-agent-snippets.md)) into your repo. Codex reads `AGENTS.md` natively. Codex Skills (`.agents/skills/<name>/SKILL.md` repo-scoped or `$HOME/.agents/skills/<name>/SKILL.md` user-scoped; invoked with `/skills` or `$<name>`) are also supported, but this repo does not currently ship a Codex skill bundle — the parallel to [`skills/agents-shipgate/`](skills/agents-shipgate/) has not been authored. The `AGENTS.md` snippet is the minimal on-ramp that works today.
+- [`docs/agents/use-with-cursor.md`](docs/agents/use-with-cursor.md) — drop the canonical `.cursor/rules/agents-shipgate.mdc` auto-attach rule (from [`docs/target-repo-agent-snippets.md`](docs/target-repo-agent-snippets.md)) into your repo. The rule fires whenever a chat touches `shipgate.yaml`, an MCP/OpenAPI spec, a tool JSON, or a `.py` file.
 
 ---
 
