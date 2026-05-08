@@ -10,7 +10,7 @@ Verify the installed CLI contract locally before relying on hard-coded docs:
 agents-shipgate contract --json
 ```
 
-- Latest release: `v0.8.0` (see [pyproject.toml](../pyproject.toml) for the in-tree version)
+- Latest release: `v0.10.0` (see [pyproject.toml](../pyproject.toml) for the in-tree version)
 - Runtime contract: `1`
 - Current report schema: `0.10` — [`docs/report-schema.v0.10.json`](report-schema.v0.10.json)
 - Current packet schema: `0.3` — [`docs/packet-schema.v0.3.json`](packet-schema.v0.3.json)
