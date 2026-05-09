@@ -17,6 +17,7 @@ walk PUBLIC_SURFACES.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
 import tomllib
@@ -32,6 +33,7 @@ from agents_shipgate.contract import (
 )
 from agents_shipgate.core.models import ReadinessReport
 from agents_shipgate.packet.models import EvidencePacket
+from agents_shipgate.triggers import evaluate, load_triggers
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -584,6 +586,439 @@ def test_packet_anchors_match_current_schema(relpath):
             f"v{CURRENT_PACKET_SCHEMA_VERSION}, so the anchor should "
             f"be `#release-evidence-packet-v{expected_anchor_digits}`."
         )
+
+
+# --- Trigger catalog and llms-full.txt drift guards ----------------------
+
+
+_VALID_TRIGGER_ACTIONS = {"run_shipgate", "skip_shipgate", "dry_run", "force_run"}
+
+
+def _load_triggers_json() -> dict:
+    return json.loads(_read("docs/triggers.json"))
+
+
+def test_triggers_json_loads_via_canonical_loader():
+    """The bundled `agents_shipgate.triggers` module is the canonical
+    loader. If a coding agent reads docs/triggers.json directly and
+    reaches a different verdict than this loader, that's a drift bug —
+    catch it by exercising the loader during CI."""
+    triggers = load_triggers()
+    assert triggers["schema_version"] == "0.1", (
+        "docs/triggers.json schema_version moved off 0.1; bump the "
+        "test constant deliberately so external consumers are notified."
+    )
+    assert isinstance(triggers.get("rules"), list) and triggers["rules"], (
+        "docs/triggers.json must declare at least one rule."
+    )
+    for rule in triggers["rules"]:
+        assert rule["action"] in _VALID_TRIGGER_ACTIONS, (
+            f"rule {rule['id']!r} has unknown action {rule['action']!r}; "
+            f"allowed: {sorted(_VALID_TRIGGER_ACTIONS)}."
+        )
+        assert rule.get("when"), f"rule {rule['id']!r} missing `when` clause."
+        assert rule.get("agents_md_row"), (
+            f"rule {rule['id']!r} missing `agents_md_row`; the row text "
+            "is what the contract test pins against AGENTS.md prose."
+        )
+
+
+def test_triggers_json_rule_rows_appear_verbatim_in_agents_md():
+    """Every `agents_md_row` value in docs/triggers.json must appear
+    verbatim in AGENTS.md. Catches the failure mode where the prose
+    table gets reworded but triggers.json is left behind."""
+    triggers = _load_triggers_json()
+    agents_md = _read("AGENTS.md")
+    seen: set[str] = set()
+    for rule in triggers["rules"]:
+        row = rule["agents_md_row"]
+        if row in seen:
+            continue
+        seen.add(row)
+        assert row in agents_md, (
+            f"rule {rule['id']!r} declares agents_md_row "
+            f"{row!r}, but that text does not appear verbatim in "
+            "AGENTS.md. Re-sync docs/triggers.json and the AGENTS.md "
+            "trigger table."
+        )
+
+
+def test_triggers_evaluator_smoke():
+    """Sanity-check the evaluator for the canonical positive and
+    negative cases. Prevents a regression where rule semantics drift
+    silently — e.g. the docs-only negative case starts firing
+    `run_shipgate`."""
+    docs_only = evaluate(paths=["README.md", "docs/index.md"])
+    assert docs_only["run_shipgate"] is False, (
+        "Docs-only PR must not trigger Shipgate; "
+        f"got {docs_only!r}."
+    )
+    mcp_change = evaluate(paths=["tools/my_mcp.json"])
+    assert mcp_change["run_shipgate"] is True, (
+        "MCP export change must trigger Shipgate; "
+        f"got {mcp_change!r}."
+    )
+    decorator = evaluate(
+        paths=["agent.py"],
+        diff_text="+@function_tool\n+def search(): ...",
+    )
+    assert decorator["run_shipgate"] is True, (
+        "@function_tool decorator addition must trigger Shipgate; "
+        f"got {decorator!r}."
+    )
+
+
+def test_triggers_skip_beats_run_on_docs_only_with_decorator_in_prose():
+    """A README-only diff that incidentally mentions `@tool` (e.g.
+    documentation prose, a code block, or a quoted Action URL) must
+    NOT trigger Shipgate. `skip_shipgate` beats `run_shipgate`;
+    otherwise the docs-only-negative rule is dead in practice."""
+    result = evaluate(
+        paths=["README.md"],
+        diff_text="+ Use @tool to register handlers (see ThreeMoonsLab/agents-shipgate)",
+    )
+    assert result["run_shipgate"] is False, (
+        "Docs-only PR with prose-mentioned @tool must NOT trigger "
+        f"Shipgate; got {result!r}."
+    )
+    matched_actions = {m["action"] for m in result["matched_rules"]}
+    assert "skip_shipgate" in matched_actions, (
+        "Expected the docs-only negative rule to fire alongside the "
+        "decorator/Action rules; otherwise the precedence isn't being "
+        f"exercised. Got matched_rules={result['matched_rules']!r}."
+    )
+
+
+@pytest.mark.parametrize(
+    "paths",
+    [
+        ["tests/test_foo.py"],
+        ["tests/conftest.py"],
+        ["src/pkg/test_module.py"],
+        ["src/pkg/module_test.py"],
+        ["tests/test_a.py", "tests/test_b.py", "tests/conftest.py"],
+        ["README.md", "tests/test_foo.py", "docs/index.md"],
+    ],
+    ids=[
+        "single-test-file",
+        "conftest",
+        "test-prefix-py",
+        "test-suffix-py",
+        "multi-test",
+        "mixed-docs-and-tests",
+    ],
+)
+def test_triggers_test_only_diff_with_decorator_skips(paths):
+    """Test-only diffs (or test+doc diffs) that incidentally contain
+    `@function_tool` in fixtures or assertions must skip — the
+    AGENTS.md row says "Pure read-only doc/test changes" and the
+    catalog must honor 'test'. Catches a regression where the rule
+    only matches `**/*.md` and tests slip through."""
+    result = evaluate(
+        paths=paths,
+        diff_text=(
+            "+@function_tool\n+def stub(): pass  # used in fixtures"
+        ),
+    )
+    assert result["run_shipgate"] is False, (
+        f"Test-only paths {paths!r} with @function_tool in diff must "
+        f"NOT trigger Shipgate; got {result!r}."
+    )
+    matched_ids = {m["id"] for m in result["matched_rules"]}
+    assert "TRIGGER-DOCS-ONLY-NEGATIVE" in matched_ids, (
+        "Expected TRIGGER-DOCS-ONLY-NEGATIVE to fire on test-only "
+        f"PR; got matched_rules={result['matched_rules']!r}."
+    )
+
+
+def test_triggers_code_plus_test_does_not_skip():
+    """A PR that mixes a real code change with a test file is NOT
+    test-only and should follow the run rules. Negative case for the
+    docs-only-negative rule's `every_file_matches` list expansion."""
+    result = evaluate(
+        paths=["src/agent.py", "tests/test_agent.py"],
+        diff_text="+@function_tool\n+def search(): ...",
+    )
+    assert result["run_shipgate"] is True, (
+        "Code+test mix with @function_tool must trigger Shipgate; "
+        f"got {result!r}."
+    )
+    matched_ids = {m["id"] for m in result["matched_rules"]}
+    assert "TRIGGER-DOCS-ONLY-NEGATIVE" not in matched_ids, (
+        "TRIGGER-DOCS-ONLY-NEGATIVE must NOT fire when a non-doc, "
+        f"non-test file is in the change set; got {result!r}."
+    )
+
+
+def test_every_file_matches_predicate_accepts_list():
+    """The `every_file_matches` predicate must accept either a string
+    or a list (any-of within the predicate). Pin the contract so a
+    refactor doesn't silently revert to string-only."""
+    from agents_shipgate.triggers import _eval_predicate
+
+    # Single glob (string form)
+    assert _eval_predicate(
+        {"every_file_matches": "**/*.md"},
+        paths=["README.md", "docs/x.md"],
+        diff_text="",
+        manifest_present=False,
+        detect_result=None,
+        user_requested=False,
+    ) is True
+
+    # List form: every path matches at least one glob in the list
+    assert _eval_predicate(
+        {"every_file_matches": ["**/*.md", "tests/**"]},
+        paths=["README.md", "tests/test_foo.py"],
+        diff_text="",
+        manifest_present=False,
+        detect_result=None,
+        user_requested=False,
+    ) is True
+
+    # List form: a path matching no glob in the list returns False
+    assert _eval_predicate(
+        {"every_file_matches": ["**/*.md", "tests/**"]},
+        paths=["README.md", "src/agent.py"],
+        diff_text="",
+        manifest_present=False,
+        detect_result=None,
+        user_requested=False,
+    ) is False
+
+
+def test_triggers_force_run_beats_skip_when_manifest_present():
+    """A docs-only PR in a repo that already has a `shipgate.yaml`
+    must STILL trigger Shipgate — the manifest's existence is the
+    operational opt-in, and `force_run` overrides any incidental
+    `skip_shipgate` match."""
+    result = evaluate(paths=["README.md"], manifest_present=True)
+    assert result["run_shipgate"] is True, (
+        "Docs-only PR with manifest present must trigger Shipgate "
+        f"via TRIGGER-EXISTING-MANIFEST-PRESENT; got {result!r}."
+    )
+    matched_actions = {m["action"] for m in result["matched_rules"]}
+    assert "force_run" in matched_actions, (
+        "Expected force_run action to fire when shipgate.yaml is "
+        f"present; got matched_rules={result['matched_rules']!r}."
+    )
+
+
+def test_triggers_dry_run_sets_dry_run_recommended():
+    """A framework version bump (only `dry_run` rule fires) must
+    surface `dry_run_recommended: true` instead of being reported as
+    'no rules matched'. Otherwise the dry_run rule is dead in
+    practice."""
+    result = evaluate(
+        paths=["requirements.txt"],
+        diff_text="-langchain==0.2.0\n+langchain==0.3.0\n",
+    )
+    assert result["run_shipgate"] is False, (
+        f"dry_run alone should not flip run_shipgate; got {result!r}."
+    )
+    assert result["dry_run_recommended"] is True, (
+        f"Expected dry_run_recommended=True; got {result!r}."
+    )
+    matched_ids = {m["id"] for m in result["matched_rules"]}
+    assert "TRIGGER-FRAMEWORK-VERSION-BUMP" in matched_ids, (
+        "Expected TRIGGER-FRAMEWORK-VERSION-BUMP in matched_rules so "
+        "callers can see the rationale; got "
+        f"matched_rules={result['matched_rules']!r}."
+    )
+
+
+def _init_git_repo(tmp_path: Path) -> None:
+    """Initialize an empty git repo at `tmp_path` with one commit so
+    `git diff HEAD` works. Used by the --git-diff helper tests."""
+    import subprocess
+
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(tmp_path)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path),
+         "-c", "user.email=test@example.com",
+         "-c", "user.name=test",
+         "commit", "-q", "--allow-empty", "-m", "init"],
+        check=True,
+    )
+
+
+def test_git_diff_bare_includes_staged_changes(tmp_path, monkeypatch):
+    """Bare `--git-diff` (no revspec) must capture staged changes via
+    `git diff HEAD`. The earlier implementation used plain `git diff`,
+    which only sees unstaged changes — a staged `@function_tool`
+    addition would silently miss the decorator rule even though the
+    prompt advertises bare flag for 'uncommitted changes'."""
+    import subprocess
+
+    from agents_shipgate.triggers import _git_diff_context
+
+    _init_git_repo(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "agent.py").write_text(
+        "@function_tool\ndef foo(): pass\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "add", "agent.py"], check=True)
+
+    paths, diff_text = _git_diff_context(None)
+    assert "agent.py" in paths, (
+        f"Staged file missing from --git-diff paths: {paths!r}"
+    )
+    assert "@function_tool" in diff_text, (
+        f"Staged content missing from --git-diff diff_text: {diff_text!r}"
+    )
+
+
+def test_git_diff_bare_includes_untracked_paths(tmp_path, monkeypatch):
+    """Bare `--git-diff` must surface untracked file paths so that
+    glob rules (e.g. `**/*mcp*.json`) can fire on a brand-new file
+    the user hasn't `git add`ed yet. Untracked file *content* is NOT
+    in the diff body — that limitation is documented in the prompt."""
+    from agents_shipgate.triggers import _git_diff_context
+
+    _init_git_repo(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "new_mcp.json").write_text('{"tools":[]}', encoding="utf-8")
+
+    paths, diff_text = _git_diff_context(None)
+    assert "new_mcp.json" in paths, (
+        f"Untracked file missing from --git-diff paths: {paths!r}"
+    )
+    assert "new_mcp.json" not in diff_text, (
+        "Untracked file content must NOT appear in diff_text "
+        f"(by design — see prompt's documented limitation); got "
+        f"{diff_text!r}"
+    )
+
+
+def test_triggers_existing_manifest_rule_uses_force_run():
+    """Pin the action of `TRIGGER-EXISTING-MANIFEST-PRESENT` to
+    `force_run` (not `run_shipgate`). Reverting this in triggers.json
+    would silently re-introduce the bug where a docs-only PR in an
+    opted-in repo gets skipped."""
+    triggers = _load_triggers_json()
+    rule = next(
+        (r for r in triggers["rules"] if r["id"] == "TRIGGER-EXISTING-MANIFEST-PRESENT"),
+        None,
+    )
+    assert rule is not None, (
+        "TRIGGER-EXISTING-MANIFEST-PRESENT must remain in the catalog."
+    )
+    assert rule["action"] == "force_run", (
+        "TRIGGER-EXISTING-MANIFEST-PRESENT must use action='force_run' "
+        "so it overrides skip_shipgate. The semantics rely on this "
+        f"specific action; got action={rule['action']!r}."
+    )
+
+
+def test_well_known_links_to_triggers_and_llms_full():
+    """`.well-known/agents-shipgate.json` is the discovery hub — it
+    must point at the trigger catalog and llms-full.txt so coding
+    agents can reach them in one fetch from the well-known URL."""
+    data = json.loads(_read(".well-known/agents-shipgate.json"))
+    triggers_url = data.get("triggers_url", "")
+    assert triggers_url.endswith("/docs/triggers.json"), (
+        f".well-known/agents-shipgate.json must declare triggers_url "
+        f"ending in /docs/triggers.json; got {triggers_url!r}."
+    )
+    llms_full_url = data.get("llms_full_url", "")
+    assert llms_full_url.endswith("/llms-full.txt"), (
+        f".well-known/agents-shipgate.json must declare llms_full_url "
+        f"ending in /llms-full.txt; got {llms_full_url!r}."
+    )
+
+
+def test_llms_txt_advertises_triggers_and_llms_full():
+    """llms.txt is the short fan-out for AI search; it must list the
+    trigger catalog and llms-full URLs so they are discoverable from
+    the canonical entry point."""
+    text = _read("llms.txt")
+    assert "docs/triggers.json" in text, (
+        "llms.txt must reference docs/triggers.json so coding agents "
+        "discover the machine-readable trigger catalog."
+    )
+    assert "llms-full.txt" in text, (
+        "llms.txt must reference llms-full.txt so coding agents that "
+        "prefer one document over chasing links can find it."
+    )
+
+
+def _import_build_llms_full():
+    spec = importlib.util.spec_from_file_location(
+        "build_llms_full", REPO_ROOT / "scripts" / "build-llms-full.py"
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Could not import scripts/build-llms-full.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_llms_full_is_up_to_date():
+    """llms-full.txt is generated by `scripts/build-llms-full.py`. A PR
+    that touches one of the source documents must regenerate the file
+    in the same commit; this test catches PRs that forget."""
+    mod = _import_build_llms_full()
+    expected = mod.render(REPO_ROOT)
+    actual = _read("llms-full.txt")
+    assert actual == expected, (
+        "llms-full.txt is out of date. Re-run "
+        "`python scripts/build-llms-full.py` and commit the result. "
+        "Sources: " + ", ".join(mod.SOURCES)
+    )
+
+
+# --- Prompt mirror enforcement ------------------------------------------
+
+
+_PROMPT_DIR = REPO_ROOT / "prompts"
+_SKILL_PROMPT_DIR = REPO_ROOT / "skills" / "agents-shipgate" / "prompts"
+
+
+_PROMPT_MIRROR_EXCLUDE = {"README.md"}
+
+
+def _prompt_basenames() -> list[str]:
+    return sorted(
+        p.name
+        for p in _PROMPT_DIR.glob("*.md")
+        if p.name not in _PROMPT_MIRROR_EXCLUDE
+    )
+
+
+@pytest.mark.parametrize("basename", _prompt_basenames())
+def test_prompt_is_mirrored_to_skill(basename):
+    """Every `prompts/*.md` must have a byte-identical mirror under
+    `skills/agents-shipgate/prompts/`. The skill bundle is what
+    Claude Code installs and pins to a release; if a prompt drifts
+    between the two locations, agents installed via the skill see
+    stale guidance."""
+    main = (_PROMPT_DIR / basename).read_text(encoding="utf-8")
+    skill_path = _SKILL_PROMPT_DIR / basename
+    assert skill_path.is_file(), (
+        f"prompts/{basename} has no mirror at "
+        f"skills/agents-shipgate/prompts/{basename}. Copy it over so "
+        "the bundled skill stays in sync."
+    )
+    skill = skill_path.read_text(encoding="utf-8")
+    assert main == skill, (
+        f"prompts/{basename} and "
+        f"skills/agents-shipgate/prompts/{basename} have diverged. "
+        "Re-sync them — they must be byte-identical."
+    )
+
+
+def test_decide_shipgate_relevance_prompt_exists():
+    """The relevance-decision prompt is the entry point for coding
+    agents that haven't decided whether to run Shipgate yet — its
+    presence is contractual."""
+    assert (_PROMPT_DIR / "decide-shipgate-relevance.md").is_file(), (
+        "prompts/decide-shipgate-relevance.md is missing. This prompt "
+        "applies docs/triggers.json to a PR diff and is the gateway "
+        "into the rest of the prompt library."
+    )
 
 
 @pytest.mark.parametrize(
