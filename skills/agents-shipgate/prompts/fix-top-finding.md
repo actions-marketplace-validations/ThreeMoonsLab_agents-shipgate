@@ -8,7 +8,12 @@ You are working in a repo with `shipgate.yaml` already in place. Run a scan and 
    ```bash
    agents-shipgate scan -c shipgate.yaml --ci-mode advisory
    ```
-   Read `agents-shipgate-reports/report.json`. The top finding is the entry with the highest severity (`critical > high > medium > low > info`) that has `"suppressed": false`.
+   Read `agents-shipgate-reports/report.json`. For v0.12+ reports the easy path is `agent_summary.first_recommended_action.why` — for most `blocked`/`review_required` verdicts it names the top finding's `check_id` and `tool_name` directly. Two exceptions to expect:
+
+   - **Evidence-coverage-driven `review_required`** (low-confidence/static evidence; no specific finding to fix). The action's `why` describes the evidence situation and recommends gathering MCP/OpenAPI inputs or eval traces — there is no `check_id` to parse out. If you see "low-confidence evidence" or "static-only" in the why-text, follow that guidance instead of looking for a top finding.
+   - **`auto_appliable_patches > 0`**. The action proposes `apply-patches`; the why-text names the apply-patches command, not a specific finding. Walk `findings[]` for the actual top entry.
+
+   Fall back to picking the entry with the highest severity (`critical > high > medium > low > info`) and `"suppressed": false` whenever the action doesn't name a finding directly.
 
 2. **Look up the check definition.**
    ```bash
@@ -16,14 +21,14 @@ You are working in a repo with `shipgate.yaml` already in place. Run a scan and 
    ```
    This returns the `CheckMetadata` with `description`, `rationale`, `fires_when`, `evidence_fields`, `recommendation`.
 
-3. **Diagnose the fix.** There are exactly four legitimate responses to a finding:
+3. **Diagnose the fix.** There are exactly four legitimate responses to a finding. v0.12+ reports project the routing via `agent_action`:
 
-   | Response | When |
-   |---|---|
-   | **Add the missing policy / scope / annotation** to `shipgate.yaml` | The check is correct; the manifest just hadn't declared the safeguard yet |
-   | **Override the heuristic** via `risk_overrides.tools.{tool}.{tags,remove_tags}` | The risk classification is wrong (e.g. a GET endpoint that picked up the `destructive` tag because of a misleading operationId) |
-   | **Suppress the finding** via `checks.ignore` with a `reason` | The check is correct but you've decided to accept the risk explicitly (e.g. "tool deprecated 2026-Q2") |
-   | **Fix the underlying tool definition** | The tool spec itself is wrong (missing description, broad scope, free-form action field) |
+   | Response | When | `agent_action` (v0.12+) |
+   |---|---|---|
+   | **Add the missing policy / scope / annotation** to `shipgate.yaml` | The check is correct; the manifest just hadn't declared the safeguard yet | `propose_patch_for_review` (a `set_pointer`/`append_pointer` patch is attached) or `escalate_to_human` (no patch — you write the entry by hand) |
+   | **Override the heuristic** via `risk_overrides.tools.{tool}.{tags,remove_tags}` | The risk classification is wrong (e.g. a GET endpoint that picked up the `destructive` tag because of a misleading operationId) | `escalate_to_human` |
+   | **Suppress the finding** via `checks.ignore` with a `reason` | The check is correct but you've decided to accept the risk explicitly (e.g. "tool deprecated 2026-Q2") | `escalate_to_human` (the future `suppress_with_reason` value is reserved for checks that pre-classify themselves as suppressible) |
+   | **Fix the underlying tool definition** | The tool spec itself is wrong (missing description, broad scope, free-form action field) | `escalate_to_human` |
 
 4. **Apply the fix.** Edit either `shipgate.yaml` or the tool source file. Do not delete tools wholesale to silence findings.
 

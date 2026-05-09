@@ -21,6 +21,24 @@ DOCS_DIR = REPO_ROOT / "docs"
 INDEX_MD = DOCS_DIR / "INDEX.md"
 LINK_RE = re.compile(r"\[[^\]]+\]\(([^)#:][^)#]*)(?:#[^)]*)?\)")
 
+# Derive the current report-schema version from the runtime model so
+# the docs-link test bumps automatically when the schema bumps. The
+# previous hardcoded literal ("v0.11") let the docs go stale relative
+# to the runtime — see PR #57 review P2.
+def _current_report_schema_version() -> str:
+    from agents_shipgate.core.models import ReadinessReport
+
+    return str(ReadinessReport.model_fields["report_schema_version"].default)
+
+
+def _previous_report_schema_version() -> str:
+    """The next-most-recent schema version, expected to remain linked
+    from the index as a frozen reference. Derived as ``current - 1``
+    on the minor."""
+    current = _current_report_schema_version()
+    major, minor = current.split(".")
+    return f"{major}.{int(minor) - 1}"
+
 AGENT_FACING_DOCS = (
     "agent-recipes.md",
     "agent-adoption-harness.md",
@@ -83,18 +101,74 @@ def test_index_no_longer_references_v05_schema():
     )
 
 
-def test_index_lists_current_v11_schema():
-    """The current schema version moved to v0.11; the index must point
-    agents at v0.11 for fresh report.json validation. v0.10 stays linked
-    as the frozen reference for older reports."""
+def test_index_lists_current_schema():
+    """The index must point agents at the current schema for fresh
+    report.json validation; the immediately-previous schema must stay
+    linked as the frozen reference. The expected version is derived
+    from the runtime model (``ReadinessReport.report_schema_version``),
+    so a schema bump that forgets to update docs/INDEX.md will fail
+    this test in the same PR — preventing the doc-drift trap from
+    PR #57 review P2."""
     index_text = INDEX_MD.read_text(encoding="utf-8")
-    assert "report-schema.v0.11.json" in index_text, (
-        "docs/INDEX.md must list report-schema.v0.11.json as the current schema "
-        "since emitted reports carry report_schema_version: \"0.11\"."
+    current = _current_report_schema_version()
+    previous = _previous_report_schema_version()
+
+    assert f"report-schema.v{current}.json" in index_text, (
+        f"docs/INDEX.md must list report-schema.v{current}.json as the "
+        f"current schema (the runtime model's default is {current!r}). "
+        "Update the docs in the same PR as the schema bump."
     )
-    assert "report-schema.v0.10.json" in index_text, (
-        "docs/INDEX.md must keep report-schema.v0.10.json linked as the "
-        "frozen reference for pre-v0.11 reports."
+    assert f"report-schema.v{previous}.json" in index_text, (
+        f"docs/INDEX.md must keep report-schema.v{previous}.json linked "
+        f"as the frozen reference for pre-v{current} reports."
+    )
+
+
+def test_no_doc_falsely_advertises_an_older_schema_as_current():
+    """No file under ``docs/`` may advertise an older report schema as
+    "current". The contract-test pattern at
+    tests/test_public_surface_contract.py covers PUBLIC_SURFACES; this
+    test extends the guard to **every** Markdown file under ``docs/``.
+
+    Earlier hand-curated lists missed `docs/overview.md` and
+    `docs/ai-search-summary.md` (#57 review P3), forcing two more
+    drift fixes. Walking the full tree closes that loophole — adding
+    a new doc that mentions the schema cannot bypass the guard."""
+    current = _current_report_schema_version()
+    older_minor = re.compile(r"report-schema\.v0\.(?P<minor>\d+)\.json")
+    current_minor = int(current.split(".")[1])
+
+    # Schema files themselves (`docs/report-schema.v0.X.json`) and
+    # private adoption notes are excluded; everything else under
+    # ``docs/`` is scanned.
+    failures: list[str] = []
+    for path in DOCS_DIR.rglob("*.md"):
+        relpath = path.relative_to(DOCS_DIR).as_posix()
+        text = path.read_text(encoding="utf-8")
+        for match in older_minor.finditer(text):
+            mentioned = int(match.group("minor"))
+            if mentioned >= current_minor:
+                continue
+            # Find the surrounding context (~one paragraph) and confirm
+            # this older mention is labeled as a frozen/legacy/older
+            # reference, not as "current".
+            start = max(0, match.start() - 200)
+            end = min(len(text), match.end() + 200)
+            context = text[start:end].lower()
+            if "current" in context and not any(
+                marker in context
+                for marker in ("frozen", "legacy", "older", "pre-v")
+            ):
+                failures.append(
+                    f"docs/{relpath}: report-schema.v0.{mentioned}.json "
+                    "near the word 'current' without a "
+                    "frozen/legacy/older marker"
+                )
+
+    assert not failures, (
+        "Doc drift: the following docs mention an older report schema as "
+        f"'current' (runtime is v{current}). Bump them or add a "
+        "frozen/legacy marker:\n  - " + "\n  - ".join(failures)
     )
 
 
