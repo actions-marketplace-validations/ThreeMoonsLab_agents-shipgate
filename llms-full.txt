@@ -157,7 +157,7 @@ Config error: Config file not found: missing.yaml
 {"error": "config_error", "message": "...", "next_action": "agents-shipgate detect --workspace . --json", "next_actions": [{"kind": "command", "command": "agents-shipgate detect --workspace . --json", "why": "..."}, {"kind": "command", "command": "agents-shipgate init --workspace . --write", "why": "..."}]}
 ```
 
-The full set of error kinds emitted in agent mode: `config_error`, `config_already_exists`, `input_parse_error`, `unknown_check_id`, `other_error`, `internal_error`, `malformed_patch`.
+The full set of error kinds emitted in agent mode: `config_error`, `config_already_exists`, `input_parse_error`, `unknown_check_id`, `unknown_fingerprint`, `other_error`, `internal_error`, `malformed_patch`. `unknown_fingerprint` is emitted by `explain-finding` when the fingerprint doesn't match any entry in the supplied report; the payload includes `suggestion` (a close-match fingerprint, when one exists) and `source_report`.
 
 `detect --json` and each `doctor --json` payload also carry `diagnostics: [...]` and `next_actions: [...]` fields. `next_action` (single string) remains the rank-1 action projected to a string; `next_actions` is the ranked list with `kind`, `command|path`, `why`, and `expects` fields. See [docs/diagnostics.md](docs/diagnostics.md) for the full catalog and schema.
 
@@ -291,13 +291,24 @@ agents-shipgate scan -c shipgate.yaml \
 
 Strict mode fails CI only on **new** findings (those not in the baseline).
 
-### Task 5 · Explain a finding
+### Task 5 · Explain a check or a specific finding
+
+For static catalog metadata about a check ID (rationale, fires-when, recommendation):
 
 ```bash
 agents-shipgate explain SHIP-POLICY-APPROVAL-MISSING --json
 ```
 
 Returns the full `CheckMetadata` with `id`, `category`, `default_severity`, `description`, `rationale`, `fires_when`, `evidence_fields`, `recommendation`.
+
+For a contextual explanation tied to a specific finding from a real scan (catalog metadata + the finding's evidence + a 3–5 sentence templated prose summary):
+
+```bash
+agents-shipgate explain-finding fp_<fingerprint> \
+    --from agents-shipgate-reports/report.json --json
+```
+
+Returns the canonical Finding fields plus `metadata` (CheckMetadata for the check_id) and `explanation` — a deterministic prose summary suitable for direct quotation in a PR comment or chat reply. The companion prompt is [`prompts/explain-finding-to-user.md`](prompts/explain-finding-to-user.md).
 
 ---
 
@@ -381,6 +392,7 @@ Promised to not break in `0.x` minor versions. See [STABILITY.md](STABILITY.md) 
 | `agents-shipgate doctor` | `-c`, `--workspace`, `--json`, `--verbose` |
 | `agents-shipgate contract` | `--json` |
 | `agents-shipgate explain` | `<check_id>`, `--no-plugins`, `--json` |
+| `agents-shipgate explain-finding` | `<fingerprint>`, `--from`, `--no-plugins`, `--json` |
 | `agents-shipgate list-checks` | `--json`, `--no-plugins` |
 | `agents-shipgate baseline save` | `-c`, `--out` |
 | `agents-shipgate fixture` | `list`, `run`, `copy`, `verify` |
@@ -452,6 +464,7 @@ Prebuilt prompts for common workflows live in [`prompts/`](prompts/):
 - [`add-shipgate-to-repo.md`](prompts/add-shipgate-to-repo.md) — bootstrap a repo
 - [`fix-top-finding.md`](prompts/fix-top-finding.md) — iterate on a single finding
 - [`recommend-fixes.md`](prompts/recommend-fixes.md) — walk all active findings and surface targeted fix recommendations across the four autofix-policy classes
+- [`explain-finding-to-user.md`](prompts/explain-finding-to-user.md) — translate one finding into 3–5 sentences of user-facing prose; companion to `agents-shipgate explain-finding`
 - [`stabilize-strict-mode.md`](prompts/stabilize-strict-mode.md) — tune → baseline → promote
 - [`triage-false-positive.md`](prompts/triage-false-positive.md) — override vs suppress decision
 - [`upgrade-shipgate-version.md`](prompts/upgrade-shipgate-version.md) — bump agents-shipgate version safely (regenerate baseline if needed)
@@ -839,6 +852,25 @@ available.
 ## Don't use for new gating
 
 - `summary.status` — preserved for v0.7 callers, **baseline-blind**. A baseline-matched critical flips this to `release_blockers_detected` even though `release_decision.decision` correctly classifies it as `review_required`. New consumers should not gate on `summary.status`. See [STABILITY.md §`release_decision.decision` vs `summary.status`](../STABILITY.md#release_decisiondecision-vs-summarystatus).
+
+## Per-finding contextual explanation (v0.12+)
+
+For prose summaries of a single finding (PR comments, chat replies, commit messages), use:
+
+```bash
+agents-shipgate explain-finding <FINGERPRINT> \
+    --from agents-shipgate-reports/report.json --json
+```
+
+The payload is the full `Finding` shape (every field on `findings[]` in `report.json`, including `source`, `patches`, `confidence`, `agent_id`, etc.) overlaid with three derived fields:
+
+- `metadata` — full `CheckMetadata` for the check_id (rationale, fires_when, evidence_fields, docs_url) when the check is in the catalog; null for unknown ids (third-party plugins, future checks).
+- `explanation` — a deterministic 3–5 sentence prose summary suitable for direct quotation. Names the affected tool, the severity, the recommended fix, and an action-aware closing sentence keyed to `agent_action`. Same inputs always produce the same output.
+- `source_report` — **absolute** path (always; relative `--from` values are resolved before serialization) to the report file the explanation was sourced from; round-trippable for caching and audit.
+
+`explain-finding` requires `report_schema_version >= 0.12` because the action-aware explanation depends on per-finding `agent_action`. Pre-v0.12 reports are rejected with `input_parse_error` and a `next_action` pointing at the canonical scan command. The Pydantic `ReadinessReport` model is intentionally looser than this command's contract (so test fixtures can construct minimal findings); the version gate is what enforces v0.12 semantics on emitted reports.
+
+Companion prompt: [`prompts/explain-finding-to-user.md`](../prompts/explain-finding-to-user.md). Use it when you need to translate a finding for a human who has never read the Shipgate docs. Keep `agents-shipgate explain <CHECK_ID>` for static catalog metadata (no specific finding); use `explain-finding` whenever you have a fingerprint and want the evidence-tied prose.
 
 ## Authoritative references
 
