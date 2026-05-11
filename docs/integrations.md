@@ -163,3 +163,45 @@ stage('Agents Shipgate') {
   }
 }
 ```
+
+## Pre-commit hook (local)
+
+Run Agents Shipgate locally on every commit that touches a tool-surface artifact. Two equivalent setups:
+
+**Canonical** (let `pre-commit` manage the install):
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/ThreeMoonsLab/agents-shipgate
+    rev: v0.10.0
+    hooks:
+      - id: agents-shipgate
+```
+
+**Local** (agents-shipgate already on PATH):
+
+```yaml
+repos:
+  - repo: local
+    hooks:
+      - id: agents-shipgate
+        name: Agents Shipgate release-readiness gate
+        entry: agents-shipgate scan -c shipgate.yaml --ci-mode advisory
+        language: system
+        pass_filenames: false
+        files: |
+          (?x)^(
+            shipgate\.yaml|
+            .*tools.*\.json|
+            .*mcp.*\.json|
+            .*openapi.*\.(yaml|yml|json)|
+            .*swagger.*\.(yaml|yml|json)|
+            \.agents-shipgate/.*\.json|
+            prompts/.*|
+            policies/.*|
+            \.github/workflows/agents-shipgate\.(yaml|yml)
+          )$
+```
+
+The hook fires when a staged change touches a **path-based** trigger from [`docs/triggers.json`](triggers.json): `shipgate.yaml`, MCP/OpenAPI/Swagger exports, `**/*tools*.json` inventories, `prompts/**`, `policies/**`, and `.github/workflows/agents-shipgate.{yml,yaml}`. Diff-only triggers (`TRIGGER-FUNCTION-TOOL-DECORATOR`, `TRIGGER-FRAMEWORK-VERSION-BUMP`, and the diff-leg of `TRIGGER-SHIPGATE-CI-WORKFLOW`) are not covered — pre-commit's `files:` regex is purely path-based. Use the GitHub Action for full trigger coverage on PRs, or `python -m agents_shipgate.triggers --git-diff HEAD` for diff-aware local checks. The canonical hook manifest pre-commit reads from the repo root is [`/.pre-commit-hooks.yaml`](../.pre-commit-hooks.yaml) — it exposes `agents-shipgate`, `agents-shipgate-strict`, and `agents-shipgate-validate`. See [`examples/pre-commit/`](../examples/pre-commit/) for the longer write-up on advisory vs. strict modes and which hook ID to pick.
