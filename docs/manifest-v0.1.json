@@ -251,6 +251,49 @@
       "title": "CiConfig",
       "type": "object"
     },
+    "CodexPluginMcpInventoryConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "optional": {
+          "default": false,
+          "title": "Optional",
+          "type": "boolean"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "plugin": {
+          "title": "Plugin",
+          "type": "string"
+        },
+        "server": {
+          "title": "Server",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "plugin",
+        "server"
+      ],
+      "title": "CodexPluginMcpInventoryConfig",
+      "type": "object"
+    },
+    "CodexPluginsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "mcp_tool_inventories": {
+          "items": {
+            "$ref": "#/$defs/CodexPluginMcpInventoryConfig"
+          },
+          "title": "Mcp Tool Inventories",
+          "type": "array"
+        }
+      },
+      "title": "CodexPluginsConfig",
+      "type": "object"
+    },
     "CrewAiConfig": {
       "additionalProperties": false,
       "properties": {
@@ -899,7 +942,8 @@
             "openai_agents_sdk",
             "google_adk",
             "langchain",
-            "crewai"
+            "crewai",
+            "codex_plugin"
           ],
           "title": "Type",
           "type": "string"
@@ -1024,6 +1068,17 @@
     },
     "ci": {
       "$ref": "#/$defs/CiConfig"
+    },
+    "codex_plugins": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CodexPluginsConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     },
     "crewai": {
       "anyOf": [
