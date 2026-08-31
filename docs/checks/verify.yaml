@@ -1,0 +1,238 @@
+# Check catalog · category: verify
+#
+# This file is the source of truth for the 'verify' category of
+# Agents Shipgate built-in checks (trust-root protection — the
+# reward-hacking guard for AI coding workflows). Loaded at import time
+# by agents_shipgate.checks._metadata_loader.load_check_metadata().
+#
+# Field reference: agents_shipgate.schemas.checks.CheckMetadata.
+# Field order in this file follows the loader's canonical layout
+# (identity → severity → narrative → evidence → remediation).
+# Fields equal to the model default may be omitted.
+#
+# After editing this file, regenerate docs/checks.json with:
+#   python scripts/generate_schemas.py
+# docs/checks.md is human-maintained — update it by hand when the
+# user-facing prose (description/rationale/recommendation) changes.
+checks:
+- id: SHIP-VERIFY-TRUST-ROOT-TOUCHED
+  default_severity: medium
+  floor_severity: medium
+  mvp_tier: lifecycle
+  description: A PR changed a release trust-root file (manifest, shipgate state,
+    policy, prompts, the Shipgate CI gate, agent instructions, or a tool-surface
+    declaration).
+  rationale: Trust-root files define the release gate. A coding agent told to make
+    CI pass can weaken the gate instead of fixing the underlying readiness issue
+    (reward hacking); touching a trust root must therefore require human review.
+  fires_when: A changed file from the verification context matches a trust-root
+    surface glob. Emits nothing on a plain scan (no verification context).
+  evidence_fields:
+  - changed_file
+  - trust_root_class
+  - matched_glob
+  recommendation: Have a human review the trust-root change before merge; do not
+    weaken the gate to pass CI.
+- id: SHIP-VERIFY-POLICY-WEAKENED
+  default_severity: high
+  floor_severity: high
+  mvp_tier: lifecycle
+  requires_human_review: true
+  description: The PR's effective release policy is weaker than the base report's
+    (CI mode downgraded, fail-on severity set loosened, or a check's severity
+    override lowered across a tier).
+  rationale: Comparing the normalized base-vs-head policy snapshot catches a coding
+    agent that makes CI pass by weakening the gate rather than fixing the finding.
+    The claim is base-relative, so it fires only when a base snapshot exists to
+    compare against; the no-base fail-safe is SHIP-VERIFY-POLICY-BASE-ABSENT.
+  fires_when: A VerificationContext and a base effective-policy snapshot are both
+    present and the head manifest's effective policy is weaker than the base
+    report's.
+  evidence_fields:
+  - kind
+  - base_ci_mode
+  - head_ci_mode
+  - removed_severities
+  - target_check_id
+  - base_severity
+  - head_severity
+  recommendation: A human must review and approve the policy change; do not weaken
+    the release gate to make CI pass.
+- id: SHIP-VERIFY-POLICY-BASE-ABSENT
+  default_severity: medium
+  floor_severity: medium
+  mvp_tier: lifecycle
+  requires_human_review: true
+  description: A policy or manifest trust root changed but there is no base policy
+    snapshot to compare it against — the base carries no Shipgate manifest (first
+    adoption), or no base report was obtainable.
+  rationale: A missing base is not a weakening, and reporting it as one made every
+    first adoption read as if the adopter had loosened a gate that never existed.
+    It is also not a pass — a reward-hacker must not be able to dodge review by
+    breaking the base scan — so the direction stays ambiguous and the change is
+    routed to a human under its own reason code.
+  fires_when: A VerificationContext is present, no base effective-policy snapshot
+    is available, and a policy/manifest trust root is in the changed files.
+  evidence_fields:
+  - kind
+  - changed_policy_files
+  recommendation: A human must review the policy surface this PR establishes or
+    changes; a coding agent cannot adopt or self-approve a release gate.
+- id: SHIP-VERIFY-BASELINE-OR-WAIVER-EXPANDED
+  default_severity: high
+  floor_severity: high
+  mvp_tier: lifecycle
+  requires_human_review: true
+  description: The PR broadens what the gate forgives — a new suppression in
+    checks.ignore, a widened waiver scope, or a larger accepted-debt baseline —
+    versus the base report.
+  rationale: Expanding suppressions, waivers, or the baseline is a reward-hacking
+    move that hides findings instead of fixing them. A base-vs-head superset
+    comparison of the effective-policy snapshot makes the expansion release-visible.
+  fires_when: A VerificationContext and a base effective-policy snapshot are both
+    present and the head suppression set, waiver scopes, or baseline fingerprints
+    are a proper superset of the base.
+  evidence_fields:
+  - kind
+  - added_check_ids
+  - added_scopes
+  - added_fingerprints
+  recommendation: A human must confirm each new suppression, waiver, or baseline
+    entry is justified; do not suppress findings to make CI pass.
+- id: SHIP-VERIFY-CI-GATE-REMOVED
+  default_severity: critical
+  floor_severity: high
+  mvp_tier: lifecycle
+  requires_human_review: true
+  description: The PR deletes the Shipgate CI workflow from an opted-in repo, which
+    would stop the release gate from running.
+  rationale: Removing CI enforcement is the bluntest gate-bypass. Detecting a
+    changed-and-now-absent workflow file makes the removal a release signal even
+    without a base scan.
+  fires_when: A VerificationContext is present, a Shipgate CI workflow path is in
+    the changed files, and that file no longer exists on disk.
+  evidence_fields:
+  - kind
+  - removed_workflow_files
+  recommendation: A human must approve removing Shipgate CI enforcement; do not
+    delete the gate to make CI pass.
+- id: SHIP-VERIFY-AGENT-INSTRUCTIONS-WEAKENED
+  default_severity: medium
+  floor_severity: medium
+  mvp_tier: lifecycle
+  requires_human_review: true
+  description: The PR edits agent-instruction trust roots (AGENTS.md, CLAUDE.md,
+    .cursor/rules, skills, etc.) and Shipgate cannot statically prove the
+    instructions were not weakened.
+  rationale: Prompts are not controls (Principle 3); a static tool cannot judge
+    whether instruction text was weakened, so any change is routed to human review
+    rather than silently trusted.
+  fires_when: A VerificationContext is present and a changed file matches an
+    agent-instruction trust-root glob.
+  evidence_fields:
+  - kind
+  - changed_instruction_files
+  recommendation: A human must review the agent-instruction change and confirm no
+    gate-protecting instruction was removed or softened.
+- id: SHIP-VERIFY-TRIGGER-CATALOG-DRIFT
+  default_severity: medium
+  floor_severity: medium
+  mvp_tier: lifecycle
+  requires_human_review: true
+  description: The PR changes the trigger catalog (docs/triggers.json or an
+    .agents-shipgate trigger config) that decides when Shipgate runs.
+  rationale: Editing the trigger catalog can carve out paths so the gate stops
+    firing on the very changes that matter — a gate-evasion one level up from
+    suppressing findings.
+  fires_when: A VerificationContext is present and a changed file matches a
+    trigger-catalog path.
+  evidence_fields:
+  - kind
+  - changed_trigger_files
+  recommendation: A human must confirm the trigger change does not create a path
+    that evades the release gate.
+- id: SHIP-VERIFY-CAPABILITY-SCOPE-BROADENED
+  default_severity: critical
+  floor_severity: critical
+  mvp_tier: lifecycle
+  requires_human_review: true
+  description: The PR removes or broadens a dynamically-loaded agent toolkit's
+    explicit least-privilege configuration bound (e.g. a stripe_agent_toolkit
+    constructor allowlist) versus the base report, silently expanding the
+    toolkit surface.
+  rationale: Toolkits that load tools through a runtime factory
+    (*toolkit.get_tools()) hide the individual tools from static enumeration,
+    so the only statically-provable signal is the constructor's permission
+    allowlist. Removing it mounts the full toolkit (refund / cancel / dispute
+    on a customer-support agent); a coding agent must not self-approve that
+    capability broadening. Without this check the opaque factory degrades the
+    verdict to insufficient_evidence instead of blocked.
+  fires_when: A VerificationContext and a base report are both present, the base
+    declared a bounded toolkit allowlist for a provider, and the head removed
+    the bound (unbounded) or added permissions the base allowlist did not.
+  evidence_fields:
+  - kind
+  - provider
+  - base_scopes
+  - head_scopes
+  - added_scopes
+  - constructor
+  - binding
+  - source_ref
+  - source_line
+  recommendation: A human must review and re-apply a least-privilege toolkit
+    configuration or explicitly approve the broadened scope; do not remove the
+    allowlist to expand agent capability without review.
+- id: SHIP-CAP-CONFIG-BINDING-CHANGED
+  default_severity: medium
+  mvp_tier: lifecycle
+  requires_human_review: true
+  description: The PR changes the config file that binds a dynamic toolkit's
+    authority; static analysis cannot diff the effective tool list.
+  rationale: A factory whose authority-bearing argument is bound from a config
+    read hides its effective tool surface from static enumeration on both sides
+    of the diff, so a config edit (e.g. adding "refund" to an actions list)
+    produces no capability change in the generic diff. The config delta must be
+    reviewed instead of passing invisibly.
+  fires_when: A VerificationContext and a base report are both present, the same
+    factory site is config-bound on both sides, and the bound config file is in
+    the PR's changed files.
+  evidence_fields:
+  - kind
+  - provider
+  - constructor
+  - binding
+  - config_path
+  - changed_file
+  - source_ref
+  recommendation: Review the config delta for added capabilities, or declare an
+    explicit local tool inventory for the toolkit so future changes are
+    statically comparable.
+- id: SHIP-CAP-CONFIG-BINDING-REMOVED
+  default_severity: high
+  floor_severity: high
+  mvp_tier: lifecycle
+  requires_human_review: true
+  description: The PR removes the config binding from a dynamic toolkit factory
+    present on both sides of the diff, so the toolkit may fall back to its
+    everything-enabled defaults.
+  rationale: A restriction-bearing config binding is the only statically-provable
+    restraint on a toolkit whose tools load through a runtime factory. Removing
+    the binding expands authority while looking like cleanup, and neither side's
+    tools are statically enumerable, so the generic capability diff sees nothing.
+    A coding agent must not self-approve that expansion; without this check the
+    diff degrades to silent insufficient_evidence parity between base and head.
+  fires_when: A VerificationContext and a base report are both present, the base
+    bound the factory's authority-bearing argument to a config read, and the head
+    constructs the same factory site with no binding at all. An unreadable
+    (unknown) head binding never fires this check.
+  evidence_fields:
+  - kind
+  - provider
+  - constructor
+  - binding
+  - base_config_path
+  - source_ref
+  recommendation: A human must review the removal; restore the config binding or
+    an explicit literal allowlist, or declare an explicit local tool inventory
+    for the toolkit so the mounted surface is statically enumerable.

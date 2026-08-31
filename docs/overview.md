@@ -1,8 +1,9 @@
 # Agents Shipgate Overview
 
-Agents Shipgate is a static release-readiness gate for AI agent tool surfaces.
-It reads `shipgate.yaml` plus declared local tool sources and writes a
-Tool-Use Readiness Report as Markdown, JSON, and SARIF.
+Agents Shipgate is the deterministic merge gate for AI-generated agent
+capability changes — a local-first, static Tool-Use Readiness review. It reads
+`shipgate.yaml` plus declared local tool sources and writes a Tool-Use
+Readiness Report as Markdown, JSON, and SARIF.
 
 Use it when an agent can call tools that refund, email, cancel, deploy, modify
 records, read sensitive data, or change infrastructure. The scanner runs before
@@ -13,7 +14,7 @@ surface before production-like permissions are granted.
 
 - Before promoting a tool-using AI agent to staging, production-like, or production environments.
 - When adding or changing MCP tools, OpenAPI operations, SDK tool functions, scopes, policies, or prompts.
-- When platform, security, or governance reviewers need deterministic release evidence.
+- When platform, security, or release reviewers need deterministic tool-use evidence.
 - When a coding agent is adding a release gate to an existing repository.
 
 ## When not to use it
@@ -32,7 +33,11 @@ surface before production-like permissions are granted.
 - Google ADK Python and YAML config
 - LangChain/LangGraph Python entrypoints
 - CrewAI Python entrypoints
+- n8n workflow JSON and source-control stubs
+- Conductor OSS workflow JSON
 - OpenAI API artifacts
+- Codex repo config
+- Codex plugin packages and marketplaces
 
 ## Core references
 
@@ -40,6 +45,7 @@ surface before production-like permissions are granted.
 - [Concepts](concepts.md)
 - [Manifest v0.1](manifest-v0.1.md)
 - [Check catalog](checks.md)
-- [Report schema v0.13](report-schema.v0.13.json) (current; v0.12 frozen at [report-schema.v0.12.json](report-schema.v0.12.json))
+- [Report schema v0.42](report-schema.v0.42.json) (current; v0.41 frozen at [report-schema.v0.41.json](report-schema.v0.41.json), with older references in the [index](INDEX.md#reference))
+- [Evidence-backed `passed` contract](passed-verdict-contract.md)
 - [Trust model](trust-model.md)
 - [Agent instructions](../AGENTS.md)

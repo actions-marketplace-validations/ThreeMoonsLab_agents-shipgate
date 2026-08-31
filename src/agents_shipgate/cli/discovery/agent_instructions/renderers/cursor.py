@@ -11,13 +11,18 @@ A user-edited file the CLI has never produced is left alone with status
 
 from __future__ import annotations
 
+from agents_shipgate.cli.discovery.agent_instructions.renderers._shared import (
+    CURRENT_CONTROL_PARAGRAPH,
+)
+
 
 def render_file() -> str:
     """Return the full file body for ``.cursor/rules/agents-shipgate.mdc``."""
-    return """---
-description: Run Agents Shipgate for AI agent tool-surface release readiness.
+    return f"""---
+description: Run Agents Shipgate as the deterministic merge gate for AI-generated agent capability changes.
 globs:
   - "shipgate.yaml"
+  - "**/shipgate.yaml"
   - "**/*openapi*.yaml"
   - "**/*openapi*.yml"
   - "**/*openapi*.json"
@@ -38,21 +43,75 @@ globs:
   - "**/*workflow*.json"
   - ".agents-shipgate/*.json"
   - "prompts/**"
+  - "**/prompts/**"
   - "policies/**"
+  - "**/policies/**"
   - ".github/workflows/agents-shipgate.yml"
   - ".github/workflows/agents-shipgate.yaml"
 alwaysApply: false
 ---
 
+Agents Shipgate is the deterministic merge gate for AI-generated agent
+capability changes — a local-first, static Tool-Use Readiness review.
+
 When a change affects agent tools, MCP exports, OpenAPI specs, prompts,
 permissions, approval policies, or release gates, run Agents Shipgate.
-Default to advisory scans while adopting the gate.
+Default to advisory verification while adopting the gate.
 
-Use `agents-shipgate-reports/report.json` as the source of truth. Prefer
-`release_decision.decision` over legacy severity/status summaries.
+For local agent control, run:
 
-Apply only high-confidence safe patches. Do not invent approval, confirmation,
-or idempotency evidence.
+  shipgate check --agent cursor --workspace . --format agent-boundary-json
+
+Read the check stdout JSON only. It is
+`shipgate.agent_boundary_result/v2`; switch on `control.state`, then follow
+`control.next_action`, `control.allowed_next_commands`, and
+`control.human_review`. Treat `decision` as diagnostic context, not as the
+operational control signal. Do not infer control from prose.
+
+If `control.state=complete`, summarize the result and finish. If
+`control.state=agent_action_required`, perform only the exact coding-agent
+action and command authorized by `control.next_action`, then rerun the command.
+If `control.state=review_publishable`, a human must approve the merge — surface
+the JSON result and note that you may still commit, push, and update the pull
+request so that review can happen. If `control.state=human_review_required`,
+stop and surface the JSON result to a human. `control.permissions` states the
+authority exactly: updating a pull request is not merging it, and
+`permissions.merge` / `permissions.report_complete` are false on every state
+except `complete`. Conversation-level acknowledgement never clears these
+states; only a new verifier artifact can do so.
+
+For local verification, run:
+
+  agents-shipgate verify --workspace . --config shipgate.yaml --ci-mode advisory --format json
+
+For committed PR/CI verification, run `agents-shipgate verify --base
+origin/main --head HEAD --json` after making the base ref available; it never
+fetches. Validate `agents-shipgate-reports/verification-receipt.json` first,
+then read `agents-shipgate-reports/agent-handoff.json` for
+`gate.merge_verdict`, `gate.can_merge_without_human`, and `control`; then read
+`agents-shipgate-reports/verifier.json` for detailed control context,
+`agents-shipgate-reports/verify-run.json` for reproducibility metadata, and
+`agents-shipgate-reports/report.json.release_decision.decision` for the
+release gate.
+Legacy `agent-result.json` surfaces, where present, are supporting/provisional
+projections and not the CI gate.
+
+{CURRENT_CONTROL_PARAGRAPH}
+
+For coding-agent host grants, run:
+
+  shipgate audit --host --json --out agents-shipgate-reports/host-grants.json
+
+Read the host-grants inventory before changing MCP servers, permission rules,
+hooks, or workflow scopes.
+
+Apply only high-confidence safe patches. Do not invent action effect, action
+authority, approval, confirmation, or idempotency evidence.
+
+Do not bypass the verifier by suppressing findings, lowering severity,
+expanding baselines or waivers, removing Shipgate CI, or weakening agent
+instructions. Verify-mode `SHIP-VERIFY-*` checks make those trust-root edits
+release-visible.
 
 For one-fetch counts and a deterministic next step, read
 `report.json.agent_summary` (v0.12+): verdict, blocker_count,
@@ -63,6 +122,12 @@ For per-finding routing read `findings[].agent_action` (v0.12+):
 auto_apply, propose_patch_for_review, escalate_to_human,
 suppress_with_reason, informational. Do not synthesize an action from
 the underlying flags when the enum is present.
+
+For reviewer triage by source reliability, run
+`agents-shipgate findings --from agents-shipgate-reports/report.json
+--provenance-kind keyword_heuristic,regex_heuristic --json`. The
+underlying `findings[].provenance_kind` field is a filter signal only,
+not a gate input.
 
 To translate a single finding into user-facing prose, run:
 
@@ -88,4 +153,15 @@ References:
 # and the rendered content changes, the previous current-render hash moves into
 # this tuple so the next CLI run can safely overwrite v(N-1) files. Leave the
 # tuple empty when there is no prior shipped version (v=1 is the initial).
-PRIOR_RENDER_SHA256: tuple[str, ...] = ()
+PRIOR_RENDER_SHA256: tuple[str, ...] = (
+    # Before contract v20 added the current-control refresh rule. Without the
+    # outgoing hash here, a repo that already ran `init --write` would be read
+    # as user-modified and would never receive the new rule.
+    "b0c14c1d9eecebf177a8231eb017593ad09984592cd0aa717d87ef216aa8ca18",
+    # Before `**/prompts/**` and `**/policies/**` joined the activation
+    # globs. The rule is `alwaysApply: false`, so until a glob matches, a
+    # lone governance edit under a nested workspace activated no Shipgate
+    # instructions at all — the trigger catalog routed it while the host
+    # surface stayed silent.
+    "2a204e69629bc3c7ce2c4b4609079bb1049aa414ac5507a4d96b4f90c33bb423",
+)

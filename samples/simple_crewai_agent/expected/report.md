@@ -7,13 +7,14 @@ Target: local
 ## Release Decision
 
 Decision: review_required
-Reason: Static-only scan with low-confidence evidence; human review recommended.
+Reason: 1 finding needs review and evidence coverage is incomplete.
 
 Blockers (0): none
 
-Review items (0): none
+Review items (1):
+- HIGH SHIP-AUTH-MISSING-SCOPE — FileReadTool lacks declared auth scopes
 
-Evidence coverage: mixed (3 low-confidence tool(s); 1 source warning(s); human review recommended)
+Evidence coverage: static (1 source warning(s); 3/3 catalog tools reachable; 1 semantic review concern(s); 2/3 actions pass-eligible; human review recommended)
 
 Baseline delta: not enabled
 
@@ -22,23 +23,63 @@ Fail policy: ci_mode=advisory, fail_on=[none], new_findings_only=false, would_fa
 ## Summary
 
 - Critical: 0
-- High: 0
+- High: 1
 - Medium: 0
 - Low: 0
 - Suppressed: 0
-- Status: Human review recommended (legacy; see Release Decision above)
+- Status: Warnings detected (legacy; see Release Decision above)
 
 ## Top Findings
 
-No critical or high findings.
+1 finding across 1 subject, most urgent first.
+
+- FileReadTool \[crewai\_agent\] \(at inventories/tools.json\#/tools/2\) — review \(1 high\)
+  - high SHIP-AUTH-MISSING-SCOPE — FileReadTool lacks declared auth scopes
+    - Declare operation-specific auth scopes for FileReadTool, or explicitly declare anonymous authority when the operation requires no credentials.
+
+## Finding Provenance
+
+Reviewer triage signal only. Provenance kind does not change severity, release decision, fingerprints, baselines, or CI exit codes.
+
+| Provenance kind | Active findings |
+| --- | ---: |
+| `static_declaration` | 1 |
+| `ast_extraction` | 0 |
+| `keyword_heuristic` | 0 |
+| `regex_heuristic` | 0 |
+| `policy_pack` | 0 |
+| `runtime_trace` | 0 |
+
+Suppressed findings excluded: 0
 
 ## Capability <-> Intent Diff
 
-No capability/intent misalignments detected from static evidence.
+Agent intent:
+
+- declared\_purpose: look up and summarize read-only support case metadata (tags: none)
+
+Actual capabilities:
+
+- FileReadTool: capability=read\_only, risk=read\_only, control=partial
+
+Policy/control gaps:
+
+- HIGH scope\_drift \[FileReadTool\]: FileReadTool lacks declared auth scopes. (at inventories/tools.json)
+  Requires: Scope-requiring tools must declare operation-specific auth scopes.
+  Release implication: Release reviewers cannot assess least privilege.
+
+Release implication:
+
+- Decision: review\_required
+- 1 release-relevant finding\(s\) require release review before shipping.
+
+Next validation:
+
+- Least-privilege scope review: Manifest and tool scopes match the narrow permissions needed for the release.
 
 ## Recommended Next Actions
 
-No action required from static findings.
+- Declare operation-specific auth scopes for FileReadTool, or explicitly declare anonymous authority when the operation requires no credentials.
 
 ## Source Warnings
 
@@ -50,7 +91,16 @@ No action required from static findings.
 - High-risk tools: 0
 - Wildcard tools: 0
 - Missing descriptions: 0
-- Sources: crewai_class_tool=1, crewai_function=1, crewai_prebuilt_tool=1
+- Sources: crewai_inventory=3
+
+## Action Surface Diff
+
+- Status: disabled - No action-surface comparison source was provided.
+- Base: none
+
+## Capability Runtime Evidence
+
+No local runtime trace artifacts were declared for capability evidence.
 
 ## Tool Surface Diff
 
@@ -66,7 +116,7 @@ No action required from static findings.
 - Class tools: 1
 - Prebuilt tools: 1
 - Dynamic or unresolved tool surfaces: 0
-- Tool inventory files: 0
+- Tool inventory files: 1
 
 CrewAI warnings:
 
@@ -74,17 +124,27 @@ CrewAI warnings:
 
 ## Findings By Category
 
-No findings.
+### Auth
 
-## Appendix: Normalized Tool Inventory
+- HIGH: SHIP-AUTH-MISSING-SCOPE [FileReadTool] - FileReadTool lacks declared auth scopes
+
+## Agent Binding Surface
+
+Status: structural
+Root agent: crew \[crewai\_agent\]
+Entry points: crew \[crewai\_agent\]
+Pass eligible: true
+Catalog partition: 3 reachable, 0 possible, 0 unbound
+
+## Appendix: Root-Reachable Tool Inventory
 
 | Tool | Source | Risk Tags | Risk Confidence | Auth Scopes | Owner |
 | --- | --- | --- | --- | --- | --- |
-| FileReadTool | crewai\_prebuilt\_tool | \- | \- | \- | \- |
-| lookup\_case | crewai\_class\_tool | read\_only | read\_only=medium | \- | \- |
-| summarize\_case | crewai\_function | \- | \- | \- | \- |
+| lookup\_case | crewai\_inventory | read\_only | read\_only=high | \- | \- |
+| FileReadTool | crewai\_inventory | read\_only | read\_only=high | \- | \- |
+| summarize\_case | crewai\_inventory | read\_only | read\_only=high | \- | \- |
 
 
 ## Disclaimer
 
-Agents Shipgate is an advisory release-readiness scanner. It does not certify agent safety or compliance. Findings are based on static configuration, declared policies, tool schemas, and optional SDK metadata. Runtime behavior, actual tool routing, and output interpretation are not verified.
+Agents Shipgate is an advisory tool: the deterministic merge gate for AI-generated agent capability changes, run as a local-first, static Tool-Use Readiness review. It does not certify agent safety or compliance. Findings are based on static configuration, declared policies, tool schemas, and optional SDK metadata. Runtime behavior, actual tool routing, and output interpretation are not verified.

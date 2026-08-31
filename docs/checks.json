@@ -3,19 +3,733 @@
   "checks": [
     {
       "autofix_safe": false,
+      "category": "skill_lint",
+      "default_severity": "medium",
+      "description": "Skill body lacks a step-by-step procedure.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#lint-body-001",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "artifact_path",
+        "sections"
+      ],
+      "fires_when": "A SKILL.md body lacks a Procedure, Steps, or Workflow section and does not contain a numbered multi-step procedure.",
+      "floor_severity": null,
+      "id": "LINT-BODY-001",
+      "mvp_tier": "hygiene",
+      "rationale": "Agents need explicit operational steps to apply a skill consistently.",
+      "recommendation": "Add a Procedure, Steps, or Workflow section with ordered actions an agent can follow.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "skill_lint",
+      "default_severity": "medium",
+      "description": "Skill body lacks an output contract.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#lint-body-003",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "artifact_path",
+        "sections"
+      ],
+      "fires_when": "A SKILL.md body lacks an Output, Deliverable, Result, or Final Response section.",
+      "floor_severity": null,
+      "id": "LINT-BODY-003",
+      "mvp_tier": "hygiene",
+      "rationale": "Without an output contract, agents and reviewers cannot tell what artifact, response shape, or completion criteria the skill requires.",
+      "recommendation": "Add an Output section defining the expected artifact, response shape, or completion criteria.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "skill_lint",
+      "default_severity": "medium",
+      "description": "Skill body lacks verification criteria.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#lint-body-004",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "artifact_path",
+        "sections"
+      ],
+      "fires_when": "A SKILL.md body lacks Verification, Quality, Tests, or Acceptance Criteria guidance.",
+      "floor_severity": null,
+      "id": "LINT-BODY-004",
+      "mvp_tier": "hygiene",
+      "rationale": "Verification guidance lets an agent check whether the workflow was applied correctly before reporting completion.",
+      "recommendation": "Add verification or acceptance criteria for successful skill execution.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "skill_lint",
+      "default_severity": "high",
+      "description": "Skill description is too vague to route reliably.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#lint-desc-001",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "artifact_path",
+        "description_length",
+        "generic_phrase"
+      ],
+      "fires_when": "A skill description is very short or contains generic assistant language instead of concrete trigger conditions.",
+      "floor_severity": null,
+      "id": "LINT-DESC-001",
+      "mvp_tier": "hygiene",
+      "rationale": "The skill description is the primary routing surface agents inspect before loading the full skill body.",
+      "recommendation": "Rewrite the description with concrete trigger conditions, domain nouns, and when-to-use guidance.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "skill_lint",
+      "default_severity": "medium",
+      "description": "Skill description is overbroad and may false-trigger.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#lint-desc-003",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "artifact_path",
+        "description_length",
+        "overbroad_phrase"
+      ],
+      "fires_when": "A skill description uses broad trigger terms or exceeds the configured description length.",
+      "floor_severity": null,
+      "id": "LINT-DESC-003",
+      "mvp_tier": "hygiene",
+      "rationale": "Broad skill descriptions can cause agents to load a skill for tasks outside its intended behavior boundary.",
+      "recommendation": "Narrow the description to the specific workflow, files, or domain where this skill should activate.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "skill_lint",
+      "default_severity": "medium",
+      "description": "Skill script lacks documented --help usage.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#lint-script-001",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "artifact_path",
+        "script_path"
+      ],
+      "fires_when": "A script is bundled with a skill but neither the script nor SKILL.md documents a `--help` usage path.",
+      "floor_severity": null,
+      "id": "LINT-SCRIPT-001",
+      "mvp_tier": "hygiene",
+      "rationale": "Agent-invoked scripts need discoverable usage text so agents can run them non-interactively and safely.",
+      "recommendation": "Document safe script invocation in SKILL.md and provide a `--help` mode for agent users.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "skill_lint",
+      "default_severity": "medium",
+      "description": "Stateful skill script lacks dry-run support.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#lint-script-004",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "artifact_path",
+        "script_path"
+      ],
+      "fires_when": "A bundled script appears stateful or destructive and does not expose dry-run support.",
+      "floor_severity": null,
+      "id": "LINT-SCRIPT-004",
+      "mvp_tier": "hygiene",
+      "rationale": "Scripts that mutate files or external state should expose a preview path before agents perform the stateful action.",
+      "recommendation": "Add `--dry-run` support or document a non-mutating preview path before stateful script execution.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "skill_lint",
+      "default_severity": "high",
+      "description": "Skill has invalid YAML frontmatter.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#lint-spec-002",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "artifact_path",
+        "error"
+      ],
+      "fires_when": "A SKILL.md frontmatter block cannot be parsed as a YAML mapping.",
+      "floor_severity": null,
+      "id": "LINT-SPEC-002",
+      "mvp_tier": "hygiene",
+      "rationale": "Agents use SKILL.md frontmatter for discovery; malformed frontmatter makes the routing surface ambiguous or unreadable.",
+      "recommendation": "Fix SKILL.md YAML frontmatter so it is a valid mapping.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "skill_lint",
+      "default_severity": "high",
+      "description": "Skill is missing required name frontmatter.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#lint-spec-003",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "artifact_path",
+        "missing_field"
+      ],
+      "fires_when": "A SKILL.md frontmatter block lacks a non-empty `name` field.",
+      "floor_severity": null,
+      "id": "LINT-SPEC-003",
+      "mvp_tier": "hygiene",
+      "rationale": "A stable skill name is required for discovery and unambiguous review.",
+      "recommendation": "Add a non-empty `name` field to SKILL.md frontmatter.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "skill_lint",
+      "default_severity": "high",
+      "description": "Skill is missing required description frontmatter.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#lint-spec-004",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "artifact_path",
+        "missing_field"
+      ],
+      "fires_when": "A SKILL.md frontmatter block lacks a non-empty `description` field.",
+      "floor_severity": null,
+      "id": "LINT-SPEC-004",
+      "mvp_tier": "hygiene",
+      "rationale": "A clear description tells agents when to select the skill before loading the full body.",
+      "recommendation": "Add a clear `description` explaining exactly when agents should use the skill.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "skill_security",
+      "default_severity": "medium",
+      "description": "Skill lacks data and instruction separation guidance.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#sec-flow-004",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "artifact_path",
+        "untrusted_content",
+        "outbound_or_secret_access"
+      ],
+      "fires_when": "A skill references untrusted content plus outbound or secret-access behavior without data/instruction separation guidance.",
+      "floor_severity": null,
+      "id": "SEC-FLOW-004",
+      "mvp_tier": "core",
+      "rationale": "Skills that combine untrusted content with outbound channels or secret access need explicit guidance that untrusted content is data, not agent instructions.",
+      "recommendation": "Add guidance that untrusted content is data only and must not supply agent instructions.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "skill_security",
+      "default_severity": "high",
+      "description": "Skill declares read-only behavior but bundled scripts mutate state.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#sec-mismatch-001",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "artifact_path",
+        "mutating_scripts"
+      ],
+      "fires_when": "A skill description says it is read-only, analytical, or review-only but a bundled script contains stateful or destructive behavior.",
+      "floor_severity": null,
+      "id": "SEC-MISMATCH-001",
+      "mvp_tier": "core",
+      "rationale": "Reviewers and agents rely on the skill description to understand the behavior boundary before loading scripts and references.",
+      "recommendation": "Update the declared purpose to include state changes or remove mutating script behavior.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "skill_security",
+      "default_severity": "critical",
+      "description": "Skill artifact contains instruction override language.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#sec-pi-001",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "artifact_path",
+        "source_path",
+        "line",
+        "matched"
+      ],
+      "fires_when": "Skill, instruction, reference, asset, or script text matches instruction-override language.",
+      "floor_severity": null,
+      "id": "SEC-PI-001",
+      "mvp_tier": "core",
+      "rationale": "Skill and instruction artifacts are loaded into agent context and must not tell agents to ignore higher-priority instructions.",
+      "recommendation": "Remove instructions that tell agents to ignore, override, or replace higher-priority instructions.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "skill_security",
+      "default_severity": "high",
+      "description": "Skill artifact tells the agent to hide behavior.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#sec-pi-003",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "artifact_path",
+        "source_path",
+        "line",
+        "matched"
+      ],
+      "fires_when": "Skill, instruction, reference, asset, or script text tells an agent not to disclose or log behavior.",
+      "floor_severity": null,
+      "id": "SEC-PI-003",
+      "mvp_tier": "core",
+      "rationale": "Instructions to conceal behavior from users, reviewers, or logs are unsafe in agent behavior surfaces.",
+      "recommendation": "Remove instructions to hide behavior from users, reviewers, or logs.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "skill_security",
+      "default_severity": "high",
+      "description": "Third-party skill lacks provenance metadata.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#sec-prov-001",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "artifact_path",
+        "third_party"
+      ],
+      "fires_when": "A skill declares itself third-party but lacks metadata.shipgate.source provenance.",
+      "floor_severity": null,
+      "id": "SEC-PROV-001",
+      "mvp_tier": "core",
+      "rationale": "Third-party skills are supply-chain artifacts and need source, owner, version, and review metadata.",
+      "recommendation": "Add metadata.shipgate.source, source_ref, owner, and review metadata for third-party skills.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "skill_security",
+      "default_severity": "medium",
+      "description": "Skill fetches remote instruction content.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#sec-remote-001",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "artifact_path",
+        "source_path",
+        "line"
+      ],
+      "fires_when": "A skill or bundled artifact fetches remote prompt, instruction, or skill content at runtime.",
+      "floor_severity": null,
+      "id": "SEC-REMOTE-001",
+      "mvp_tier": "core",
+      "rationale": "Mutable remote prompt or instruction content can change skill behavior after review.",
+      "recommendation": "Avoid fetching mutable remote instructions at runtime or document source trust and pinning.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "skill_security",
+      "default_severity": "critical",
+      "description": "Remote content is fetched and executed.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#sec-remote-002",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "artifact_path",
+        "source_path",
+        "line"
+      ],
+      "fires_when": "A skill artifact sources or executes content fetched from a remote URL.",
+      "floor_severity": null,
+      "id": "SEC-REMOTE-002",
+      "mvp_tier": "core",
+      "rationale": "Runtime remote-code execution lets mutable external content change the behavior of a skill after review.",
+      "recommendation": "Remove runtime remote-code execution or pin, verify, and sandbox the content explicitly.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "skill_security",
+      "default_severity": "critical",
+      "description": "Remote content is piped to a shell or interpreter.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#sec-script-001",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "artifact_path",
+        "source_path",
+        "line"
+      ],
+      "fires_when": "A script, instruction, or command block matches curl/wget piped to shell or interpreter execution.",
+      "floor_severity": null,
+      "id": "SEC-SCRIPT-001",
+      "mvp_tier": "core",
+      "rationale": "Piping remote content to an interpreter executes mutable external code in the agent environment.",
+      "recommendation": "Vendor the script or pin and verify remote content instead of piping it directly to an interpreter.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "skill_security",
+      "default_severity": "critical",
+      "description": "Destructive or stateful command lacks guardrails.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#sec-script-002",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "artifact_path",
+        "source_path",
+        "line"
+      ],
+      "fires_when": "A skill artifact contains destructive or stateful command patterns without nearby dry-run or confirmation guidance.",
+      "floor_severity": null,
+      "id": "SEC-SCRIPT-002",
+      "mvp_tier": "core",
+      "rationale": "Skills that drive destructive commands need dry-run, confirmation, or path validation before an agent can invoke them safely.",
+      "recommendation": "Add dry-run, confirmation, path validation, or remove destructive commands from the skill workflow.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "skill_security",
+      "default_severity": "critical",
+      "description": "Skill artifact contains a hardcoded secret-like value.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#sec-secret-001",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "artifact_path",
+        "source_path",
+        "line",
+        "secret_kind"
+      ],
+      "fires_when": "Skill, instruction, reference, asset, or script text matches known token patterns or labeled secret values.",
+      "floor_severity": null,
+      "id": "SEC-SECRET-001",
+      "mvp_tier": "core",
+      "rationale": "Secrets in skill artifacts can leak into prompts, reports, logs, or agent execution environments.",
+      "recommendation": "Remove the secret from the skill artifact and rotate the exposed credential.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "skill_security",
+      "default_severity": "high",
+      "description": "Skill artifact instructs credential or secret-file access.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#sec-secret-003",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "artifact_path",
+        "source_path",
+        "line",
+        "credential_reference"
+      ],
+      "fires_when": "Skill, instruction, reference, asset, or script text references credential files or secret-bearing environment variables.",
+      "floor_severity": null,
+      "id": "SEC-SECRET-003",
+      "mvp_tier": "core",
+      "rationale": "Skills should not direct agents to inspect broad credential files or environment secrets unless the workflow explicitly scopes and protects them.",
+      "recommendation": "Remove broad credential-file access or replace it with explicit placeholder-based credential guidance.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "skill_security",
+      "default_severity": "high",
+      "description": "Skill pre-approves shell or bash without justification.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#sec-tool-001",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "artifact_path",
+        "allowed_tools"
+      ],
+      "fires_when": "SKILL.md frontmatter allows shell/bash-like tools without reviewed script, sandbox, or justification language.",
+      "floor_severity": null,
+      "id": "SEC-TOOL-001",
+      "mvp_tier": "core",
+      "rationale": "Shell preapproval removes an important confirmation step before an agent runs commands from a skill.",
+      "recommendation": "Remove shell/bash preapproval or add reviewed-script and sandbox justification.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "action_surface",
+      "default_severity": "critical",
+      "description": "Action approval policy was removed.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-action-approval-removed",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "change"
+      ],
+      "fires_when": "Base action approval.required was true and head no longer requires approval.",
+      "floor_severity": "high",
+      "id": "SHIP-ACTION-APPROVAL-REMOVED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Removing approval weakens the release boundary for an existing action.",
+      "recommendation": "Restore action_surface.actions[].approval.required: true or document the reviewed exception under action_surface.actions[].evidence.approval_ticket.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "action_surface",
+      "default_severity": "high",
+      "description": "Action declaration weakens an inherited approval or safeguard control.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-action-control-downgrade",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "action_id",
+        "path",
+        "inherited",
+        "declared"
+      ],
+      "fires_when": "action_surface.actions.approval or safeguards sets an inherited true control to false.",
+      "floor_severity": null,
+      "id": "SHIP-ACTION-CONTROL-DOWNGRADE",
+      "mvp_tier": "lifecycle",
+      "rationale": "Manifest-wide approval and safeguard controls are governance requirements; per-action metadata should not silently weaken them.",
+      "recommendation": "Keep the inherited action_surface.actions[] approval/safeguard control enabled or remove the weakening declaration.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "action_surface",
+      "default_severity": "critical",
+      "description": "New destructive action lacks approval or rollback controls.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-action-destructive-rollback-missing",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "action_id",
+        "missing"
+      ],
+      "fires_when": "An added destructive action lacks approval.required or safeguards.rollback.",
+      "floor_severity": "high",
+      "id": "SHIP-ACTION-DESTRUCTIVE-ROLLBACK-MISSING",
+      "mvp_tier": "lifecycle",
+      "rationale": "Destructive actions need explicit approval and rollback evidence before release.",
+      "recommendation": "Declare approval.required and safeguards.rollback or remove the destructive action.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "action_surface",
+      "default_severity": "high",
+      "description": "Action declaration weakens the inferred effect.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-action-effect-downgrade-declared",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "action_id",
+        "inferred_effect",
+        "declared_effect"
+      ],
+      "fires_when": "action_surface.actions.effect is lower risk than the effect inferred from the loaded tool metadata.",
+      "floor_severity": null,
+      "id": "SHIP-ACTION-EFFECT-DOWNGRADE-DECLARED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Per-action metadata should not be able to declare away a higher-risk operation inferred from the tool surface.",
+      "recommendation": "Set action_surface.actions[].effect to the inferred operation effect or remove the weaker declaration.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "action_surface",
+      "default_severity": "critical",
+      "description": "Action effect escalated compared with the base surface.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-action-effect-escalated",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "change"
+      ],
+      "fires_when": "An action changes to a higher-risk effect such as read to write or write to destructive.",
+      "floor_severity": "high",
+      "id": "SHIP-ACTION-EFFECT-ESCALATED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Effect escalation changes what the agent can do in the real world and needs explicit review.",
+      "recommendation": "Review action_surface.actions[].effect; restore the prior effect or document approval/evidence for the escalation.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "action_surface",
+      "default_severity": "high",
+      "description": "New external communication action lacks audit evidence.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-action-external-communication-audit-missing",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "action_id",
+        "missing"
+      ],
+      "fires_when": "An added external_communication action lacks safeguards.audit_log.",
+      "floor_severity": null,
+      "id": "SHIP-ACTION-EXTERNAL-COMMUNICATION-AUDIT-MISSING",
+      "mvp_tier": "lifecycle",
+      "rationale": "External communication changes agent blast radius and should be auditable.",
+      "recommendation": "Declare safeguards.audit_log for the external communication action.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "action_surface",
+      "default_severity": "critical",
+      "description": "New financial write action lacks required controls.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-action-financial-write-control-missing",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "action_id",
+        "missing"
+      ],
+      "fires_when": "An added action is financial_write and lacks approval.required, safeguards.audit_log, or safeguards.idempotency.",
+      "floor_severity": "high",
+      "id": "SHIP-ACTION-FINANCIAL-WRITE-CONTROL-MISSING",
+      "mvp_tier": "lifecycle",
+      "rationale": "Financial write actions need approval, audit, and idempotency evidence before release.",
+      "recommendation": "Declare approval.required, safeguards.audit_log, and safeguards.idempotency.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "action_surface",
+      "default_severity": "high",
+      "description": "An action-surface policy requirement is not satisfied.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-action-policy-violation",
+      "dynamic_default": true,
+      "evidence_fields": [
+        "policy_id",
+        "action_id",
+        "missing"
+      ],
+      "fires_when": "A user-declared action_surface.policies rule matches an action and one or more required dot-path values are absent or different, or the selected control pack (policies.control_pack) obliges a control for an effect with no dedicated check of its own. The rule is named in evidence.policy_id.",
+      "floor_severity": "medium",
+      "id": "SHIP-ACTION-POLICY-VIOLATION",
+      "mvp_tier": "lifecycle",
+      "rationale": "Action Surface Diff policies are the reviewer-facing release boundary for external action capability.",
+      "recommendation": "Satisfy the action-surface policy requirements or remove/narrow the action.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "action_surface",
+      "default_severity": "high",
+      "description": "Action safeguard was removed.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-action-safeguard-removed",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "change"
+      ],
+      "fires_when": "A previously true action safeguard is false or absent in the head surface.",
+      "floor_severity": null,
+      "id": "SHIP-ACTION-SAFEGUARD-REMOVED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Removing audit, idempotency, rollback, or dry-run safeguards expands blast radius.",
+      "recommendation": "Restore the removed action_surface.actions[].safeguards field or document the reviewed exception under action_surface.actions[].evidence.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "action_surface",
+      "default_severity": "high",
+      "description": "A loaded tool lacks explicit action-surface metadata.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-action-undeclared",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "action_id",
+        "tool_name"
+      ],
+      "fires_when": "action_surface.require_explicit_actions is true and a loaded tool has no matching action_surface.actions entry.",
+      "floor_severity": null,
+      "id": "SHIP-ACTION-UNDECLARED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Action Surface Diff depends on reviewer-visible action metadata for release decisions.",
+      "recommendation": "Add action_surface.actions metadata for the tool or disable require_explicit_actions.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "action_surface",
+      "default_severity": "critical",
+      "description": "Action surface includes a wildcard or admin-like scope.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-action-wildcard-scope",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "action_id",
+        "scopes",
+        "change"
+      ],
+      "fires_when": "An added action declares a broad scope, or a modified action expands into a broad scope.",
+      "floor_severity": "high",
+      "id": "SHIP-ACTION-WILDCARD-SCOPE",
+      "mvp_tier": "lifecycle",
+      "rationale": "Wildcard scopes make action blast radius too broad for deterministic release review.",
+      "recommendation": "Replace action_surface.actions[].scopes with operation-specific scopes; remove wildcard/admin scopes.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
       "category": "adk",
       "default_severity": "high",
       "description": "Google ADK toolset cannot be statically enumerated.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-adk-dynamic-toolset-not-enumerable",
+      "dynamic_default": false,
       "evidence_fields": [
         "toolset",
         "explicit_inventory"
       ],
       "fires_when": "A Google ADK toolset is dynamic or unresolved and no explicit MCP/OpenAPI/tool inventory input is declared.",
+      "floor_severity": null,
       "id": "SHIP-ADK-DYNAMIC-TOOLSET-NOT-ENUMERABLE",
+      "mvp_tier": "adapter",
       "rationale": "Release review needs an explicit tool inventory; ADK MCP/OpenAPI toolsets may resolve tools dynamically at runtime.",
       "recommendation": "Provide explicit MCP/OpenAPI/tool inventory inputs for dynamic ADK toolsets.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -24,15 +738,19 @@
       "default_severity": "medium",
       "description": "Google ADK eval coverage is not declared.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-adk-eval-coverage-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "agent_count",
         "eval_file_count"
       ],
       "fires_when": "Google ADK inputs target production_like or production and no eval files are declared.",
+      "floor_severity": null,
       "id": "SHIP-ADK-EVAL-COVERAGE-MISSING",
+      "mvp_tier": "adapter",
       "rationale": "ADK releases should include response and tool-trajectory eval evidence before promotion.",
       "recommendation": "Declare ADK eval files for expected responses and tool-use trajectories.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -41,15 +759,19 @@
       "default_severity": "medium",
       "description": "Google ADK function tool lacks static metadata.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-adk-function-tool-metadata-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "missing",
         "source_type"
       ],
       "fires_when": "A Google ADK function/config tool lacks description or parameter metadata.",
+      "floor_severity": null,
       "id": "SHIP-ADK-FUNCTION-TOOL-METADATA-MISSING",
+      "mvp_tier": "adapter",
       "rationale": "Static review depends on descriptions and parameter schemas because user ADK code is not imported.",
       "recommendation": "Add docstrings, annotations, or explicit local inventory metadata.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -58,14 +780,18 @@
       "default_severity": "high",
       "description": "High-risk Google ADK tools lack static guardrail evidence.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-adk-guardrail-evidence-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "tools"
       ],
       "fires_when": "High-risk ADK tools are present without callbacks, plugins, or equivalent manifest policy evidence.",
+      "floor_severity": null,
       "id": "SHIP-ADK-GUARDRAIL-EVIDENCE-MISSING",
+      "mvp_tier": "adapter",
       "rationale": "Callbacks and plugins are the static ADK surface where release reviewers can see guardrail intent.",
       "recommendation": "Attach ADK callbacks/plugins or manifest policies that document guardrails.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -74,14 +800,18 @@
       "default_severity": "high",
       "description": "Google ADK long-running tool lacks an operation contract.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-adk-longrunning-contract-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "output_schema"
       ],
       "fires_when": "A LongRunningFunctionTool lacks structured status/progress and operation id output evidence.",
+      "floor_severity": null,
       "id": "SHIP-ADK-LONGRUNNING-CONTRACT-MISSING",
+      "mvp_tier": "adapter",
       "rationale": "Long-running tools need explicit status and operation-id semantics for safe continuation.",
       "recommendation": "Document operation id, status/progress fields, and completion behavior.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -90,16 +820,101 @@
       "default_severity": "high",
       "description": "Google ADK McpToolset lacks a static tool filter.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-adk-mcp-toolset-unfiltered",
+      "dynamic_default": false,
       "evidence_fields": [
         "source_ref",
         "agent_name",
         "inventory_path"
       ],
       "fires_when": "A Google ADK McpToolset has no static tool_filter.",
+      "floor_severity": null,
       "id": "SHIP-ADK-MCP-TOOLSET-UNFILTERED",
+      "mvp_tier": "adapter",
       "rationale": "Unfiltered MCP toolsets can expose more tools than reviewers expect.",
       "recommendation": "Declare a tool_filter and provide a local MCP tool inventory.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "host_boundary",
+      "default_severity": "high",
+      "description": "An experimental coding-agent boundary adapter observed a change.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-agent-boundary-experimental-surface-changed",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind"
+      ],
+      "fires_when": "A changed surface is recognized only by an adapter marked experimental.",
+      "floor_severity": "medium",
+      "id": "SHIP-AGENT-BOUNDARY-EXPERIMENTAL-SURFACE-CHANGED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Experimental adapter coverage is not strong enough to authorize completion automatically.",
+      "recommendation": "Have a human review the experimental boundary surface.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "host_boundary",
+      "default_severity": "medium",
+      "description": "Boundary input could not be evaluated completely.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-agent-boundary-input-incomplete",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "code"
+      ],
+      "fires_when": "A relevant diff or file is missing coherent content, unsafe to read, traversing, binary, oversized, or otherwise unresolved.",
+      "floor_severity": "medium",
+      "id": "SHIP-AGENT-BOUNDARY-INPUT-INCOMPLETE",
+      "mvp_tier": "lifecycle",
+      "rationale": "Truncated, malformed, unsafe, or unresolved diff inputs cannot justify a completion decision.",
+      "recommendation": "Provide a complete, coherent boundary diff and rerun the check.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "host_boundary",
+      "default_severity": "medium",
+      "description": "A protected coding-agent surface changed without an explicit safe static classification.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-agent-boundary-protected-surface-unclassified",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind"
+      ],
+      "fires_when": "A recognized coding-agent host, instruction, policy, state, or workflow surface changes and no specialized rule proves its classification.",
+      "floor_severity": "medium",
+      "id": "SHIP-AGENT-BOUNDARY-PROTECTED-SURFACE-UNCLASSIFIED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Absence of a specialized risk finding is not evidence that a host or trust-root change is non-broadening.",
+      "recommendation": "Have a human review the protected boundary change.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "host_boundary",
+      "default_severity": "high",
+      "description": "Static host-enforced requirements changed.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-agent-boundary-static-requirements-changed",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind"
+      ],
+      "fires_when": "A repository .codex/requirements.toml file changes.",
+      "floor_severity": "medium",
+      "id": "SHIP-AGENT-BOUNDARY-STATIC-REQUIREMENTS-CHANGED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Requirements files constrain the host's approval, sandbox, and network boundary and are reviewer-owned trust roots.",
+      "recommendation": "Have a human review the static host requirements change.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -108,15 +923,19 @@
       "default_severity": "high",
       "description": "OpenAI API function schema is not strict enough for reliable tool calls.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-api-function-schema-strictness",
+      "dynamic_default": false,
       "evidence_fields": [
         "issues",
         "risk_tags"
       ],
       "fires_when": "An OpenAI API function lacks strict=true, object parameters, additionalProperties=false, complete required fields, or bounded risky fields.",
+      "floor_severity": null,
       "id": "SHIP-API-FUNCTION-SCHEMA-STRICTNESS",
+      "mvp_tier": "adapter",
       "rationale": "Strict schemas reduce ambiguous tool arguments and downstream side-effect risk.",
       "recommendation": "Use strict function schemas with explicit required fields and constrained risky parameters.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -125,14 +944,18 @@
       "default_severity": "medium",
       "description": "Deprecated compatibility alias for the v0.3 OpenAI API operational readiness bundle.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-api-operational-readiness",
+      "dynamic_default": false,
       "evidence_fields": [
         "legacy_check_id"
       ],
       "fires_when": "Not emitted by v0.4 scans; matching configuration expands to the v0.4 atomic OpenAI API operational readiness checks.",
+      "floor_severity": null,
       "id": "SHIP-API-OPERATIONAL-READINESS",
+      "mvp_tier": "adapter",
       "rationale": "v0.4 emits atomic OpenAI API readiness check IDs, but this ID remains available for existing suppressions, severity overrides, baselines, SARIF consumers, and explain/list-checks workflows during the deprecation window.",
       "recommendation": "Migrate suppressions, severity overrides, and baselines to the specific v0.4 SHIP-API-* readiness check IDs.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -141,14 +964,18 @@
       "default_severity": "high",
       "description": "Prompt scope contradicts enabled OpenAI API tools.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-api-prompt-tool-scope-mismatch",
+      "dynamic_default": false,
       "evidence_fields": [
         "tools"
       ],
       "fires_when": "Prompt text says read-only/advice-only while write tools are enabled, or high-risk tools lack approval/confirmation instructions.",
+      "floor_severity": null,
       "id": "SHIP-API-PROMPT-TOOL-SCOPE-MISMATCH",
+      "mvp_tier": "adapter",
       "rationale": "Prompt instructions should match the actual write/high-risk tool surface.",
       "recommendation": "Align prompt scope with enabled tools and add approval/confirmation instructions.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -157,14 +984,18 @@
       "default_severity": "medium",
       "description": "OpenAI API high-risk flow lacks retry policy metadata.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-api-retry-policy-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "high_risk_tools"
       ],
       "fires_when": "High-risk OpenAI API tools exist and no retry_policy is declared.",
+      "floor_severity": null,
       "id": "SHIP-API-RETRY-POLICY-MISSING",
+      "mvp_tier": "adapter",
       "rationale": "Retries need explicit policy metadata so reviewers can reason about duplicate side effects.",
       "recommendation": "Declare retry_policy in openai_api.policy_rules or model_config.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -173,15 +1004,19 @@
       "default_severity": "high",
       "description": "OpenAI API write tool may be retried without idempotency evidence.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-api-retry-without-idempotency",
+      "dynamic_default": false,
       "evidence_fields": [
         "retry_policy",
         "risk_tags"
       ],
       "fires_when": "Retry policy is declared and a risky write tool lacks idempotency evidence.",
+      "floor_severity": null,
       "id": "SHIP-API-RETRY-WITHOUT-IDEMPOTENCY",
+      "mvp_tier": "core",
       "rationale": "Retries against non-idempotent writes can duplicate financial, destructive, or external side effects.",
       "recommendation": "Add idempotency evidence for retried risky OpenAI API tools or avoid retrying those side effects.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -190,16 +1025,20 @@
       "default_severity": "medium",
       "description": "OpenAI API structured output schema is missing or under-specified.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-api-structured-output-readiness",
+      "dynamic_default": false,
       "evidence_fields": [
         "path",
         "issues",
         "high_risk_tools"
       ],
       "fires_when": "No response format exists, a response schema is too broad, decision/status fields lack enums, or refusal/needs_review/error modeling is absent.",
+      "floor_severity": null,
       "id": "SHIP-API-STRUCTURED-OUTPUT-READINESS",
+      "mvp_tier": "adapter",
       "rationale": "Downstream release decisions need explicit, structured success/refusal/review modeling.",
       "recommendation": "Declare a strict response format with decision/status enums, needs_review/refusal/error fields, and critical fields.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -208,14 +1047,18 @@
       "default_severity": "medium",
       "description": "OpenAI API high-risk flow lacks test case metadata.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-api-test-cases-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "high_risk_tools"
       ],
       "fires_when": "High-risk OpenAI API tools exist and no test cases are declared.",
+      "floor_severity": null,
       "id": "SHIP-API-TEST-CASES-MISSING",
+      "mvp_tier": "adapter",
       "rationale": "High-risk tool-call flows should have release evidence before promotion.",
       "recommendation": "Add simple OpenAI API test cases for high-risk tool-call flows.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -224,14 +1067,18 @@
       "default_severity": "medium",
       "description": "OpenAI API high-risk flow lacks timeout metadata.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-api-timeout-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "high_risk_tools"
       ],
       "fires_when": "High-risk OpenAI API tools exist and no timeout metadata is declared.",
+      "floor_severity": null,
       "id": "SHIP-API-TIMEOUT-MISSING",
+      "mvp_tier": "adapter",
       "rationale": "Timeouts define failure behavior and reduce ambiguous tool-call continuation.",
       "recommendation": "Declare tool-call timeout metadata for high-risk OpenAI API flows.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -240,14 +1087,18 @@
       "default_severity": "medium",
       "description": "OpenAI API high-risk tool lacks success/failure output modeling.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-api-tool-output-schema-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "tool_output_schemas"
       ],
       "fires_when": "A high-risk OpenAI API tool lacks declared success/failure output schema metadata.",
+      "floor_severity": null,
       "id": "SHIP-API-TOOL-OUTPUT-SCHEMA-MISSING",
+      "mvp_tier": "adapter",
       "rationale": "Tool output schemas help release reviewers reason about downstream failure handling.",
       "recommendation": "Declare success_fields and failure_fields for high-risk OpenAI API tools.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -256,15 +1107,19 @@
       "default_severity": "medium",
       "description": "OpenAI API trace sample shows a policy-controlled tool without approval.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-api-trace-approval-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "tool_name",
         "approved"
       ],
       "fires_when": "A trace sample marks approved=false for a tool with approval policy evidence.",
+      "floor_severity": null,
       "id": "SHIP-API-TRACE-APPROVAL-MISSING",
+      "mvp_tier": "evidence",
       "rationale": "Trace samples should demonstrate approval behavior for tools that require approval.",
       "recommendation": "Require approval before calling policy-controlled OpenAI API tools.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": true,
       "suggested_patch_kind": "manual"
     },
     {
@@ -273,15 +1128,19 @@
       "default_severity": "medium",
       "description": "OpenAI API trace sample shows a policy-controlled tool without confirmation.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-api-trace-confirmation-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "tool_name",
         "confirmed"
       ],
       "fires_when": "A trace sample marks confirmed=false for a tool with confirmation policy evidence.",
+      "floor_severity": null,
       "id": "SHIP-API-TRACE-CONFIRMATION-MISSING",
+      "mvp_tier": "evidence",
       "rationale": "Trace samples should demonstrate explicit confirmation for tools that require confirmation.",
       "recommendation": "Require explicit confirmation before calling policy-controlled OpenAI API tools.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": true,
       "suggested_patch_kind": "manual"
     },
     {
@@ -290,14 +1149,18 @@
       "default_severity": "high",
       "description": "Manifest declares broad permission scopes.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-auth-manifest-broad-scope",
+      "dynamic_default": false,
       "evidence_fields": [
         "scopes"
       ],
       "fires_when": "permissions.scopes contains wildcard/admin-like scopes.",
+      "floor_severity": "medium",
       "id": "SHIP-AUTH-MANIFEST-BROAD-SCOPE",
+      "mvp_tier": "core",
       "rationale": "Broad manifest scopes weaken least-privilege review.",
       "recommendation": "Replace with operation-specific scopes.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": true,
       "suggested_patch_kind": "manual"
     },
     {
@@ -306,14 +1169,18 @@
       "default_severity": "high",
       "description": "Scope-requiring tool lacks declared auth scopes.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-auth-missing-scope",
+      "dynamic_default": false,
       "evidence_fields": [
         "risk_tags"
       ],
       "fires_when": "A write or sensitive-data tool has no auth scopes.",
+      "floor_severity": "medium",
       "id": "SHIP-AUTH-MISSING-SCOPE",
+      "mvp_tier": "core",
       "rationale": "Reviewers cannot assess least privilege without scope metadata.",
       "recommendation": "Declare scopes in OpenAPI, MCP, or manifest metadata.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -322,16 +1189,20 @@
       "default_severity": "high",
       "description": "Tool-required scopes are not covered by manifest permissions.scopes.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-auth-scope-coverage-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "tool_scopes",
         "manifest_scopes",
         "missing_scopes"
       ],
       "fires_when": "A tool scope is absent from permissions.scopes and not covered by a wildcard.",
+      "floor_severity": "medium",
       "id": "SHIP-AUTH-SCOPE-COVERAGE-MISSING",
+      "mvp_tier": "core",
       "rationale": "The manifest should describe the actual permissions needed by the release.",
       "recommendation": "Add or reconcile required scopes.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "append_pointer"
     },
     {
@@ -340,14 +1211,431 @@
       "default_severity": "high",
       "description": "Tool declares broad auth scopes.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-auth-tool-broad-scope",
+      "dynamic_default": false,
       "evidence_fields": [
         "scopes"
       ],
       "fires_when": "A tool auth scope is wildcard/admin-like.",
+      "floor_severity": "medium",
       "id": "SHIP-AUTH-TOOL-BROAD-SCOPE",
+      "mvp_tier": "core",
       "rationale": "Tool-level broad scopes may grant more power than the operation needs.",
       "recommendation": "Use narrower tool scopes.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": true,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "baseline",
+      "default_severity": "high",
+      "description": "Baseline entry's review window has expired.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-baseline-entry-expired",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "fingerprint",
+        "check_id",
+        "tool_name",
+        "expires",
+        "days_overdue",
+        "reason"
+      ],
+      "fires_when": "A baseline entry's `provenance.expires` is before today's UTC date.",
+      "floor_severity": null,
+      "id": "SHIP-BASELINE-ENTRY-EXPIRED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Reviewer-set `provenance.expires` is the renewable consent for accepting technical debt. Past that date the entry needs a fresh review, not a silent extension.",
+      "recommendation": "Re-review the accepted debt and either remove the entry, fix the underlying finding, or extend `provenance.expires` with a new reason.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "baseline",
+      "default_severity": "low",
+      "description": "Baseline entry no longer corresponds to an active finding or check ID.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-baseline-entry-stale",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "fingerprint",
+        "check_id",
+        "tool_name",
+        "kind",
+        "replacement_check_ids"
+      ],
+      "fires_when": "A baseline entry references a deprecated check ID (an alias in LEGACY_CHECK_ID_ALIASES) or did not match any active scan finding (resolved_count contribution).",
+      "floor_severity": null,
+      "id": "SHIP-BASELINE-ENTRY-STALE",
+      "mvp_tier": "lifecycle",
+      "rationale": "Stale baseline entries hide intent \u2014 reviewers cannot tell whether the accepted debt was resolved or whether the check was renamed. Pruning keeps the baseline aligned with reality.",
+      "recommendation": "Remove resolved entries via `agents-shipgate baseline save`, or update deprecated check IDs to their canonical replacements.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "baseline",
+      "default_severity": "critical",
+      "description": "Baseline file integrity check failed.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-baseline-integrity-mismatch",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "fingerprint",
+        "check_id",
+        "tool_name",
+        "kind",
+        "expected_hash",
+        "computed_hash",
+        "audit_log_path",
+        "latest_audit_run_id",
+        "error"
+      ],
+      "fires_when": "The baseline file's SHA-256 differs from the latest audit log entry's hash_after, the audit log is missing, empty, or malformed, an entry's provenance.run_id is not in the audit log, or an entry pre-dates v0.5 and lacks provenance entirely.",
+      "floor_severity": null,
+      "id": "SHIP-BASELINE-INTEGRITY-MISMATCH",
+      "mvp_tier": "lifecycle",
+      "rationale": "The baseline JSON has been edited outside `agents-shipgate baseline save`, lacks an audit log row, has a malformed audit log row, or references a run_id not present in the audit log. A release gate that accepts silent baseline edits cannot claim to govern technical debt.",
+      "recommendation": "Re-run `agents-shipgate baseline save` to refresh the baseline and audit log, or `agents-shipgate baseline verify` for the full report. Investigate the diff before accepting.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "verify",
+      "default_severity": "medium",
+      "description": "The PR changes the config file that binds a dynamic toolkit's authority; static analysis cannot diff the effective tool list.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-cap-config-binding-changed",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "provider",
+        "constructor",
+        "binding",
+        "config_path",
+        "changed_file",
+        "source_ref"
+      ],
+      "fires_when": "A VerificationContext and a base report are both present, the same factory site is config-bound on both sides, and the bound config file is in the PR's changed files.",
+      "floor_severity": null,
+      "id": "SHIP-CAP-CONFIG-BINDING-CHANGED",
+      "mvp_tier": "lifecycle",
+      "rationale": "A factory whose authority-bearing argument is bound from a config read hides its effective tool surface from static enumeration on both sides of the diff, so a config edit (e.g. adding \"refund\" to an actions list) produces no capability change in the generic diff. The config delta must be reviewed instead of passing invisibly.",
+      "recommendation": "Review the config delta for added capabilities, or declare an explicit local tool inventory for the toolkit so future changes are statically comparable.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "verify",
+      "default_severity": "high",
+      "description": "The PR removes the config binding from a dynamic toolkit factory present on both sides of the diff, so the toolkit may fall back to its everything-enabled defaults.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-cap-config-binding-removed",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "provider",
+        "constructor",
+        "binding",
+        "base_config_path",
+        "source_ref"
+      ],
+      "fires_when": "A VerificationContext and a base report are both present, the base bound the factory's authority-bearing argument to a config read, and the head constructs the same factory site with no binding at all. An unreadable (unknown) head binding never fires this check.",
+      "floor_severity": "high",
+      "id": "SHIP-CAP-CONFIG-BINDING-REMOVED",
+      "mvp_tier": "lifecycle",
+      "rationale": "A restriction-bearing config binding is the only statically-provable restraint on a toolkit whose tools load through a runtime factory. Removing the binding expands authority while looking like cleanup, and neither side's tools are statically enumerable, so the generic capability diff sees nothing. A coding agent must not self-approve that expansion; without this check the diff degrades to silent insufficient_evidence parity between base and head.",
+      "recommendation": "A human must review the removal; restore the config binding or an explicit literal allowlist, or declare an explicit local tool inventory for the toolkit so the mounted surface is statically enumerable.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "codex_boundary",
+      "default_severity": "medium",
+      "description": "AGENTS.md removed a Shipgate requirement.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-codex-boundary-agents-shipgate-requirement-removed",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "deleted",
+        "removed_shipgate_lines"
+      ],
+      "fires_when": "A changed AGENTS.md/AGENTS.override.md deletes Shipgate command or requirement text without adding a replacement.",
+      "floor_severity": "medium",
+      "id": "SHIP-CODEX-BOUNDARY-AGENTS-SHIPGATE-REQUIREMENT-REMOVED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Agent instructions are not controls; removing gate instructions requires human review because semantic weakening cannot be proven safely.",
+      "recommendation": "Have a human confirm the agent instructions were not weakened.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "codex_boundary",
+      "default_severity": "high",
+      "description": "Codex app connector tool approval changed to approve.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-codex-boundary-app-auto-approve",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "app",
+        "tool"
+      ],
+      "fires_when": "A changed apps.*.tools.* approval_mode is approve for a non-destructive-looking tool.",
+      "floor_severity": "medium",
+      "id": "SHIP-CODEX-BOUNDARY-APP-AUTO-APPROVE",
+      "mvp_tier": "lifecycle",
+      "rationale": "Connector-backed app tools are externally mediated and need human review before local auto-approval.",
+      "recommendation": "Review app connector approval changes before local automation.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "codex_boundary",
+      "default_severity": "critical",
+      "description": "Shipgate GitHub Action no longer invokes the gate.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-codex-boundary-ci-gate-removed",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "deleted",
+        "shipgate_invocation_present"
+      ],
+      "fires_when": ".github/workflows/agents-shipgate.yml or .yaml is deleted or no longer contains a Shipgate invocation.",
+      "floor_severity": "critical",
+      "id": "SHIP-CODEX-BOUNDARY-CI-GATE-REMOVED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Removing the local or CI gate is a direct bypass.",
+      "recommendation": "Restore the Shipgate workflow or get human approval to remove it.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "codex_boundary",
+      "default_severity": "medium",
+      "description": "Codex project configuration could not be parsed.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-codex-boundary-config-parse-failed",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "error"
+      ],
+      "fires_when": "A changed repo-local .codex/config.toml or hooks.json cannot be parsed as TOML or JSON.",
+      "floor_severity": "medium",
+      "id": "SHIP-CODEX-BOUNDARY-CONFIG-PARSE-FAILED",
+      "mvp_tier": "lifecycle",
+      "rationale": "A malformed Codex config prevents deterministic inspection of the local execution boundary, so the local agent check fails closed to review.",
+      "recommendation": "Fix the malformed Codex config or have a human review the boundary change.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "codex_boundary",
+      "default_severity": "critical",
+      "description": "Codex full-access sandbox is selected.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-codex-boundary-danger-full-access",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "value"
+      ],
+      "fires_when": "sandbox_mode or default_permissions selects danger-full-access.",
+      "floor_severity": "high",
+      "id": "SHIP-CODEX-BOUNDARY-DANGER-FULL-ACCESS",
+      "mvp_tier": "lifecycle",
+      "rationale": "danger-full-access removes local sandbox restrictions and must not be silently approved by an agent.",
+      "recommendation": "Use a narrower permission profile or get explicit human approval.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "codex_boundary",
+      "default_severity": "high",
+      "description": "A Codex executable hook changed.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-codex-boundary-hook-command-changed",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "event",
+        "command_present"
+      ],
+      "fires_when": "A changed Codex hooks source contains a command hook.",
+      "floor_severity": "medium",
+      "id": "SHIP-CODEX-BOUNDARY-HOOK-COMMAND-CHANGED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Hooks execute in the agent lifecycle and can alter local behavior before or after tool calls.",
+      "recommendation": "Review executable hooks before relying on them.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "codex_boundary",
+      "default_severity": "high",
+      "description": "Codex auto-approves an MCP server whose tool surface is not statically enumerable.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-codex-boundary-mcp-auto-approve-unknown",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "server",
+        "tool_names"
+      ],
+      "fires_when": "default_tools_approval_mode is approve and no risky tool can be proven from the local MCP config.",
+      "floor_severity": "medium",
+      "id": "SHIP-CODEX-BOUNDARY-MCP-AUTO-APPROVE-UNKNOWN",
+      "mvp_tier": "lifecycle",
+      "rationale": "Without an explicit tool allowlist or per-tool metadata, Shipgate cannot prove auto-approved MCP calls are read-only.",
+      "recommendation": "Enumerate MCP tools or keep the approval mode at prompt.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "codex_boundary",
+      "default_severity": "critical",
+      "description": "Codex auto-approves a write or destructive MCP/app tool.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-codex-boundary-mcp-auto-approve-write",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "server",
+        "tool",
+        "risky_tools"
+      ],
+      "fires_when": "A changed MCP/app tool approval mode is approve for a tool whose name indicates write, delete, execute, deploy, publish, payment, refund, or another side-effecting action.",
+      "floor_severity": "critical",
+      "id": "SHIP-CODEX-BOUNDARY-MCP-AUTO-APPROVE-WRITE",
+      "mvp_tier": "lifecycle",
+      "rationale": "Auto-approval of write-capable external tools lets the agent take side-effecting actions without a review boundary.",
+      "recommendation": "Do not auto-approve write or destructive tools.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "codex_boundary",
+      "default_severity": "high",
+      "description": "Codex network access expanded.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-codex-boundary-network-expanded",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "profile",
+        "value"
+      ],
+      "fires_when": "sandbox_workspace_write.network_access becomes true or a Codex permission network mode is full.",
+      "floor_severity": "medium",
+      "id": "SHIP-CODEX-BOUNDARY-NETWORK-EXPANDED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Enabling workspace-write network access or full network mode changes the local execution boundary.",
+      "recommendation": "Have a human approve the expanded Codex network boundary.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "codex_boundary",
+      "default_severity": "high",
+      "description": "Codex network permissions allow a wildcard domain.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-codex-boundary-network-wildcard",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "profile",
+        "domain",
+        "value"
+      ],
+      "fires_when": "A changed Codex permission profile allows a domain containing '*'.",
+      "floor_severity": "medium",
+      "id": "SHIP-CODEX-BOUNDARY-NETWORK-WILDCARD",
+      "mvp_tier": "lifecycle",
+      "rationale": "Wildcard network access expands the local agent's reachable resources beyond a reviewable allowlist.",
+      "recommendation": "Replace wildcard network access with explicit domains or get human approval.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "codex_boundary",
+      "default_severity": "critical",
+      "description": "Codex boundary policy was weakened.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-codex-boundary-policy-weakened",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "deleted",
+        "weakened_action",
+        "weakened_risk"
+      ],
+      "fires_when": "A changed policies/codex-boundary.shipgate.yaml deletes the policy file or downgrades a block/critical rule.",
+      "floor_severity": "critical",
+      "id": "SHIP-CODEX-BOUNDARY-POLICY-WEAKENED",
+      "mvp_tier": "lifecycle",
+      "rationale": "The policy that judges a Codex boundary change must not be weakened by the same change under review.",
+      "recommendation": "Restore the stricter policy or get human approval before weakening the local boundary gate.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "codex_boundary",
+      "default_severity": "medium",
+      "description": "A Codex skill gained command-bearing instructions.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-codex-boundary-skill-command-changed",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind"
+      ],
+      "fires_when": "A changed .agents/skills/**/SKILL.md adds command-like text.",
+      "floor_severity": "medium",
+      "id": "SHIP-CODEX-BOUNDARY-SKILL-COMMAND-CHANGED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Skills can steer agents into shell commands or helper scripts, so command-bearing changes need review before local automation.",
+      "recommendation": "Review command-bearing skill changes before local automation.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "codex_boundary",
+      "default_severity": "medium",
+      "description": "Codex permissions contain an unknown high-risk key.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-codex-boundary-unknown-permission-key",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "profile",
+        "key"
+      ],
+      "fires_when": "A changed .codex/config.toml contains an unknown key below a permissions profile or permissions network table.",
+      "floor_severity": "medium",
+      "id": "SHIP-CODEX-BOUNDARY-UNKNOWN-PERMISSION-KEY",
+      "mvp_tier": "lifecycle",
+      "rationale": "Permission-profile schema drift can change the sandbox boundary; unknown keys under permissions fail closed while unrelated top-level keys remain advisory.",
+      "recommendation": "Review the unknown permission key before trusting the local Codex boundary.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -356,6 +1644,7 @@
       "default_severity": "medium",
       "description": "Codex plugin app connector surface is not statically enumerable.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-codex-plugin-app-surface-not-enumerable",
+      "dynamic_default": false,
       "evidence_fields": [
         "plugin",
         "app",
@@ -363,10 +1652,13 @@
         "path"
       ],
       "fires_when": "A Codex plugin declares an app connector without an explicit local enumerable tool surface.",
+      "floor_severity": null,
       "id": "SHIP-CODEX-PLUGIN-APP-SURFACE-NOT-ENUMERABLE",
+      "mvp_tier": "adapter",
       "rationale": "Connector-backed app capabilities are externally mediated and cannot be proven from local plugin metadata alone.",
       "recommendation": "Treat connector app capabilities as a review item or provide explicit local inventory/policy evidence.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -375,6 +1667,7 @@
       "default_severity": "high",
       "description": "Codex plugin component path cannot be loaded.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-codex-plugin-component-path-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "plugin",
         "component",
@@ -382,10 +1675,13 @@
         "reason"
       ],
       "fires_when": "A plugin component path is missing, outside the plugin root, or outside the manifest directory.",
+      "floor_severity": null,
       "id": "SHIP-CODEX-PLUGIN-COMPONENT-PATH-MISSING",
+      "mvp_tier": "adapter",
       "rationale": "Release review cannot inspect declared skills, MCP servers, apps, or hooks when component paths are missing or escape the package.",
       "recommendation": "Fix component paths so every declared plugin artifact resolves locally.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -394,16 +1690,20 @@
       "default_severity": "medium",
       "description": "Codex plugin marketplace entry lacks policy metadata.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-codex-plugin-marketplace-policy-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "marketplace",
         "plugin",
         "missing"
       ],
       "fires_when": "A marketplace plugin entry lacks policy.installation, policy.authentication, or category.",
+      "floor_severity": null,
       "id": "SHIP-CODEX-PLUGIN-MARKETPLACE-POLICY-MISSING",
+      "mvp_tier": "adapter",
       "rationale": "Marketplace installation and authentication policy are part of the release surface coding agents need to review.",
       "recommendation": "Add policy.installation, policy.authentication, and category to the marketplace entry.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -412,6 +1712,7 @@
       "default_severity": "high",
       "description": "Codex plugin MCP server is declared but not statically enumerable.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-codex-plugin-mcp-server-not-enumerable",
+      "dynamic_default": false,
       "evidence_fields": [
         "plugin",
         "server",
@@ -419,10 +1720,13 @@
         "inventory_path"
       ],
       "fires_when": "A Codex plugin declares an MCP server and no matching codex_plugins.mcp_tool_inventories entry loaded successfully.",
+      "floor_severity": null,
       "id": "SHIP-CODEX-PLUGIN-MCP-SERVER-NOT-ENUMERABLE",
+      "mvp_tier": "adapter",
       "rationale": "Agents Shipgate does not execute MCP commands, so reviewer-visible tool metadata requires an explicit local inventory.",
       "recommendation": "Provide a local MCP tool inventory for the plugin server.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -431,6 +1735,7 @@
       "default_severity": "medium",
       "description": "Codex plugin package metadata is incomplete or ambiguous.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-codex-plugin-metadata-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "plugin",
         "source_id",
@@ -438,10 +1743,13 @@
         "issues"
       ],
       "fires_when": "A Codex plugin manifest is missing required identity metadata, its name does not match the package root, or duplicate plugin names are present.",
+      "floor_severity": null,
       "id": "SHIP-CODEX-PLUGIN-METADATA-MISSING",
+      "mvp_tier": "adapter",
       "rationale": "Plugin identity needs to be stable before publication or downstream agent adoption.",
       "recommendation": "Fill required plugin metadata and make plugin names unambiguous.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -450,6 +1758,7 @@
       "default_severity": "medium",
       "description": "Codex plugin skill metadata is missing or duplicated.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-codex-plugin-skill-metadata-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "plugin",
         "skill",
@@ -458,10 +1767,34 @@
         "duplicate"
       ],
       "fires_when": "A SKILL.md lacks name or description frontmatter, or two skills in the same plugin share a name.",
+      "floor_severity": null,
       "id": "SHIP-CODEX-PLUGIN-SKILL-METADATA-MISSING",
+      "mvp_tier": "adapter",
       "rationale": "Skill frontmatter is the static routing surface agents use to decide whether a skill applies.",
       "recommendation": "Give each skill a unique name and clear description frontmatter.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "conductor",
+      "default_severity": "high",
+      "description": "Conductor tool surface cannot be statically enumerated.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-conductor-dynamic-tool-surface-not-enumerable",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "surface",
+        "explicit_inventory"
+      ],
+      "fires_when": "A Conductor workflow uses a dynamic or missing MCP method/server, a dynamic LLM tool advertisement, a runtime-generated task, or a sub-workflow target that cannot be resolved from local workflow JSON.",
+      "floor_severity": null,
+      "id": "SHIP-CONDUCTOR-DYNAMIC-TOOL-SURFACE-NOT-ENUMERABLE",
+      "mvp_tier": "adapter",
+      "rationale": "Runtime MCP targets, dynamic LLM tool advertisements, generated tasks, and unresolved sub-workflows prevent a deterministic release review from enumerating the action surface.",
+      "recommendation": "Use literal MCP server and method bindings, a static LLM tool advertisement, or an exact local sub-workflow target before release review.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -470,15 +1803,19 @@
       "default_severity": "high",
       "description": "CrewAI tool surface cannot be statically enumerated.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-crewai-dynamic-tool-surface-not-enumerable",
+      "dynamic_default": false,
       "evidence_fields": [
         "surface",
         "explicit_inventory"
       ],
       "fires_when": "A CrewAI agent tool binding is dynamic or unresolved and no explicit local inventory is declared.",
+      "floor_severity": null,
       "id": "SHIP-CREWAI-DYNAMIC-TOOL-SURFACE-NOT-ENUMERABLE",
+      "mvp_tier": "adapter",
       "rationale": "CrewAI exposes ad hoc agent-bound tool lists rather than a consistent toolset abstraction, so the check names the broader tool surface instead of ADK's toolset.",
       "recommendation": "Provide explicit MCP-style tool inventory metadata for dynamic CrewAI tool lists.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -487,15 +1824,19 @@
       "default_severity": "medium",
       "description": "CrewAI function tool lacks static metadata.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-crewai-function-tool-metadata-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "missing",
         "source_type"
       ],
       "fires_when": "A CrewAI @tool or BaseTool class lacks description or parameter metadata.",
+      "floor_severity": null,
       "id": "SHIP-CREWAI-FUNCTION-TOOL-METADATA-MISSING",
+      "mvp_tier": "adapter",
       "rationale": "Static review depends on descriptions and parameter schemas because user CrewAI code is not imported.",
       "recommendation": "Add docstrings, descriptions, type annotations, args_schema, or explicit local inventory metadata.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -504,14 +1845,18 @@
       "default_severity": "medium",
       "description": "Tool description contains instruction-override-like language.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-doc-injection-risk",
+      "dynamic_default": false,
       "evidence_fields": [
         "matched"
       ],
       "fires_when": "Description text matches instruction override patterns. Severity is high only when multiple patterns match on a write/high-risk tool.",
+      "floor_severity": null,
       "id": "SHIP-DOC-INJECTION-RISK",
+      "mvp_tier": "core",
       "rationale": "Tool metadata can be placed into model context and should not contain prompt-like directives.",
       "recommendation": "Rewrite the description as neutral metadata.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -520,14 +1865,18 @@
       "default_severity": "medium",
       "description": "Tool description is missing or too short.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-doc-missing-description",
+      "dynamic_default": false,
       "evidence_fields": [
         "description_length"
       ],
       "fires_when": "A tool description is missing or shorter than the minimum.",
+      "floor_severity": null,
       "id": "SHIP-DOC-MISSING-DESCRIPTION",
+      "mvp_tier": "hygiene",
       "rationale": "Poor tool descriptions increase wrong-tool and reviewer misunderstanding risk.",
       "recommendation": "Add a clear capability description.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -536,14 +1885,18 @@
       "default_severity": "medium",
       "description": "Tool description contains a secret-like value.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-doc-secret-in-description",
+      "dynamic_default": false,
       "evidence_fields": [
         "matched"
       ],
       "fires_when": "Description contains known key formats or labeled secret-like values. Severity is high only when multiple patterns match on a write/high-risk tool.",
+      "floor_severity": null,
       "id": "SHIP-DOC-SECRET-IN-DESCRIPTION",
+      "mvp_tier": "core",
       "rationale": "Credentials in tool metadata can leak into reports, prompts, or logs.",
       "recommendation": "Remove and rotate the exposed secret.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -552,6 +1905,7 @@
       "default_severity": "high",
       "description": "Local HITL approval trace evidence is missing or incomplete for an approval-required tool.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-evidence-approval-trace-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "tool_name",
         "required",
@@ -561,10 +1915,13 @@
         "source_provenance"
       ],
       "fires_when": "validation.required_evidence.approval_trace_required is true and no loaded local approval trace shows approved=true for an approval-required tool.",
+      "floor_severity": null,
       "id": "SHIP-EVIDENCE-APPROVAL-TRACE-MISSING",
+      "mvp_tier": "evidence",
       "rationale": "Limited automation review depends on reviewer-visible local evidence that approval-controlled actions were approved before the tool call; absence of local evidence does not prove the runtime control is absent.",
       "recommendation": "Add or fix local approval trace evidence, or change the validation review posture.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": true,
       "suggested_patch_kind": "manual"
     },
     {
@@ -573,6 +1930,7 @@
       "default_severity": "high",
       "description": "Local high-risk auto-approval exclusion evidence is missing or incomplete.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-evidence-high-risk-exclusion-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "required",
         "reason",
@@ -582,10 +1940,13 @@
         "source_provenance"
       ],
       "fires_when": "validation.required_evidence.high_risk_auto_approval_exclusion_required is true and a high-risk tool with declared approval policy is not listed in loaded high_risk_auto_approval_exclusions.",
+      "floor_severity": null,
       "id": "SHIP-EVIDENCE-HIGH-RISK-EXCLUSION-MISSING",
+      "mvp_tier": "evidence",
       "rationale": "High-risk tools that already declare approval policy need separate local evidence that they are excluded from auto-approval review posture; absence of local evidence does not prove the runtime control is absent.",
       "recommendation": "Document high-risk approval-controlled tools in local high_risk_auto_approval_exclusions with reasons.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": true,
       "suggested_patch_kind": "manual"
     },
     {
@@ -594,6 +1955,7 @@
       "default_severity": "high",
       "description": "Local HITL promotion criteria evidence is missing or incomplete.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-evidence-hitl-promotion-criteria-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "target_review_posture",
         "reason",
@@ -603,10 +1965,13 @@
         "source_provenance"
       ],
       "fires_when": "validation.target_review_posture is limited_auto_approval and promotion criteria are absent, unloadable, or the canonical required-evidence flags are not true in the manifest and criteria file.",
+      "floor_severity": null,
       "id": "SHIP-EVIDENCE-HITL-PROMOTION-CRITERIA-MISSING",
+      "mvp_tier": "evidence",
       "rationale": "A limited auto-approval review posture needs local criteria evidence; Shipgate structures the missing evidence for reviewers but does not certify runtime enforcement.",
       "recommendation": "Add or fix local promotion criteria evidence documenting the review posture and required evidence flags.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": true,
       "suggested_patch_kind": "manual"
     },
     {
@@ -615,6 +1980,7 @@
       "default_severity": "high",
       "description": "Local HITL override reason evidence is missing or incomplete.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-evidence-override-reason-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "required",
         "reason",
@@ -623,10 +1989,229 @@
         "source_provenance"
       ],
       "fires_when": "validation.required_evidence.override_reason_required is true and override logs are absent, empty, unloadable, or contain events without non-empty reasons.",
+      "floor_severity": null,
       "id": "SHIP-EVIDENCE-OVERRIDE-REASON-MISSING",
+      "mvp_tier": "evidence",
       "rationale": "Override, bypass, and auto-approval events need reviewer-visible local reasons for governance review; absence of local evidence does not prove the runtime control is absent.",
       "recommendation": "Record non-empty reasons in local override, bypass, and auto-approval evidence.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": true,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "host_boundary",
+      "default_severity": "medium",
+      "description": "A coding-agent host configuration file could not be parsed.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-host-boundary-config-parse-failed",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "error",
+        "source"
+      ],
+      "fires_when": "A changed .mcp.json, .cursor/mcp.json, .vscode/mcp.json, .claude/settings(.local).json, or .github/workflows file cannot be parsed as JSON or YAML, or its content cannot be resolved from the diff.",
+      "floor_severity": "medium",
+      "id": "SHIP-HOST-BOUNDARY-CONFIG-PARSE-FAILED",
+      "mvp_tier": "lifecycle",
+      "rationale": "A malformed host config prevents deterministic inspection of the agent's host capability boundary, so the diff-aware check fails closed to review.",
+      "recommendation": "Fix the malformed host config or have a human review the change.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "host_boundary",
+      "default_severity": "high",
+      "description": "Claude Code hooks changed.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-host-boundary-hook-changed",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "events"
+      ],
+      "fires_when": "A changed .claude/settings.json or .claude/settings.local.json adds, modifies, or removes hook handlers.",
+      "floor_severity": "medium",
+      "id": "SHIP-HOST-BOUNDARY-HOOK-CHANGED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Hooks execute commands inside the agent lifecycle and can alter host behavior before or after every tool call.",
+      "recommendation": "Review executable hook changes before the agent relies on them.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "host_boundary",
+      "default_severity": "high",
+      "description": "A new MCP server was declared for the coding-agent host.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-host-boundary-mcp-server-added",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "server",
+        "transport_hint",
+        "command_or_url"
+      ],
+      "fires_when": "A changed .mcp.json, .cursor/mcp.json, or .vscode/mcp.json adds a server key that did not exist before.",
+      "floor_severity": "medium",
+      "id": "SHIP-HOST-BOUNDARY-MCP-SERVER-ADDED",
+      "mvp_tier": "lifecycle",
+      "rationale": "A new MCP server adds an entire external tool surface to the agent host; it must be human-reviewed before the agent can use it.",
+      "recommendation": "Have a human review the new MCP server before the agent can use it.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "host_boundary",
+      "default_severity": "high",
+      "description": "An existing MCP server declaration changed its command, URL, args, or env keys.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-host-boundary-mcp-server-changed",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "server",
+        "changed_keys"
+      ],
+      "fires_when": "A changed MCP server file modifies command, args, url, serverUrl, or env for an existing server. Env var values never appear in evidence \u2014 key names only.",
+      "floor_severity": "medium",
+      "id": "SHIP-HOST-BOUNDARY-MCP-SERVER-CHANGED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Changing what an already-trusted MCP server executes or connects to silently re-shapes the host tool surface behind an approved name.",
+      "recommendation": "Review the changed MCP server command, URL, args, or env keys.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "host_boundary",
+      "default_severity": "high",
+      "description": "The Claude Code permission allowlist expanded.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-host-boundary-permission-allow-expanded",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "rule"
+      ],
+      "fires_when": "A changed .claude/settings.json or .claude/settings.local.json adds a non-wildcard permissions.allow entry.",
+      "floor_severity": "medium",
+      "id": "SHIP-HOST-BOUNDARY-PERMISSION-ALLOW-EXPANDED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Every new allow rule widens what the host executes without a prompt; expansion needs a human in the loop.",
+      "recommendation": "Have a human approve the new permission allow rule.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "host_boundary",
+      "default_severity": "high",
+      "description": "A Claude Code permission deny rule was removed.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-host-boundary-permission-deny-removed",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "rule"
+      ],
+      "fires_when": "A changed .claude/settings.json or .claude/settings.local.json drops an entry from permissions.deny.",
+      "floor_severity": "medium",
+      "id": "SHIP-HOST-BOUNDARY-PERMISSION-DENY-REMOVED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Deny rules are the host's explicit guardrails; removing one silently re-enables a previously forbidden capability.",
+      "recommendation": "Have a human confirm the removed deny rule is no longer needed.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "host_boundary",
+      "default_severity": "critical",
+      "description": "A Claude Code allow rule grants a wildcard tool surface.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-host-boundary-permission-wildcard-allow",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "rule"
+      ],
+      "fires_when": "A changed .claude/settings.json or .claude/settings.local.json adds an allow rule that is '*', a bare tool name, or a wildcard-shaped rule such as 'Bash(*)' or 'Bash(*:*)'.",
+      "floor_severity": "high",
+      "id": "SHIP-HOST-BOUNDARY-PERMISSION-WILDCARD-ALLOW",
+      "mvp_tier": "lifecycle",
+      "rationale": "Wildcard allow rules remove the host's per-command approval boundary entirely; an agent must not self-grant unrestricted tool access.",
+      "recommendation": "Do not allow wildcard tool permissions; scope the rule to specific commands.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "host_boundary",
+      "default_severity": "critical",
+      "description": "A GitHub workflow gained a pull_request_target trigger.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-host-boundary-pull-request-target-added",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind"
+      ],
+      "fires_when": "A changed .github/workflows file adds pull_request_target to its triggers.",
+      "floor_severity": "high",
+      "id": "SHIP-HOST-BOUNDARY-PULL-REQUEST-TARGET-ADDED",
+      "mvp_tier": "lifecycle",
+      "rationale": "pull_request_target runs workflow code with secrets against fork PRs; adding it is a classic privilege-escalation surface.",
+      "recommendation": "Review the pull_request_target trigger; it runs with secrets on fork PRs.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "host_boundary",
+      "default_severity": "high",
+      "description": "GitHub workflow permissions expanded.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-host-boundary-workflow-permissions-expanded",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "job",
+        "scope",
+        "old",
+        "new"
+      ],
+      "fires_when": "A changed .github/workflows file grants an explicit write scope that the base did not grant, at the top level or per job.",
+      "floor_severity": "medium",
+      "id": "SHIP-HOST-BOUNDARY-WORKFLOW-PERMISSIONS-EXPANDED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Moving a scope from read to write (or granting a new write scope) widens what CI can do with the repository token.",
+      "recommendation": "Have a human approve the expanded workflow write permission.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "host_boundary",
+      "default_severity": "critical",
+      "description": "A GitHub workflow grants write-all permissions.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-host-boundary-workflow-write-all",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "job"
+      ],
+      "fires_when": "A changed .github/workflows file sets permissions to write-all at the top level or for a job.",
+      "floor_severity": "high",
+      "id": "SHIP-HOST-BOUNDARY-WORKFLOW-WRITE-ALL",
+      "mvp_tier": "lifecycle",
+      "rationale": "write-all hands the workflow token every write scope at once; an agent must not self-grant blanket CI write access.",
+      "recommendation": "Replace write-all with the minimal explicit permission scopes.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -635,14 +2220,18 @@
       "default_severity": "high",
       "description": "Production target includes low-confidence tool extraction.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-inventory-low-confidence-production-surface",
+      "dynamic_default": false,
       "evidence_fields": [
         "tools"
       ],
       "fires_when": "environment.target is production and tools include lower-confidence extraction.",
+      "floor_severity": "medium",
       "id": "SHIP-INVENTORY-LOW-CONFIDENCE-PRODUCTION-SURFACE",
+      "mvp_tier": "core",
       "rationale": "Production promotion should not depend primarily on best-effort SDK inference.",
       "recommendation": "Declare those tools through manifest, MCP, or OpenAPI inputs.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -651,14 +2240,18 @@
       "default_severity": "high",
       "description": "Tool surface cannot be enumerated from declared inputs.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-inventory-not-enumerable",
+      "dynamic_default": false,
       "evidence_fields": [
         "tool_sources"
       ],
       "fires_when": "No tools are loaded from required manifest sources.",
+      "floor_severity": null,
       "id": "SHIP-INVENTORY-NOT-ENUMERABLE",
+      "mvp_tier": "core",
       "rationale": "A release gate must fail closed when it cannot see the agent's tools.",
       "recommendation": "Declare at least one local MCP JSON or OpenAPI tool source.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -667,15 +2260,19 @@
       "default_severity": "medium",
       "description": "Tool surface exceeds the MVP review threshold.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-inventory-tool-surface-too-large",
+      "dynamic_default": false,
       "evidence_fields": [
         "tool_count",
         "threshold"
       ],
       "fires_when": "The normalized tool count exceeds the built-in threshold.",
+      "floor_severity": null,
       "id": "SHIP-INVENTORY-TOOL-SURFACE-TOO-LARGE",
+      "mvp_tier": "hygiene",
       "rationale": "Large tool surfaces are harder to reason about during promotion.",
       "recommendation": "Split or reduce the tool surface before release.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -684,15 +2281,19 @@
       "default_severity": "high",
       "description": "Wildcard or all-tools exposure is declared.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-inventory-wildcard-tools",
+      "dynamic_default": false,
       "evidence_fields": [
         "source_id",
         "source_ref"
       ],
       "fires_when": "A source declares all tools or wildcard exposure.",
+      "floor_severity": "medium",
       "id": "SHIP-INVENTORY-WILDCARD-TOOLS",
+      "mvp_tier": "core",
       "rationale": "Wildcard tools make review and least-privilege reasoning impossible.",
       "recommendation": "Replace wildcard exposure with an explicit allowlist.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -701,15 +2302,19 @@
       "default_severity": "high",
       "description": "LangChain tool surface cannot be statically enumerated.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-langchain-dynamic-tool-surface-not-enumerable",
+      "dynamic_default": false,
       "evidence_fields": [
         "surface",
         "explicit_inventory"
       ],
       "fires_when": "A LangChain or LangGraph tool binding is dynamic or unresolved and no explicit local inventory is declared.",
+      "floor_severity": null,
       "id": "SHIP-LANGCHAIN-DYNAMIC-TOOL-SURFACE-NOT-ENUMERABLE",
+      "mvp_tier": "adapter",
       "rationale": "LangChain and LangGraph expose ad hoc tool lists and agent-bound tools rather than a consistent toolset abstraction, so the check names the broader tool surface instead of ADK's toolset.",
       "recommendation": "Provide explicit MCP-style tool inventory metadata for dynamic LangChain tool lists.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -718,15 +2323,19 @@
       "default_severity": "medium",
       "description": "LangChain function tool lacks static metadata.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-langchain-function-tool-metadata-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "missing",
         "source_type"
       ],
       "fires_when": "A LangChain @tool or StructuredTool lacks description or parameter metadata.",
+      "floor_severity": null,
       "id": "SHIP-LANGCHAIN-FUNCTION-TOOL-METADATA-MISSING",
+      "mvp_tier": "adapter",
       "rationale": "Static review depends on descriptions and parameter schemas because user LangChain code is not imported.",
       "recommendation": "Add docstrings, descriptions, type annotations, args_schema, or explicit local inventory metadata.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -735,15 +2344,19 @@
       "default_severity": "high",
       "description": "Production high-risk tool has no declared owner.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-manifest-high-risk-owner-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "environment",
         "risk_tags"
       ],
       "fires_when": "environment.target is production_like or production and a high-risk tool lacks owner metadata.",
+      "floor_severity": null,
       "id": "SHIP-MANIFEST-HIGH-RISK-OWNER-MISSING",
+      "mvp_tier": "core",
       "rationale": "High-risk production tools need an accountable owning team for review and remediation.",
       "recommendation": "Declare an owner for each high-risk production tool.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -752,15 +2365,19 @@
       "default_severity": "medium",
       "description": "A policy references a missing tool.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-manifest-stale-policy",
+      "dynamic_default": false,
       "evidence_fields": [
         "policy",
         "tool"
       ],
       "fires_when": "A policy entry names a tool that is not loaded.",
+      "floor_severity": null,
       "id": "SHIP-MANIFEST-STALE-POLICY",
+      "mvp_tier": "hygiene",
       "rationale": "Approval, confirmation, and idempotency policies should map to the actual release surface.",
       "recommendation": "Remove stale policy entries or update them to current tool names.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "remove_pointer"
     },
     {
@@ -769,14 +2386,18 @@
       "default_severity": "medium",
       "description": "A risk override references a missing tool.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-manifest-stale-risk-override",
+      "dynamic_default": false,
       "evidence_fields": [
         "tool"
       ],
       "fires_when": "risk_overrides.tools contains a tool that is not loaded.",
+      "floor_severity": null,
       "id": "SHIP-MANIFEST-STALE-RISK-OVERRIDE",
+      "mvp_tier": "hygiene",
       "rationale": "Risk overrides should not outlive the tool they describe.",
       "recommendation": "Remove stale risk overrides or update them to current tool names.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "remove_pointer"
     },
     {
@@ -785,16 +2406,20 @@
       "default_severity": "medium",
       "description": "A suppression references a missing check or tool.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-manifest-stale-suppression",
+      "dynamic_default": false,
       "evidence_fields": [
         "check_id",
         "tool",
         "issues"
       ],
       "fires_when": "checks.ignore contains an unknown check_id or a tool name that is not loaded.",
+      "floor_severity": null,
       "id": "SHIP-MANIFEST-STALE-SUPPRESSION",
+      "mvp_tier": "hygiene",
       "rationale": "Stale suppressions hide intent and make release review harder to audit.",
       "recommendation": "Remove stale suppressions or update them to current check IDs and tool names.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "remove_pointer"
     },
     {
@@ -803,15 +2428,155 @@
       "default_severity": "medium",
       "description": "Manifest declares permission scopes unused by loaded tools.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-manifest-unused-scope",
+      "dynamic_default": false,
       "evidence_fields": [
         "scope",
         "tool_scopes"
       ],
       "fires_when": "permissions.scopes includes a scope not required by any loaded tool.",
+      "floor_severity": null,
       "id": "SHIP-MANIFEST-UNUSED-SCOPE",
+      "mvp_tier": "hygiene",
       "rationale": "Unused permissions weaken least-privilege review and often indicate stale config.",
       "recommendation": "Remove unused scopes or add tool metadata showing why they are required.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "mcp_permissions",
+      "default_severity": "high",
+      "description": "MCP narrowing annotation contradicts side-effect evidence.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-mcp-annotation-contradiction",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "form",
+        "published_annotations",
+        "contradictions",
+        "independent_evidence",
+        "annotation_changes",
+        "annotation_surface_changed",
+        "independent_evidence_unchanged",
+        "client_consequence"
+      ],
+      "fires_when": "An explicit readOnlyHint true or destructiveHint false contradicts independent structural or clearly labeled inferred evidence on the same MCP tool.",
+      "floor_severity": "medium",
+      "id": "SHIP-MCP-ANNOTATION-CONTRADICTION",
+      "mvp_tier": "lifecycle",
+      "rationale": "MCP clients can use read-only and destructive annotations to reduce confirmation prompts even when independent evidence indicates the call can write or destroy data.",
+      "recommendation": "Review or correct the MCP annotation before clients use it to reduce confirmation prompts.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "mcp_permissions",
+      "default_severity": "critical",
+      "description": "MCP side-effecting tool is auto-approved.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-mcp-auto-approve-side-effect",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "permission_classes",
+        "risk_score",
+        "approval_mode"
+      ],
+      "fires_when": "A tool classified as write, destructive, external, financial, or production has approval mode approve.",
+      "floor_severity": "critical",
+      "id": "SHIP-MCP-AUTO-APPROVE-SIDE-EFFECT",
+      "mvp_tier": "lifecycle",
+      "rationale": "Auto-approved side-effecting MCP tools can let an agent write, publish, destroy, operate production systems, or make financial changes without review.",
+      "recommendation": "Do not auto-approve side-effecting MCP tools.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "mcp_permissions",
+      "default_severity": "high",
+      "description": "MCP server passes through secret environment variables.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-mcp-env-secret-passthrough",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "source_id",
+        "env_secret_names"
+      ],
+      "fires_when": "A statically parsed MCP server declares secret-like env vars or passes through secret-like host env references.",
+      "floor_severity": "medium",
+      "id": "SHIP-MCP-ENV-SECRET-PASSTHROUGH",
+      "mvp_tier": "lifecycle",
+      "rationale": "Secret-bearing environment pass-through expands the credential boundary available to a tool server.",
+      "recommendation": "Review the secret boundary or replace pass-through with a narrower credential mechanism.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "mcp_permissions",
+      "default_severity": "high",
+      "description": "MCP capability permissions expanded.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-mcp-permission-expanded",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "capability_id",
+        "semantic_direction",
+        "semantic_changes"
+      ],
+      "fires_when": "A diffed MCP capability broadens scope, effect, risk tags, controls, or schema according to the capability lattice.",
+      "floor_severity": "medium",
+      "id": "SHIP-MCP-PERMISSION-EXPANDED",
+      "mvp_tier": "lifecycle",
+      "rationale": "MCP capability broadening changes the agent's static tool authority.",
+      "recommendation": "Review the expanded MCP capability; narrow tools/scopes or add explicit approval evidence.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "mcp_permissions",
+      "default_severity": "low",
+      "description": "Read-only local documentation MCP server added.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-mcp-readonly-server-added",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "capability_id",
+        "permission_classes",
+        "risk_score"
+      ],
+      "fires_when": "A new local documentation MCP capability is classified as read-only.",
+      "floor_severity": null,
+      "id": "SHIP-MCP-READONLY-SERVER-ADDED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Local read-only documentation servers are low risk but should remain visible in capability review.",
+      "recommendation": "Keep the MCP server read-only and local; review if it gains write, network, or secret access.",
+      "requires_human_review": false,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "mcp_permissions",
+      "default_severity": "high",
+      "description": "MCP tool side effect cannot be proven from static schema.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-mcp-unknown-tool-schema",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "source_id",
+        "wildcard",
+        "approval_mode"
+      ],
+      "fires_when": "A new or changed MCP capability has no explicit tool schema or is a wildcard server surface.",
+      "floor_severity": "medium",
+      "id": "SHIP-MCP-UNKNOWN-TOOL-SCHEMA",
+      "mvp_tier": "lifecycle",
+      "rationale": "Incomplete or wildcard MCP metadata cannot prove the callable tool surface is read-only.",
+      "recommendation": "Provide an explicit MCP tool inventory/schema or keep the server behind human review.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -820,15 +2585,19 @@
       "default_severity": "medium",
       "description": "n8n AI-exposed tool lacks static metadata.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-n8n-ai-tool-metadata-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "missing",
         "source_type"
       ],
       "fires_when": "An n8n AI-exposed tool lacks description or static parameter metadata.",
+      "floor_severity": null,
       "id": "SHIP-N8N-AI-TOOL-METADATA-MISSING",
+      "mvp_tier": "adapter",
       "rationale": "Static review depends on descriptions and parameter schemas because Shipgate does not execute n8n workflows.",
       "recommendation": "Add n8n tool descriptions, $fromAI() parameter metadata, workflow input schemas, or explicit inventory metadata.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -837,15 +2606,19 @@
       "default_severity": "high",
       "description": "n8n credential stubs are not declared.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-n8n-credential-evidence-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "credential_ref_count",
         "credential_stub_file_count"
       ],
       "fires_when": "Production-like n8n workflows reference credentials but no local credential stubs are declared.",
+      "floor_severity": null,
       "id": "SHIP-N8N-CREDENTIAL-EVIDENCE-MISSING",
+      "mvp_tier": "adapter",
       "rationale": "Credential type evidence lets reviewers assess high-risk integrations without exposing secret values.",
       "recommendation": "Declare local n8n credential stubs.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -854,15 +2627,19 @@
       "default_severity": "high",
       "description": "n8n tool surface cannot be statically enumerated.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-n8n-dynamic-tool-surface-not-enumerable",
+      "dynamic_default": false,
       "evidence_fields": [
         "surface",
         "explicit_inventory"
       ],
       "fires_when": "An n8n workflow has an unresolved DB workflow id, runtime expression in a tool name, wildcard MCP Server/Client exposure without an inventory, or an uninventoried community/custom tool node.",
+      "floor_severity": null,
       "id": "SHIP-N8N-DYNAMIC-TOOL-SURFACE-NOT-ENUMERABLE",
+      "mvp_tier": "adapter",
       "rationale": "Release review needs an explicit local inventory when n8n workflow JSON uses runtime tool names, unresolved workflow references, wildcard MCP exposure, or community tool nodes without static metadata. This is high severity in every environment because static release evidence cannot prove the actual tool inventory.",
       "recommendation": "Provide explicit local n8n/MCP tool inventory metadata or replace runtime/wildcard n8n tool exposure.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -871,16 +2648,20 @@
       "default_severity": "medium",
       "description": "n8n eval coverage is not declared.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-n8n-eval-coverage-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "workflow_count",
         "ai_agent_count",
         "eval_file_count"
       ],
       "fires_when": "n8n inputs target production_like or production and no eval files are declared.",
+      "floor_severity": null,
       "id": "SHIP-N8N-EVAL-COVERAGE-MISSING",
+      "mvp_tier": "adapter",
       "rationale": "n8n AI workflow releases should include response and tool-trajectory eval evidence before promotion.",
       "recommendation": "Declare n8n eval files for expected responses and tool-use trajectories.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -889,6 +2670,7 @@
       "default_severity": "high",
       "description": "n8n MCP Client Tool exposes an unfiltered toolset.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-n8n-mcp-client-toolset-unfiltered",
+      "dynamic_default": false,
       "evidence_fields": [
         "source_ref",
         "node_id",
@@ -896,10 +2678,13 @@
         "explicit_inventory"
       ],
       "fires_when": "An n8n MCP Client Tool uses All or All Except selection and no explicit local inventory is declared.",
+      "floor_severity": null,
       "id": "SHIP-N8N-MCP-CLIENT-TOOLSET-UNFILTERED",
+      "mvp_tier": "adapter",
       "rationale": "All-tools and all-except MCP client selections can expose more tools than reviewers expect. The check is environment-sensitive because the selector is straightforward to narrow before production, while production-like use increases blast radius.",
       "recommendation": "Select an explicit MCP tool allowlist in n8n or provide a local MCP inventory.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -908,16 +2693,20 @@
       "default_severity": "high",
       "description": "n8n workflow JSON contains a secret-like value.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-n8n-secret-in-workflow-parameter",
+      "dynamic_default": false,
       "evidence_fields": [
         "source_ref",
         "parameter_pointer",
         "secret_kind"
       ],
       "fires_when": "A static n8n workflow parameter, node note, pinData entry, or staticData entry matches a secret-like token pattern. Evidence is redacted and contains only source location and secret kind, never a secret verifier.",
+      "floor_severity": null,
       "id": "SHIP-N8N-SECRET-IN-WORKFLOW-PARAMETER",
+      "mvp_tier": "core",
       "rationale": "Workflow JSON, pinned data, static data, and node notes can be committed or reported; hardcoded secret-like values should be moved into credentials or variables.",
       "recommendation": "Move secret values into n8n credentials or variables and rotate the exposed value.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -926,15 +2715,19 @@
       "default_severity": "critical",
       "description": "High-risk tool lacks a declared approval policy.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-policy-approval-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "risk_tags",
         "policy_match"
       ],
       "fires_when": "Financial/destructive/infrastructure/code-exec risk exists without approval policy.",
+      "floor_severity": "high",
       "id": "SHIP-POLICY-APPROVAL-MISSING",
+      "mvp_tier": "core",
       "rationale": "High-risk actions need explicit approval before promotion.",
       "recommendation": "Declare an approval policy or remove the tool.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": true,
       "suggested_patch_kind": "manual"
     },
     {
@@ -943,15 +2736,19 @@
       "default_severity": "high",
       "description": "Destructive/external/customer-communication tool lacks a confirmation policy.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-policy-confirmation-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "risk_tags",
         "policy_match"
       ],
       "fires_when": "Risk tags require confirmation but no confirmation policy matches.",
+      "floor_severity": "medium",
       "id": "SHIP-POLICY-CONFIRMATION-MISSING",
+      "mvp_tier": "core",
       "rationale": "Destructive and external actions should require explicit confirmation.",
       "recommendation": "Declare confirmation policy or remove the tool.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": true,
       "suggested_patch_kind": "manual"
     },
     {
@@ -960,15 +2757,19 @@
       "default_severity": "high",
       "description": "Action-like tool accepts broad free-form input.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-schema-broad-free-text",
+      "dynamic_default": false,
       "evidence_fields": [
         "parameter",
         "type"
       ],
       "fires_when": "A write/action-like tool has free-form command/action/update-style parameters.",
+      "floor_severity": null,
       "id": "SHIP-SCHEMA-BROAD-FREE-TEXT",
+      "mvp_tier": "core",
       "rationale": "Broad action/body/update fields increase blast radius for write tools.",
       "recommendation": "Constrain the field with structured schema or enums.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -977,14 +2778,18 @@
       "default_severity": "medium",
       "description": "Tool returns free-form string output.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-schema-freeform-output",
+      "dynamic_default": false,
       "evidence_fields": [
         "output_schema"
       ],
       "fires_when": "A tool output schema is string or an SDK function returns str.",
+      "floor_severity": null,
       "id": "SHIP-SCHEMA-FREEFORM-OUTPUT",
+      "mvp_tier": "evidence",
       "rationale": "Free-form tool output may carry prompt injection into later model context.",
       "recommendation": "Prefer structured output for model-consumed tool results.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -993,15 +2798,19 @@
       "default_severity": "high",
       "description": "Risky numeric parameter lacks a maximum bound.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-schema-missing-bounds",
+      "dynamic_default": false,
       "evidence_fields": [
         "parameter",
         "type"
       ],
       "fires_when": "A risky numeric parameter lacks a maximum.",
+      "floor_severity": null,
       "id": "SHIP-SCHEMA-MISSING-BOUNDS",
+      "mvp_tier": "core",
       "rationale": "Unbounded counts or financial amounts weaken blast-radius control.",
       "recommendation": "Add a maximum or equivalent policy limit.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     },
     {
@@ -1010,15 +2819,19 @@
       "default_severity": "high",
       "description": "Tool appears to overlap with a manifest prohibited action.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-scope-prohibited-tool-present",
+      "dynamic_default": false,
       "evidence_fields": [
         "prohibited_action",
         "risk_tags"
       ],
       "fires_when": "Tool name/description/risk tags overlap prohibited_actions without a mitigating policy.",
+      "floor_severity": "medium",
       "id": "SHIP-SCOPE-PROHIBITED-TOOL-PRESENT",
+      "mvp_tier": "core",
       "rationale": "Prohibited actions should not be contradicted by attached tool capabilities.",
       "recommendation": "Remove or narrow the tool, or revise policy/scope text.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": true,
       "suggested_patch_kind": "manual"
     },
     {
@@ -1027,15 +2840,42 @@
       "default_severity": "high",
       "description": "Write-capable tool contradicts a read-only declared purpose.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-scope-tool-outside-purpose",
+      "dynamic_default": false,
       "evidence_fields": [
         "declared_purpose",
         "risk_tags"
       ],
       "fires_when": "Purpose text is read-only but attached tools are write-capable.",
+      "floor_severity": "medium",
       "id": "SHIP-SCOPE-TOOL-OUTSIDE-PURPOSE",
+      "mvp_tier": "core",
       "rationale": "Declared purpose should constrain the attached tool surface.",
       "recommendation": "Remove the tool or update release scope.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "scope",
+      "default_severity": "high",
+      "description": "A dynamically-loaded agent toolkit is mounted without a scope bound.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-scope-toolkit-unbounded",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "provider",
+        "constructor",
+        "binding",
+        "source_ref"
+      ],
+      "fires_when": "A recognized agent-toolkit constructor is called with no configuration\nallowlist (the parsed ToolkitScopeBound is unbounded), so the full toolkit\nsurface is mounted.",
+      "floor_severity": null,
+      "id": "SHIP-SCOPE-TOOLKIT-UNBOUNDED",
+      "mvp_tier": "core",
+      "rationale": "A recognized toolkit constructor (e.g. stripe_agent_toolkit) called with no\nconfiguration allowlist mounts its full tool surface \u2014 refund/cancel/dispute \u2014\nwhich the static extractor cannot enumerate. The unbounded grant must be\nreviewed rather than pass silently into insufficient_evidence.",
+      "recommendation": "Pass an explicit configuration allowlist (resource:verb actions) to the toolkit constructor so the agent mounts only the tools it needs. If the toolkit must stay dynamic, declare an explicit local tool inventory for the tools it mounts so the surface is statically reviewable.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": true,
       "suggested_patch_kind": "manual"
     },
     {
@@ -1044,15 +2884,227 @@
       "default_severity": "high",
       "description": "Risky write tool lacks idempotency evidence; critical when retry is known.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-sidefx-idempotency-missing",
+      "dynamic_default": false,
       "evidence_fields": [
         "risk_tags",
         "retry_policy_known"
       ],
       "fires_when": "Risky write tool lacks idempotency annotation, key, or policy.",
+      "floor_severity": "medium",
       "id": "SHIP-SIDEFX-IDEMPOTENCY-MISSING",
+      "mvp_tier": "core",
       "rationale": "Retries against non-idempotent writes can duplicate financial or external side effects.",
       "recommendation": "Add idempotency evidence or policy.",
       "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": true,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "manifest",
+      "default_severity": "low",
+      "description": "No CODEOWNERS rule requires a human to approve manifest changes.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-trust-manifest-unprotected",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "ci_mode",
+        "manifest_path",
+        "codeowners_path",
+        "codeowners_self_owned",
+        "searched",
+        "branch_protection"
+      ],
+      "fires_when": "The manifest declares ci.mode strict and no CODEOWNERS file GitHub would read assigns an owner to both the manifest path and to CODEOWNERS itself.",
+      "floor_severity": null,
+      "id": "SHIP-TRUST-MANIFEST-UNPROTECTED",
+      "mvp_tier": "hygiene",
+      "rationale": "Every verdict rests on the manifest, so a repository that lets it change unreviewed has a gate the gated work can turn off. CODEOWNERS plus branch protection is what makes attestation the PR review of a protected file rather than a separate ceremony.",
+      "recommendation": "Add a CODEOWNERS rule for the manifest and require review on the branch it merges to. Branch protection is not statically verifiable, so this check reports only the CODEOWNERS half and never moves a verdict.",
+      "requires_human_review": false,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "verify",
+      "default_severity": "medium",
+      "description": "The PR edits agent-instruction trust roots (AGENTS.md, CLAUDE.md, .cursor/rules, skills, etc.) and Shipgate cannot statically prove the instructions were not weakened.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-verify-agent-instructions-weakened",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "changed_instruction_files"
+      ],
+      "fires_when": "A VerificationContext is present and a changed file matches an agent-instruction trust-root glob.",
+      "floor_severity": "medium",
+      "id": "SHIP-VERIFY-AGENT-INSTRUCTIONS-WEAKENED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Prompts are not controls (Principle 3); a static tool cannot judge whether instruction text was weakened, so any change is routed to human review rather than silently trusted.",
+      "recommendation": "A human must review the agent-instruction change and confirm no gate-protecting instruction was removed or softened.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "verify",
+      "default_severity": "high",
+      "description": "The PR broadens what the gate forgives \u2014 a new suppression in checks.ignore, a widened waiver scope, or a larger accepted-debt baseline \u2014 versus the base report.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-verify-baseline-or-waiver-expanded",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "added_check_ids",
+        "added_scopes",
+        "added_fingerprints"
+      ],
+      "fires_when": "A VerificationContext and a base effective-policy snapshot are both present and the head suppression set, waiver scopes, or baseline fingerprints are a proper superset of the base.",
+      "floor_severity": "high",
+      "id": "SHIP-VERIFY-BASELINE-OR-WAIVER-EXPANDED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Expanding suppressions, waivers, or the baseline is a reward-hacking move that hides findings instead of fixing them. A base-vs-head superset comparison of the effective-policy snapshot makes the expansion release-visible.",
+      "recommendation": "A human must confirm each new suppression, waiver, or baseline entry is justified; do not suppress findings to make CI pass.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "verify",
+      "default_severity": "critical",
+      "description": "The PR removes or broadens a dynamically-loaded agent toolkit's explicit least-privilege configuration bound (e.g. a stripe_agent_toolkit constructor allowlist) versus the base report, silently expanding the toolkit surface.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-verify-capability-scope-broadened",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "provider",
+        "base_scopes",
+        "head_scopes",
+        "added_scopes",
+        "constructor",
+        "binding",
+        "source_ref",
+        "source_line"
+      ],
+      "fires_when": "A VerificationContext and a base report are both present, the base declared a bounded toolkit allowlist for a provider, and the head removed the bound (unbounded) or added permissions the base allowlist did not.",
+      "floor_severity": "critical",
+      "id": "SHIP-VERIFY-CAPABILITY-SCOPE-BROADENED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Toolkits that load tools through a runtime factory (*toolkit.get_tools()) hide the individual tools from static enumeration, so the only statically-provable signal is the constructor's permission allowlist. Removing it mounts the full toolkit (refund / cancel / dispute on a customer-support agent); a coding agent must not self-approve that capability broadening. Without this check the opaque factory degrades the verdict to insufficient_evidence instead of blocked.",
+      "recommendation": "A human must review and re-apply a least-privilege toolkit configuration or explicitly approve the broadened scope; do not remove the allowlist to expand agent capability without review.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "verify",
+      "default_severity": "critical",
+      "description": "The PR deletes the Shipgate CI workflow from an opted-in repo, which would stop the release gate from running.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-verify-ci-gate-removed",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "removed_workflow_files"
+      ],
+      "fires_when": "A VerificationContext is present, a Shipgate CI workflow path is in the changed files, and that file no longer exists on disk.",
+      "floor_severity": "high",
+      "id": "SHIP-VERIFY-CI-GATE-REMOVED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Removing CI enforcement is the bluntest gate-bypass. Detecting a changed-and-now-absent workflow file makes the removal a release signal even without a base scan.",
+      "recommendation": "A human must approve removing Shipgate CI enforcement; do not delete the gate to make CI pass.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "verify",
+      "default_severity": "medium",
+      "description": "A policy or manifest trust root changed but there is no base policy snapshot to compare it against \u2014 the base carries no Shipgate manifest (first adoption), or no base report was obtainable.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-verify-policy-base-absent",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "changed_policy_files"
+      ],
+      "fires_when": "A VerificationContext is present, no base effective-policy snapshot is available, and a policy/manifest trust root is in the changed files.",
+      "floor_severity": "medium",
+      "id": "SHIP-VERIFY-POLICY-BASE-ABSENT",
+      "mvp_tier": "lifecycle",
+      "rationale": "A missing base is not a weakening, and reporting it as one made every first adoption read as if the adopter had loosened a gate that never existed. It is also not a pass \u2014 a reward-hacker must not be able to dodge review by breaking the base scan \u2014 so the direction stays ambiguous and the change is routed to a human under its own reason code.",
+      "recommendation": "A human must review the policy surface this PR establishes or changes; a coding agent cannot adopt or self-approve a release gate.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "verify",
+      "default_severity": "high",
+      "description": "The PR's effective release policy is weaker than the base report's (CI mode downgraded, fail-on severity set loosened, or a check's severity override lowered across a tier).",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-verify-policy-weakened",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "base_ci_mode",
+        "head_ci_mode",
+        "removed_severities",
+        "target_check_id",
+        "base_severity",
+        "head_severity"
+      ],
+      "fires_when": "A VerificationContext and a base effective-policy snapshot are both present and the head manifest's effective policy is weaker than the base report's.",
+      "floor_severity": "high",
+      "id": "SHIP-VERIFY-POLICY-WEAKENED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Comparing the normalized base-vs-head policy snapshot catches a coding agent that makes CI pass by weakening the gate rather than fixing the finding. The claim is base-relative, so it fires only when a base snapshot exists to compare against; the no-base fail-safe is SHIP-VERIFY-POLICY-BASE-ABSENT.",
+      "recommendation": "A human must review and approve the policy change; do not weaken the release gate to make CI pass.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "verify",
+      "default_severity": "medium",
+      "description": "The PR changes the trigger catalog (docs/triggers.json or an .agents-shipgate trigger config) that decides when Shipgate runs.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-verify-trigger-catalog-drift",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "kind",
+        "changed_trigger_files"
+      ],
+      "fires_when": "A VerificationContext is present and a changed file matches a trigger-catalog path.",
+      "floor_severity": "medium",
+      "id": "SHIP-VERIFY-TRIGGER-CATALOG-DRIFT",
+      "mvp_tier": "lifecycle",
+      "rationale": "Editing the trigger catalog can carve out paths so the gate stops firing on the very changes that matter \u2014 a gate-evasion one level up from suppressing findings.",
+      "recommendation": "A human must confirm the trigger change does not create a path that evades the release gate.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "verify",
+      "default_severity": "medium",
+      "description": "A PR changed a release trust-root file (manifest, shipgate state, policy, prompts, the Shipgate CI gate, agent instructions, or a tool-surface declaration).",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-verify-trust-root-touched",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "changed_file",
+        "trust_root_class",
+        "matched_glob"
+      ],
+      "fires_when": "A changed file from the verification context matches a trust-root surface glob. Emits nothing on a plain scan (no verification context).",
+      "floor_severity": "medium",
+      "id": "SHIP-VERIFY-TRUST-ROOT-TOUCHED",
+      "mvp_tier": "lifecycle",
+      "rationale": "Trust-root files define the release gate. A coding agent told to make CI pass can weaken the gate instead of fixing the underlying readiness issue (reward hacking); touching a trust root must therefore require human review.",
+      "recommendation": "Have a human review the trust-root change before merge; do not weaken the gate to pass CI.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
     }
   ],

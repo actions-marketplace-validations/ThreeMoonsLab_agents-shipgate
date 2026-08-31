@@ -1,0 +1,62 @@
+version: "0.1"
+
+project:
+  name: ai-generated-refund-pr-demo
+  owner: support-platform
+
+agent:
+  name: support-agent
+  declared_purpose:
+    - answer support knowledge base questions
+    - prepare refund cases for human review
+
+environment:
+  target: production_like
+
+tool_sources:
+  - id: support_tools
+    type: mcp
+    path: tools.json
+    trust: internal
+
+agent_bindings:
+  declarations:
+    - agent: root
+      complete: true
+      tools:
+        - {tool: support.search_kb, source_id: support_tools}
+        - {tool: stripe.create_refund, source_id: support_tools}
+      handoffs: []
+      reason: reviewed verifier demo binding
+
+permissions:
+  scopes:
+    - support:kb:read
+  credential_mode: service_account
+
+action_surface:
+  actions:
+    - tool: support.search_kb
+      effect: read
+      override:
+        evidence: "readOnlyHint: true and idempotentHint: true on the MCP export; the only scope is support:kb:read"
+        reason: "The word 'refund' appears in the article text this tool searches, not in anything it changes."
+      scopes: [support:kb:read]
+      authority:
+        mode: scoped
+        auth_type: oauth2
+        credential_mode: service_account
+    # Dormant in the base fixture. The verifier's head export activates this
+    # reviewed declaration so the unsafe capability fails on missing controls.
+    - tool: stripe.create_refund
+      effect: destructive
+      risk_tags: [financial_action]
+      scopes: ["stripe:*"]
+      authority:
+        mode: scoped
+        auth_type: oauth2
+        credential_mode: service_account
+
+ci:
+  mode: advisory
+  pr_comment: true

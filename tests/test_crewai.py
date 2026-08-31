@@ -123,6 +123,16 @@ tool_sources:
         if finding.check_id == "SHIP-CREWAI-DYNAMIC-TOOL-SURFACE-NOT-ENUMERABLE"
     ]
     assert len(dynamic) == 1
+    assert dynamic[0].evidence == {
+        "surface": {
+            "kind": "agent",
+            "source_ref": "crew.py",
+            "line": 7,
+            "reason": "tool list comes from a runtime call",
+        },
+        "explicit_inventory": False,
+    }
+    assert dynamic[0].confidence == "medium"
     assert report.frameworks["crewai"]["dynamic_tool_surface_count"] == 1
 
 
@@ -286,5 +296,7 @@ crewai:
     assert "SHIP-CREWAI-DYNAMIC-TOOL-SURFACE-NOT-ENUMERABLE" not in {
         finding.check_id for finding in report.findings
     }
-    assert report.tool_inventory[0]["source_type"] == "crewai_inventory"
+    assert report.tool_catalog[0]["source_type"] == "crewai_inventory"
+    assert report.tool_inventory == []
+    assert report.binding_surface_facts.status == "partial"
     assert doctor["frameworks"]["crewai"]["tool_inventory_file_count"] == 1

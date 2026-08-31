@@ -1,17 +1,29 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar, Literal
 
-from agents_shipgate.config.schema import (
-    AgentsShipgateManifest,
-    CodexPluginMcpInventoryConfig,
-    ToolSourceConfig,
+from agents_shipgate.core.artifact_models import CodexPluginArtifacts
+from agents_shipgate.core.domain import (
+    AgentBindingObservation,
+    LoadedToolSource,
+    Tool,
 )
 from agents_shipgate.core.errors import InputParseError
-from agents_shipgate.core.models import (
+from agents_shipgate.inputs.common import (
+    PositionIndex,
+    json_pointer_escape,
+    list_input_directory,
+    load_structured_file,
+    load_structured_file_with_positions,
+    load_text_file,
+    manifest_relative_path,
+    resolve_input_path,
+)
+from agents_shipgate.inputs.mcp import load_mcp_tools
+from agents_shipgate.inputs.protocol import LoadedAdapterResult
+from agents_shipgate.schemas.codex_plugin import (
     CodexPluginAppSummary,
-    CodexPluginArtifacts,
     CodexPluginComponentPathIssue,
     CodexPluginHookStub,
     CodexPluginMarketplaceSummary,
@@ -19,21 +31,53 @@ from agents_shipgate.core.models import (
     CodexPluginSkillSummary,
     CodexPluginSourceLocation,
     CodexPluginSummary,
-    LoadedToolSource,
-    Tool,
 )
-from agents_shipgate.inputs.common import (
-    PositionIndex,
-    json_pointer_escape,
-    load_structured_file_with_positions,
-    load_text_file,
-    manifest_relative_path,
-    resolve_input_path,
+from agents_shipgate.schemas.manifest import (
+    AgentsShipgateManifest,
+    CodexPluginMcpInventoryConfig,
+    ToolSourceConfig,
 )
-from agents_shipgate.inputs.mcp import load_mcp_tools
 
 COMMAND_KEYS = {"command", "cmd", "run", "shell", "script"}
 PLUGIN_MANIFEST = ".codex-plugin/plugin.json"
+_CODEX_PLUGIN_COMPONENT_KEYS = {"apps", "hooks", "mcpServers", "skills"}
+_CODEX_PLUGIN_METADATA_KEYS = {
+    "author",
+    "description",
+    "homepage",
+    "interface",
+    "keywords",
+    "license",
+    "name",
+    "repository",
+    "version",
+}
+_KNOWN_CODEX_PLUGIN_KEYS = _CODEX_PLUGIN_COMPONENT_KEYS | _CODEX_PLUGIN_METADATA_KEYS
+
+
+def _attributed(
+    loaded: list[LoadedToolSource], source: ToolSourceConfig
+) -> list[LoadedToolSource]:
+    """Record which configured row produced these results, before anything joins on it.
+
+    This adapter is per-scan, so the dispatcher cannot pass it the config object
+    and attributes pass-2 results by the ``(adapter source type, minted source
+    id)`` pair instead. Neither half of that pair survives here: an MCP
+    inventory is minted as ``codex_plugin:<plugin>/<server>:inventory`` with
+    source type ``codex_plugin_mcp_inventory``, so its tools carried no
+    configured provenance at all and every source-wide declaration —
+    ``authority`` since #410, ``binding`` since #432 — silently applied to
+    nothing. ``binding`` is what made it visible, because it says out loud that
+    the source contributed nothing when it plainly did.
+
+    The loop above holds the configured row, which is the frame that knows;
+    matching ids downstream is the join #410 already established cannot be
+    trusted.
+    """
+
+    for entry in loaded:
+        entry.configured_source_id = source.id
+    return loaded
 
 
 def load_codex_plugin_artifacts(
@@ -64,7 +108,7 @@ def load_codex_plugin_artifacts(
                     seen_roots=seen_roots,
                     seen_names=seen_names,
                 )
-                loaded_sources.extend(package_sources)
+                loaded_sources.extend(_attributed(package_sources, source))
             elif source.mode == "marketplace":
                 marketplace_sources = _load_marketplace_source(
                     source=source,
@@ -74,7 +118,7 @@ def load_codex_plugin_artifacts(
                     seen_roots=seen_roots,
                     seen_names=seen_names,
                 )
-                loaded_sources.extend(marketplace_sources)
+                loaded_sources.extend(_attributed(marketplace_sources, source))
             else:
                 raise InputParseError(
                     f"Codex plugin source {source.id!r} has invalid mode "
@@ -89,6 +133,7 @@ def load_codex_plugin_artifacts(
                 LoadedToolSource(
                     source_id=source.id,
                     source_type="codex_plugin",
+                    configured_source_id=source.id,
                     warnings=[warning],
                 )
             )
@@ -101,6 +146,16 @@ def load_codex_plugin_artifacts(
     artifacts.hook_stub_count = len(artifacts.hook_stubs)
     artifacts.mcp_inventory_file_count = len(artifacts.mcp_inventory_files)
     artifacts.warnings = sorted(dict.fromkeys(artifacts.warnings))
+    if artifacts.warnings or artifacts.component_path_issues or any(
+        marketplace.skipped_entries for marketplace in artifacts.marketplaces
+    ):
+        # A package-root observation is a closed-world statement. If any part
+        # of the configured Codex plugin source was skipped or degraded, keep
+        # the binding graph incomplete instead of treating an observed skill
+        # as proof that the entire callable surface is empty.
+        for loaded_source in loaded_sources:
+            if loaded_source.source_type == "codex_plugin":
+                loaded_source.binding_observations = []
     return loaded_sources, artifacts
 
 
@@ -198,6 +253,54 @@ def _load_marketplace_source(
     return loaded
 
 
+def resolve_local_codex_marketplace_roots(
+    *,
+    marketplace_path: Path,
+    base_dir: Path,
+) -> tuple[Path, ...]:
+    """Resolve the contained local package roots declared by a marketplace.
+
+    Stop at the package boundary: plugin contents remain the normal loader's
+    responsibility so a malformed declared plugin still routes to ``verify``.
+    """
+
+    resolved_marketplace = resolve_input_path(base_dir, str(marketplace_path))
+    data = load_structured_file(resolved_marketplace)
+    if not isinstance(data, dict):
+        raise InputParseError(
+            f"Codex marketplace file must contain an object: {resolved_marketplace}"
+        )
+    plugins = data.get("plugins")
+    if not isinstance(plugins, list):
+        raise InputParseError(
+            "Codex marketplace file must contain a plugins array: "
+            f"{resolved_marketplace}"
+        )
+
+    summary = CodexPluginMarketplaceSummary(
+        source_id="coverage",
+        name=data.get("name") if isinstance(data.get("name"), str) else None,
+        path=manifest_relative_path(str(resolved_marketplace), base_dir),
+        plugin_count=0,
+    )
+    roots: list[Path] = []
+    for index, entry in enumerate(plugins):
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        root = _resolve_marketplace_plugin_root(
+            entry=entry,
+            base_dir=base_dir,
+            marketplace=summary,
+            pointer=f"/plugins/{index}",
+        )
+        if root is not None:
+            roots.append(root.resolve())
+    return tuple(dict.fromkeys(roots))
+
+
 def _load_plugin_package(
     *,
     source: ToolSourceConfig,
@@ -222,6 +325,12 @@ def _load_plugin_package(
     data, positions = load_structured_file_with_positions(manifest_path)
     if not isinstance(data, dict):
         raise InputParseError(f"Codex plugin manifest must contain an object: {manifest_path}")
+    unknown_keys = sorted(set(data) - _KNOWN_CODEX_PLUGIN_KEYS)
+    if unknown_keys:
+        artifacts.warnings.append(
+            "Codex plugin manifest contains unrecognized top-level keys "
+            f"{unknown_keys!r}; callable-surface completeness cannot be proven."
+        )
 
     name = data.get("name") if isinstance(data.get("name"), str) else root.name
     source_id = f"codex_plugin:{source.id}/{name}"
@@ -260,12 +369,88 @@ def _load_plugin_package(
     seen_roots[root_resolved] = plugin
     artifacts.plugins.append(plugin)
 
+    skill_start = len(artifacts.skills)
+    app_start = len(artifacts.apps)
+    mcp_start = len(artifacts.mcp_server_stubs)
+    hook_start = len(artifacts.hook_stubs)
+    issue_start = len(artifacts.component_path_issues)
+    warning_start = len(artifacts.warnings)
+
     loaded_sources: list[LoadedToolSource] = []
     _load_skills(data, root, base_dir, name, artifacts)
     _load_apps(data, root, base_dir, name, artifacts)
     loaded_sources.extend(_load_mcp_servers(data, root, base_dir, name, artifacts, inventories))
     _load_hooks(data, root, base_dir, name, artifacts)
+    if _is_complete_skill_only_package(
+        data=data,
+        plugin=plugin,
+        skills=artifacts.skills[skill_start:],
+        apps=artifacts.apps[app_start:],
+        mcp_servers=artifacts.mcp_server_stubs[mcp_start:],
+        hooks=artifacts.hook_stubs[hook_start:],
+        component_path_issues=artifacts.component_path_issues[issue_start:],
+        warnings=artifacts.warnings[warning_start:],
+        has_declared_inventory=any(
+            inventory_plugin == name for inventory_plugin, _ in inventories
+        ),
+    ):
+        # Compatibility projection: the current binding schema names every
+        # graph root an "agent". A skill-only plugin is instead a package root
+        # whose fully parsed component graph proves that it exposes no
+        # callable tools or handoffs. No reviewed agent_bindings declaration
+        # is needed for this structural zero-capability fact.
+        loaded_sources.append(
+            LoadedToolSource(
+                source_id=source_id,
+                source_type="codex_plugin",
+                binding_observations=[
+                    AgentBindingObservation(
+                        agent=f"codex-plugin:{name}",
+                        source_id=source_id,
+                        source=plugin.manifest_path,
+                        source_pointer="",
+                        tools_complete=True,
+                        handoffs_complete=True,
+                    )
+                ],
+            )
+        )
     return loaded_sources
+
+
+def _is_complete_skill_only_package(
+    *,
+    data: dict[str, Any],
+    plugin: CodexPluginSummary,
+    skills: list[CodexPluginSkillSummary],
+    apps: list[CodexPluginAppSummary],
+    mcp_servers: list[CodexPluginMcpServerStub],
+    hooks: list[CodexPluginHookStub],
+    component_path_issues: list[CodexPluginComponentPathIssue],
+    warnings: list[str],
+    has_declared_inventory: bool,
+) -> bool:
+    unknown_keys = set(data) - _KNOWN_CODEX_PLUGIN_KEYS
+    non_skill_component_keys = (
+        _CODEX_PLUGIN_COMPONENT_KEYS - {"skills"}
+    ) & set(data)
+    return bool(skills) and not any(
+        (
+            unknown_keys,
+            non_skill_component_keys,
+            plugin.missing_fields,
+            plugin.name_mismatch,
+            plugin.duplicate_root,
+            plugin.duplicate_name,
+            apps,
+            mcp_servers,
+            hooks,
+            component_path_issues,
+            warnings,
+            has_declared_inventory,
+            any(skill.missing_fields or skill.duplicate for skill in skills),
+        )
+    )
 
 
 def _resolve_package_root(
@@ -288,7 +473,8 @@ def _resolve_package_root(
         raise InputParseError(
             f"Codex plugin source must be a plugin root directory or {PLUGIN_MANIFEST}: {path}"
         )
-    if not manifest_path.exists():
+    resolved_manifest = resolve_input_path(base_dir, str(manifest_path))
+    if not resolved_manifest.is_file():
         raise InputParseError(f"Codex plugin manifest not found: {manifest_path}")
     return root, manifest_path
 
@@ -328,7 +514,15 @@ def _resolve_marketplace_plugin_root(
             {"plugin": entry.get("name"), "reason": str(exc)}
         )
         return None
-    if not (root / PLUGIN_MANIFEST).exists():
+    manifest_path = root / PLUGIN_MANIFEST
+    try:
+        resolved_manifest = resolve_input_path(base_dir, str(manifest_path))
+    except InputParseError as exc:
+        marketplace.skipped_entries.append(
+            {"plugin": entry.get("name"), "reason": str(exc)}
+        )
+        return None
+    if not resolved_manifest.is_file():
         marketplace.skipped_entries.append(
             {
                 "plugin": entry.get("name"),
@@ -700,7 +894,14 @@ def _resolve_plugin_path(root: Path, raw_path: str) -> Path:
 def _skill_files(path: Path) -> list[Path]:
     if path.name == "SKILL.md":
         return [path]
-    return sorted(child for child in path.glob("*/SKILL.md") if child.is_file())
+    skill_files: list[Path] = []
+    for child in list_input_directory(path):
+        if not child.is_dir():
+            continue
+        for candidate in list_input_directory(child):
+            if candidate.name == "SKILL.md" and candidate.is_file():
+                skill_files.append(candidate)
+    return sorted(skill_files)
 
 
 def _skill_frontmatter(text: str) -> dict[str, str]:
@@ -751,3 +952,25 @@ def _location(
         source_start_line=start_line,
         source_start_column=start_column,
     )
+
+
+class CodexPluginAdapter:
+    """``ToolSourceAdapter`` wrapping :func:`load_codex_plugin_artifacts`.
+
+    Framework-scoped. The dispatcher invokes ``load()`` once per scan
+    when either a ``tool_sources`` entry of type ``codex_plugin`` or
+    the top-level ``manifest.codex_plugins`` section is configured.
+    """
+
+    source_type: ClassVar[str] = "codex_plugin"
+    scope: ClassVar[Literal["per_source", "per_scan"]] = "per_scan"
+    artifact_class: ClassVar[type | None] = CodexPluginArtifacts
+
+    def load(
+        self,
+        source: ToolSourceConfig | None,
+        base_dir: Path,
+        manifest: AgentsShipgateManifest,
+    ) -> LoadedAdapterResult:
+        loaded_sources, artifacts = load_codex_plugin_artifacts(manifest, base_dir)
+        return LoadedAdapterResult(tool_sources=loaded_sources, artifact=artifacts)

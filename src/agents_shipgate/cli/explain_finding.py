@@ -23,10 +23,11 @@ from pydantic import ValidationError
 
 from agents_shipgate.checks.registry import check_catalog
 from agents_shipgate.cli.agent_mode import emit_agent_mode_error
-from agents_shipgate.cli.diagnostics import NextAction
-from agents_shipgate.core.models import (
-    AgentAction,
-    CheckMetadata,
+from agents_shipgate.core.privacy import sanitize_report_payload
+from agents_shipgate.schemas.checks import CheckMetadata
+from agents_shipgate.schemas.common import AgentAction
+from agents_shipgate.schemas.diagnostics import NextAction
+from agents_shipgate.schemas.report import (
     Finding,
     ReadinessReport,
 )
@@ -118,6 +119,8 @@ def _load_report(path: Path) -> tuple[ReadinessReport, dict[str, Any]]:
             "that this command depends on. Re-scan with the current "
             "CLI: `agents-shipgate scan -c shipgate.yaml --format json`."
         )
+
+    payload = sanitize_report_payload(payload)
 
     try:
         return ReadinessReport.model_validate(payload), payload
@@ -267,8 +270,14 @@ class FingerprintNotFound(LookupError):
     def __init__(self, fingerprint: str, *, suggestion: str | None) -> None:
         self.fingerprint = fingerprint
         self.suggestion = suggestion
+        # Name where the value comes from, not just that it did not match:
+        # the reader supplied an identifier and has to be told which field to
+        # copy the right one from (#329).
         suffix = f" Did you mean {suggestion}?" if suggestion else ""
-        super().__init__(f"Unknown fingerprint: {fingerprint}.{suffix}")
+        super().__init__(
+            f"Unknown fingerprint: {fingerprint}.{suffix} No entry in "
+            "findings[].fingerprint matches it."
+        )
 
 
 def explain_finding(
@@ -317,7 +326,9 @@ def explain_finding(
     except FingerprintNotFound as exc:
         suffix = f" Did you mean {exc.suggestion}?" if exc.suggestion else ""
         typer.echo(
-            f"Unknown fingerprint: {exc.fingerprint}.{suffix}", err=True
+            f"Unknown fingerprint: {exc.fingerprint}.{suffix} No entry in "
+            f"findings[].fingerprint in {source} matches it.",
+            err=True,
         )
         emit_agent_mode_error(
             "unknown_fingerprint",
@@ -348,27 +359,24 @@ def explain_finding(
         raise typer.Exit(2) from exc
     except ValueError as exc:
         typer.echo(f"explain-finding: {exc}", err=True)
+        rescan_action = NextAction(
+            kind="command",
+            command="agents-shipgate scan -c shipgate.yaml --format json",
+            why=(
+                f"Could not load {source}. Generate a fresh "
+                "report.json with the canonical 4-call flow."
+            ),
+            expects=(
+                "agents-shipgate-reports/report.json on disk, "
+                "validatable against the current report schema."
+            ),
+        )
         emit_agent_mode_error(
             "input_parse_error",
             message=str(exc),
             source_report=str(source),
-            next_action="agents-shipgate scan -c shipgate.yaml --format json",
-            next_actions=[
-                NextAction(
-                    kind="command",
-                    command=(
-                        "agents-shipgate scan -c shipgate.yaml --format json"
-                    ),
-                    why=(
-                        f"Could not load {source}. Generate a fresh "
-                        "report.json with the canonical 4-call flow."
-                    ),
-                    expects=(
-                        "agents-shipgate-reports/report.json on disk, "
-                        "validatable against the current report schema."
-                    ),
-                ).model_dump(mode="json")
-            ],
+            next_action=rescan_action.to_legacy_string(),
+            next_actions=[rescan_action.model_dump(mode="json")],
         )
         raise typer.Exit(3) from exc
 

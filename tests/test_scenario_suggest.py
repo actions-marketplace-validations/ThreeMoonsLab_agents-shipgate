@@ -7,7 +7,8 @@ from typer.testing import CliRunner
 from agents_shipgate.cli.main import app
 from agents_shipgate.cli.scan import run_scan
 from agents_shipgate.cli.scenario import scenario_yaml_payload
-from agents_shipgate.core.models import (
+from agents_shipgate.report.json_report import report_json_payload
+from agents_shipgate.schemas.report import (
     Finding,
     Misalignment,
     ReadinessReport,
@@ -15,7 +16,6 @@ from agents_shipgate.core.models import (
     SuggestedScenario,
     ToolSurfaceSummary,
 )
-from agents_shipgate.report.json_report import report_json_payload
 
 SAMPLE = Path("samples/support_refund_agent/shipgate.yaml")
 ACTIVE_SCENARIO_SEVERITIES = {"critical", "high", "medium"}
@@ -66,6 +66,33 @@ def test_scenario_suggest_writes_yaml_from_report_scenarios(tmp_path):
     assert "Wrote" in result.output
 
 
+def test_scenario_suggest_emits_source_block_for_high_risk_findings(tmp_path):
+    """v0.19 reviewer-grade provenance: scenario rows derived from
+    findings with structured ``source`` and ``policy_evidence_source``
+    pointers carry the dual citation as a nested ``source`` mapping —
+    reviewers reading the YAML can jump to both the tool and the
+    manifest line without re-loading report.json."""
+    report_path = _sample_report_path(tmp_path)
+    out_path = tmp_path / "suggested-scenarios.yaml"
+    runner.invoke(
+        app,
+        ["scenario", "suggest", "--from", str(report_path), "--out", str(out_path)],
+    )
+    payload = _load_yaml(out_path)
+    rows = payload["scenarios"]
+    # At least one row must come from a high-risk finding that carries
+    # both source pointers; pick the first row that does.
+    sourced = [row for row in rows if isinstance(row.get("source"), dict)]
+    assert sourced, "no scenario row carried the v0.19 dual-source block"
+    block = sourced[0]["source"]
+    assert isinstance(block, dict)
+    assert "tool" in block or "policy_evidence" in block
+    if "policy_evidence" in block:
+        # Manifest pointer rows must point at shipgate.yaml.
+        assert block["policy_evidence"].get("path") == "shipgate.yaml"
+        assert block["policy_evidence"].get("pointer", "").startswith("/")
+
+
 def test_scenario_suggest_covers_reachable_active_scenario_findings(tmp_path):
     report_path = _sample_report_path(tmp_path)
     out_path = tmp_path / "suggested-scenarios.yaml"
@@ -94,18 +121,14 @@ def test_scenario_suggest_covers_reachable_active_scenario_findings(tmp_path):
     row_finding_ids = {row["finding_id"] for row in rows}
     assert reachable_active == row_finding_ids
 
-    wildcard = next(
-        finding
-        for finding in report["findings"]
-        if finding["check_id"] == "SHIP-INVENTORY-WILDCARD-TOOLS"
-    )
     owner = next(
         finding
         for finding in report["findings"]
         if finding["check_id"] == "SHIP-MANIFEST-HIGH-RISK-OWNER-MISSING"
     )
-    assert wildcard["id"] in row_finding_ids
     assert owner["id"] in row_finding_ids
+    assert any(row["name"] == "wildcard_mcp_tools.*" for row in report["tool_catalog"])
+    assert all(row["name"] != "wildcard_mcp_tools.*" for row in report["tool_inventory"])
     assert any(
         findings[finding_id]["severity"] == "medium"
         for finding_id in row_finding_ids

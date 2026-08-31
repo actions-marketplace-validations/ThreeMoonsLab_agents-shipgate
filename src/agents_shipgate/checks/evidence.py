@@ -3,15 +3,25 @@ from __future__ import annotations
 from typing import Any
 
 from agents_shipgate.checks.base import agent_finding, tool_finding
+from agents_shipgate.core.artifact_models import (
+    AnthropicArtifacts,
+    OpenAIApiArtifacts,
+    ValidationArtifacts,
+)
+from agents_shipgate.core.capability_traces import (
+    capability_refs_for_tool,
+    capability_trace_refs_for_tool,
+)
 from agents_shipgate.core.context import ScanContext
-from agents_shipgate.core.models import (
-    Finding,
+from agents_shipgate.core.domain import Tool
+from agents_shipgate.core.risk_hints import is_policy_eligible_high_risk_tool, risk_tags
+from agents_shipgate.schemas.common import (
     HitlProvenanceType,
     HitlSourceProvenance,
-    Tool,
+    ProvenanceKind,
     sorted_hitl_source_provenance,
 )
-from agents_shipgate.core.risk_hints import is_high_risk_tool, risk_tags
+from agents_shipgate.schemas.report import Finding
 
 CANONICAL_LIMITED_AUTO_APPROVAL_FLAGS = (
     "approval_trace_required",
@@ -38,7 +48,7 @@ def run(context: ScanContext) -> list[Finding]:
 
 
 def _approval_trace_findings(context: ScanContext) -> list[Finding]:
-    artifacts = context.validation_artifacts
+    artifacts = context.artifact("validation", ValidationArtifacts)
     trace_files = artifacts.approval_trace_files if artifacts else []
     traces = artifacts.approval_traces if artifacts else []
     approved_tools = {
@@ -99,13 +109,23 @@ def _approval_trace_findings(context: ScanContext) -> list[Finding]:
                     f"Add local approval trace evidence for {tool_name}, fix the "
                     "declared source, or change the validation review posture."
                 ),
+                policy_evidence_pointer=(
+                    "/validation/required_evidence/approval_trace_required"
+                ),
+                provenance_kind="runtime_trace" if traces else "static_declaration",
+                capability_refs=capability_refs_for_tool(context, tool_name),
+                capability_trace_refs=capability_trace_refs_for_tool(
+                    context,
+                    tool_name,
+                    source_types={"validation_approval_trace"},
+                ),
             )
         )
     return findings
 
 
 def _override_reason_findings(context: ScanContext) -> list[Finding]:
-    artifacts = context.validation_artifacts
+    artifacts = context.artifact("validation", ValidationArtifacts)
     log_files = artifacts.override_log_files if artifacts else []
     events = artifacts.override_events if artifacts else []
     if not log_files:
@@ -158,6 +178,10 @@ def _override_reason_findings(context: ScanContext) -> list[Finding]:
                     "or auto-approval event."
                 ),
                 context=context,
+                provenance_kind="static_declaration",
+                policy_evidence_pointer=(
+                    "/validation/required_evidence/override_reason_required"
+                ),
             )
         ]
 
@@ -197,12 +221,16 @@ def _override_reason_findings(context: ScanContext) -> list[Finding]:
                 "override, bypass, or auto-approval events."
             ),
             context=context,
+            provenance_kind="static_declaration",
+            policy_evidence_pointer=(
+                "/validation/required_evidence/override_reason_required"
+            ),
         )
     ]
 
 
 def _high_risk_exclusion_findings(context: ScanContext) -> list[Finding]:
-    artifacts = context.validation_artifacts
+    artifacts = context.artifact("validation", ValidationArtifacts)
     exclusion_files = artifacts.high_risk_exclusion_files if artifacts else []
     exclusions = artifacts.high_risk_auto_approval_exclusions if artifacts else []
     excluded_tools = {
@@ -212,7 +240,7 @@ def _high_risk_exclusion_findings(context: ScanContext) -> list[Finding]:
     findings: list[Finding] = []
     reason = "file_missing" if not exclusion_files else "tool_missing"
     for tool in sorted(context.tools, key=lambda item: item.name):
-        if not is_high_risk_tool(tool):
+        if not is_policy_eligible_high_risk_tool(tool):
             continue
         if tool.name not in approval_declared:
             continue
@@ -266,6 +294,11 @@ def _high_risk_exclusion_findings(context: ScanContext) -> list[Finding]:
                     "with a reason before targeting limited auto-approval."
                 ),
                 context=context,
+                provenance_kind="static_declaration",
+                policy_evidence_pointer=(
+                    "/validation/required_evidence/"
+                    "high_risk_auto_approval_exclusion_required"
+                ),
             )
         )
     return findings
@@ -275,7 +308,7 @@ def _promotion_criteria_findings(context: ScanContext) -> list[Finding]:
     validation = context.manifest.validation
     if validation is None or validation.target_review_posture != "limited_auto_approval":
         return []
-    artifacts = context.validation_artifacts
+    artifacts = context.artifact("validation", ValidationArtifacts)
     criteria_files = artifacts.promotion_criteria_files if artifacts else []
     criteria = artifacts.promotion_criteria if artifacts else []
     if not criteria_files:
@@ -352,6 +385,8 @@ def _promotion_criteria_finding(
             "auto-approval review posture and required evidence flags."
         ),
         context=context,
+        provenance_kind="static_declaration",
+        policy_evidence_pointer="/validation/target_review_posture",
     )
 
 
@@ -390,10 +425,12 @@ def _missing_criteria_flags(
 
 def _approval_tools(context: ScanContext) -> set[str]:
     tools = set(context.manifest.policies.approval_tools())
-    if context.api_artifacts:
-        tools |= context.api_artifacts.approval_tools()
-    if context.anthropic_artifacts:
-        tools |= context.anthropic_artifacts.approval_tools()
+    api_artifacts = context.artifact("openai_api", OpenAIApiArtifacts)
+    if api_artifacts:
+        tools |= api_artifacts.approval_tools()
+    anthropic_artifacts = context.artifact("anthropic_api", AnthropicArtifacts)
+    if anthropic_artifacts:
+        tools |= anthropic_artifacts.approval_tools()
     return tools
 
 
@@ -405,6 +442,10 @@ def _evidence_finding_for_tool(
     title: str,
     evidence: dict[str, object],
     recommendation: str,
+    policy_evidence_pointer: str | None = None,
+    provenance_kind: ProvenanceKind = "static_declaration",
+    capability_refs: list[str] | None = None,
+    capability_trace_refs: list[str] | None = None,
 ) -> Finding:
     if tool is not None:
         return tool_finding(
@@ -417,6 +458,10 @@ def _evidence_finding_for_tool(
             confidence="high",
             recommendation=recommendation,
             context=context,
+            provenance_kind=provenance_kind,
+            policy_evidence_pointer=policy_evidence_pointer,
+            capability_refs=capability_refs,
+            capability_trace_refs=capability_trace_refs,
         )
     return agent_finding(
         check_id=check_id,
@@ -427,6 +472,10 @@ def _evidence_finding_for_tool(
         confidence="medium",
         recommendation=recommendation,
         context=context,
+        provenance_kind=provenance_kind,
+        policy_evidence_pointer=policy_evidence_pointer,
+        capability_refs=capability_refs,
+        capability_trace_refs=capability_trace_refs,
     )
 
 
@@ -448,7 +497,7 @@ def _source_provenance(
             detail=requirement_detail,
         )
     ]
-    artifacts = context.validation_artifacts
+    artifacts = context.artifact("validation", ValidationArtifacts)
     if artifacts is not None:
         items.extend(item for item in artifacts.source_provenance if item.type == type)
     if not _declared_evidence_sources(context, type):
@@ -478,6 +527,7 @@ def _declared_evidence_sources(
     return bool(
         {
             "approval_trace": evidence.approval_traces,
+            "agent_trace": evidence.agent_traces,
             "override_log": evidence.override_logs,
             "high_risk_exclusion": evidence.high_risk_exclusions,
             "promotion_criteria": evidence.promotion_criteria,

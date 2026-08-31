@@ -1,26 +1,66 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "schema_version": "0.1",
+  "schema_version": "0.4",
   "name": "agents-shipgate-triggers",
-  "description": "Machine-readable trigger catalog for Agents Shipgate. Mirrors the AGENTS.md trigger table — a coding agent that has not yet adopted Shipgate can fetch this and apply the rules to a PR diff or repo state to decide whether to run `agents-shipgate detect`. Stable for 0.x: rule IDs, predicate vocabulary, and action enum will not change in minor versions.",
+  "description": "Machine-readable trigger catalog for Agents Shipgate. Mirrors the AGENTS.md trigger table — a coding agent can fetch this and apply the rules to a PR diff or repo state to decide whether to run `agents-shipgate verify --preview --json` or the full verifier. Stable for 0.x: rule IDs, predicate vocabulary, and action enum will not change in minor versions.",
   "source_of_truth": "AGENTS.md#should-i-run-shipgate-on-this-pr",
   "documentation_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/AGENTS.md",
-  "default_command": "agents-shipgate detect --workspace . --json",
+  "default_command": "agents-shipgate verify --preview --json",
   "predicate_vocabulary": {
-    "glob": "Any changed file in the PR matches the glob (relative to repo root). Globstar `**` matches zero or more path segments; `*` matches within a segment; brace expansion is not supported.",
+    "glob": "Any changed file in the PR matches the glob (relative to repo root). Globstar `**` matches zero or more path segments; `*` matches within a segment; brace expansion is not supported. Matching is case-insensitive, like `boundary_adapter` and the verifier's trust-root classification: Git can carry a spelling (`Policies/`, `agents.md`) that resolves to the canonical governance file on a case-insensitive filesystem, so a case variant must not route differently.",
     "diff_contains": "The unified diff (added or modified lines) of this PR contains the literal string. Use only with stable token forms — decorator names, package names, function calls.",
     "file_present": "The named path exists in the working tree at the head commit, regardless of whether this PR changed it.",
     "file_absent": "The named path does NOT exist in the working tree at the head commit.",
-    "every_file_matches": "Every changed file in this PR matches at least one of the listed globs (or the single glob, if a string). False on an empty PR.",
-    "none_match_glob": "No changed file matches any of the listed globs.",
+    "every_file_matches": "Every changed file in this PR matches at least one of the listed globs (or the single glob, if a string). False on an empty PR. Matching is case-SENSITIVE, unlike `glob` and `none_match_glob`. This predicate classifies a change set as ignorable, so a wider match produces more skips: case-folding it would read `src/TEST_agent.py` — a legitimate production path on a case-sensitive filesystem — as a test file and skip a PR that adds a tool beside it.",
+    "none_match_glob": "No changed file matches any of the listed globs. Same case-insensitive matching as `glob`: it guards a negative rule, so a wider match makes that rule fire less, never more.",
+    "boundary_adapter": "Any changed file matches the named entry in `boundary_adapters`. Matching is case-insensitive. The adapter registry is the authoritative path source shared by check, verify, preflight, audit, and triggers.",
+    "none_match_boundary_surface": "No changed file matches any path in `boundary_adapters`. Used by negative rules so a host trust root is never treated as a docs-only change.",
     "any_of": "Logical OR over a list of nested predicates.",
     "all_of": "Logical AND over a list of nested predicates.",
-    "detect_returns": "Result of `agents-shipgate detect --workspace . --json` matches the given `key: value` pair (`is_agent_project: false`, `suggested_sources: []`, etc.). Used in `stop_conditions` only.",
+    "detect_returns": "Result of `agents-shipgate detect --workspace . --json` matches the given `key: value` pair (`is_agent_project: false`, `suggested_sources: []`, etc.). A key the supplied payload does not carry is *absent*, not false: the block that reads it is then unevaluable rather than satisfied. Used in `stop_conditions` only.",
     "user_did_not_request": "The user did not explicitly ask for a Shipgate run in their prompt. Used in `stop_conditions` only."
   },
+  "boundary_adapters": [
+    {
+      "id": "codex",
+      "hosts": ["codex"],
+      "exact_paths": [".codex/config.toml", ".codex/hooks.json", ".codex/requirements.toml"],
+      "globs": ["**/.codex/config.toml", "**/.codex/hooks.json", "**/.codex/requirements.toml"],
+      "experimental": false
+    },
+    {
+      "id": "claude_code",
+      "hosts": ["claude-code"],
+      "exact_paths": [".claude/settings.json", ".claude/settings.local.json", ".mcp.json", "CLAUDE.md"],
+      "globs": ["**/.mcp.json", "**/CLAUDE.md", ".claude/commands/*", ".claude/commands/**", ".claude/skills/*/SKILL.md", ".claude/skills/**/SKILL.md"],
+      "experimental": false
+    },
+    {
+      "id": "cursor",
+      "hosts": ["cursor"],
+      "exact_paths": [".cursor/cli.json", ".cursor/mcp.json"],
+      "globs": [".cursor/rules/*", ".cursor/rules/**"],
+      "experimental": false
+    },
+    {
+      "id": "vscode_mcp",
+      "hosts": ["vscode"],
+      "exact_paths": [".vscode/mcp.json"],
+      "globs": [],
+      "experimental": true
+    },
+    {
+      "id": "shared",
+      "hosts": ["codex", "claude-code", "cursor"],
+      "exact_paths": ["AGENTS.md", "AGENTS.override.md", "shipgate.yaml", ".shipgate/agent-contract.json", "policies/agent-boundary.shipgate.yaml", "policies/codex-boundary.shipgate.yaml", "policies/host-boundary.shipgate.yaml"],
+      "globs": ["**/AGENTS.md", "**/AGENTS.override.md", ".agents/skills/*/SKILL.md", ".agents/skills/**/SKILL.md", ".github/workflows/*.yml", ".github/workflows/*.yaml", "**/.github/workflows/*.yml", "**/.github/workflows/*.yaml", ".agents-shipgate/baseline*.json", ".agents-shipgate/*waiver*.json", ".agents-shipgate/state*.json", "policies/*.shipgate.yaml"],
+      "experimental": false
+    }
+  ],
   "rules": [
     {
       "id": "TRIGGER-MCP-EXPORT-CHANGED",
+      "surface_class": "capability",
       "agents_md_row": "Adds/changes MCP exports, OpenAPI specs, or `tools/*openai*tools*.json`",
       "when": {
         "any_of": [
@@ -30,10 +70,33 @@
       },
       "action": "run_shipgate",
       "rationale": "MCP exports declare a tool surface; changes need a tool-use readiness check.",
-      "command": "agents-shipgate detect --workspace . --json"
+      "command": "agents-shipgate verify --preview --json"
+    },
+    {
+      "id": "TRIGGER-MCP-TOOL-SCHEMA-CONTENT",
+      "surface_class": "capability",
+      "agents_md_row": "Adds/changes MCP exports, OpenAPI specs, or `tools/*openai*tools*.json`",
+      "when": {
+        "all_of": [
+          {"any_of": [
+            {"diff_contains": "inputSchema"},
+            {"diff_contains": "input_schema"}
+          ]},
+          {"any_of": [
+            {"diff_contains": "readOnlyHint"},
+            {"diff_contains": "destructiveHint"},
+            {"diff_contains": "idempotentHint"},
+            {"diff_contains": "openWorldHint"}
+          ]}
+        ]
+      },
+      "action": "run_shipgate",
+      "rationale": "A tool definition carrying an MCP input schema and MCP annotation hints is a tool surface whatever the file is named. TRIGGER-MCP-EXPORT-CHANGED recognises MCP exports by filename, which misses `pkg/github/__toolsnaps__/delete_repository.snap` and `mcp-server/tools.json` alike; content recognition does not depend on a naming convention the repository never agreed to.",
+      "command": "agents-shipgate verify --preview --json"
     },
     {
       "id": "TRIGGER-OPENAPI-SPEC-CHANGED",
+      "surface_class": "capability",
       "agents_md_row": "Adds/changes MCP exports, OpenAPI specs, or `tools/*openai*tools*.json`",
       "when": {
         "any_of": [
@@ -47,10 +110,11 @@
       },
       "action": "run_shipgate",
       "rationale": "OpenAPI specs define HTTP-tool surfaces; scope coverage and side-effect classification depend on them.",
-      "command": "agents-shipgate detect --workspace . --json"
+      "command": "agents-shipgate verify --preview --json"
     },
     {
       "id": "TRIGGER-STATIC-TOOL-INVENTORY-CHANGED",
+      "surface_class": "capability",
       "agents_md_row": "Adds/changes MCP exports, OpenAPI specs, or `tools/*openai*tools*.json`",
       "when": {
         "any_of": [
@@ -63,7 +127,53 @@
       "rationale": "Static tool inventories for the OpenAI and Anthropic Messages APIs are first-class tool sources."
     },
     {
+      "id": "TRIGGER-CODEX-BOUNDARY-CONFIG-CHANGED",
+      "surface_class": "host_boundary",
+      "agents_md_row": "Adds/changes Codex repo config, hooks, or permission profiles",
+      "when": {"boundary_adapter": "codex"},
+      "action": "run_shipgate",
+      "rationale": "Repo-local Codex config controls sandboxing, network access, MCP approvals, hooks, and permission profiles; changes need a local boundary check.",
+      "command": "shipgate check --agent codex --workspace . --format agent-boundary-json"
+    },
+    {
+      "id": "TRIGGER-CLAUDE-BOUNDARY-CONFIG-CHANGED",
+      "surface_class": "host_boundary",
+      "agents_md_row": "Adds/changes coding-agent host config, hooks, permissions, MCP servers, or workflows",
+      "when": {"boundary_adapter": "claude_code"},
+      "action": "run_shipgate",
+      "rationale": "Claude Code project settings and MCP declarations control permissions, hooks, sandboxing, network access, and reachable servers; changes need a local boundary check.",
+      "command": "shipgate check --agent claude-code --workspace . --format agent-boundary-json"
+    },
+    {
+      "id": "TRIGGER-CURSOR-BOUNDARY-CONFIG-CHANGED",
+      "surface_class": "host_boundary",
+      "agents_md_row": "Adds/changes coding-agent host config, hooks, permissions, MCP servers, or workflows",
+      "when": {"boundary_adapter": "cursor"},
+      "action": "run_shipgate",
+      "rationale": "Cursor project permissions, MCP declarations, and rules define the coding-agent boundary; changes need a local boundary check.",
+      "command": "shipgate check --agent cursor --workspace . --format agent-boundary-json"
+    },
+    {
+      "id": "TRIGGER-VSCODE-MCP-BOUNDARY-CHANGED",
+      "surface_class": "host_boundary",
+      "agents_md_row": "Adds/changes coding-agent host config, hooks, permissions, MCP servers, or workflows",
+      "when": {"boundary_adapter": "vscode_mcp"},
+      "action": "run_shipgate",
+      "rationale": "VS Code workspace MCP declarations are an experimental host boundary and must fail closed when changed.",
+      "command": "shipgate check --agent codex --workspace . --format agent-boundary-json"
+    },
+    {
+      "id": "TRIGGER-SHARED-HOST-BOUNDARY-CHANGED",
+      "surface_class": "host_boundary",
+      "agents_md_row": "Adds/changes coding-agent host config, hooks, permissions, MCP servers, or workflows",
+      "when": {"boundary_adapter": "shared"},
+      "action": "run_shipgate",
+      "rationale": "Workflow permissions, pull_request_target, and write-capable automation are shared coding-agent trust roots.",
+      "command": "shipgate check --agent codex --workspace . --format agent-boundary-json"
+    },
+    {
       "id": "TRIGGER-CODEX-PLUGIN-CHANGED",
+      "surface_class": "capability",
       "agents_md_row": "Adds/changes Codex plugin manifests, marketplace files, `.app.json`, `.mcp.json`, or `SKILL.md` files",
       "when": {
         "any_of": [
@@ -78,10 +188,43 @@
       },
       "action": "run_shipgate",
       "rationale": "Codex plugin packages and marketplaces are static release surfaces; plugin metadata, skills, apps, MCP server declarations, and hooks need a readiness check.",
-      "command": "agents-shipgate detect --workspace . --json"
+      "command": "agents-shipgate verify --preview --json"
+    },
+    {
+      "id": "TRIGGER-N8N-WORKFLOW-CHANGED",
+      "surface_class": "capability",
+      "agents_md_row": "Adds/changes n8n workflow JSON, credential stubs, or n8n tool inventories",
+      "when": {
+        "any_of": [
+          {"diff_contains": "n8n-nodes-base."},
+          {"diff_contains": "n8n-nodes-langchain."},
+          {"diff_contains": "@n8n/n8n-nodes-"},
+          {"glob": "**/*n8n*.json"},
+          {"glob": "**/.n8n/**"}
+        ]
+      },
+      "action": "run_shipgate",
+      "rationale": "n8n workflow JSON declares an AI tool surface (AI Agent tool sub-nodes, MCP client/server tools, HTTP Request tools); `n8n-nodes-*` node-type tokens are the stable in-diff marker. Changes need a tool-use readiness check."
+    },
+    {
+      "id": "TRIGGER-CONDUCTOR-WORKFLOW-CHANGED",
+      "surface_class": "capability",
+      "agents_md_row": "Adds/changes Conductor OSS workflow JSON with AI/MCP tasks",
+      "when": {
+        "any_of": [
+          {"diff_contains": "CALL_MCP_TOOL"},
+          {"diff_contains": "LIST_MCP_TOOLS"},
+          {"diff_contains": "LLM_CHAT_COMPLETE"},
+          {"glob": "**/conductor/**/*.json"},
+          {"glob": "**/ai/examples/**/*.json"}
+        ]
+      },
+      "action": "run_shipgate",
+      "rationale": "Conductor OSS workflow JSON can declare runtime MCP discovery/calls and LLM tool-selection surfaces; changes need deterministic static review."
     },
     {
       "id": "TRIGGER-FUNCTION-TOOL-DECORATOR",
+      "surface_class": "capability",
       "agents_md_row": "Adds/changes `@function_tool`/`@tool` decorators (LangChain, CrewAI, OpenAI Agents SDK)",
       "when": {
         "any_of": [
@@ -94,26 +237,59 @@
       "rationale": "`@function_tool` / `@tool` (LangChain, CrewAI, OpenAI Agents SDK) and ADK `FunctionTool(...)` add or modify the tools the agent can call."
     },
     {
+      "id": "TRIGGER-GOOGLE-ADK-AGENT-TOOLS-CHANGED",
+      "surface_class": "capability",
+      "agents_md_row": "Adds/changes a Google ADK `Agent`/`LlmAgent` `tools=[...]` list",
+      "when": {
+        "all_of": [
+          {"diff_contains": "tools=["},
+          {"any_of": [
+            {"diff_contains": "LlmAgent("},
+            {"all_of": [
+              {"any_of": [
+                {"diff_contains": "google.adk"},
+                {"diff_contains": "google-adk"}
+              ]},
+              {"diff_contains": "Agent("}
+            ]}
+          ]}
+        ]
+      },
+      "action": "run_shipgate",
+      "rationale": "A `tools=[...]` argument appears in this diff together with either `LlmAgent(` — a class name no other supported framework uses, so it identifies Google ADK on its own — or a `google.adk` module path alongside an `Agent(` construction. The two legs exist because an edit that adds one tool to an existing agent shows only the constructor and the list; the import sits outside the hunk, so requiring it would miss every modified list and cover only whole-file additions. Plain functions passed to `tools=[...]` carry no decorator, so TRIGGER-FUNCTION-TOOL-DECORATOR never sees them — this rule is what routes an ADK agent's directly reachable tool list. Two forms are deliberately NOT matched. The spaced `tools = [` is TOML array syntax as often as it is Python (it also swallows `enabled_tools = [...]`), and a token that broad is what this catalog is trying to stop reporting as structure. A bare `Agent(` with no ADK token cannot be told apart from CrewAI's `Agent(tools=[...])` by diff text alone, so a *modified* list on the `Agent` alias is out of reach here; closing it needs a signal read from the head file rather than the diff.",
+      "command": "agents-shipgate verify --preview --json"
+    },
+    {
       "id": "TRIGGER-PROMPTS-OR-POLICIES",
+      "surface_class": "governance",
       "agents_md_row": "Edits `prompts/`, `policies/`, or `permissions.scopes` in `shipgate.yaml`",
       "when": {
         "any_of": [
           {"glob": "prompts/**"},
-          {"glob": "policies/**"}
+          {"glob": "**/prompts/**"},
+          {"glob": "policies/**"},
+          {"glob": "**/policies/**"}
         ]
       },
       "action": "run_shipgate",
-      "rationale": "Prompts and policy YAML carry approval / confirmation evidence. Trace findings reference these surfaces."
+      "rationale": "Prompts and policy YAML carry approval / confirmation evidence. Trace findings reference these surfaces. The globs match at any depth, and case-insensitively, so a nested or differently-spelled workspace (`services/foo/policies/**`, `enterprise/lib/captain/Prompts/**`) routes exactly like a repo-root one. That is parity with the verifier: `SHIP-VERIFY-TRUST-ROOT-TOUCHED` classifies both surfaces off `TRUST_ROOT_SURFACES`, which has always carried `**/policies/**` and `**/prompts/**`, and the policy check's no-base fail-safe, `SHIP-VERIFY-POLICY-BASE-ABSENT`, additionally treats `**/policies/**` as a fail-safe trust root (its surface list covers the manifest, policies and `.agents-shipgate/`, not prompts). A root-only, case-sensitive trigger reported edits those checks call governance-bearing as `no_match`. The `**/`-prefixed and bare forms are both listed because a consumer applying this catalog with a glob engine where `**/` requires at least one leading segment would otherwise lose the repo-root match."
     },
     {
       "id": "TRIGGER-SHIPGATE-MANIFEST",
+      "surface_class": "governance",
       "agents_md_row": "Edits `prompts/`, `policies/`, or `permissions.scopes` in `shipgate.yaml`",
-      "when": {"glob": "shipgate.yaml"},
+      "when": {
+        "any_of": [
+          {"glob": "shipgate.yaml"},
+          {"glob": "**/shipgate.yaml"}
+        ]
+      },
       "action": "run_shipgate",
-      "rationale": "The manifest is the source of truth for the release gate."
+      "rationale": "The manifest is the source of truth for the release gate. The glob matches at any depth: a monorepo keeps one manifest per project directory (`services/refund/shipgate.yaml`), and a root-only rule reported an edit to the very file that declares a project's agent, purpose, and tool surface as `no_match`. The `**/`-prefixed and bare forms are both listed for the same reason as the prompts/policies rule: a consumer whose glob engine requires a leading segment for `**/` would otherwise lose the repo-root match."
     },
     {
       "id": "TRIGGER-SHIPGATE-CI-WORKFLOW",
+      "surface_class": "governance",
       "agents_md_row": "Adds/edits `.github/workflows/agents-shipgate.yml` or related CI",
       "when": {
         "any_of": [
@@ -127,6 +303,7 @@
     },
     {
       "id": "TRIGGER-EXISTING-MANIFEST-PRESENT",
+      "surface_class": "adoption",
       "agents_md_row": "Repo already opted in (shipgate.yaml present in the workspace)",
       "when": {"file_present": "shipgate.yaml"},
       "action": "force_run",
@@ -134,20 +311,58 @@
     },
     {
       "id": "TRIGGER-FRAMEWORK-VERSION-BUMP",
+      "surface_class": "dependency",
       "agents_md_row": "(Optional) Refactor or framework upgrade that may shift the extracted tool surface",
       "when": {
-        "any_of": [
-          {"diff_contains": "openai-agents"},
-          {"diff_contains": "langchain"},
-          {"diff_contains": "crewai"},
-          {"diff_contains": "google-adk"}
+        "all_of": [
+          {"any_of": [
+            {"diff_contains": "openai-agents"},
+            {"diff_contains": "langchain"},
+            {"diff_contains": "crewai"},
+            {"diff_contains": "google-adk"},
+            {"diff_contains": "conductor-oss"}
+          ]},
+          {"any_of": [
+            {"glob": "**/pyproject.toml"},
+            {"glob": "**/setup.py"},
+            {"glob": "**/setup.cfg"},
+            {"glob": "**/requirements*.txt"},
+            {"glob": "**/requirements*.in"},
+            {"glob": "**/requirements/*.txt"},
+            {"glob": "**/requirements/*.in"},
+            {"glob": "**/constraints*.txt"},
+            {"glob": "**/constraints*.in"},
+            {"glob": "**/Pipfile"},
+            {"glob": "**/Pipfile.lock"},
+            {"glob": "**/poetry.lock"},
+            {"glob": "**/uv.lock"},
+            {"glob": "**/pdm.lock"},
+            {"glob": "**/pylock.toml"},
+            {"glob": "**/pylock.*.toml"},
+            {"glob": "**/environment.yml"},
+            {"glob": "**/environment.yaml"},
+            {"glob": "**/conda-lock.yml"},
+            {"glob": "**/conda-lock.yaml"},
+            {"glob": "**/package.json"},
+            {"glob": "**/package-lock.json"},
+            {"glob": "**/npm-shrinkwrap.json"},
+            {"glob": "**/pnpm-lock.yaml"},
+            {"glob": "**/yarn.lock"},
+            {"glob": "**/bun.lock"},
+            {"glob": "**/bun.lockb"},
+            {"glob": "**/pom.xml"},
+            {"glob": "**/build.gradle"},
+            {"glob": "**/build.gradle.kts"},
+            {"glob": "**/gradle/libs.versions.toml"}
+          ]}
         ]
       },
       "action": "dry_run",
-      "rationale": "Framework dependency bumps can shift the extracted tool surface; dry-run is a defensive no-cost check."
+      "rationale": "Two signals co-occur: a supported-framework package token appears somewhere in this diff, AND a dependency manifest is among the changed files. That co-occurrence is the whole of the evidence — the rule does not confirm that any version moved, and a bare token in prose or sample code no longer matches on its own. A framework upgrade can shift the statically extracted tool surface, so an advisory dry-run is a no-cost defensive check. (The rule ID is retained for 0.x compatibility; read this rationale, not the ID, for what was observed.)"
     },
     {
       "id": "TRIGGER-DOCS-ONLY-NEGATIVE",
+      "surface_class": "negative",
       "agents_md_row": "Pure read-only doc/test changes with no manifest impact",
       "when": {
         "all_of": [
@@ -176,8 +391,11 @@
             "**/*openapi*.yml",
             "**/*openapi*.json",
             "prompts/**",
-            "policies/**"
-          ]}
+            "**/prompts/**",
+            "policies/**",
+            "**/policies/**"
+          ]},
+          {"none_match_boundary_surface": true}
         ]
       },
       "action": "skip_shipgate",
@@ -185,27 +403,28 @@
     }
   ],
   "stop_conditions": {
-    "description": "Stop and do not propose Shipgate when ALL of these hold (mirrors AGENTS.md \"Stop conditions\" prose).",
+    "description": "Stop and do not propose Shipgate when ALL of these hold (mirrors AGENTS.md \"Stop conditions\" prose). Every negative in this conjunction is a claim about the whole workspace, which is why `python_parse_truncated: false` belongs in it: a detect run whose Python parse stopped at its cap read only part of the repository, and `is_agent_project: false` from a partial read is not a reason to stop. The raw parse bit is the one to read here, not `agent_scope_truncated` — that one additionally requires more than one candidate scope, so a single-scope workspace whose only agent sits past the cap leaves it false. A `detect` payload that does not carry every key named here leaves the block unevaluable — `stop_conditions_evaluated` is false and no stop is inferred.",
     "all_of": [
       {"detect_returns": "is_agent_project: false"},
       {"detect_returns": "suggested_sources: []"},
       {"detect_returns": "codex_plugin_candidates: []"},
+      {"detect_returns": "python_parse_truncated: false"},
       {"file_absent": "shipgate.yaml"},
       {"user_did_not_request": true}
     ]
   },
   "actions": {
     "force_run": "Propose Shipgate unconditionally. Overrides `skip_shipgate` rules — used when the repo has explicitly opted in (e.g. existing `shipgate.yaml`) and every PR should be checked.",
-    "run_shipgate": "Propose `agents-shipgate detect --json` as the next step; if `is_agent_project` or `suggested_sources` is non-trivial, follow with `init --write --ci` and `scan`. Does NOT win over `skip_shipgate` — a docs-only PR that incidentally mentions a tool decorator stays skipped.",
+    "run_shipgate": "Propose `agents-shipgate verify --preview --json` as the next step; if preview says the repo needs configuration, use supporting setup commands before the full verifier. Does NOT win over `skip_shipgate` — a docs-only PR that incidentally mentions a tool decorator stays skipped.",
     "skip_shipgate": "Do not propose Shipgate. Beats `run_shipgate` (but loses to `force_run`). Recommend other appropriate checks for the PR.",
     "dry_run": "Advisory: `run_shipgate` stays false but `dry_run_recommended` is true in the evaluator output. Callers may propose a non-mutating scan; never propose `init --write` based on `dry_run` alone."
   },
   "action_precedence": [
-    "stop_conditions (block everything)",
+    "stop_conditions (block everything) \u2014 unless a force_run or run_shipgate rule matched, in which case the diff carries capability evidence the whole-workspace negative did not account for",
     "force_run (overrides skip)",
     "skip_shipgate (overrides run)",
     "run_shipgate",
     "dry_run (sets dry_run_recommended; run_shipgate stays false)",
-    "no rules matched (skip)"
+    "no rules matched, or a skip resting on changed files no rule classified (verdict withheld: evaluation_status=unclassified, run_shipgate=null, next_action routes to the scan)"
   ]
 }

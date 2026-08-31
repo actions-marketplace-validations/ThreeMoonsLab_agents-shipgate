@@ -42,16 +42,15 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar, Literal
 
-from agents_shipgate.config.schema import AnthropicConfig, ArtifactPathConfig
-from agents_shipgate.core.errors import InputParseError
-from agents_shipgate.core.models import (
-    AnthropicArtifacts,
+from agents_shipgate.core.artifact_models import AnthropicArtifacts
+from agents_shipgate.core.domain import (
     LoadedToolSource,
     Tool,
     ToolRiskHint,
 )
+from agents_shipgate.core.errors import InputParseError
 from agents_shipgate.inputs.common import (
     iter_tool_items,
     load_structured_file,
@@ -61,6 +60,13 @@ from agents_shipgate.inputs.common import (
     resolve_input_path,
     schema_to_parameters,
     stable_tool_id,
+)
+from agents_shipgate.inputs.protocol import LoadedAdapterResult
+from agents_shipgate.schemas.manifest import (
+    AgentsShipgateManifest,
+    AnthropicConfig,
+    ArtifactPathConfig,
+    ToolSourceConfig,
 )
 
 PROMPT_SUFFIXES = {".md", ".markdown", ".txt"}
@@ -361,6 +367,8 @@ def _tool_from_anthropic_definition(
                 tag=tag,
                 source="anthropic_client_tool_type",
                 confidence="high",
+                basis="typed_provider_fact",
+                provenance_kind="ast_extraction",
                 evidence={"anthropic_tool_type": typed_client_kind},
             )
         )
@@ -401,3 +409,28 @@ def _display_path(path: Path, base_dir: Path) -> str:
         return path.resolve().relative_to(base_dir.resolve()).as_posix()
     except ValueError:
         return path.as_posix()
+
+
+class AnthropicAPIAdapter:
+    """``ToolSourceAdapter`` wrapping :func:`load_anthropic_artifacts`.
+
+    Manifest-only: ``source_type = "anthropic_api"`` is NOT in
+    ``ToolSourceConfig.type``'s Literal. Always invoked once per scan
+    via the dispatcher's pass 2; reads from ``manifest.anthropic``.
+    """
+
+    source_type: ClassVar[str] = "anthropic_api"
+    scope: ClassVar[Literal["per_source", "per_scan"]] = "per_scan"
+    artifact_class: ClassVar[type | None] = AnthropicArtifacts
+
+    def load(
+        self,
+        source: ToolSourceConfig | None,
+        base_dir: Path,
+        manifest: AgentsShipgateManifest,
+    ) -> LoadedAdapterResult:
+        anthropic_source, artifacts = load_anthropic_artifacts(
+            manifest.anthropic, base_dir
+        )
+        tool_sources = [anthropic_source] if anthropic_source is not None else []
+        return LoadedAdapterResult(tool_sources=tool_sources, artifact=artifacts)

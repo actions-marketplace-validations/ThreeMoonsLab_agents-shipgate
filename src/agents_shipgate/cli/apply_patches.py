@@ -16,7 +16,16 @@ Exit codes:
 - 0 — dry-run completed, or all patches applied.
 - 2 — ``--from`` payload malformed.
 - 4 — internal error.
-- 5 — containment violation; refused to apply.
+- 5 — containment violation, or a ``declare_action`` patch that could not be
+  written (the manifest answers the row differently, or has changed since the
+  scan); nothing written.
+
+``declare_action`` (report v0.39) is the one kind whose patches do not come
+from ``findings[].patches``. It answers a declaration question published on
+``release_decision.evidence_coverage.evidence_gaps[].next_action.patch``, it
+is outside the default ``--kinds`` so no existing pipeline starts writing
+declarations, and its refusals are the one file-level outcome this command
+reports through the exit code — see ``_declare_action`` (#410 §D).
 """
 
 from __future__ import annotations
@@ -33,8 +42,14 @@ import typer
 from pydantic import ValidationError
 from ruamel.yaml import YAML
 
-from agents_shipgate.core.patches import (
+from agents_shipgate.schemas.declaration_continuation import (
+    DECLARATION_CONTINUATION_ARTIFACT_NAME,
+    AppliedDeclaration,
+    DeclarationContinuationV1,
+)
+from agents_shipgate.schemas.patches import (
     AppendPointerPatch,
+    DeclareActionPatch,
     ManualPatch,
     Patch,
     RemovePointerPatch,
@@ -59,7 +74,17 @@ def apply_patches(
         help=(
             "Comma-separated patch kinds to include. ManualPatch is never "
             "applied; if you want it included for completeness pass "
-            "manual explicitly."
+            "manual explicitly. declare_action is deliberately outside the "
+            "default set: it writes a new declaration into the manifest, so "
+            "it is applied only when asked for by name."
+        ),
+    ),
+    finding_ids: list[str] | None = typer.Option(
+        None,
+        "--finding-id",
+        help=(
+            "Apply patches only from this exact finding id. May be repeated. "
+            "Every requested id must exist; omission keeps the legacy all-findings behavior."
         ),
     ),
     apply: bool = typer.Option(
@@ -80,9 +105,13 @@ def apply_patches(
     confidence_levels = _confidence_set(confidence)
     kind_set = {k.strip() for k in kinds.split(",") if k.strip()}
 
+    report_bytes = b""
     try:
-        report = json.loads(from_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
+        # Bytes, then decode: the receipt below pins this report by content,
+        # and text reading normalizes newlines out of the digest.
+        report_bytes = from_path.read_bytes()
+        report = json.loads(report_bytes.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         message = f"Cannot parse JSON report at {from_path}: {exc}"
         typer.echo(message, err=True)
         _emit_malformed_patch_error(from_path, message)
@@ -130,10 +159,36 @@ def apply_patches(
         raise typer.Exit(5)
     manifest_dir_resolved = Path(manifest_dir).resolve()
 
+    findings = report.get("findings", [])
+    requested_ids = set(finding_ids or [])
+    available_ids = {
+        str(finding.get("id"))
+        for finding in findings
+        if isinstance(finding, dict) and finding.get("id")
+    }
+    missing_ids = sorted(requested_ids - available_ids)
+    if missing_ids:
+        message = (
+            "Requested finding id(s) are absent from the report: "
+            + ", ".join(missing_ids)
+        )
+        typer.echo(message, err=True)
+        _emit_malformed_patch_error(from_path, message)
+        raise typer.Exit(2)
+
     raw_patches: list[dict[str, Any]] = []
-    for finding in report.get("findings", []):
+    for finding in findings:
+        if requested_ids and str(finding.get("id")) not in requested_ids:
+            continue
         for patch in finding.get("patches") or []:
             raw_patches.append(patch)
+    # Declaration patches hang off the evidence-gap rows, not off findings:
+    # a declaration question is not a finding and never was (#410 §D). They
+    # are skipped entirely under ``--finding-id``, which asks for the patches
+    # of named findings and would otherwise silently widen to rows that have
+    # no id to name.
+    if not requested_ids:
+        raw_patches.extend(_declaration_patches(report))
 
     # Coerce raw patches into typed Patch instances. A malformed payload
     # (missing required fields, unknown kind, etc.) maps to exit code 2
@@ -182,13 +237,19 @@ def apply_patches(
     typed_patches = [p for p in typed_patches if not isinstance(p, ManualPatch)]
 
     # Containment check (per C13). Every target must live under manifest_dir.
+    #
+    # A ``declare_action`` patch names its target *relative* to that directory,
+    # so resolving it is what places it — the check below then cannot fail for
+    # it except through a traversal spelled into the path, which is exactly
+    # what it should still catch.
     violations: list[tuple[str, str]] = []
     for patch in typed_patches:
-        target = Path(patch.target_file).resolve()
+        spelled = _patch_target_spelling(patch)
+        target = _resolve_target(patch, manifest_dir_resolved)
         try:
             target.relative_to(manifest_dir_resolved)
         except ValueError:
-            violations.append((patch.target_file, str(manifest_dir_resolved)))
+            violations.append((spelled, str(manifest_dir_resolved)))
     if violations:
         message = (
             "Containment violation: refusing to apply patches outside the "
@@ -226,43 +287,180 @@ def apply_patches(
 
     grouped: dict[str, list[Patch]] = defaultdict(list)
     for patch in typed_patches:
-        grouped[str(Path(patch.target_file).resolve())].append(patch)
+        grouped[str(_resolve_target(patch, manifest_dir_resolved))].append(patch)
 
     summary = _Summary()
+    refused_declarations: list[tuple[str, str]] = []
+    continuations: list[tuple[str, list[Patch], _FileOutcome]] = []
     for target_file, patches in sorted(grouped.items()):
         outcome = _apply_one_file(Path(target_file), patches, apply=apply)
         summary.record(target_file, outcome)
+        if outcome.status == "applied" and outcome.sha256_after is not None:
+            continuations.append((target_file, patches, outcome))
+        # ``skipped_drift`` counts too, and for the same reason ``error`` does:
+        # a stale report writes nothing, and an agent that re-ran verify on a
+        # silent exit 0 would come back with the identical route. Both outcomes
+        # leave the file untouched, and both need the caller to do something
+        # different before trying again.
+        if outcome.status in {"error", "skipped_drift"} and any(
+            isinstance(patch, DeclareActionPatch) for patch in patches
+        ):
+            refused_declarations.append((target_file, outcome.error or "refused"))
+
+    _write_declaration_continuation(
+        from_path,
+        report_bytes=report_bytes,
+        manifest_dir=manifest_dir_resolved,
+        applied=continuations,
+    )
 
     if json_output:
         typer.echo(json.dumps(summary.as_dict(apply=apply), indent=2))
     else:
         summary.print(apply=apply)
 
+    if refused_declarations:
+        # The only outcome this command reports through the exit code beyond
+        # the two input errors, and it is scoped to declarations on purpose.
+        # An agent following ``next_action.kind: confirm_declarations`` runs
+        # this command and then re-runs verify; if a refusal exited 0 it would
+        # re-run against an unchanged manifest, get the identical route back,
+        # and loop. Every other kind keeps the exit status it has always had.
+        message = (
+            "Did not write "
+            + ("a declaration" if len(refused_declarations) == 1 else "declarations")
+            + " into the manifest; nothing was changed."
+        )
+        typer.echo(message, err=True)
+        for target, detail in refused_declarations:
+            typer.echo(f"  - {target}: {detail}", err=True)
+        _emit_input_error(
+            "other_error",
+            message,
+            next_action=(
+                "Answer the conflicting declaration by hand in the manifest, "
+                "or re-run the scan if the manifest changed since it ran."
+            ),
+            next_actions=[
+                {
+                    "kind": "review",
+                    "command": None,
+                    "path": refused_declarations[0][0],
+                    "why": (
+                        "Either the manifest already answers one of these action "
+                        "rows differently or names the same tool twice — a "
+                        "derived proposal never replaces a reviewed answer — or "
+                        "it has changed since the scan that produced this report."
+                    ),
+                    "expects": (
+                        "The named action_surface.actions row carries the "
+                        "effect its reviewer intends, then rerun verification."
+                    ),
+                }
+            ],
+        )
+        raise typer.Exit(5)
+
 
 # --- Internals --------------------------------------------------------------
 
 
+def _write_declaration_continuation(
+    from_path: Path,
+    *,
+    report_bytes: bytes,
+    manifest_dir: Path,
+    applied: list[tuple[str, list[Patch], _FileOutcome]],
+) -> None:
+    """Record a declaration write so the run that judges it can recognise it.
+
+    Written beside the report the patches came from, which is the directory
+    ``verify --out`` names — so the next run finds it without being told, and a
+    receipt from a different reports directory can never be picked up by
+    accident.
+
+    Only ``declare_action`` writes produce one. Every other patch kind repairs
+    something the manifest already says and has never needed to travel across
+    its own mutation; minting a receipt for them would be publishing a surface
+    with no reader.
+
+    Best-effort by design: the write has already happened and succeeded, and
+    failing the command because a *receipt* could not be written would turn a
+    completed repair into an error. A missing receipt costs the next run its
+    publish-only route, which is the fail-closed direction.
+    """
+
+    rows: list[AppliedDeclaration] = []
+    manifest_path: str | None = None
+    before: str | None = None
+    after: str | None = None
+    for target_file, patches, outcome in applied:
+        declarations = [p for p in patches if isinstance(p, DeclareActionPatch)]
+        if not declarations:
+            continue
+        if manifest_path is not None:
+            # Two files each carrying declarations is not a shape the route
+            # emits — every ``declare_action`` patch targets the configured
+            # manifest — and a receipt can pin only one pair of digests. Refuse
+            # to describe it rather than describe half of it.
+            return
+        try:
+            manifest_path = (
+                Path(target_file).resolve().relative_to(manifest_dir).as_posix()
+            )
+        except (OSError, ValueError):
+            return
+        before, after = outcome.sha256_before, outcome.sha256_after
+        for patch in declarations:
+            rows.append(
+                AppliedDeclaration(
+                    target_path=patch.target_path,
+                    selector={
+                        key: str(value) for key, value in patch.selector.items()
+                    },
+                    declaration={
+                        key: str(value) for key, value in patch.declaration.items()
+                    },
+                )
+            )
+    if manifest_path is None or before is None or after is None or not rows:
+        return
+    try:
+        receipt = DeclarationContinuationV1(
+            manifest_path=manifest_path,
+            manifest_sha256_before=before,
+            manifest_sha256_after=after,
+            source_report_sha256=hashlib.sha256(report_bytes).hexdigest(),
+            applied=rows,
+        )
+        (from_path.parent / DECLARATION_CONTINUATION_ARTIFACT_NAME).write_text(
+            json.dumps(receipt.model_dump(mode="json"), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except (OSError, ValueError):
+        return
+
+
 def _emit_input_error(kind: str, message: str, **fields: object) -> None:
-    """Emit a structured one-line JSON error on stderr when
-    AGENTS_SHIPGATE_AGENT_MODE=1 is set, matching the convention used by
-    other commands. Silent otherwise.
+    """Emit this command's agent-mode errors through the shared emitter.
+
+    This used to be a second, parallel implementation that reproduced the
+    payload by hand. Two things followed from that, and both were invisible
+    until something looked: the line never carried the ``command`` field every
+    other agent-mode error carries, and — because the recovery routes here are
+    built as plain dicts rather than
+    :class:`~agents_shipgate.schemas.diagnostics.NextAction` objects — they
+    silently opted out of the invocation policy, advertising a console script
+    to a caller that had none (#322).
 
     ``fields`` may carry ``next_action`` (legacy single string) and
-    ``next_actions`` (ranked list of NextAction dicts) so callers can
-    attach recovery hints in the same shape as the global agent-mode
-    helper."""
-    import os
-    import sys
+    ``next_actions`` (ranked list of action dicts); the shared emitter
+    normalizes both.
+    """
 
-    if os.environ.get("AGENTS_SHIPGATE_AGENT_MODE", "").lower() not in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
-        return
-    payload = {"error": kind, "message": message, **fields}
-    print(json.dumps(payload, default=str), file=sys.stderr)
+    from agents_shipgate.cli.agent_mode import emit_agent_mode_error
+
+    emit_agent_mode_error(kind, message=message, **fields)
 
 
 def _emit_malformed_patch_error(from_path: Path, message: str) -> None:
@@ -291,6 +489,61 @@ def _emit_malformed_patch_error(from_path: Path, message: str) -> None:
     )
 
 
+def _resolve_target(patch: Patch, manifest_dir: Path) -> Path:
+    """The file a patch writes, as an absolute path on this machine.
+
+    Two spellings meet here and only here. The pointer patches carry an
+    absolute ``target_file`` (v0.6, C13); a ``declare_action`` patch carries a
+    ``target_path`` relative to ``manifest_dir``, because that row is embedded
+    by artifacts that leave this machine. Resolving both in one place is what
+    keeps the containment check and the write grouping reading the same answer.
+    """
+
+    if isinstance(patch, DeclareActionPatch):
+        return (manifest_dir / patch.target_path).resolve()
+    return Path(patch.target_file).resolve()
+
+
+def _patch_target_spelling(patch: Patch) -> str:
+    """The target as the patch itself spells it, for a message a reader can match."""
+
+    if isinstance(patch, DeclareActionPatch):
+        return patch.target_path
+    return patch.target_file
+
+
+def _declaration_patches(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every ``declare_action`` patch the report published on a gap row.
+
+    Read defensively rather than validated: this function walks a payload the
+    caller supplied, and a report written by an older build simply has none of
+    these keys. Anything that is not a mapping is skipped, and the patches it
+    does find go through the same ``_coerce_patch`` / confidence / kind filters
+    as a finding's — nothing here is a second admission path.
+    """
+
+    decision = report.get("release_decision")
+    if not isinstance(decision, dict):
+        return []
+    coverage = decision.get("evidence_coverage")
+    if not isinstance(coverage, dict):
+        return []
+    gaps = coverage.get("evidence_gaps")
+    if not isinstance(gaps, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for gap in gaps:
+        if not isinstance(gap, dict):
+            continue
+        action = gap.get("next_action")
+        if not isinstance(action, dict):
+            continue
+        patch = action.get("patch")
+        if isinstance(patch, dict):
+            out.append(patch)
+    return out
+
+
 def _confidence_set(min_level: str) -> set[str]:
     order = ["low", "medium", "high"]
     if min_level not in order:
@@ -307,6 +560,8 @@ def _coerce_patch(payload: dict[str, Any]) -> Patch:
         return AppendPointerPatch.model_validate(payload)
     if kind == "remove_pointer":
         return RemovePointerPatch.model_validate(payload)
+    if kind == "declare_action":
+        return DeclareActionPatch.model_validate(payload)
     if kind == "manual":
         return ManualPatch.model_validate(payload)
     raise typer.BadParameter(f"Unknown patch kind: {kind}")
@@ -318,6 +573,11 @@ class _FileOutcome:
     patches_in_group: int
     diff: str | None = None
     error: str | None = None
+    #: Byte digests of the target on both sides of the write, populated only
+    #: where one happened. They are what the declaration continuation pins, and
+    #: they are taken here because this is the only place that holds both.
+    sha256_before: str | None = None
+    sha256_after: str | None = None
 
 
 @dataclass
@@ -366,8 +626,19 @@ def _apply_one_file(
             patches_in_group=len(patches),
             error=f"target file does not exist: {path}",
         )
-    original_text = path.read_text(encoding="utf-8")
-    current_sha = hashlib.sha256(original_text.encode("utf-8")).hexdigest()
+    # Hashed as **bytes**, because that is what the generator hashed. Reading
+    # as text normalizes CRLF to LF, so an untouched CRLF manifest produced a
+    # digest the patch could never match and reported ``skipped_drift`` for
+    # ever — and, once a declaration refusal became an exit code, an
+    # unbreakable loop for the agent following the route.
+    raw = path.read_bytes()
+    current_sha = hashlib.sha256(raw).hexdigest()
+    original_text = raw.decode("utf-8")
+    # The style the file is written in, preserved across the round trip: the
+    # YAML and JSON writers below both emit "\n", so a CRLF manifest would
+    # otherwise come back with every line ending rewritten and a diff that is
+    # entirely newline noise.
+    newline = "\r\n" if b"\r\n" in raw else "\n"
 
     expected_shas = {p.target_sha256 for p in patches}
     if expected_shas != {current_sha}:
@@ -381,17 +652,34 @@ def _apply_one_file(
         )
 
     suffix = path.suffix.lower()
-    if suffix in {".yaml", ".yml"}:
-        new_text = _apply_yaml(original_text, patches)
-    elif suffix == ".json":
-        new_text = _apply_json(original_text, patches)
-    else:
+    try:
+        if suffix in {".yaml", ".yml"}:
+            new_text = _apply_yaml(original_text, patches)
+        elif suffix == ".json":
+            new_text = _apply_json(original_text, patches)
+        else:
+            new_text = None
+    except DeclarationConflict as exc:
+        # Refused, not crashed, and nothing is written: the whole group is
+        # applied in memory before the single write, so an abort here leaves
+        # the file exactly as it was. Only this one exception is caught —
+        # every other failure keeps its current loudness rather than being
+        # downgraded to a summary row.
+        return _FileOutcome(
+            status="error",
+            patches_in_group=len(patches),
+            error=str(exc),
+        )
+    if new_text is None:
         return _FileOutcome(
             status="error",
             patches_in_group=len(patches),
             error=f"unsupported target format for {path.suffix}",
         )
 
+    # Converted before it is compared, so a patch that changes nothing stays a
+    # no-op on a CRLF file instead of rewriting every line ending.
+    new_text = _with_newlines(new_text, newline)
     diff = "".join(
         difflib.unified_diff(
             original_text.splitlines(keepends=True),
@@ -402,8 +690,15 @@ def _apply_one_file(
     )
 
     if apply and original_text != new_text:
-        path.write_text(new_text, encoding="utf-8")
-        return _FileOutcome(status="applied", patches_in_group=len(patches), diff=diff)
+        written = new_text.encode("utf-8")
+        path.write_bytes(written)
+        return _FileOutcome(
+            status="applied",
+            patches_in_group=len(patches),
+            diff=diff,
+            sha256_before=current_sha,
+            sha256_after=hashlib.sha256(written).hexdigest(),
+        )
 
     return _FileOutcome(
         status="applied" if apply else "dry_run",
@@ -412,10 +707,26 @@ def _apply_one_file(
     )
 
 
+def _with_newlines(text: str, newline: str) -> str:
+    """Re-emit ``text`` in the newline style the file was written in."""
+
+    if newline == "\n":
+        return text
+    return text.replace("\r\n", "\n").replace("\n", newline)
+
+
 def _apply_yaml(text: str, patches: list[Patch]) -> str:
     yaml = YAML(typ="rt")  # round-trip preserves comments + key order
     yaml.preserve_quotes = True
     yaml.width = 4096
+    # Round-tripping preserves comments and key order but not per-node
+    # indentation — ruamel re-emits every sequence at one global setting. Left
+    # at the default, writing one declaration also re-indented every unrelated
+    # list in the manifest, and the PR diff of a trust-root edit was mostly
+    # whitespace. These are the values ``init`` writes (``  - id:``), so a
+    # manifest Shipgate generated round-trips byte-identical apart from the
+    # patch itself, which is what makes "the reviewer reads exceptions" true.
+    yaml.indent(mapping=2, sequence=4, offset=2)
     data = yaml.load(text) or {}
     for patch in _ordered_for_apply(patches):
         _apply_patch_to_data(data, patch)
@@ -451,7 +762,9 @@ def _ordered_for_apply(patches: list[Patch]) -> list[Patch]:
     for patch in patches:
         if isinstance(patch, RemovePointerPatch):
             removes.append(patch)
-        elif isinstance(patch, (SetPointerPatch, AppendPointerPatch)):
+        elif isinstance(patch, (SetPointerPatch, AppendPointerPatch, DeclareActionPatch)):
+            # A declaration either fills a blank on an existing row or appends
+            # one; neither shifts an index a pending remove already named.
             sets_and_appends.append(patch)
         else:
             others.append(patch)
@@ -481,9 +794,105 @@ def _apply_patch_to_data(root: Any, patch: Patch) -> None:
         _append_pointer(root, patch.pointer, patch.value)
     elif isinstance(patch, RemovePointerPatch):
         _remove_pointer(root, patch.pointer)
+    elif isinstance(patch, DeclareActionPatch):
+        _declare_action(root, patch)
     elif isinstance(patch, ManualPatch):
         # No-op (filtered out earlier; defensive).
         return
+
+
+class DeclarationConflict(ValueError):
+    """A declaration patch would have overwritten or guessed at an answer.
+
+    Its own exception type because the recovery is different from every other
+    patch failure: nothing here is stale or malformed, the manifest simply
+    already says something the proposal is not allowed to change. The whole
+    file group fails so nothing partial is written, and the message names the
+    row and the field a human has to look at.
+    """
+
+
+def _declare_action(root: Any, patch: DeclareActionPatch) -> None:
+    """Write one declaration into ``action_surface.actions``, or refuse.
+
+    Three outcomes, and the refusals are the point:
+
+    * **No row names this tool** — append ``{**selector, **declaration}``.
+    * **Exactly one row names it** — write only the fields it leaves silent.
+      A field it already answers *differently* is a human's answer, and an
+      evidence-derived proposal may never replace one (#410 §D). Refuse.
+    * **More than one row names it** — the manifest disambiguates two
+      same-named actions by ``tool_id``, and picking one here would be a guess
+      about which action the evidence was read from. Refuse.
+
+    Matching is on ``tool`` alone, then checked. Matching on the whole selector
+    instead would miss a row that declares ``tool:`` without ``tool_id:`` and
+    append a second row for the same action — two selectors resolving to one
+    tool, which the manifest rejects as a duplicate on the next load. Missing
+    the row is the failure mode that writes something wrong; finding it and
+    disagreeing is the one that stops.
+    """
+
+    surface = root.get("action_surface")
+    if surface is None:
+        surface = {}
+        root["action_surface"] = surface
+    actions = surface.get("actions")
+    if actions is None:
+        actions = []
+        surface["actions"] = actions
+    if not isinstance(actions, list):
+        raise DeclarationConflict(
+            "action_surface.actions must be a list of declarations; "
+            f"found {type(actions).__name__}"
+        )
+
+    tool = patch.selector.get("tool")
+    named = [row for row in actions if isinstance(row, dict) and row.get("tool") == tool]
+    # A row whose qualifiers *disagree* with this selector is a different
+    # action that happens to share a display name — two providers exporting
+    # ``send_email`` is a supported shape, and the manifest tells them apart by
+    # ``tool_id``/``source_id``. Such a row is skipped, not refused: refusing
+    # made a batch of valid patches unexecutable, because the first one
+    # appended a row the second then read as its own mismatched match.
+    matches = [row for row in named if not _selector_conflicts(row, patch.selector)]
+    if not matches:
+        actions.append({**patch.selector, **patch.declaration})
+        return
+    if len(matches) > 1:
+        raise DeclarationConflict(
+            f"{len(matches)} action_surface.actions rows are compatible with tool "
+            f"{tool!r}; refusing to guess which one this declaration answers for."
+        )
+    row = matches[0]
+    for key, value in patch.declaration.items():
+        existing = row.get(key)
+        if key in row and existing is not None and existing != value:
+            raise DeclarationConflict(
+                f"action_surface.actions row for tool {tool!r} already "
+                f"declares {key}: {existing!r}; a derived proposal never "
+                "replaces a reviewed answer."
+            )
+        row[key] = value
+
+
+def _selector_conflicts(row: dict, selector: dict) -> bool:
+    """Does this row name a *different* action than the selector does?
+
+    Only keys both spell can disagree. A row that declares ``tool:`` alone is
+    compatible with a qualified selector — that is the common shape, a human
+    wrote the row and the scan knows more about it than they typed — while a
+    row carrying a different ``tool_id`` is a different capability with the
+    same display name, and writing into it would answer the wrong question.
+
+    ``tool`` itself is not consulted: the caller has already grouped on it.
+    """
+
+    return any(
+        key in row and row[key] != value
+        for key, value in selector.items()
+        if key != "tool"
+    )
 
 
 def _split_pointer(pointer: str) -> list[str]:

@@ -1,71 +1,33 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import ValidationError
 
-from agents_shipgate.config.schema import AgentsShipgateManifest, PolicyPackConfig
+from agents_shipgate.core.capability_policy import match_policy_pack_subject
 from agents_shipgate.core.context import ScanContext
 from agents_shipgate.core.errors import ConfigError, InputParseError
-from agents_shipgate.core.models import (
-    Confidence,
+from agents_shipgate.core.policy_evidence import finding_support, policy_evidence_gap
+from agents_shipgate.core.static_inputs import read_static_input_bytes
+from agents_shipgate.core.surface_exclusions import (
+    catalog_label_index,
+    tool_label,
+)
+from agents_shipgate.inputs.common import load_structured_file, resolve_input_path
+from agents_shipgate.schemas.common import SourceReference
+from agents_shipgate.schemas.manifest import AgentsShipgateManifest, PolicyPackConfig
+from agents_shipgate.schemas.policy_pack import (
+    PolicyPackFile,
+    PolicyPackRule,
+)
+from agents_shipgate.schemas.report import (
     Finding,
     LoadedPolicyPack,
-    Severity,
-    SourceReference,
-    Tool,
-    ToolParameter,
+    PolicyApprovalRouting,
+    PolicyRoutingMetadata,
 )
-from agents_shipgate.core.risk_hints import risk_tags
-from agents_shipgate.inputs.common import load_structured_file, resolve_input_path
-
-
-class PolicyPackParameterMatch(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    name: str | None = None
-    names: list[str] = Field(default_factory=list)
-    types: list[str] = Field(default_factory=list)
-    missing_maximum: bool | None = None
-    required: bool | None = None
-
-
-class PolicyPackMatch(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    risk_tags: list[str] = Field(default_factory=list)
-    source_types: list[str] = Field(default_factory=list)
-    environment_targets: list[str] = Field(default_factory=list)
-    missing_owner: bool | None = None
-    missing_auth_scopes: bool | None = None
-    missing_approval_policy: bool | None = None
-    missing_confirmation_policy: bool | None = None
-    missing_idempotency_policy: bool | None = None
-    parameters: list[PolicyPackParameterMatch] = Field(default_factory=list)
-
-
-class PolicyPackRule(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    title: str | None = None
-    description: str | None = None
-    category: str = "policy_pack"
-    severity: Severity
-    confidence: Confidence = "medium"
-    recommendation: str
-    match: PolicyPackMatch
-
-
-class PolicyPackFile(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    id: str | None = None
-    name: str | None = None
-    version: str | None = None
-    rules: list[PolicyPackRule]
 
 
 @dataclass(frozen=True)
@@ -98,10 +60,12 @@ def load_policy_packs(
     for config in configs:
         try:
             path = resolve_input_path(base_dir, config.path)
+            sha256, sha256_status = _verify_pack_pin(path, config)
             data = load_structured_file(path)
             if not isinstance(data, dict):
                 raise ConfigError(f"Policy pack must contain a YAML object: {config.path}")
             pack_file = PolicyPackFile.model_validate(data)
+            _validate_policy_pack_team_refs(manifest, pack_file, config.path)
             pack_id = config.id or pack_file.id or path.stem
             display_path = _relative_display_path(path, base_dir)
             pack = LoadedPolicyPack(
@@ -109,6 +73,10 @@ def load_policy_packs(
                 name=pack_file.name or pack_id,
                 version=pack_file.version,
                 path=display_path,
+                source=config.source,
+                sha256=sha256,
+                sha256_status=sha256_status,
+                owner=pack_file.owner,
                 rule_count=len(pack_file.rules),
             )
             loaded.append(pack)
@@ -131,12 +99,49 @@ def run_policy_pack_rules(
     policy_packs: LoadedPolicyPacks,
 ) -> list[Finding]:
     findings: list[Finding] = []
+    # One label index for every gap this run emits — see
+    # ``core.surface_exclusions.catalog_label_index``. This emitter rendered
+    # ``name [tool_id]``, which wrapped a 64-hex digest in the label and so
+    # slipped past a guard that compared the whole subject to a catalog id.
+    labels = catalog_label_index(context.tool_catalog)
     for resolved in policy_packs.rules:
-        for tool in context.tools:
-            evidence = _match_evidence(tool, context, resolved)
-            if evidence is None:
+        for subject in context.capability_policy_subjects:
+            match = match_policy_pack_subject(
+                subject,
+                resolved.rule.match,
+                environment_target=context.manifest.environment.target,
+                base_evidence={
+                    "policy_pack": resolved.pack.id,
+                    "policy_pack_path": resolved.pack.path,
+                    "policy_pack_source": resolved.pack.source,
+                    "policy_pack_sha256": resolved.pack.sha256,
+                    "policy_pack_sha256_status": resolved.pack.sha256_status,
+                },
+            )
+            if match.status == "not_matched":
                 continue
             rule = resolved.rule
+            support = finding_support(
+                match.support.predicates,
+                requested_confidence=rule.confidence,
+                status=match.status,
+            )
+            if match.status != "matched" or not support.policy_eligible:
+                context.policy_evidence_gaps.append(
+                    policy_evidence_gap(
+                        status=match.status,
+                        subject=tool_label(
+                            subject.tool.id, labels, name=subject.tool.name
+                        )
+                        or subject.tool.name,
+                        subject_id=subject.tool.id,
+                        policy_id=rule.id,
+                        source_ref=resolved.pack.path,
+                        support=support,
+                        manifest_path=f"{resolved.pack.path}#rules/{rule.id}/match",
+                    )
+                )
+                continue
             title = rule.title or rule.description or f"Policy pack rule {rule.id} matched"
             findings.append(
                 Finding(
@@ -144,16 +149,88 @@ def run_policy_pack_rules(
                     title=title,
                     severity=rule.severity,
                     category=rule.category,
-                    tool_id=tool.id,
-                    tool_name=tool.name,
+                    tool_id=subject.tool.id,
+                    tool_name=subject.tool.name,
                     agent_id=context.agent.id,
-                    evidence=evidence,
-                    confidence=rule.confidence,
+                    evidence=match.evidence,
+                    confidence=support.confidence,
+                    provenance_kind="policy_pack",
                     source=SourceReference(type="policy_pack", ref=resolved.pack.path),
+                    capability_refs=[subject.fact.id],
+                    capability_policy_evidence=match.capability_policy_evidence,
+                    policy_routing=_policy_routing_metadata(resolved),
+                    support=support,
                     recommendation=rule.recommendation,
+                    blocks_release=rule.block and support.blocking_eligible,
                 )
             )
     return findings
+
+
+def _policy_routing_metadata(
+    resolved: ResolvedPolicyPackRule,
+) -> PolicyRoutingMetadata:
+    approval = resolved.rule.approval
+    return PolicyRoutingMetadata(
+        owner=resolved.rule.owner or resolved.pack.owner,
+        reviewers=list(resolved.rule.reviewers),
+        approval=PolicyApprovalRouting(
+            required=approval.required if approval is not None else False,
+            teams=list(approval.teams) if approval is not None else [],
+            min_approvals=approval.min_approvals if approval is not None else None,
+            enforced=False,
+        ),
+    )
+
+
+def _verify_pack_pin(
+    path: Path, config: PolicyPackConfig
+) -> tuple[str | None, str]:
+    """v0.2: enforce the optional sha256 content pin on shared packs."""
+    pinned = (config.sha256 or "").strip().lower()
+    if not pinned:
+        return None, "unpinned"
+    try:
+        digest = hashlib.sha256(read_static_input_bytes(path)).hexdigest()
+    except (OSError, ValueError) as exc:
+        raise ConfigError(
+            f"Could not hash pinned policy pack {config.path!r}: {exc}"
+        ) from exc
+    if digest != pinned:
+        raise ConfigError(
+            f"Policy pack {config.path!r} does not match its pinned sha256. "
+            f"Expected {pinned}, got {digest}. The pack content changed since "
+            "it was pinned; re-review the pack and update the pin, or restore "
+            "the pinned content."
+        )
+    return digest, "verified"
+
+
+def _validate_policy_pack_team_refs(
+    manifest: AgentsShipgateManifest,
+    pack_file: PolicyPackFile,
+    pack_path: str,
+) -> None:
+    org = getattr(manifest, "organization", None)
+    if org is None or not org.teams:
+        return
+    known = set(org.teams)
+
+    def check(ref: str | None, *, rule_id: str, field: str) -> None:
+        if ref is not None and ref not in known:
+            raise ConfigError(
+                f"Policy pack {pack_path!r} rule {rule_id!r} references "
+                f"unknown organization team {ref!r} in {field}; known teams: "
+                f"{', '.join(sorted(known))}."
+            )
+
+    for rule in pack_file.rules:
+        check(rule.owner, rule_id=rule.id, field="owner")
+        for reviewer in rule.reviewers:
+            check(reviewer, rule_id=rule.id, field="reviewers")
+        if rule.approval is not None:
+            for team in rule.approval.teams:
+                check(team, rule_id=rule.id, field="approval.teams")
 
 
 def _validate_rule_ids(rules: list[ResolvedPolicyPackRule]) -> None:
@@ -172,136 +249,6 @@ def _validate_rule_ids(rules: list[ResolvedPolicyPackRule]) -> None:
                 f"already declared in {previous}."
             )
         seen[rule_id] = resolved.pack.path
-
-
-def _match_evidence(
-    tool: Tool,
-    context: ScanContext,
-    resolved: ResolvedPolicyPackRule,
-) -> dict[str, Any] | None:
-    rule_match = resolved.rule.match
-    evidence: dict[str, Any] = {
-        "policy_pack": resolved.pack.id,
-        "policy_pack_path": resolved.pack.path,
-    }
-    tags = risk_tags(tool, min_confidence="medium")
-    if rule_match.risk_tags:
-        matched_tags = sorted(set(tags).intersection(rule_match.risk_tags))
-        if not matched_tags:
-            return None
-        evidence["risk_tags"] = matched_tags
-    if rule_match.source_types:
-        if tool.source_type not in rule_match.source_types:
-            return None
-        evidence["source_type"] = tool.source_type
-    if rule_match.environment_targets:
-        target = context.manifest.environment.target
-        if target not in rule_match.environment_targets:
-            return None
-        evidence["environment_target"] = target
-    if rule_match.missing_owner is not None:
-        missing = not bool(tool.owner)
-        if missing is not rule_match.missing_owner:
-            return None
-        evidence["missing_owner"] = missing
-    if rule_match.missing_auth_scopes is not None:
-        missing = not bool(tool.auth.scopes)
-        if missing is not rule_match.missing_auth_scopes:
-            return None
-        evidence["missing_auth_scopes"] = missing
-    if rule_match.missing_approval_policy is not None:
-        missing = tool.name not in _approval_tools(context)
-        if missing is not rule_match.missing_approval_policy:
-            return None
-        evidence["missing_approval_policy"] = missing
-    if rule_match.missing_confirmation_policy is not None:
-        missing = tool.name not in _confirmation_tools(context)
-        if missing is not rule_match.missing_confirmation_policy:
-            return None
-        evidence["missing_confirmation_policy"] = missing
-    if rule_match.missing_idempotency_policy is not None:
-        missing = not _has_idempotency_evidence(tool, context)
-        if missing is not rule_match.missing_idempotency_policy:
-            return None
-        evidence["missing_idempotency_policy"] = missing
-    if rule_match.parameters:
-        matched_parameters = _matched_parameters(tool.parameters, rule_match.parameters)
-        if len(matched_parameters) != len(rule_match.parameters):
-            return None
-        evidence["parameters"] = matched_parameters
-    return evidence
-
-
-def _matched_parameters(
-    parameters: list[ToolParameter],
-    predicates: list[PolicyPackParameterMatch],
-) -> list[dict[str, Any]]:
-    matches: list[dict[str, Any]] = []
-    for predicate in predicates:
-        matched = next(
-            (parameter for parameter in parameters if _parameter_matches(parameter, predicate)),
-            None,
-        )
-        if matched is None:
-            continue
-        matches.append(
-            {
-                "name": matched.name,
-                "type": matched.type,
-                "required": matched.required,
-                "maximum": matched.maximum,
-            }
-        )
-    return matches
-
-
-def _parameter_matches(
-    parameter: ToolParameter,
-    predicate: PolicyPackParameterMatch,
-) -> bool:
-    names = set(predicate.names)
-    if predicate.name:
-        names.add(predicate.name)
-    if names and parameter.name not in names:
-        return False
-    if predicate.types and parameter.type not in predicate.types:
-        return False
-    if predicate.missing_maximum is not None:
-        missing = parameter.maximum is None
-        if missing is not predicate.missing_maximum:
-            return False
-    if predicate.required is not None and parameter.required is not predicate.required:
-        return False
-    return True
-
-
-def _approval_tools(context: ScanContext) -> set[str]:
-    tools = context.manifest.policies.approval_tools()
-    if context.api_artifacts:
-        tools |= context.api_artifacts.approval_tools()
-    return tools
-
-
-def _confirmation_tools(context: ScanContext) -> set[str]:
-    tools = context.manifest.policies.confirmation_tools()
-    if context.api_artifacts:
-        tools |= context.api_artifacts.confirmation_tools()
-    return tools
-
-
-def _idempotency_tools(context: ScanContext) -> set[str]:
-    tools = context.manifest.policies.idempotency_tools()
-    if context.api_artifacts:
-        tools |= context.api_artifacts.idempotency_tools()
-    return tools
-
-
-def _has_idempotency_evidence(tool: Tool, context: ScanContext) -> bool:
-    if tool.name in _idempotency_tools(context):
-        return True
-    if tool.annotations.get("idempotentHint") is True:
-        return True
-    return any(parameter.name == "idempotency_key" for parameter in tool.parameters)
 
 
 def _relative_display_path(path: Path, base_dir: Path) -> str:

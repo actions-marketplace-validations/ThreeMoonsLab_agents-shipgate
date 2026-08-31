@@ -1,5 +1,763 @@
 {
   "$defs": {
+    "ActionApprovalConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "required": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Required"
+        },
+        "threshold": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Threshold"
+        }
+      },
+      "title": "ActionApprovalConfig",
+      "type": "object"
+    },
+    "ActionAuthorityConfig": {
+      "additionalProperties": false,
+      "description": "Reviewed authority evidence for one declared action.\n\nScopes intentionally remain on ``ActionDeclarationConfig.scopes`` so\nthere is one canonical permission list in the manifest. This block is\noptional, so that list is the action's permissions with or without it;\none resolver reads it for every surface\n(``core.semantic_assessment.resolve_action_scopes``).",
+      "properties": {
+        "auth_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Auth Type"
+        },
+        "credential_mode": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Credential Mode"
+        },
+        "mode": {
+          "enum": [
+            "none",
+            "scoped",
+            "unscoped",
+            "ambient"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "title": "ActionAuthorityConfig",
+      "type": "object"
+    },
+    "ActionDeclarationConfig": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "override": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "override"
+            ]
+          },
+          "then": {
+            "properties": {
+              "effect": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "effect"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "basis": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "basis"
+            ]
+          },
+          "then": {
+            "anyOf": [
+              {
+                "properties": {
+                  "effect": {
+                    "not": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "required": [
+                  "effect"
+                ]
+              },
+              {
+                "properties": {
+                  "risk_tags": {
+                    "minItems": 1
+                  }
+                },
+                "required": [
+                  "risk_tags"
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "properties": {
+        "approval": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActionApprovalConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "authority": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActionAuthorityConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "basis": {
+          "anyOf": [
+            {
+              "pattern": "^confirmed:[0-9a-f]{1,64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Basis"
+        },
+        "effect": {
+          "anyOf": [
+            {
+              "enum": [
+                "read",
+                "write",
+                "destructive",
+                "external_communication",
+                "financial_write",
+                "production_operation",
+                "privileged_data_access",
+                "code_execution",
+                "identity_access"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Effect"
+        },
+        "evidence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActionEvidenceConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Id"
+        },
+        "operation": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Operation"
+        },
+        "override": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActionEffectOverrideConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Provider"
+        },
+        "risk_tags": {
+          "items": {
+            "enum": [
+              "read_only",
+              "write",
+              "writes_data",
+              "destructive",
+              "external_write",
+              "external_communication",
+              "customer_communication",
+              "financial_action",
+              "financial_write",
+              "external_side_effect",
+              "infrastructure_change",
+              "production_operation",
+              "production_ops",
+              "sensitive_data_access",
+              "privileged_data_access",
+              "privileged_data",
+              "code_execution",
+              "identity_access",
+              "network_access",
+              "filesystem_write",
+              "customer_data",
+              "secret_access",
+              "irreversible"
+            ],
+            "type": "string"
+          },
+          "title": "Risk Tags",
+          "type": "array"
+        },
+        "safeguards": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActionSafeguardsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "scopes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Scopes",
+          "type": "array"
+        },
+        "source_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Id"
+        },
+        "source_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Type"
+        },
+        "tool": {
+          "title": "Tool",
+          "type": "string"
+        },
+        "tool_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tool Id"
+        }
+      },
+      "required": [
+        "tool"
+      ],
+      "title": "ActionDeclarationConfig",
+      "type": "object"
+    },
+    "ActionEffectOverrideConfig": {
+      "additionalProperties": false,
+      "description": "Reviewed acknowledgement that a declared effect sits below evidence.\n\nA declaration may freely *escalate* past what the scanner inferred \u2014 a\nreviewer calling an action more dangerous than the evidence proves needs no\nceremony. De-escalating past inferred evidence is the asymmetric case: it\nis the one edit that converts a gapped action into a pass-eligible one, so\nit may not be silent. This block is how a reviewer says \"I looked, and the\ninference does not apply here\"; it never removes the review row, it only\nmarks it acknowledged (#409).\n\nIt acknowledges *inferred* evidence only. Where policy-eligible evidence\noutranks the declaration the conflict is blocking and this block changes\nnothing about it.",
+      "properties": {
+        "evidence": {
+          "pattern": "[^\\s\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f-\\u1160\\u17b4-\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufff8\ud82f\udca0-\ud82f\udca3\ud834\udd73-\ud834\udd7a\udb40\udc00-\udb43\udfff]",
+          "title": "Evidence",
+          "type": "string"
+        },
+        "reason": {
+          "pattern": "[^\\s\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f-\\u1160\\u17b4-\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufff8\ud82f\udca0-\ud82f\udca3\ud834\udd73-\ud834\udd7a\udb40\udc00-\udb43\udfff]",
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "evidence",
+        "reason"
+      ],
+      "title": "ActionEffectOverrideConfig",
+      "type": "object"
+    },
+    "ActionEvidenceConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "approval_ticket": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Approval Ticket"
+        },
+        "owner": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Owner"
+        },
+        "runbook": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Runbook"
+        }
+      },
+      "title": "ActionEvidenceConfig",
+      "type": "object"
+    },
+    "ActionPolicyConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "block": {
+          "default": true,
+          "title": "Block",
+          "type": "boolean"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "match": {
+          "$ref": "#/$defs/ActionPolicyMatchConfig"
+        },
+        "message": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Message"
+        },
+        "recommendation": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Recommendation"
+        },
+        "require": {
+          "additionalProperties": true,
+          "title": "Require",
+          "type": "object"
+        },
+        "severity": {
+          "enum": [
+            "info",
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "title": "Severity",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "severity"
+      ],
+      "title": "ActionPolicyConfig",
+      "type": "object"
+    },
+    "ActionPolicyMatchConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "action_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Action Ids",
+          "type": "array"
+        },
+        "effects": {
+          "items": {
+            "enum": [
+              "read",
+              "write",
+              "destructive",
+              "external_communication",
+              "financial_write",
+              "production_operation",
+              "privileged_data_access",
+              "code_execution",
+              "identity_access"
+            ],
+            "type": "string"
+          },
+          "title": "Effects",
+          "type": "array"
+        },
+        "risk_tags": {
+          "items": {
+            "enum": [
+              "read_only",
+              "write",
+              "writes_data",
+              "destructive",
+              "external_write",
+              "external_communication",
+              "customer_communication",
+              "financial_action",
+              "financial_write",
+              "external_side_effect",
+              "infrastructure_change",
+              "production_operation",
+              "production_ops",
+              "sensitive_data_access",
+              "privileged_data_access",
+              "privileged_data",
+              "code_execution",
+              "identity_access",
+              "network_access",
+              "filesystem_write",
+              "customer_data",
+              "secret_access",
+              "irreversible"
+            ],
+            "type": "string"
+          },
+          "title": "Risk Tags",
+          "type": "array"
+        },
+        "scopes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Scopes",
+          "type": "array"
+        },
+        "tool_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Tool Ids",
+          "type": "array"
+        },
+        "tools": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Tools",
+          "type": "array"
+        }
+      },
+      "title": "ActionPolicyMatchConfig",
+      "type": "object"
+    },
+    "ActionSafeguardsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "audit_log": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Audit Log"
+        },
+        "dry_run": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Dry Run"
+        },
+        "idempotency": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency"
+        },
+        "rollback": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rollback"
+        }
+      },
+      "title": "ActionSafeguardsConfig",
+      "type": "object"
+    },
+    "ActionSurfaceConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "actions": {
+          "items": {
+            "$ref": "#/$defs/ActionDeclarationConfig"
+          },
+          "title": "Actions",
+          "type": "array"
+        },
+        "policies": {
+          "items": {
+            "$ref": "#/$defs/ActionPolicyConfig"
+          },
+          "title": "Policies",
+          "type": "array"
+        },
+        "require_explicit_actions": {
+          "default": false,
+          "title": "Require Explicit Actions",
+          "type": "boolean"
+        }
+      },
+      "title": "ActionSurfaceConfig",
+      "type": "object"
+    },
+    "AgentBindingDeclarationConfig": {
+      "additionalProperties": false,
+      "description": "Reviewed, closed-world tool and handoff set for one agent.",
+      "properties": {
+        "agent": {
+          "title": "Agent",
+          "type": "string"
+        },
+        "complete": {
+          "const": true,
+          "default": true,
+          "title": "Complete",
+          "type": "boolean"
+        },
+        "handoffs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Handoffs",
+          "type": "array"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        },
+        "tools": {
+          "items": {
+            "$ref": "#/$defs/BoundToolSelectorConfig"
+          },
+          "title": "Tools",
+          "type": "array"
+        }
+      },
+      "required": [
+        "agent",
+        "reason"
+      ],
+      "title": "AgentBindingDeclarationConfig",
+      "type": "object"
+    },
+    "AgentBindingRootConfig": {
+      "additionalProperties": false,
+      "description": "Exact selector for the statically reviewed root agent.",
+      "properties": {
+        "object": {
+          "title": "Object",
+          "type": "string"
+        },
+        "source_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Id"
+        }
+      },
+      "required": [
+        "object"
+      ],
+      "title": "AgentBindingRootConfig",
+      "type": "object"
+    },
+    "AgentBindingsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "declarations": {
+          "items": {
+            "$ref": "#/$defs/AgentBindingDeclarationConfig"
+          },
+          "title": "Declarations",
+          "type": "array"
+        },
+        "root": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentBindingRootConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "AgentBindingsConfig",
+      "type": "object"
+    },
     "AgentConfig": {
       "additionalProperties": false,
       "properties": {
@@ -163,9 +921,109 @@
       "title": "ArtifactPathConfig",
       "type": "object"
     },
+    "BaselineConfig": {
+      "additionalProperties": false,
+      "description": "Manifest knob governing v0.5 baseline integrity checks.\n\n``integrity_mode`` decides what happens when ``scan`` (with\n``--baseline``) detects an integrity issue:\n\n- ``off``: no integrity checks run (back-compat escape hatch for\n  repos that have not migrated to v0.5 baselines yet).\n- ``warn`` (default in v0.17): integrity findings are emitted but\n  ``blocks_release`` is false; release decision is unaffected.\n- ``strict``: ``SHIP-BASELINE-INTEGRITY-MISMATCH`` findings get\n  ``blocks_release=true`` and ``agents-shipgate baseline verify``\n  exits with code 6 on the same condition. Recommended target for\n  v0.18.\n\n``audit_log`` overrides the default audit log path. Relative paths\nresolve against the baseline file's directory so ``baseline save``\nand ``scan --baseline`` use the same file. Usually left at its default.",
+      "properties": {
+        "audit_log": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Audit Log"
+        },
+        "integrity_mode": {
+          "default": "warn",
+          "enum": [
+            "off",
+            "warn",
+            "strict"
+          ],
+          "title": "Integrity Mode",
+          "type": "string"
+        }
+      },
+      "title": "BaselineConfig",
+      "type": "object"
+    },
+    "BoundToolSelectorConfig": {
+      "additionalProperties": false,
+      "description": "One canonical tool selector inside a reviewed binding declaration.",
+      "properties": {
+        "provider": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Provider"
+        },
+        "source_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Id"
+        },
+        "source_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Type"
+        },
+        "tool": {
+          "title": "Tool",
+          "type": "string"
+        },
+        "tool_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tool Id"
+        }
+      },
+      "required": [
+        "tool"
+      ],
+      "title": "BoundToolSelectorConfig",
+      "type": "object"
+    },
     "ChecksConfig": {
       "additionalProperties": false,
       "properties": {
+        "acknowledge_overrides": {
+          "items": {
+            "$ref": "#/$defs/OverrideAcknowledgement"
+          },
+          "title": "Acknowledge Overrides",
+          "type": "array"
+        },
         "ignore": {
           "items": {
             "$ref": "#/$defs/SuppressionConfig"
@@ -182,15 +1040,23 @@
         },
         "severity_overrides": {
           "additionalProperties": {
-            "enum": [
-              "info",
-              "low",
-              "medium",
-              "high",
-              "critical"
-            ],
-            "type": "string"
+            "anyOf": [
+              {
+                "enum": [
+                  "info",
+                  "low",
+                  "medium",
+                  "high",
+                  "critical"
+                ],
+                "type": "string"
+              },
+              {
+                "$ref": "#/$defs/SeverityOverrideEntry"
+              }
+            ]
           },
+          "description": "Per-check severity overrides. Accepts either a severity scalar (legacy form) or a SeverityOverrideEntry object with optional reason and expires.",
           "title": "Severity Overrides",
           "type": "object"
         }
@@ -306,7 +1172,7 @@
         },
         "tool_inventories": {
           "items": {
-            "$ref": "#/$defs/ArtifactPathConfig"
+            "$ref": "#/$defs/ToolInventoryConfig"
           },
           "title": "Tool Inventories",
           "type": "array"
@@ -317,6 +1183,7 @@
     },
     "EnvironmentConfig": {
       "additionalProperties": false,
+      "description": "Where the agent this manifest describes actually runs.\n\n``template`` is not a deployment (#410 \u00a7G). It is the honest answer for a\nsample, an example, or a scaffold that ships to be copied: there is no\nenvironment, so there are no credentials, and asking every action which\ncredential it runs with asks a question the repository cannot answer in\nprinciple. Both repositories the adoption walks used are of exactly this\nkind, and ``authority: {mode: none}`` written twelve times is the same\nclaim spelled at cost.\n\nDeclaring it answers the authority dimension once, and only where nothing\nelse answers it: an action row's ``authority``, a ``tool_sources[]``\nblock, a bare ``scopes:`` list, and anything the **source** publishes all\nwin over it. A statement about the absence of a deployment may add an\nanswer where there is none; it may never subtract evidence something else\nproved.\n\nIt is never quiet either: every action it answers for is a review concern,\nso a ``template`` repository can reach ``review_required`` and never\n``passed``. That is the property that keeps it from being the cheap way\nout \u2014 an adopter must state their real authority before a green gate is\navailable at all.",
       "properties": {
         "promotion_from": {
           "anyOf": [
@@ -347,7 +1214,8 @@
             "local",
             "staging",
             "production_like",
-            "production"
+            "production",
+            "template"
           ],
           "title": "Target",
           "type": "string"
@@ -385,7 +1253,7 @@
         },
         "tool_inventories": {
           "items": {
-            "$ref": "#/$defs/ArtifactPathConfig"
+            "$ref": "#/$defs/ToolInventoryConfig"
           },
           "title": "Tool Inventories",
           "type": "array"
@@ -401,6 +1269,42 @@
       "title": "GoogleAdkConfig",
       "type": "object"
     },
+    "HumanAckDeclaration": {
+      "additionalProperties": false,
+      "properties": {
+        "affected_surface": {
+          "title": "Affected Surface",
+          "type": "string"
+        },
+        "expires": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expires"
+        },
+        "owner": {
+          "title": "Owner",
+          "type": "string"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "affected_surface",
+        "owner",
+        "reason"
+      ],
+      "title": "HumanAckDeclaration",
+      "type": "object"
+    },
     "LangChainConfig": {
       "additionalProperties": false,
       "properties": {
@@ -413,7 +1317,7 @@
         },
         "tool_inventories": {
           "items": {
-            "$ref": "#/$defs/ArtifactPathConfig"
+            "$ref": "#/$defs/ToolInventoryConfig"
           },
           "title": "Tool Inventories",
           "type": "array"
@@ -455,7 +1359,7 @@
         },
         "tool_inventories": {
           "items": {
-            "$ref": "#/$defs/ArtifactPathConfig"
+            "$ref": "#/$defs/ToolInventoryConfig"
           },
           "title": "Tool Inventories",
           "type": "array"
@@ -583,6 +1487,137 @@
       "title": "OpenAIApiConfig",
       "type": "object"
     },
+    "OrganizationAuditConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "registry": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Registry"
+        }
+      },
+      "title": "OrganizationAuditConfig",
+      "type": "object"
+    },
+    "OrganizationConfig": {
+      "additionalProperties": false,
+      "description": "Optional org metadata for local, deterministic governance workflows.",
+      "properties": {
+        "audit": {
+          "$ref": "#/$defs/OrganizationAuditConfig"
+        },
+        "exception_policy": {
+          "$ref": "#/$defs/OrganizationExceptionPolicyConfig"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "repo": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Repo"
+        },
+        "service": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Service"
+        },
+        "teams": {
+          "additionalProperties": {
+            "$ref": "#/$defs/OrganizationTeamConfig"
+          },
+          "title": "Teams",
+          "type": "object"
+        },
+        "tier": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tier"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "OrganizationConfig",
+      "type": "object"
+    },
+    "OrganizationExceptionPolicyConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "max_age_days": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Age Days"
+        },
+        "require_expiry": {
+          "default": false,
+          "title": "Require Expiry",
+          "type": "boolean"
+        },
+        "require_owner": {
+          "default": false,
+          "title": "Require Owner",
+          "type": "boolean"
+        },
+        "require_reason": {
+          "default": false,
+          "title": "Require Reason",
+          "type": "boolean"
+        }
+      },
+      "title": "OrganizationExceptionPolicyConfig",
+      "type": "object"
+    },
+    "OrganizationTeamConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "reviewers": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Reviewers",
+          "type": "array"
+        }
+      },
+      "title": "OrganizationTeamConfig",
+      "type": "object"
+    },
     "OutputConfig": {
       "additionalProperties": false,
       "properties": {
@@ -608,6 +1643,51 @@
         }
       },
       "title": "OutputConfig",
+      "type": "object"
+    },
+    "OverrideAcknowledgement": {
+      "additionalProperties": false,
+      "description": "One entry in ``checks.acknowledge_overrides`` (v0.17 / M1).\n\nRequired for any ``severity_overrides`` entry whose application\ncrosses a severity tier boundary (critical / high / medium-low) as a\ndowngrade. Tier-crossing upgrades never require ack (strictly more\nconservative). Below-floor downgrades are rejected outright; ack does\nnot bypass the floor.",
+      "properties": {
+        "check_id": {
+          "title": "Check Id",
+          "type": "string"
+        },
+        "expires": {
+          "anyOf": [
+            {
+              "format": "date",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expires"
+        },
+        "owner": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Owner"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "check_id",
+        "reason"
+      ],
+      "title": "OverrideAcknowledgement",
       "type": "object"
     },
     "PacketOutputConfig": {
@@ -677,6 +1757,24 @@
     "PoliciesConfig": {
       "additionalProperties": false,
       "properties": {
+        "control_pack": {
+          "anyOf": [
+            {
+              "enum": [
+                "default",
+                "financial-strict",
+                "read-only-agent"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Built-in control pack naming which controls each action effect obliges. Omit for 'default'. Every pack requires at least what 'default' requires.",
+          "title": "Control Pack"
+        },
         "require_approval_for_tools": {
           "items": {
             "$ref": "#/$defs/PolicyToolEntry"
@@ -725,6 +1823,30 @@
         "path": {
           "title": "Path",
           "type": "string"
+        },
+        "sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sha256"
+        },
+        "source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source"
         }
       },
       "required": [
@@ -736,6 +1858,18 @@
     "PolicyToolEntry": {
       "additionalProperties": false,
       "properties": {
+        "provider": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Provider"
+        },
         "reason": {
           "anyOf": [
             {
@@ -748,9 +1882,45 @@
           "default": null,
           "title": "Reason"
         },
+        "source_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Id"
+        },
+        "source_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Type"
+        },
         "tool": {
           "title": "Tool",
           "type": "string"
+        },
+        "tool_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tool Id"
         }
       },
       "required": [
@@ -800,6 +1970,13 @@
     "RiskOverridesConfig": {
       "additionalProperties": false,
       "properties": {
+        "selectors": {
+          "items": {
+            "$ref": "#/$defs/ToolRiskOverride"
+          },
+          "title": "Selectors",
+          "type": "array"
+        },
         "tools": {
           "additionalProperties": {
             "$ref": "#/$defs/ToolRiskOverride"
@@ -811,6 +1988,151 @@
       "title": "RiskOverridesConfig",
       "type": "object"
     },
+    "SeverityOverrideEntry": {
+      "additionalProperties": false,
+      "description": "Rich form of a ``checks.severity_overrides`` entry (v0.17 / M1).\n\nThe legacy scalar form (``SHIP-XYZ: medium``) continues to work via the\n``ChecksConfig.severity_overrides`` validator below; the rich form is\nadditive and lets reviewers attach a reason and an expiry to any\nindividual override.\n\nExample::\n\n    checks:\n      severity_overrides:\n        # Legacy scalar \u2014 still supported\n        SHIP-SCHEMA-MISSING-BOUNDS: medium\n        # Rich form \u2014 preferred for tier-crossing overrides because\n        # ``reason`` is the only thing that lands in the audit row.\n        SHIP-AUTH-MANIFEST-BROAD-SCOPE:\n          severity: medium\n          reason: \"internal-network agent; scope reviewed JIRA-1234\"\n          expires: 2026-09-01",
+      "properties": {
+        "expires": {
+          "anyOf": [
+            {
+              "format": "date",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expires"
+        },
+        "owner": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Owner"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "severity": {
+          "enum": [
+            "info",
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "title": "Severity",
+          "type": "string"
+        }
+      },
+      "required": [
+        "severity"
+      ],
+      "title": "SeverityOverrideEntry",
+      "type": "object"
+    },
+    "SourceAuthorityConfig": {
+      "additionalProperties": false,
+      "description": "Reviewed authority for every action a tool source contributes (#410).\n\nAuthority is a fact about a *deployment*, not about a function: the six\nSalesforce tools behind one OAuth client share one answer, and asking for\nit once per tool asks the same infrastructure question six times. That is\nnot merely tedious \u2014 it is what breeds the copy-paste that breeds wrong\nanswers, and a wrong authority declaration is the one that makes an\nunscoped production credential read as ``mode: none``.\n\nDeclared here, it applies to every action of the source. An\n``action_surface.actions[]`` row that declares its own ``authority``\noverrides it for that action, and the resolver treats both spellings\nidentically: same conflict rule against the source's own published\nevidence, same refusal to stand in for authority the source itself\npublishes ambiguously.\n\n``scopes`` lives inside this block rather than beside it, because unlike an\naction row there is no sibling permission list for a source to own.",
+      "properties": {
+        "auth_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Auth Type"
+        },
+        "credential_mode": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Credential Mode"
+        },
+        "mode": {
+          "enum": [
+            "none",
+            "scoped",
+            "unscoped",
+            "ambient"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "scopes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Scopes",
+          "type": "array"
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "title": "SourceAuthorityConfig",
+      "type": "object"
+    },
+    "SourceBindingConfig": {
+      "additionalProperties": false,
+      "description": "Reviewed statement that this source's published surface *is* the surface under review.\n\nBinding is real information for an **agent**: a catalog may hold 63 OpenAPI\noperations of which the agent wires 5, and #385 drew that boundary\ndeliberately \u2014 catalog membership is never evidence of capability.\n\nFor a **tool server** there is no such gap. The repository under review is\nthe tool surface: anything in its published ``tools/list`` is callable by\nany client that connects to it, there is no root agent, and there is\nnothing to select between. Stating that one structural fact used to cost\none ``agent_bindings.declarations[].tools`` row per tool \u2014 116 of them for\n``github/github-mcp-server`` \u2014 which is what breeds the copy-paste that\nbreeds wrong answers, and is where an adopter stops (#432).\n\nDeclared here it applies to every tool the source contributes, exactly as\n``authority`` applies to every action it contributes. It is **additive and\nwidening**: it can only move tools *into* the analysed surface, where every\ncheck then judges them. A source with no ``binding`` block behaves exactly\nas before.\n\nIt stays a human declaration. Inferring \"this source binds everything\" from\nthe source's own content is the #268 attack, and the point of this block is\nto make the statement one line, not to remove it.",
+      "properties": {
+        "complete": {
+          "const": true,
+          "default": true,
+          "title": "Complete",
+          "type": "boolean"
+        },
+        "reason": {
+          "pattern": "[^\\s\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f-\\u1160\\u17b4-\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufff8\ud82f\udca0-\ud82f\udca3\ud834\udd73-\ud834\udd7a\udb40\udc00-\udb43\udfff]",
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason"
+      ],
+      "title": "SourceBindingConfig",
+      "type": "object"
+    },
     "SuppressionConfig": {
       "additionalProperties": false,
       "properties": {
@@ -818,9 +2140,70 @@
           "title": "Check Id",
           "type": "string"
         },
+        "expires": {
+          "anyOf": [
+            {
+              "format": "date",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expires"
+        },
+        "owner": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Owner"
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Provider"
+        },
         "reason": {
           "title": "Reason",
           "type": "string"
+        },
+        "source_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Id"
+        },
+        "source_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Type"
         },
         "tool": {
           "anyOf": [
@@ -833,6 +2216,18 @@
           ],
           "default": null,
           "title": "Tool"
+        },
+        "tool_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tool Id"
         }
       },
       "required": [
@@ -840,6 +2235,120 @@
         "reason"
       ],
       "title": "SuppressionConfig",
+      "type": "object"
+    },
+    "ToolIdentityBindingConfig": {
+      "additionalProperties": false,
+      "description": "Reviewed declaration that observations describe one capability.",
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "members": {
+          "items": {
+            "$ref": "#/$defs/ToolObservationSelectorConfig"
+          },
+          "title": "Members",
+          "type": "array"
+        },
+        "primary": {
+          "$ref": "#/$defs/ToolObservationSelectorConfig"
+        },
+        "provider": {
+          "title": "Provider",
+          "type": "string"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "provider",
+        "reason",
+        "primary"
+      ],
+      "title": "ToolIdentityBindingConfig",
+      "type": "object"
+    },
+    "ToolIdentityConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "bindings": {
+          "items": {
+            "$ref": "#/$defs/ToolIdentityBindingConfig"
+          },
+          "title": "Bindings",
+          "type": "array"
+        }
+      },
+      "title": "ToolIdentityConfig",
+      "type": "object"
+    },
+    "ToolInventoryConfig": {
+      "additionalProperties": false,
+      "description": "A reviewed tool inventory, optionally bound to the source it completes.\n\n``source_id`` names the ``tool_sources[].id`` (or framework-entrypoint\nsource id) whose surface this file enumerates. Without it the inventory is\nan *independent* source: its entries become new observations that merely\nhappen to share names with the statically-extracted ones, so the catalog\ngrows and the ``incomplete_surface`` gap keyed to the original source is\nnever satisfied (#386). With it, each named tool is joined to that source's\nobservation through the one reviewed-binding engine in\n``core/tool_identity.py`` \u2014 nothing is ever joined by name alone.\n\nEntries the completed source does not expose stay standalone observations:\nan inventory exists precisely because static extraction may have missed\ntools, and a tool nobody wired is honestly reported as unbound rather than\nsilently attributed to an agent.",
+      "properties": {
+        "optional": {
+          "default": false,
+          "title": "Optional",
+          "type": "boolean"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "source_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Id"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "title": "ToolInventoryConfig",
+      "type": "object"
+    },
+    "ToolObservationSelectorConfig": {
+      "additionalProperties": false,
+      "description": "Exact selector for one extracted tool observation.",
+      "properties": {
+        "source_id": {
+          "title": "Source Id",
+          "type": "string"
+        },
+        "source_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Type"
+        },
+        "tool": {
+          "title": "Tool",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_id",
+        "tool"
+      ],
+      "title": "ToolObservationSelectorConfig",
       "type": "object"
     },
     "ToolRiskOverride": {
@@ -862,6 +2371,18 @@
           "default": null,
           "title": "Owner"
         },
+        "provider": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Provider"
+        },
         "reason": {
           "title": "Reason",
           "type": "string"
@@ -873,12 +2394,60 @@
           "title": "Remove Tags",
           "type": "array"
         },
+        "source_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Id"
+        },
+        "source_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Type"
+        },
         "tags": {
           "items": {
             "type": "string"
           },
           "title": "Tags",
           "type": "array"
+        },
+        "tool": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tool"
+        },
+        "tool_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tool Id"
         }
       },
       "required": [
@@ -890,7 +2459,30 @@
     "ToolSourceConfig": {
       "additionalProperties": false,
       "properties": {
+        "authority": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceAuthorityConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "binding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceBindingConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "id": {
+          "pattern": "\\S",
           "title": "Id",
           "type": "string"
         },
@@ -936,15 +2528,6 @@
           "title": "Trust"
         },
         "type": {
-          "enum": [
-            "mcp",
-            "openapi",
-            "openai_agents_sdk",
-            "google_adk",
-            "langchain",
-            "crewai",
-            "codex_plugin"
-          ],
           "title": "Type",
           "type": "string"
         }
@@ -989,6 +2572,13 @@
     "ValidationEvidenceConfig": {
       "additionalProperties": false,
       "properties": {
+        "agent_traces": {
+          "items": {
+            "$ref": "#/$defs/ArtifactPathConfig"
+          },
+          "title": "Agent Traces",
+          "type": "array"
+        },
         "approval_traces": {
           "items": {
             "$ref": "#/$defs/ArtifactPathConfig"
@@ -1047,10 +2637,16 @@
   "$id": "https://raw.githubusercontent.com/ThreeMoonsLab/agents-shipgate/main/docs/manifest-v0.1.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
-  "description": "JSON Schema for shipgate.yaml. Generated from agents_shipgate.config.schema.AgentsShipgateManifest. Do not edit by hand.",
+  "description": "JSON Schema for shipgate.yaml. Generated from agents_shipgate.schemas.manifest.AgentsShipgateManifest. Do not edit by hand.",
   "properties": {
+    "action_surface": {
+      "$ref": "#/$defs/ActionSurfaceConfig"
+    },
     "agent": {
       "$ref": "#/$defs/AgentConfig"
+    },
+    "agent_bindings": {
+      "$ref": "#/$defs/AgentBindingsConfig"
     },
     "anthropic": {
       "anyOf": [
@@ -1062,6 +2658,9 @@
         }
       ],
       "default": null
+    },
+    "baseline": {
+      "$ref": "#/$defs/BaselineConfig"
     },
     "checks": {
       "$ref": "#/$defs/ChecksConfig"
@@ -1105,6 +2704,13 @@
       ],
       "default": null
     },
+    "human_ack": {
+      "items": {
+        "$ref": "#/$defs/HumanAckDeclaration"
+      },
+      "title": "Human Ack",
+      "type": "array"
+    },
     "langchain": {
       "anyOf": [
         {
@@ -1138,6 +2744,17 @@
       ],
       "default": null
     },
+    "organization": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OrganizationConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
     "output": {
       "$ref": "#/$defs/OutputConfig"
     },
@@ -1152,6 +2769,9 @@
     },
     "risk_overrides": {
       "$ref": "#/$defs/RiskOverridesConfig"
+    },
+    "tool_identity": {
+      "$ref": "#/$defs/ToolIdentityConfig"
     },
     "tool_sources": {
       "items": {

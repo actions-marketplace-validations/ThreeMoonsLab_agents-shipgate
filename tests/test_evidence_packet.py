@@ -1,7 +1,7 @@
 """Tests for the Release Evidence Packet (`agents_shipgate.packet`).
 
 Covers:
-- ``build_packet`` invariants (all 10 sections always present, verdict
+- ``build_packet`` invariants (all reviewer sections always present, verdict
   derives from ``release_decision.decision`` only, disclaimers are
   verbatim and unconditional).
 - HTML escaping safety.
@@ -21,9 +21,11 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from agents_shipgate.ci.release_decision import build_release_decision
 from agents_shipgate.cli.main import app
 from agents_shipgate.cli.scan import run_scan
 from agents_shipgate.core.disclaimers import HITL_RUNTIME_CONTROL_DISCLAIMER
+from agents_shipgate.core.domain import Tool
 from agents_shipgate.packet import (
     EvidencePacket,
     PacketSchemaError,
@@ -32,9 +34,18 @@ from agents_shipgate.packet import (
     render_packet_markdown,
     serialize_packet_json,
 )
+from agents_shipgate.packet.builder import _build_not_proven
 from agents_shipgate.packet.disclaimer import (
     PACKET_NON_PROOF,
     PACKET_NON_PROOF_HEADLINE,
+)
+from agents_shipgate.packet.evidence_matrix import build_evidence_matrix
+from agents_shipgate.packet.json_packet import _strip_report_only_fields
+from agents_shipgate.schemas.report import (
+    Finding,
+    ReadinessReport,
+    ReportSummary,
+    ToolSurfaceSummary,
 )
 
 SAMPLE_CONFIG = Path("samples/support_refund_agent/shipgate.yaml")
@@ -44,6 +55,78 @@ EXPECTED_PACKET_JSON = EXPECTED_DIR / "packet.json"
 EXPECTED_PACKET_HTML = EXPECTED_DIR / "packet.html"
 
 GENERATED_AT = "2026-01-01T00:00:00+00:00"
+
+
+def _minimal_packet_with_not_proven(
+    section,
+    *,
+    low_confidence_tool_count: int = 0,
+) -> EvidencePacket:
+    from agents_shipgate.schemas.packet import (
+        ApprovalCoverageSection,
+        CapabilityIntentDiff,
+        DynamicScenariosSection,
+        HighRiskSurfaceSection,
+        HumanInTheLoopEvidence,
+        IdempotencyRiskSection,
+        MemoryIsolationStatus,
+        ReleaseDecisionSection,
+        ScopeCoverageSection,
+    )
+    from agents_shipgate.schemas.report import (
+        BaselineDelta,
+        EvidenceCoverageDecision,
+        FailPolicy,
+    )
+
+    decision = ReleaseDecisionSection(
+        decision="insufficient_evidence" if low_confidence_tool_count else "passed",
+        verdict="INSUFFICIENT EVIDENCE" if low_confidence_tool_count else "PASSED",
+        reason="Evidence coverage below threshold.",
+        evidence_coverage=EvidenceCoverageDecision(
+            level="static",
+            human_review_recommended=low_confidence_tool_count > 0,
+            source_warning_count=0,
+            low_confidence_tool_count=low_confidence_tool_count,
+        ),
+        baseline_delta=BaselineDelta(enabled=False),
+        fail_policy=FailPolicy(
+            ci_mode="advisory",
+            fail_on=[],
+            new_findings_only=False,
+            would_fail_ci=False,
+            exit_code=0,
+        ),
+    )
+    return EvidencePacket(
+        generated_at=GENERATED_AT,
+        run_id="r",
+        project={"name": "p"},
+        agent={"name": "a"},
+        environment={"target": "local"},
+        release_decision=decision,
+        capability_intent=CapabilityIntentDiff(
+            status="not_declared",
+            declared_purpose=[],
+            prohibited_actions=[],
+            observed_tools=[],
+            rows=[],
+            divergence_findings=[],
+        ),
+        high_risk_surface=HighRiskSurfaceSection(
+            status="informational",
+            total_tools=0,
+            high_risk_count=0,
+            tools=[],
+        ),
+        approval_coverage=ApprovalCoverageSection(status="informational"),
+        idempotency_risk=IdempotencyRiskSection(status="informational"),
+        scope_coverage=ScopeCoverageSection(status="informational"),
+        memory_isolation=MemoryIsolationStatus(),
+        human_in_the_loop=HumanInTheLoopEvidence(status="not_declared"),
+        dynamic_scenarios=DynamicScenariosSection(status="informational"),
+        not_proven=section,
+    )
 
 
 def _scan_with_packet(tmp_path: Path) -> tuple[Path, EvidencePacket]:
@@ -65,7 +148,40 @@ def test_packet_emits_alongside_report_by_default(tmp_path):
     out, packet = _scan_with_packet(tmp_path)
     for name in ("packet.md", "packet.json", "packet.html"):
         assert (out / name).exists(), name
-    assert packet.packet_schema_version == "0.3"
+    assert packet.packet_schema_version == "0.17"
+
+
+def test_packet_v07_keeps_capability_refs_on_release_items():
+    payload = {
+        "release_decision": {
+            "blockers": [{"check_id": "SHIP-TEST", "capability_refs": ["cap_release"]}],
+            "review_items": [],
+        },
+        "evidence_matrix": {
+            "rows": [
+                {
+                    "blocking_findings": [
+                        {
+                            "check_id": "SHIP-MATRIX",
+                            "capability_refs": ["cap_matrix"],
+                        }
+                    ],
+                    "review_items": [],
+                }
+            ]
+        },
+        "future_packet_section": {"misalignment": {"capability_refs": ["cap_misalignment"]}},
+    }
+
+    _strip_report_only_fields(payload)
+
+    assert payload["release_decision"]["blockers"][0]["capability_refs"] == ["cap_release"]
+    assert payload["evidence_matrix"]["rows"][0]["blocking_findings"][0]["capability_refs"] == [
+        "cap_matrix"
+    ]
+    assert payload["future_packet_section"]["misalignment"]["capability_refs"] == [
+        "cap_misalignment"
+    ]
 
 
 def test_no_packet_flag_skips_packet_outputs(tmp_path):
@@ -85,9 +201,11 @@ def test_packet_has_reviewer_sections(tmp_path):
     payload = serialize_packet_json(packet)
     for section in (
         "release_decision",
+        "evidence_matrix",
         "capability_intent",
         "high_risk_surface",
         "tool_surface_diff",
+        "action_surface_diff",
         "approval_coverage",
         "idempotency_risk",
         "scope_coverage",
@@ -98,6 +216,401 @@ def test_packet_has_reviewer_sections(tmp_path):
     ):
         assert section in payload, f"missing section: {section}"
     assert payload["tool_surface_diff"]["status"] == "not_declared"
+    assert payload["action_surface_diff"]["status"] == "not_declared"
+    assert len(payload["evidence_matrix"]["rows"]) == 13
+
+
+def test_evidence_matrix_covers_expected_domains_and_renders(tmp_path):
+    out, packet = _scan_with_packet(tmp_path)
+    domains = [row.domain for row in packet.evidence_matrix.rows]
+    assert domains == [
+        "Inventory",
+        "Schema",
+        "Auth",
+        "Approval",
+        "Confirmation",
+        "Idempotency",
+        "Side effects",
+        "Memory isolation",
+        "Human-in-the-loop evidence",
+        "Prompt/scope alignment",
+        "Retry/timeout",
+        "Baseline debt",
+        "Action-surface policy",
+    ]
+    approval = next(row for row in packet.evidence_matrix.rows if row.domain == "Approval")
+    assert any("SHIP-POLICY-APPROVAL-MISSING" in item for item in approval.missing_controls)
+    assert any(
+        item.check_id == "SHIP-POLICY-APPROVAL-MISSING" for item in approval.blocking_findings
+    )
+
+    md = (out / "packet.md").read_text(encoding="utf-8")
+    html = (out / "packet.html").read_text(encoding="utf-8")
+    assert "## §1A Evidence matrix — compact review summary" in md
+    assert "| Domain | Evidence present | Evidence source | Confidence |" in md
+    assert "§1A Evidence matrix — compact review summary" in html
+
+
+def test_not_proven_residuals_include_non_static_provenance():
+    findings = [
+        Finding(
+            check_id="SHIP-KEYWORD",
+            title="keyword",
+            severity="medium",
+            category="test",
+            recommendation="r",
+            provenance_kind="keyword_heuristic",
+        ),
+        Finding(
+            check_id="SHIP-REGEX",
+            title="regex",
+            severity="medium",
+            category="test",
+            recommendation="r",
+            provenance_kind="regex_heuristic",
+        ),
+        Finding(
+            check_id="SHIP-AST",
+            title="ast",
+            severity="medium",
+            category="test",
+            recommendation="r",
+            provenance_kind="ast_extraction",
+        ),
+        Finding(
+            check_id="SHIP-POLICY-PACK",
+            title="policy pack",
+            severity="medium",
+            category="test",
+            recommendation="r",
+            provenance_kind="policy_pack",
+        ),
+    ]
+
+    section = _build_not_proven(findings, source_warnings=[], tools=[])
+    residuals = "\n".join(section.additional_residuals)
+
+    assert "heuristic provenance" in residuals
+    assert "keyword_heuristic=1" in residuals
+    assert "regex_heuristic=1" in residuals
+    assert "AST-extracted tool surfaces" in residuals
+    assert "external policy packs" in residuals
+
+
+def test_not_proven_low_confidence_residuals_match_release_decision_count():
+    tools = [
+        Tool(
+            id="high",
+            name="high_confidence_inventory",
+            source_type="mcp",
+            extraction_confidence="high",
+        ),
+        Tool(
+            id="medium",
+            name="medium_confidence_sdk",
+            source_type="sdk_function",
+            extraction_confidence="medium",
+        ),
+        Tool(
+            id="low",
+            name="low_confidence_sdk",
+            source_type="sdk_function",
+            extraction_confidence="low",
+        ),
+    ]
+
+    section = _build_not_proven([], source_warnings=[], tools=tools)
+
+    assert section.low_confidence_tools == [
+        "low_confidence_sdk",
+        "medium_confidence_sdk",
+    ]
+    report = ReadinessReport(
+        run_id="r",
+        project={"name": "p"},
+        agent={"name": "a"},
+        environment={"target": "local"},
+        summary=ReportSummary(
+            status="human_review_recommended",
+            critical_count=0,
+            high_count=0,
+            medium_count=0,
+            human_review_recommended=True,
+            evidence_coverage="static",
+        ),
+        tool_surface=ToolSurfaceSummary(
+            total_tools=len(tools),
+            high_risk_tools=0,
+        ),
+        findings=[],
+        source_warnings=[],
+    )
+    decision = build_release_decision(
+        report=report,
+        tools=tools,
+        ci_mode="advisory",
+        fail_on=None,
+        new_findings_only=False,
+    )
+
+    assert decision.evidence_coverage.low_confidence_tool_count == len(section.low_confidence_tools)
+
+    packet = _minimal_packet_with_not_proven(
+        section,
+        low_confidence_tool_count=decision.evidence_coverage.low_confidence_tool_count,
+    )
+    md = render_packet_markdown(packet)
+    html = render_packet_html(packet)
+
+    assert "Low-confidence tool extractions: none" not in md
+    assert "Low-confidence tool extractions: none" not in html
+    assert "`medium\\_confidence\\_sdk`" in md
+    assert "<code>medium_confidence_sdk</code>" in html
+    assert "high_confidence_inventory" not in md
+    assert "high_confidence_inventory" not in html
+
+
+def test_evidence_matrix_uses_release_decision_only_for_blocking_and_review():
+    payload = {
+        "release_decision": {
+            "blockers": [],
+            "review_items": [
+                {
+                    "id": "review-1",
+                    "fingerprint": "fp_review",
+                    "check_id": "SHIP-POLICY-CONFIRMATION-MISSING",
+                    "severity": "high",
+                    "title": "Confirmation missing",
+                    "baseline_status": None,
+                    "blocks_release": False,
+                }
+            ],
+            "baseline_delta": {"enabled": False},
+        },
+        "findings": [
+            {
+                "id": "active-critical",
+                "fingerprint": "fp_active",
+                "check_id": "SHIP-POLICY-APPROVAL-MISSING",
+                "severity": "critical",
+                "category": "policy",
+                "title": "Approval missing",
+                "tool_name": "refund",
+                "confidence": "high",
+                "suppressed": False,
+                "baseline_status": None,
+                "blocks_release": False,
+            },
+            {
+                "id": "suppressed",
+                "fingerprint": "fp_suppressed",
+                "check_id": "SHIP-POLICY-CONFIRMATION-MISSING",
+                "severity": "high",
+                "category": "policy",
+                "title": "Suppressed confirmation",
+                "confidence": "high",
+                "suppressed": True,
+            },
+        ],
+    }
+
+    matrix = build_evidence_matrix(payload)
+    approval = next(row for row in matrix.rows if row.domain == "Approval")
+    confirmation = next(row for row in matrix.rows if row.domain == "Confirmation")
+
+    assert approval.blocking_findings == []
+    assert any("SHIP-POLICY-APPROVAL-MISSING" in item for item in approval.missing_controls)
+    assert confirmation.missing_controls == []
+    assert [item.check_id for item in confirmation.review_items] == [
+        "SHIP-POLICY-CONFIRMATION-MISSING"
+    ]
+
+
+def test_evidence_matrix_confidence_aggregation_and_baseline_debt():
+    payload = {
+        "baseline": {"path": ".agents-shipgate/baseline.json", "matched_count": 1},
+        "release_decision": {
+            "blockers": [],
+            "review_items": [
+                {
+                    "id": "matched-1",
+                    "fingerprint": "fp_matched",
+                    "check_id": "SHIP-AUTH-SCOPE-COVERAGE-MISSING",
+                    "severity": "high",
+                    "title": "Scope debt",
+                    "baseline_status": "matched",
+                    "blocks_release": False,
+                }
+            ],
+            "baseline_delta": {"enabled": True, "matched_count": 1},
+        },
+        "findings": [
+            {
+                "id": "f1",
+                "fingerprint": "fp1",
+                "check_id": "SHIP-AUTH-SCOPE-COVERAGE-MISSING",
+                "severity": "high",
+                "category": "auth",
+                "title": "Scope missing",
+                "confidence": "high",
+                "suppressed": False,
+                "baseline_status": "matched",
+            },
+            {
+                "id": "f2",
+                "fingerprint": "fp2",
+                "check_id": "SHIP-AUTH-TOOL-BROAD-SCOPE",
+                "severity": "high",
+                "category": "auth",
+                "title": "Broad scope",
+                "confidence": "medium",
+                "suppressed": False,
+                "baseline_status": None,
+            },
+        ],
+    }
+
+    matrix = build_evidence_matrix(payload)
+    auth = next(row for row in matrix.rows if row.domain == "Auth")
+    baseline = next(row for row in matrix.rows if row.domain == "Baseline debt")
+
+    assert auth.confidence == "mixed"
+    assert baseline.evidence_source == [
+        "baseline",
+        "release_decision.baseline_delta",
+        "findings[]",
+    ]
+    assert [item.check_id for item in baseline.review_items] == ["SHIP-AUTH-SCOPE-COVERAGE-MISSING"]
+
+
+def test_evidence_matrix_source_only_rows_use_medium_confidence():
+    payload = {
+        "release_decision": {"blockers": [], "review_items": []},
+        "action_surface_facts": {
+            "actions": [{"name": "refund", "effect": "write", "safeguards": {}}]
+        },
+        "findings": [],
+    }
+
+    matrix = build_evidence_matrix(payload)
+    action_surface = next(row for row in matrix.rows if row.domain == "Action-surface policy")
+
+    assert action_surface.evidence_present == "covered"
+    assert action_surface.evidence_source == ["action_surface_facts.actions"]
+    assert action_surface.confidence == "medium"
+
+
+def test_evidence_matrix_confidence_mixed_stays_domain_local():
+    payload = {
+        "release_decision": {"blockers": [], "review_items": []},
+        "findings": [
+            {
+                "id": "auth-high",
+                "fingerprint": "fp_auth_high",
+                "check_id": "SHIP-AUTH-SCOPE-COVERAGE-MISSING",
+                "severity": "high",
+                "category": "auth",
+                "title": "Scope missing",
+                "confidence": "high",
+                "suppressed": False,
+            },
+            {
+                "id": "auth-medium",
+                "fingerprint": "fp_auth_medium",
+                "check_id": "SHIP-AUTH-TOOL-BROAD-SCOPE",
+                "severity": "high",
+                "category": "auth",
+                "title": "Broad scope",
+                "confidence": "medium",
+                "suppressed": False,
+            },
+            {
+                "id": "retry-low",
+                "fingerprint": "fp_retry_low",
+                "check_id": "SHIP-API-TIMEOUT-MISSING",
+                "severity": "medium",
+                "category": "api",
+                "title": "Timeout missing",
+                "confidence": "low",
+                "suppressed": False,
+            },
+        ],
+    }
+
+    matrix = build_evidence_matrix(payload)
+    auth = next(row for row in matrix.rows if row.domain == "Auth")
+    retry = next(row for row in matrix.rows if row.domain == "Retry/timeout")
+    approval = next(row for row in matrix.rows if row.domain == "Approval")
+
+    assert auth.confidence == "mixed"
+    assert retry.confidence == "low"
+    assert approval.confidence == "unknown"
+
+
+def test_evidence_matrix_action_surface_uses_blocks_release_for_action_finding():
+    payload = {
+        "release_decision": {
+            "blockers": [
+                {
+                    "id": "blocker-1",
+                    "fingerprint": "fp_blocker",
+                    "check_id": "SHIP-ACTION-CONTROL-DOWNGRADE",
+                    "severity": "critical",
+                    "title": "Action control downgraded",
+                    "baseline_status": None,
+                    "blocks_release": True,
+                },
+                {
+                    "id": "non-action-blocker",
+                    "fingerprint": "fp_non_action",
+                    "check_id": "SHIP-POLICY-APPROVAL-MISSING",
+                    "severity": "critical",
+                    "title": "Approval missing",
+                    "baseline_status": None,
+                    "blocks_release": True,
+                },
+            ],
+            "review_items": [],
+        },
+        "findings": [
+            {
+                "id": "finding-1",
+                "fingerprint": "fp_blocker",
+                "check_id": "SHIP-ACTION-CONTROL-DOWNGRADE",
+                "severity": "critical",
+                "category": "action_surface",
+                "title": "Action control downgraded",
+                "tool_name": "refund",
+                "confidence": "high",
+                "suppressed": False,
+                "blocks_release": True,
+            },
+            {
+                "id": "non-action-finding",
+                "fingerprint": "fp_non_action",
+                "check_id": "SHIP-POLICY-APPROVAL-MISSING",
+                "severity": "critical",
+                "category": "policy",
+                "title": "Approval missing",
+                "tool_name": "refund",
+                "confidence": "high",
+                "suppressed": False,
+                "blocks_release": True,
+            },
+        ],
+    }
+
+    matrix = build_evidence_matrix(payload)
+    action_surface = next(row for row in matrix.rows if row.domain == "Action-surface policy")
+
+    assert "findings[].blocks_release" in action_surface.evidence_source
+    assert any("SHIP-ACTION-CONTROL-DOWNGRADE" in item for item in action_surface.missing_controls)
+    assert not any(
+        "SHIP-POLICY-APPROVAL-MISSING" in item for item in action_surface.missing_controls
+    )
+    assert [item.check_id for item in action_surface.blocking_findings] == [
+        "SHIP-ACTION-CONTROL-DOWNGRADE"
+    ]
 
 
 def test_verdict_derives_from_release_decision_not_fail_policy(tmp_path):
@@ -112,16 +625,25 @@ def test_verdict_derives_from_release_decision_not_fail_policy(tmp_path):
     assert section.fail_policy.exit_code == 0
     assert section.decision == "blocked"
     assert section.verdict == "BLOCKED"
+    assert section.static_analysis_only is True
+    assert section.runtime_behavior_verified is False
+    assert "did not execute the agent" in section.static_verdict_disclaimer
 
 
-def test_capability_intent_diff_lists_observed_tools(tmp_path):
+def test_capability_intent_keeps_heuristic_policy_matches_out_of_findings(tmp_path):
     _, packet = _scan_with_packet(tmp_path)
     section = packet.capability_intent
     assert section.declared_purpose
     assert "stripe.create_refund" in section.observed_tools
-    # SHIP-SCOPE-PROHIBITED-TOOL-PRESENT fires twice on this fixture.
-    assert any(item.check_id == "SHIP-SCOPE-PROHIBITED-TOOL-PRESENT"
-               for item in section.divergence_findings)
+    assert not any(
+        item.check_id == "SHIP-SCOPE-PROHIBITED-TOOL-PRESENT"
+        for item in section.divergence_findings
+    )
+    assert packet.release_decision.evidence_coverage.policy_gap_count > 0
+    assert any(
+        gap.why.startswith("SHIP-SCOPE-PROHIBITED-TOOL-PRESENT:")
+        for gap in packet.release_decision.evidence_coverage.evidence_gaps
+    )
 
 
 def test_high_risk_surface_includes_high_risk_tools(tmp_path):
@@ -141,19 +663,13 @@ def test_approval_coverage_separates_declared_and_gap(tmp_path):
     by_tool = {row.tool: row for row in section.rows}
     assert by_tool["shopify.cancel_order"].declared is True
     assert by_tool["stripe.create_refund"].declared is False
-    assert any(
-        item.check_id == "SHIP-POLICY-APPROVAL-MISSING"
-        for item in section.gap_findings
-    )
+    assert any(item.check_id == "SHIP-POLICY-APPROVAL-MISSING" for item in section.gap_findings)
 
 
 def test_idempotency_risk_reports_retry_policy_and_gaps(tmp_path):
     _, packet = _scan_with_packet(tmp_path)
     section = packet.idempotency_risk
-    assert any(
-        item.check_id == "SHIP-SIDEFX-IDEMPOTENCY-MISSING"
-        for item in section.gap_findings
-    )
+    assert any(item.check_id == "SHIP-SIDEFX-IDEMPOTENCY-MISSING" for item in section.gap_findings)
 
 
 def test_scope_coverage_finds_missing_declared(tmp_path):
@@ -211,12 +727,7 @@ def test_html_escapes_user_controlled_strings():
     in the rendered HTML; we never round-trip through a markdown
     renderer that allows raw HTML, so this is a structural guarantee."""
 
-    from agents_shipgate.core.models import (
-        BaselineDelta,
-        EvidenceCoverageDecision,
-        FailPolicy,
-    )
-    from agents_shipgate.packet.models import (
+    from agents_shipgate.schemas.packet import (
         ApprovalCoverageSection,
         CapabilityIntentDiff,
         DynamicScenariosSection,
@@ -229,6 +740,11 @@ def test_html_escapes_user_controlled_strings():
         NotProvenSection,
         ReleaseDecisionSection,
         ScopeCoverageSection,
+    )
+    from agents_shipgate.schemas.report import (
+        BaselineDelta,
+        EvidenceCoverageDecision,
+        FailPolicy,
     )
 
     decision = ReleaseDecisionSection(
@@ -286,8 +802,7 @@ def test_html_escapes_user_controlled_strings():
         not_proven=NotProvenSection(
             headline=PACKET_NON_PROOF_HEADLINE,
             unconditional=[
-                NotProvenItem(label=label, body=body)
-                for label, body in PACKET_NON_PROOF
+                NotProvenItem(label=label, body=body) for label, body in PACKET_NON_PROOF
             ],
             source_warnings=["<svg/onload=alert(1)>"],
         ),
@@ -300,6 +815,99 @@ def test_html_escapes_user_controlled_strings():
     assert "&lt;svg/onload=alert(1)&gt;" in html
     assert "<img src=x" not in html
     assert "&lt;img src=x onerror=alert(1)&gt;" in html
+
+
+def test_insufficient_evidence_verdict_renders_in_packet():
+    """v0.14: a release_decision with decision='insufficient_evidence'
+    must render verdict='INSUFFICIENT EVIDENCE' in the packet, get the
+    `verdict-insufficient` CSS class, and surface a labelled section
+    heading in markdown."""
+
+    from agents_shipgate.packet.builder import _VERDICT_BY_DECISION
+    from agents_shipgate.packet.html import _VERDICT_CLASS
+    from agents_shipgate.schemas.packet import (
+        ApprovalCoverageSection,
+        CapabilityIntentDiff,
+        DynamicScenariosSection,
+        HighRiskSurfaceSection,
+        HumanInTheLoopEvidence,
+        IdempotencyRiskSection,
+        MemoryIsolationStatus,
+        NotProvenItem,
+        NotProvenSection,
+        ReleaseDecisionSection,
+        ScopeCoverageSection,
+    )
+    from agents_shipgate.schemas.report import (
+        BaselineDelta,
+        EvidenceCoverageDecision,
+        FailPolicy,
+    )
+
+    assert _VERDICT_BY_DECISION["insufficient_evidence"] == "INSUFFICIENT EVIDENCE"
+    assert _VERDICT_CLASS["INSUFFICIENT EVIDENCE"] == "verdict verdict-insufficient"
+
+    decision = ReleaseDecisionSection(
+        decision="insufficient_evidence",
+        verdict="INSUFFICIENT EVIDENCE",
+        reason="Evidence coverage below threshold (2 low-confidence tool(s)).",
+        evidence_coverage=EvidenceCoverageDecision(
+            level="static",
+            human_review_recommended=True,
+            source_warning_count=0,
+            low_confidence_tool_count=2,
+        ),
+        baseline_delta=BaselineDelta(enabled=False),
+        fail_policy=FailPolicy(
+            ci_mode="advisory",
+            fail_on=[],
+            new_findings_only=False,
+            would_fail_ci=False,
+            exit_code=0,
+        ),
+    )
+    packet = EvidencePacket(
+        generated_at=GENERATED_AT,
+        run_id="r",
+        project={"name": "p"},
+        agent={"name": "a"},
+        environment={"target": "local"},
+        release_decision=decision,
+        capability_intent=CapabilityIntentDiff(
+            status="not_declared",
+            declared_purpose=[],
+            prohibited_actions=[],
+            observed_tools=[],
+            rows=[],
+            divergence_findings=[],
+        ),
+        high_risk_surface=HighRiskSurfaceSection(
+            status="informational",
+            total_tools=0,
+            high_risk_count=0,
+            tools=[],
+        ),
+        approval_coverage=ApprovalCoverageSection(status="informational"),
+        idempotency_risk=IdempotencyRiskSection(status="informational"),
+        scope_coverage=ScopeCoverageSection(status="informational"),
+        memory_isolation=MemoryIsolationStatus(),
+        human_in_the_loop=HumanInTheLoopEvidence(status="not_declared"),
+        dynamic_scenarios=DynamicScenariosSection(status="informational"),
+        not_proven=NotProvenSection(
+            headline=PACKET_NON_PROOF_HEADLINE,
+            unconditional=[
+                NotProvenItem(label=label, body=body) for label, body in PACKET_NON_PROOF
+            ],
+        ),
+    )
+
+    html = render_packet_html(packet)
+    assert "verdict-insufficient" in html
+    assert "INSUFFICIENT EVIDENCE" in html
+
+    md = render_packet_markdown(packet)
+    assert "INSUFFICIENT EVIDENCE" in md
+    assert "`insufficient_evidence`" in md
 
 
 def test_load_packet_json_rejects_wrong_schema_version():
@@ -331,7 +939,10 @@ def test_load_packet_json_upgrades_v02_hitl_fields(tmp_path):
 
     upgraded = load_packet_json(payload)
 
-    assert upgraded.packet_schema_version == "0.3"
+    assert upgraded.packet_schema_version == "0.17"
+    assert upgraded.evidence_matrix.notes
+    assert upgraded.action_surface_diff.status == "not_declared"
+    assert upgraded.action_surface_diff.enabled is False
     assert upgraded.human_in_the_loop.runtime_control_disclaimer == (
         HITL_RUNTIME_CONTROL_DISCLAIMER
     )
@@ -339,7 +950,7 @@ def test_load_packet_json_upgrades_v02_hitl_fields(tmp_path):
     assert upgraded.human_in_the_loop.provenance_mode == "unavailable"
 
 
-def test_load_packet_json_upgrades_v01_to_v03(tmp_path):
+def test_load_packet_json_upgrades_v01_to_v05(tmp_path):
     _, packet = _scan_with_packet(tmp_path)
     payload = serialize_packet_json(packet)
     payload["packet_schema_version"] = "0.1"
@@ -351,14 +962,132 @@ def test_load_packet_json_upgrades_v01_to_v03(tmp_path):
 
     upgraded = load_packet_json(payload)
 
-    assert upgraded.packet_schema_version == "0.3"
+    assert upgraded.packet_schema_version == "0.17"
+    assert upgraded.evidence_matrix.notes
     assert upgraded.tool_surface_diff.status == "not_declared"
     assert upgraded.tool_surface_diff.enabled is False
+    assert upgraded.action_surface_diff.status == "not_declared"
+    assert upgraded.action_surface_diff.enabled is False
     assert upgraded.human_in_the_loop.runtime_control_disclaimer == (
         HITL_RUNTIME_CONTROL_DISCLAIMER
     )
     assert upgraded.human_in_the_loop.source_provenance == []
     assert upgraded.human_in_the_loop.provenance_mode == "unavailable"
+
+
+def test_load_packet_json_upgrades_v04_action_surface_section(tmp_path):
+    _, packet = _scan_with_packet(tmp_path)
+    payload = serialize_packet_json(packet)
+    payload["packet_schema_version"] = "0.4"
+    payload.pop("action_surface_diff")
+
+    upgraded = load_packet_json(payload)
+
+    assert upgraded.packet_schema_version == "0.17"
+    assert upgraded.action_surface_diff.status == "not_declared"
+    assert upgraded.action_surface_diff.enabled is False
+    assert upgraded.evidence_matrix.notes
+
+
+def test_load_packet_json_upgrades_v05_evidence_matrix(tmp_path):
+    _, packet = _scan_with_packet(tmp_path)
+    payload = serialize_packet_json(packet)
+    payload["packet_schema_version"] = "0.5"
+    payload.pop("evidence_matrix")
+
+    upgraded = load_packet_json(payload)
+
+    assert upgraded.packet_schema_version == "0.17"
+    assert len(upgraded.evidence_matrix.rows) == 13
+    assert any("older packet schema" in note for note in upgraded.evidence_matrix.notes)
+
+
+@pytest.mark.parametrize(
+    "legacy_version",
+    ["0.1", "0.2", "0.3", "0.4", "0.5", "0.6", "0.7"],
+)
+@pytest.mark.parametrize(
+    ("ci_mode", "would_fail_ci", "expected_exit_code"),
+    [("advisory", False, 0), ("strict", True, 20)],
+)
+def test_legacy_passed_packet_downgrades_to_actionable_insufficient_evidence(
+    tmp_path,
+    legacy_version,
+    ci_mode,
+    would_fail_ci,
+    expected_exit_code,
+):
+    _, packet = _scan_with_packet(tmp_path)
+    payload = serialize_packet_json(packet)
+    payload["packet_schema_version"] = legacy_version
+    release = payload["release_decision"]
+    release.update(
+        {
+            "decision": "passed",
+            "verdict": "PASSED",
+            "reason": "Legacy static scan passed.",
+            "blockers": [],
+            "review_items": [],
+        }
+    )
+    release["fail_policy"].update({"ci_mode": ci_mode, "would_fail_ci": False, "exit_code": 0})
+    release["evidence_coverage"].pop("semantic_coverage", None)
+    release["evidence_coverage"]["evidence_gaps"] = []
+
+    upgraded = load_packet_json(payload)
+
+    assert upgraded.packet_schema_version == "0.17"
+    assert upgraded.release_decision.decision == "insufficient_evidence"
+    assert upgraded.release_decision.verdict == "INSUFFICIENT EVIDENCE"
+    assert "not a v0.8 safety statement" in upgraded.release_decision.reason
+    assert f"Packet schema {legacy_version}" in upgraded.release_decision.reason
+    semantic = upgraded.release_decision.evidence_coverage.semantic_coverage
+    assert semantic.pass_eligible_actions == 0
+    assert semantic.gap_count == 1
+    assert semantic.reason_counts == {"legacy_packet_requires_regeneration": 1}
+    gap = upgraded.release_decision.evidence_coverage.evidence_gaps[-1]
+    assert gap.kind == "incomplete_surface"
+    assert gap.next_action.kind == "provide_complete_inventory"
+    assert gap.next_action.command == ("agents-shipgate scan -c shipgate.yaml --format json")
+    assert upgraded.release_decision.fail_policy.would_fail_ci is would_fail_ci
+    assert upgraded.release_decision.fail_policy.exit_code == expected_exit_code
+    assert "INSUFFICIENT EVIDENCE" in render_packet_markdown(upgraded)
+
+
+@pytest.mark.parametrize("prior_version", ["0.8", "0.11", "0.12", "0.13", "0.14", "0.15", "0.16"])
+def test_a_post_v08_packet_keeps_the_verdict_it_recorded(tmp_path, prior_version):
+    """Reading an old packet must not rewrite what it decided.
+
+    The downgrade above exists because v0.7 and older predate evidence-backed
+    semantic coverage — a real gap in what those artifacts can prove. It was
+    gated on "is this a version I recognise" rather than on "is this before
+    v0.8", so every packet-schema bump quietly added the *immediately previous*
+    version to the set being rewritten: a stored v0.13 `passed` packet loaded
+    as `insufficient_evidence`, explained by a claim about history that is
+    false of it.
+    """
+
+    _, packet = _scan_with_packet(tmp_path)
+    payload = serialize_packet_json(packet)
+    payload["packet_schema_version"] = prior_version
+    payload["release_decision"].update(
+        {
+            "decision": "passed",
+            "verdict": "PASSED",
+            "reason": "Static scan passed.",
+            "blockers": [],
+            "review_items": [],
+        }
+    )
+
+    upgraded = load_packet_json(payload)
+
+    assert upgraded.packet_schema_version == "0.17"
+    assert upgraded.release_decision.decision == "passed"
+    assert upgraded.release_decision.verdict == "PASSED"
+    assert "predates evidence-backed semantic coverage" not in (
+        upgraded.release_decision.reason
+    )
 
 
 def test_evidence_packet_cli_accepts_report_json(tmp_path):
@@ -418,6 +1147,24 @@ def test_evidence_packet_from_report_marks_degradation_in_json(tmp_path):
     assert payload["release_decision"]["verdict"] == "BLOCKED"
 
 
+def test_evidence_packet_from_report_preserves_evidence_matrix(tmp_path):
+    out, fresh_packet = _scan_with_packet(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "evidence-packet",
+            "--from",
+            str(out / "report.json"),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["evidence_matrix"] == serialize_packet_json(fresh_packet)["evidence_matrix"]
+
+
 def test_evidence_packet_from_report_rebuilds_hitl_gap_provenance(tmp_path):
     scan_out = tmp_path / "scan"
     run_scan(
@@ -442,10 +1189,7 @@ def test_evidence_packet_from_report_rebuilds_hitl_gap_provenance(tmp_path):
     payload = json.loads(result.output)
     hitl = payload["human_in_the_loop"]
     assert hitl["provenance_mode"] == "rebuilt_from_findings"
-    assert any(
-        item["status"] == "expected_but_absent"
-        for item in hitl["source_provenance"]
-    )
+    assert any(item["status"] == "expected_but_absent" for item in hitl["source_provenance"])
 
 
 def test_evidence_packet_from_report_marks_covered_hitl_provenance_unavailable(tmp_path):
@@ -501,8 +1245,7 @@ def test_evidence_packet_from_clean_report_does_not_invent_scope_gaps(tmp_path):
     scope_findings = [
         f
         for f in fresh_report.findings
-        if f.check_id
-        in {"SHIP-AUTH-SCOPE-COVERAGE-MISSING", "SHIP-MANIFEST-UNUSED-SCOPE"}
+        if f.check_id in {"SHIP-AUTH-SCOPE-COVERAGE-MISSING", "SHIP-MANIFEST-UNUSED-SCOPE"}
     ]
     assert scope_findings == [], (
         f"clean fixture unexpectedly produced scope findings: "
@@ -527,9 +1270,7 @@ def test_evidence_packet_from_clean_report_does_not_invent_scope_gaps(tmp_path):
         ],
     )
     assert result.exit_code == 0, result.output
-    rebuilt_packet = load_packet_json(
-        (rebuilt_dir / "packet.json").read_text(encoding="utf-8")
-    )
+    rebuilt_packet = load_packet_json((rebuilt_dir / "packet.json").read_text(encoding="utf-8"))
 
     assert fresh_packet.scope_coverage.missing_declared == []
     assert rebuilt_packet.scope_coverage.missing_declared == []
@@ -567,12 +1308,10 @@ def test_evidence_packet_writes_packet_json_when_format_includes_json(tmp_path):
     # The written packet.json must round-trip.
     payload = (target / "packet.json").read_text(encoding="utf-8")
     reloaded = load_packet_json(payload)
-    assert reloaded.packet_schema_version == "0.3"
+    assert reloaded.packet_schema_version == "0.17"
 
 
-def test_evidence_packet_pdf_only_exits_zero_when_weasyprint_missing(
-    tmp_path, monkeypatch
-):
+def test_evidence_packet_pdf_only_exits_zero_when_weasyprint_missing(tmp_path, monkeypatch):
     """Regression for PR #43 review: ``--format pdf`` is the only requested
     output and WeasyPrint is unavailable. The packet contract treats PDF
     as a documented graceful-skip (matches the scan path), so the CLI
@@ -599,9 +1338,7 @@ def test_evidence_packet_pdf_only_exits_zero_when_weasyprint_missing(
     assert not (target / "packet.pdf").exists()
 
 
-def test_evidence_packet_pdf_skip_does_not_block_other_outputs(
-    tmp_path, monkeypatch
-):
+def test_evidence_packet_pdf_skip_does_not_block_other_outputs(tmp_path, monkeypatch):
     """``--format md,pdf`` with WeasyPrint missing must still emit
     packet.md and exit 0. The PDF skip is informational; the rest of
     the format set is unaffected."""
@@ -698,7 +1435,7 @@ def test_evidence_packet_cli_round_trips(tmp_path):
     )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["packet_schema_version"] == "0.3"
+    assert payload["packet_schema_version"] == "0.17"
     assert payload["run_id"] == packet.run_id
 
 

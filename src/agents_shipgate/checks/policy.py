@@ -1,40 +1,29 @@
 from __future__ import annotations
 
 from agents_shipgate.checks.base import tool_finding
+from agents_shipgate.core.capability_policy import (
+    capability_policy_evidence_for_subject,
+    subject_requires_approval_review,
+    subject_requires_confirmation_review,
+)
 from agents_shipgate.core.context import ScanContext
-from agents_shipgate.core.risk_hints import has_risk_tag, is_effectively_read_only, risk_tags
-
-APPROVAL_TAGS = {
-    "financial_action",
-    "destructive",
-    "infrastructure_change",
-    "code_execution",
-}
-
-CONFIRMATION_TAGS = {
-    "destructive",
-    "external_write",
-    "customer_communication",
-}
+from agents_shipgate.core.control_packs import resolve_control_pack
 
 
 def run(context: ScanContext):
     findings = []
-    approval_tools = set(context.manifest.policies.approval_tools())
-    confirmation_tools = set(context.manifest.policies.confirmation_tools())
-    if context.api_artifacts:
-        approval_tools.update(context.api_artifacts.approval_tools())
-        confirmation_tools.update(context.api_artifacts.confirmation_tools())
-    if context.anthropic_artifacts:
-        approval_tools.update(context.anthropic_artifacts.approval_tools())
-        confirmation_tools.update(context.anthropic_artifacts.confirmation_tools())
+    # #410 §F: which effects oblige approval / confirmation is the manifest's
+    # one answer, not a set written out in this file.
+    pack = resolve_control_pack(context.manifest)
+    subjects_by_tool_id = {
+        subject.tool.id: subject for subject in context.capability_policy_subjects
+    }
     for tool in context.tools:
-        if is_effectively_read_only(tool):
+        subject = subjects_by_tool_id.get(tool.id)
+        if subject is None:
             continue
-        if (
-            has_risk_tag(tool, APPROVAL_TAGS, min_confidence="medium")
-            and tool.name not in approval_tools
-        ):
+        tool = subject.tool
+        if subject_requires_approval_review(subject, pack=pack):
             findings.append(
                 tool_finding(
                     tool=tool,
@@ -42,16 +31,31 @@ def run(context: ScanContext):
                     title=f"{tool.name} lacks a declared approval policy",
                     severity="critical",
                     category="policy",
-                    evidence={"risk_tags": risk_tags(tool, min_confidence="medium"), "policy_match": None},
+                    evidence={
+                        "risk_tags": list(subject.legacy_risk_tags),
+                        "policy_match": None,
+                        "control_pack": pack.id,
+                    },
                     confidence="high",
                     recommendation=f"Declare an approval policy for {tool.name} or remove this tool from the release.",
                     context=context,
+                    provenance_kind="static_declaration",
+                    # Reviewer-grade provenance: the *tool* source already
+                    # points at where the high-risk tool is defined; the
+                    # *manifest* evidence pointer tells the reviewer
+                    # where to declare the missing policy.
+                    policy_evidence_pointer="/policies/require_approval_for_tools",
+                    capability_refs=[subject.fact.id],
+                    capability_policy_evidence=capability_policy_evidence_for_subject(
+                        subject,
+                        matched_predicates={
+                            "missing_approval_policy": True,
+                            "effect": [subject.fact.effect.effect],
+                        },
+                    ),
                 )
             )
-        if (
-            has_risk_tag(tool, CONFIRMATION_TAGS, min_confidence="medium")
-            and tool.name not in confirmation_tools
-        ):
+        if subject_requires_confirmation_review(subject, pack=pack):
             findings.append(
                 tool_finding(
                     tool=tool,
@@ -59,10 +63,24 @@ def run(context: ScanContext):
                     title=f"{tool.name} lacks a declared confirmation policy",
                     severity="high",
                     category="policy",
-                    evidence={"risk_tags": risk_tags(tool, min_confidence="medium"), "policy_match": None},
+                    evidence={
+                        "risk_tags": list(subject.legacy_risk_tags),
+                        "policy_match": None,
+                        "control_pack": pack.id,
+                    },
                     confidence="high",
                     recommendation=f"Declare a user confirmation policy for {tool.name} or remove this action from the release.",
                     context=context,
+                    provenance_kind="static_declaration",
+                    policy_evidence_pointer="/policies/require_confirmation_for_tools",
+                    capability_refs=[subject.fact.id],
+                    capability_policy_evidence=capability_policy_evidence_for_subject(
+                        subject,
+                        matched_predicates={
+                            "missing_confirmation_policy": True,
+                            "effect": [subject.fact.effect.effect],
+                        },
+                    ),
                 )
             )
     return findings

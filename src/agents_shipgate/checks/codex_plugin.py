@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from agents_shipgate.checks.base import agent_finding
+from agents_shipgate.core.artifact_models import CodexPluginArtifacts
 from agents_shipgate.core.context import ScanContext
 
 
 def run(context: ScanContext):
-    artifacts = context.codex_plugin_artifacts
+    artifacts = context.artifact("codex_plugin", CodexPluginArtifacts)
     if artifacts is None:
         return []
 
@@ -37,6 +38,7 @@ def run(context: ScanContext):
                         "identity unambiguous before release review."
                     ),
                     context=context,
+                    provenance_kind="static_declaration",
                 )
             )
 
@@ -55,6 +57,7 @@ def run(context: ScanContext):
                         "MCP, app, or hook artifact resolves inside the plugin package."
                     ),
                     context=context,
+                    provenance_kind="static_declaration",
                 )
             )
 
@@ -76,6 +79,7 @@ def run(context: ScanContext):
                         "to every Codex marketplace plugin entry."
                     ),
                     context=context,
+                    provenance_kind="static_declaration",
                 )
             )
 
@@ -101,6 +105,7 @@ def run(context: ScanContext):
                     "server through codex_plugins.mcp_tool_inventories."
                 ),
                 context=context,
+                provenance_kind="static_declaration",
             )
         )
 
@@ -123,6 +128,7 @@ def run(context: ScanContext):
                     "unless an explicit local tool inventory or policy evidence is provided."
                 ),
                 context=context,
+                provenance_kind="static_declaration",
             )
         )
 
@@ -148,6 +154,7 @@ def run(context: ScanContext):
                     "description so agents can route it deterministically."
                 ),
                 context=context,
+                provenance_kind="static_declaration",
             )
         )
 

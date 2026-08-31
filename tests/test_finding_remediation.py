@@ -32,12 +32,16 @@ from agents_shipgate.core.findings import (
     _REMEDIATION_FALLBACK,
     annotate_remediation,
 )
-from agents_shipgate.core.models import CheckMetadata, Finding, ReadinessReport
-from agents_shipgate.core.patches import (
+from agents_shipgate.schemas.checks import CheckMetadata
+from agents_shipgate.schemas.patches import (
     AppendPointerPatch,
     ManualPatch,
     RemovePointerPatch,
     SetPointerPatch,
+)
+from agents_shipgate.schemas.report import (
+    Finding,
+    ReadinessReport,
 )
 
 SAMPLES = Path(__file__).resolve().parent.parent / "samples"
@@ -212,6 +216,90 @@ def test_unknown_check_id_uses_safe_closed_fallback():
         == _REMEDIATION_FALLBACK["suggested_patch_kind"]
     )
     assert finding.docs_url is None
+
+
+# --- Reviewer-grade catalog escalation override ----------------------------
+
+
+def test_human_review_regardless_of_patch_overrides_auto_apply():
+    """High-confidence non-manual patch on an approval-missing finding
+    must NOT route to ``auto_apply`` — the brief explicitly lists
+    approval/confirmation/idempotency/broad-scope/prohibited-action/
+    runtime-trace and HITL-evidence categories as requiring human
+    sign-off even when a high-confidence machine-applicable patch is
+    available.
+
+    The override flips ``autofix_safe`` to False inside
+    ``annotate_remediation`` BEFORE ``derive_agent_action`` runs, so the
+    existing routing logic naturally lands at
+    ``propose_patch_for_review`` and all three fields agree.
+    """
+    finding = _finding(
+        "SHIP-POLICY-APPROVAL-MISSING",
+        patches=[_high_remove()],
+    )
+    annotate_remediation([finding], _builtin_lookup())
+    assert finding.autofix_safe is False
+    assert finding.requires_human_review is True
+    assert finding.agent_action == "propose_patch_for_review"
+
+
+def test_human_review_override_keeps_escalate_when_no_patch():
+    """Without machine-applicable patches, the override still routes to
+    ``escalate_to_human`` (not ``informational``), matching the brief's
+    expectation that these checks always need human attention."""
+    finding = _finding("SHIP-EVIDENCE-APPROVAL-TRACE-MISSING", patches=None)
+    annotate_remediation([finding], _builtin_lookup())
+    assert finding.autofix_safe is False
+    assert finding.requires_human_review is True
+    assert finding.agent_action == "escalate_to_human"
+
+
+def test_non_overridden_check_still_auto_applies_with_high_patch():
+    """Negative control: a check WITHOUT the override flag must still
+    route a high-confidence non-manual patch to ``auto_apply``. Proves
+    the override is targeted to the high-risk catalog entries, not a
+    blanket regression."""
+    finding = _finding(
+        "SHIP-MANIFEST-STALE-SUPPRESSION",
+        patches=[_high_remove()],
+    )
+    annotate_remediation([finding], _builtin_lookup())
+    assert finding.autofix_safe is True
+    assert finding.requires_human_review is False
+    assert finding.agent_action == "auto_apply"
+
+
+def test_catalog_marks_high_risk_checks_with_override():
+    """Stability check: the canonical list of overridden check IDs from
+    the plan must stay in sync with the catalog. Adding a new high-risk
+    check that needs the override should fail this test until the
+    catalog entry is updated."""
+    lookup = _builtin_lookup()
+    expected = {
+        "SHIP-POLICY-APPROVAL-MISSING",
+        "SHIP-POLICY-CONFIRMATION-MISSING",
+        "SHIP-SIDEFX-IDEMPOTENCY-MISSING",
+        "SHIP-AUTH-MANIFEST-BROAD-SCOPE",
+        "SHIP-AUTH-TOOL-BROAD-SCOPE",
+        "SHIP-SCOPE-PROHIBITED-TOOL-PRESENT",
+        "SHIP-SCOPE-TOOLKIT-UNBOUNDED",
+        "SHIP-API-TRACE-APPROVAL-MISSING",
+        "SHIP-API-TRACE-CONFIRMATION-MISSING",
+        "SHIP-EVIDENCE-APPROVAL-TRACE-MISSING",
+        "SHIP-EVIDENCE-OVERRIDE-REASON-MISSING",
+        "SHIP-EVIDENCE-HIGH-RISK-EXCLUSION-MISSING",
+        "SHIP-EVIDENCE-HITL-PROMOTION-CRITERIA-MISSING",
+    }
+    actual = {
+        check_id
+        for check_id, meta in lookup.items()
+        if meta.requires_human_review_regardless_of_patch
+    }
+    assert actual == expected, (
+        f"override-flagged checks drifted from the plan: "
+        f"+{sorted(actual - expected)} -{sorted(expected - actual)}"
+    )
 
 
 def test_unknown_check_id_with_high_patches_still_derives():

@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar, Literal
 
-from agents_shipgate.config.schema import AgentsShipgateManifest
-from agents_shipgate.core.models import AuthInfo, CrewAiArtifacts, LoadedToolSource, Tool
+from agents_shipgate.core.artifact_models import CrewAiArtifacts
+from agents_shipgate.core.domain import (
+    AuthInfo,
+    LoadedToolSource,
+    Tool,
+)
 from agents_shipgate.inputs._python_framework import (
     assignment_call,
     assignment_target,
@@ -18,6 +22,8 @@ from agents_shipgate.inputs._python_framework import (
     unique_tools,
 )
 from agents_shipgate.inputs.common import stable_tool_id, tool_name_warning
+from agents_shipgate.inputs.config_trace import trace_config_binding
+from agents_shipgate.inputs.protocol import LoadedAdapterResult
 from agents_shipgate.inputs.python_static import (
     dotted_name,
     field_default_string,
@@ -32,6 +38,10 @@ from agents_shipgate.inputs.python_static import (
     last_name,
     literal_string,
     pydantic_model_schemas,
+)
+from agents_shipgate.schemas.manifest import (
+    AgentsShipgateManifest,
+    ToolSourceConfig,
 )
 
 TOOL_DECORATOR_MODULES = {"crewai.tools"}
@@ -80,6 +90,11 @@ class _CrewAiExtractor:
         self.discovered_tools: list[Tool] = []
         self.list_vars: dict[str, list[str] | None] = {}
         self.agent_vars: set[str] = set()
+        self.call_targets = {
+            id(call): assignment_target(node)
+            for node in ordered_nodes(self.tree, (ast.Assign, ast.AnnAssign))
+            if (call := assignment_call(node)) is not None
+        }
         self.warnings: list[str] = []
 
     def extract(self) -> tuple[list[Tool], list[str]]:
@@ -236,15 +251,29 @@ class _CrewAiExtractor:
         if call_kind == "Agent":
             tools_expr = keyword(call, "tools")
             names = self._resolve_tool_names(tools_expr) if tools_expr is not None else []
-            record = {"source_ref": self.source_ref, "line": call.lineno, "tools": names or []}
+            record = {
+                "name": self.call_targets.get(id(call)) or "root",
+                "source_id": self.source_id,
+                "source_ref": self.source_ref,
+                "line": call.lineno,
+                "tools": names or [],
+            }
             self.artifacts.agents.append(record)
             if tools_expr is not None and names is None:
-                self._dynamic("agent", call.lineno, dynamic_reason(tools_expr))
+                self._dynamic(
+                    "agent", call.lineno, dynamic_reason(tools_expr), expr=tools_expr
+                )
         elif call_kind == "Crew":
             agents_expr = keyword(call, "agents")
             agents = _resolve_names(agents_expr) if agents_expr is not None else []
             self.artifacts.crews.append(
-                {"source_ref": self.source_ref, "line": call.lineno, "agents": agents or []}
+                {
+                    "name": self.call_targets.get(id(call)) or "crew",
+                    "source_id": self.source_id,
+                    "source_ref": self.source_ref,
+                    "line": call.lineno,
+                    "agents": agents or [],
+                }
             )
 
     def _resolve_tool_names(self, node: ast.AST | None) -> list[str] | None:
@@ -344,8 +373,25 @@ class _CrewAiExtractor:
             {"name": tool.name, "source_ref": self.source_ref, "line": source_line(tool.source_location)}
         )
 
-    def _dynamic(self, kind: str, line: int, reason: str) -> None:
-        surface = {"kind": kind, "source_ref": self.source_ref, "line": line, "reason": reason}
+    def _dynamic(
+        self, kind: str, line: int, reason: str, *, expr: ast.AST | None = None
+    ) -> None:
+        surface: dict[str, Any] = {
+            "kind": kind,
+            "source_ref": self.source_ref,
+            "line": line,
+            "reason": reason,
+        }
+        # Config-bound capability detection: when the dynamic tools
+        # expression is statically traceable to a config read, record the
+        # binding on the surface fact. Purely additive — an untraceable
+        # expression leaves the fact byte-identical to the legacy shape.
+        if isinstance(expr, ast.expr):
+            trace = trace_config_binding(expr, tree=self.tree, line=line)
+            if trace.binding == "config":
+                surface["config_binding"] = "config"
+                if trace.config_path:
+                    surface["config_path"] = trace.config_path
         self.artifacts.dynamic_tool_surfaces.append(surface)
         self.warnings.append(
             f"CrewAI {kind} at {self.source_ref}:{line} has dynamic tool surface: {reason}."
@@ -434,3 +480,25 @@ def _resolve_names(node: ast.AST | None) -> list[str] | None:
     if isinstance(node, ast.Name):
         return [node.id]
     return None
+
+
+class CrewAIAdapter:
+    """``ToolSourceAdapter`` wrapping :func:`load_crewai_artifacts`.
+
+    Framework-scoped. The dispatcher invokes ``load()`` once per scan
+    when either a ``tool_sources`` entry of type ``crewai`` or the
+    top-level ``manifest.crewai`` section is configured.
+    """
+
+    source_type: ClassVar[str] = "crewai"
+    scope: ClassVar[Literal["per_source", "per_scan"]] = "per_scan"
+    artifact_class: ClassVar[type | None] = CrewAiArtifacts
+
+    def load(
+        self,
+        source: ToolSourceConfig | None,
+        base_dir: Path,
+        manifest: AgentsShipgateManifest,
+    ) -> LoadedAdapterResult:
+        loaded_sources, artifacts = load_crewai_artifacts(manifest, base_dir)
+        return LoadedAdapterResult(tool_sources=loaded_sources, artifact=artifacts)

@@ -1,20 +1,24 @@
 import json
 
-from agents_shipgate.config.schema import SuppressionConfig
 from agents_shipgate.core.baseline import (
-    BaselineFile,
-    BaselineFinding,
     apply_baseline,
     load_baseline,
 )
+from agents_shipgate.core.domain import Tool
 from agents_shipgate.core.findings import (
     apply_severity_overrides,
     apply_suppressions,
     assign_finding_ids,
+    dedupe_findings,
     finding_fingerprint,
     summarize_findings,
 )
-from agents_shipgate.core.models import Finding, Tool
+from agents_shipgate.schemas.baseline import (
+    BaselineFile,
+    BaselineFinding,
+)
+from agents_shipgate.schemas.manifest import SuppressionConfig
+from agents_shipgate.schemas.report import Finding
 
 
 def test_apply_suppressions_matches_tool_name_and_preserves_reason():
@@ -41,6 +45,86 @@ def test_apply_suppressions_matches_tool_name_and_preserves_reason():
 
     assert finding.suppressed is True
     assert finding.suppression_reason == "Intentional free-form search."
+
+
+def test_dedupe_findings_collapses_equivalent_evidence():
+    first = Finding(
+        check_id="ORG-DUPLICATE",
+        title="Duplicate policy",
+        severity="medium",
+        category="org_policy",
+        tool_name="refund",
+        evidence={"b": 2, "a": 1},
+        recommendation="Fix duplicate.",
+    )
+    second = first.model_copy(update={"evidence": {"a": 1, "b": 2}})
+
+    assert dedupe_findings([first, second]) == [first]
+
+
+def test_dedupe_findings_ignores_explanatory_capability_refs():
+    first = Finding(
+        check_id="ORG-DUPLICATE",
+        title="Duplicate policy",
+        severity="medium",
+        category="org_policy",
+        tool_name="refund",
+        evidence={"a": 1},
+        recommendation="Fix duplicate.",
+        capability_refs=["cap_a"],
+    )
+    second = first.model_copy(update={"capability_refs": ["cap_b"]})
+
+    assert dedupe_findings([first, second]) == [first]
+
+
+def test_dedupe_findings_preserves_distinct_titles():
+    first = Finding(
+        check_id="ORG-DUPLICATE",
+        title="Duplicate policy for refund",
+        severity="medium",
+        category="org_policy",
+        tool_name="refund",
+        evidence={"a": 1},
+        recommendation="Fix duplicate.",
+    )
+    second = first.model_copy(update={"title": "Duplicate policy for email"})
+
+    assert dedupe_findings([first, second]) == [first, second]
+
+
+def test_collision_discriminator_ignores_explanatory_capability_refs():
+    base_findings = [
+        Finding(
+            check_id="ORG-COLLISION",
+            title="First collision",
+            severity="medium",
+            category="org_policy",
+            tool_name="refund",
+            evidence={"a": 1},
+            recommendation="Fix first.",
+        ),
+        Finding(
+            check_id="ORG-COLLISION",
+            title="Second collision",
+            severity="medium",
+            category="org_policy",
+            tool_name="refund",
+            evidence={"a": 1},
+            recommendation="Fix second.",
+        ),
+    ]
+    enriched_findings = [
+        finding.model_copy(update={"capability_refs": [f"cap_{index}"]})
+        for index, finding in enumerate(base_findings, start=1)
+    ]
+
+    base_ids = [finding.id for finding in assign_finding_ids(base_findings)]
+    enriched_ids = [
+        finding.id for finding in assign_finding_ids(enriched_findings)
+    ]
+
+    assert enriched_ids == base_ids
 
 
 def test_legacy_api_operational_readiness_suppression_matches_split_check():
@@ -87,7 +171,7 @@ def test_legacy_api_operational_readiness_severity_override_matches_split_check(
     assert finding.evidence["default_severity"] == "medium"
 
 
-def test_legacy_api_operational_readiness_baseline_matches_split_check():
+def test_legacy_api_operational_readiness_baseline_does_not_cross_identity_boundary():
     finding = Finding(
         check_id="SHIP-API-TEST-CASES-MISSING",
         title="OpenAI API flow lacks test case metadata",
@@ -111,10 +195,10 @@ def test_legacy_api_operational_readiness_baseline_matches_split_check():
 
     summary = apply_baseline([finding], baseline, display_path="baseline.json")
 
-    assert finding.baseline_status == "matched"
-    assert summary.matched_count == 1
-    assert summary.new_count == 0
-    assert summary.resolved_count == 0
+    assert finding.baseline_status == "new"
+    assert summary.matched_count == 0
+    assert summary.new_count == 1
+    assert summary.resolved_count == 1
 
 
 def test_finding_ids_are_stable_across_ordering():

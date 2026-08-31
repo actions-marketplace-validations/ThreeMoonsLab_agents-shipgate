@@ -1,6 +1,6 @@
 # Upstream Integrations
 
-Per-framework, 60-second instructions for dropping Agents Shipgate into a project that already uses one of the supported tool surfaces. This is the "coding agent's adoption checklist" — paste the minimal `shipgate.yaml`, run the canonical 4-call flow, and you're scanning.
+Per-framework, 60-second instructions for dropping Agents Shipgate into a project that already uses one of the supported tool surfaces. This is the "coding agent's adoption checklist" — paste the minimal `shipgate.yaml`, run the first-adoption helper flow, then use `agents-shipgate verify` for ongoing PRs.
 
 > **Audience.** Coding agents adding Shipgate to a target repo for the first time, or repo maintainers picking up Shipgate. If you want the full architectural reference, see [`docs/manifest-v0.1.md`](manifest-v0.1.md) and [`docs/minimal-real-configs.md`](minimal-real-configs.md). This doc is the speedrun.
 
@@ -142,9 +142,46 @@ ci:
 
 **Working fixture**: [`samples/google_adk_agent/`](../samples/google_adk_agent/).
 
+**Extraction confidence** is measured on the module, not assumed from the
+framework. A Python entrypoint whose tool surface the adapter fully resolved
+reaches `high` on its own, with no tool inventory. That requires all of:
+
+- every `tools=` element resolves to a definition **in this module**, including
+  the `func=` of every `FunctionTool` / `LongRunningFunctionTool`;
+- every name it resolves through is bound exactly once, at module scope — a
+  parameter, class, import, `except ... as`, `case ... as`, `global`, or later
+  assignment of the same name is enough to make the resolution a guess rather
+  than a proof;
+- no toolset is dynamic and no `sub_agents` element is unresolvable;
+- nothing reaches `agent.tools` after construction — including through an
+  alias, `setattr`, or `getattr(agent, "tools")` — and no agent is built from
+  `**kwargs`;
+- each bound function is undecorated, takes no `*args`/`**kwargs`, and annotates
+  every parameter with a type the schema emitter represents faithfully.
+
+Anything else lowers the tool to `medium`, and the `low_confidence_tool`
+evidence gap names the construct responsible (`dynamic_toolset`,
+`untyped_parameter`, `mutable_tool_binding`, …). How far it reaches depends on
+what the reason is about:
+
+- The first four bullets are about **which tools exist**, so one of them holds
+  the whole file at `medium` — including tools contributed by a *resolved*
+  OpenAPI or MCP toolset in that file, and including the canonical tool after a
+  reviewed `tool_identity` binding merges the observation into another source.
+  No reviewed inventory can close these: an inventory describes tools, not
+  which tools an agent has. Fix the construct in the module.
+- The last bullet is about **one function's interface**, so it lowers only that
+  tool and leaves its siblings proven. A reviewed inventory *can* close these,
+  since the schema is exactly what it supplies.
+
+Propagation only ever lowers a tool, never raises one. Agent Config `tools:`
+entries are name references with no signature to read, so that path stays
+`low`.
+
 **Pitfalls**:
 - `OpenAPIToolset(...)` and `McpToolset(...)` need `tool_filter` declared; without it, the toolset counts as "unfiltered" and `SHIP-ADK-MCP-TOOLSET-UNFILTERED` fires high. Add the filter, then point `inventory_path` at a local tool inventory.
 - Production targets need `google_adk.eval_sets` declared; otherwise `SHIP-ADK-EVAL-COVERAGE-MISSING` fires. Add the block only after the eval file exists, or mark the artifact `optional: true` during bring-up.
+- An unannotated parameter is enough to hold a tool at `medium`: the JSON-schema fallback would type it `string`, which is a guess wearing a schema's clothes. ADK builds its own function declarations from those annotations, so adding them is worth doing regardless.
 
 ## MCP-only (no Python framework)
 
@@ -311,11 +348,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: ThreeMoonsLab/agents-shipgate@v0.10.0
+      - uses: ThreeMoonsLab/agents-shipgate@v0.15.0
         with:
           ci_mode: advisory
           diff_base: target
           pr_comment: 'true'
+          shipgate_version: '0.15.0'
 ```
 
 `init --ci` writes a similar workflow into `.github/workflows/agents-shipgate.yml`. Switch to `ci_mode: strict` only after the team has reviewed the advisory output and saved a baseline (see [`baseline.md`](baseline.md)).

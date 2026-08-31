@@ -4,7 +4,7 @@ import re
 
 from agents_shipgate.checks.base import tool_finding
 from agents_shipgate.core.context import ScanContext
-from agents_shipgate.core.models import Tool
+from agents_shipgate.core.domain import Tool
 from agents_shipgate.core.risk_hints import (
     has_risk_tag,
     is_effectively_read_only,
@@ -77,13 +77,15 @@ def run(context: ScanContext):
                             "and release review to cover write-capable tools."
                         ),
                         context=context,
+                        provenance_kind="keyword_heuristic",
+                        policy_evidence_pointer="/agent/declared_purpose",
                     )
                 )
 
     for tool in context.tools:
         if is_effectively_read_only(tool):
             continue
-        for prohibited in prohibited_actions:
+        for prohibited_index, prohibited in enumerate(prohibited_actions):
             if _prohibited_action_is_mitigated(context, tool, prohibited):
                 continue
             if _tool_matches_prohibited_action(tool, prohibited):
@@ -104,6 +106,10 @@ def run(context: ScanContext):
                             "so the manifest and tool surface do not contradict each other."
                         ),
                         context=context,
+                        provenance_kind="keyword_heuristic",
+                        policy_evidence_pointer=(
+                            f"/agent/prohibited_actions/{prohibited_index}"
+                        ),
                     )
                 )
                 break
@@ -153,11 +159,11 @@ def _prohibited_action_is_mitigated(
     context: ScanContext, tool: Tool, prohibited_action: str
 ) -> bool:
     tokens = _tokens(prohibited_action)
-    if "approval" in tokens and tool.name in context.manifest.policies.approval_tools():
+    if "approval" in tokens and "approval" in tool.resolved_controls:
         return True
-    if "confirmation" in tokens and tool.name in context.manifest.policies.confirmation_tools():
+    if "confirmation" in tokens and "confirmation" in tool.resolved_controls:
         return True
-    if "idempotency" in tokens and tool.name in context.manifest.policies.idempotency_tools():
+    if "idempotency" in tokens and "idempotency" in tool.resolved_controls:
         return True
     return False
 

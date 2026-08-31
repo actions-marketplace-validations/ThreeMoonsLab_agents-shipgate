@@ -3,16 +3,30 @@ from __future__ import annotations
 from typing import Any
 
 from agents_shipgate.checks.base import agent_finding, tool_finding
+from agents_shipgate.core.artifact_models import (
+    AnthropicArtifacts,
+    OpenAIApiArtifacts,
+)
+from agents_shipgate.core.capability_traces import (
+    capability_refs_for_tool,
+    capability_trace_refs_for_tool,
+)
 from agents_shipgate.core.context import ScanContext
+from agents_shipgate.core.domain import (
+    Tool,
+    ToolParameter,
+)
 from agents_shipgate.core.heuristics import (
     BROAD_FREE_TEXT_PARAMETER_NAMES,
     RISKY_NUMERIC_PARAMETER_NAMES,
 )
-from agents_shipgate.core.models import Tool, ToolParameter
 from agents_shipgate.core.risk_hints import (
     has_risk_tag,
     is_high_risk_tool,
+    is_policy_eligible_high_risk_tool,
+    is_policy_eligible_write_tool,
     is_write_tool,
+    policy_eligible_effects,
     risk_tags,
 )
 
@@ -29,7 +43,10 @@ CONFIRMATION_PROMPT_TERMS = ("confirm", "confirmation", "explicit consent", "ask
 
 
 def run(context: ScanContext):
-    if context.api_artifacts is None and context.anthropic_artifacts is None:
+    if (
+        context.artifact("openai_api", OpenAIApiArtifacts) is None
+        and context.artifact("anthropic_api", AnthropicArtifacts) is None
+    ):
         return []
     findings = []
     findings.extend(_function_schema_strictness(context))
@@ -45,7 +62,9 @@ def _function_schema_strictness(context: ScanContext):
         issues = _function_schema_issues(tool)
         if not issues:
             continue
-        high_risk = is_write_tool(tool) or is_high_risk_tool(tool)
+        high_risk = is_policy_eligible_write_tool(
+            tool
+        ) or is_policy_eligible_high_risk_tool(tool)
         findings.append(
             tool_finding(
                 tool=tool,
@@ -60,6 +79,7 @@ def _function_schema_strictness(context: ScanContext):
                     "additionalProperties=false, complete required list, and bounded risky fields."
                 ),
                 context=context,
+                provenance_kind="static_declaration",
             )
         )
     return findings
@@ -71,11 +91,13 @@ def _structured_output_readiness(context: ScanContext):
     # OpenAI-only tool filter so a mixed manifest (anthropic + openai_api)
     # doesn't list Anthropic tools as high-risk under an OpenAI-shaped
     # finding.
-    artifacts = context.api_artifacts
+    artifacts = context.artifact("openai_api", OpenAIApiArtifacts)
     if artifacts is None:
         return []
     high_risk_tools = [
-        tool.name for tool in _openai_api_tools(context) if is_high_risk_tool(tool)
+        tool.name
+        for tool in _openai_api_tools(context)
+        if is_policy_eligible_high_risk_tool(tool)
     ]
     if not artifacts.response_formats:
         return [
@@ -91,6 +113,7 @@ def _structured_output_readiness(context: ScanContext):
                     "and needs_review fields where downstream behavior depends on the output."
                 ),
                 context=context,
+                provenance_kind="static_declaration",
             )
         ]
 
@@ -119,6 +142,7 @@ def _structured_output_readiness(context: ScanContext):
                     "needs_review/refusal/error modeling, and declared critical fields."
                 ),
                 context=context,
+                provenance_kind="static_declaration",
             )
         )
     return findings
@@ -126,13 +150,12 @@ def _structured_output_readiness(context: ScanContext):
 
 def _prompt_tool_scope_mismatch(context: ScanContext):
     prompt_segments: list[str] = []
-    if context.api_artifacts is not None and context.api_artifacts.prompt_text:
-        prompt_segments.append(context.api_artifacts.prompt_text)
-    if (
-        context.anthropic_artifacts is not None
-        and context.anthropic_artifacts.prompt_text
-    ):
-        prompt_segments.append(context.anthropic_artifacts.prompt_text)
+    api_artifacts = context.artifact("openai_api", OpenAIApiArtifacts)
+    anthropic_artifacts = context.artifact("anthropic_api", AnthropicArtifacts)
+    if api_artifacts is not None and api_artifacts.prompt_text:
+        prompt_segments.append(api_artifacts.prompt_text)
+    if anthropic_artifacts is not None and anthropic_artifacts.prompt_text:
+        prompt_segments.append(anthropic_artifacts.prompt_text)
     if not prompt_segments:
         return []
     prompt = "\n\n".join(prompt_segments).lower()
@@ -157,6 +180,7 @@ def _prompt_tool_scope_mismatch(context: ScanContext):
                     "Align prompt scope with enabled tools or remove write/high-risk tools."
                 ),
                 context=context,
+                provenance_kind="keyword_heuristic",
             )
         )
     needs_confirmation = [
@@ -185,6 +209,7 @@ def _prompt_tool_scope_mismatch(context: ScanContext):
                     "before financial, destructive, or external customer actions."
                 ),
                 context=context,
+                provenance_kind="keyword_heuristic",
             )
         )
     return findings
@@ -197,12 +222,14 @@ def _operational_readiness(context: ScanContext):
     # fire OpenAI-shaped findings against Anthropic tools that have no
     # response_formats / retry_policy / test_cases / tool_output_schemas
     # to satisfy. See plan §5.
-    artifacts = context.api_artifacts
+    artifacts = context.artifact("openai_api", OpenAIApiArtifacts)
     if artifacts is None:
         return []
     findings = []
     api_tools = _openai_api_tools(context)
-    high_risk_tools = [tool for tool in api_tools if is_high_risk_tool(tool)]
+    high_risk_tools = [
+        tool for tool in api_tools if is_policy_eligible_high_risk_tool(tool)
+    ]
     retry_policy = artifacts.retry_policy()
     timeouts = artifacts.timeouts()
     output_schemas = artifacts.tool_output_schemas()
@@ -218,6 +245,7 @@ def _operational_readiness(context: ScanContext):
                 confidence="medium",
                 recommendation="Declare retry_policy in openai_api.policy_rules or model_config.",
                 context=context,
+                provenance_kind="static_declaration",
             )
         )
     if high_risk_tools and not timeouts:
@@ -231,6 +259,7 @@ def _operational_readiness(context: ScanContext):
                 confidence="medium",
                 recommendation="Declare tool-call timeout metadata for high-risk OpenAI API flows.",
                 context=context,
+                provenance_kind="static_declaration",
             )
         )
     if high_risk_tools and not artifacts.test_cases:
@@ -244,6 +273,7 @@ def _operational_readiness(context: ScanContext):
                 confidence="medium",
                 recommendation="Add simple OpenAI API test cases for high-risk tool-call flows.",
                 context=context,
+                provenance_kind="static_declaration",
             )
         )
     for tool in high_risk_tools:
@@ -262,6 +292,7 @@ def _operational_readiness(context: ScanContext):
                         "in openai_api policy rules."
                     ),
                     context=context,
+                    provenance_kind="static_declaration",
                 )
             )
         if retry_policy and _needs_idempotency(tool, artifacts):
@@ -282,6 +313,7 @@ def _operational_readiness(context: ScanContext):
                         "this side effect."
                     ),
                     context=context,
+                    provenance_kind="static_declaration",
                 )
             )
     _append_trace_findings(findings, context)
@@ -289,7 +321,7 @@ def _operational_readiness(context: ScanContext):
 
 
 def _append_trace_findings(findings: list, context: ScanContext) -> None:
-    artifacts = context.api_artifacts
+    artifacts = context.artifact("openai_api", OpenAIApiArtifacts)
     if artifacts is None:
         return
     approval_tools = context.manifest.policies.approval_tools() | artifacts.approval_tools()
@@ -311,6 +343,14 @@ def _append_trace_findings(findings: list, context: ScanContext) -> None:
                     confidence="medium",
                     recommendation=f"Require approval before calling {tool_name}.",
                     context=context,
+                    provenance_kind="runtime_trace",
+                    capability_refs=capability_refs_for_tool(context, tool_name),
+                    capability_trace_refs=capability_trace_refs_for_tool(
+                        context,
+                        tool_name,
+                        source_types={"openai_api_trace"},
+                        observed={"approved": False},
+                    ),
                 )
             )
         if tool_name in confirmation_tools and event.get("confirmed") is False:
@@ -324,6 +364,14 @@ def _append_trace_findings(findings: list, context: ScanContext) -> None:
                     confidence="medium",
                     recommendation=f"Require explicit confirmation before calling {tool_name}.",
                     context=context,
+                    provenance_kind="runtime_trace",
+                    capability_refs=capability_refs_for_tool(context, tool_name),
+                    capability_trace_refs=capability_trace_refs_for_tool(
+                        context,
+                        tool_name,
+                        source_types={"openai_api_trace"},
+                        observed={"confirmed": False},
+                    ),
                 )
             )
 
@@ -385,10 +433,9 @@ def _needs_idempotency(tool: Tool, artifacts) -> bool:
         return False
     if any(parameter.name == "idempotency_key" for parameter in tool.parameters):
         return False
-    return is_write_tool(tool) and has_risk_tag(
-        tool,
-        {"financial_action", "destructive", "external_write"},
-        min_confidence="medium",
+    return bool(
+        policy_eligible_effects(tool)
+        & {"financial_write", "destructive", "external_communication"}
     )
 
 

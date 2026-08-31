@@ -1,0 +1,3088 @@
+{
+  "$defs": {
+    "AgentActionControlEnvelope": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "else": {
+            "properties": {
+              "decision": {
+                "minLength": 1,
+                "type": "string"
+              }
+            }
+          },
+          "if": {
+            "properties": {
+              "decision_source": {
+                "const": "none"
+              }
+            },
+            "required": [
+              "decision_source"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "decision_source": {
+                "const": "setup"
+              }
+            },
+            "required": [
+              "decision_source"
+            ]
+          },
+          "then": {
+            "properties": {
+              "operation": {
+                "enum": [
+                  "detect",
+                  "init",
+                  "doctor"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "enum": [
+                  "detect",
+                  "init",
+                  "doctor"
+                ]
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "artifacts": {
+                "maxProperties": 0
+              },
+              "control_state": {
+                "enum": [
+                  "agent_action_required",
+                  "human_review_required"
+                ]
+              },
+              "current_control_id": {
+                "type": "null"
+              },
+              "decision": {
+                "enum": [
+                  "setup_complete",
+                  "setup_incomplete",
+                  "setup_not_applicable"
+                ]
+              },
+              "decision_source": {
+                "const": "setup"
+              },
+              "input_id": {
+                "minLength": 1,
+                "pattern": "\\S",
+                "type": "string"
+              },
+              "permissions": {
+                "properties": {
+                  "commit": {
+                    "const": false
+                  },
+                  "edit": {
+                    "const": false
+                  },
+                  "merge": {
+                    "const": false
+                  },
+                  "push": {
+                    "const": false
+                  },
+                  "report_complete": {
+                    "const": false
+                  },
+                  "update_pr": {
+                    "const": false
+                  }
+                },
+                "required": [
+                  "edit",
+                  "commit",
+                  "push",
+                  "update_pr",
+                  "merge",
+                  "report_complete"
+                ],
+                "type": "object"
+              },
+              "source": {
+                "const": "run"
+              }
+            },
+            "required": [
+              "input_id"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "decision": {
+                "enum": [
+                  "setup_complete",
+                  "setup_incomplete",
+                  "setup_not_applicable"
+                ]
+              }
+            },
+            "required": [
+              "decision"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "const": "setup"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "decision_source": {
+                "const": "release_decision"
+              }
+            },
+            "required": [
+              "decision_source"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision": {
+                "enum": [
+                  "passed",
+                  "review_required",
+                  "insufficient_evidence",
+                  "blocked"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "decision_source": {
+                "const": "agent_boundary"
+              }
+            },
+            "required": [
+              "decision_source"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision": {
+                "enum": [
+                  "allow",
+                  "warn",
+                  "require_review",
+                  "block"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "decision_source": {
+                "const": "setup"
+              }
+            },
+            "required": [
+              "decision_source"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision": {
+                "enum": [
+                  "setup_complete",
+                  "setup_incomplete",
+                  "setup_not_applicable"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "check"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "agent_boundary",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "verify"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "release_decision",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "preview"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "release_decision",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "scan"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "release_decision",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "detect"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "setup",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "init"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "setup",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "doctor"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "setup",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "next_action": {
+                "properties": {
+                  "kind": {
+                    "const": "verify"
+                  }
+                }
+              }
+            },
+            "required": [
+              "next_action"
+            ]
+          },
+          "then": {
+            "properties": {
+              "verify_required": {
+                "const": true
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "next_action": {
+                "properties": {
+                  "kind": {
+                    "const": "edit"
+                  }
+                }
+              }
+            },
+            "required": [
+              "next_action"
+            ]
+          },
+          "then": {
+            "properties": {
+              "operation": {
+                "enum": [
+                  "detect",
+                  "init",
+                  "doctor"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "next_action": {
+                "properties": {
+                  "kind": {
+                    "const": "confirm_declarations"
+                  }
+                }
+              }
+            },
+            "required": [
+              "next_action"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "const": "release_decision"
+              },
+              "operation": {
+                "enum": [
+                  "verify"
+                ]
+              }
+            }
+          }
+        }
+      ],
+      "description": "One exact coding-agent-owned step remains.\n\n``permissions`` admits two vectors because the route decides: a step that\nruns before any diff was read authorizes nothing beyond itself, while a step\ntaken on an evaluated change keeps publication authority. Both deny merge.",
+      "properties": {
+        "artifacts": {
+          "additionalProperties": {
+            "$ref": "#/$defs/AgentControlArtifactRef"
+          },
+          "title": "Artifacts",
+          "type": "object"
+        },
+        "contract_version": {
+          "minLength": 1,
+          "title": "Contract Version",
+          "type": "string"
+        },
+        "control_state": {
+          "const": "agent_action_required",
+          "title": "Control State",
+          "type": "string"
+        },
+        "current_control_id": {
+          "anyOf": [
+            {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Current Control Id"
+        },
+        "decision": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Decision"
+        },
+        "decision_source": {
+          "enum": [
+            "release_decision",
+            "agent_boundary",
+            "setup",
+            "none"
+          ],
+          "title": "Decision Source",
+          "type": "string"
+        },
+        "execution": {
+          "enum": [
+            "not_run",
+            "succeeded",
+            "skipped",
+            "failed"
+          ],
+          "title": "Execution",
+          "type": "string"
+        },
+        "exit_code": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Exit Code"
+        },
+        "human_review": {
+          "$ref": "#/$defs/NoHumanReview"
+        },
+        "input_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Input Id"
+        },
+        "next_action": {
+          "$ref": "#/$defs/EnvelopeCodingAgentAction"
+        },
+        "next_actor": {
+          "const": "coding_agent",
+          "default": "coding_agent",
+          "title": "Next Actor",
+          "type": "string"
+        },
+        "operation": {
+          "enum": [
+            "verify",
+            "preview",
+            "scan",
+            "check",
+            "detect",
+            "init",
+            "doctor"
+          ],
+          "title": "Operation",
+          "type": "string"
+        },
+        "pending_review": {
+          "items": {
+            "$ref": "#/$defs/AgentControlPendingReview"
+          },
+          "title": "Pending Review",
+          "type": "array"
+        },
+        "permissions": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublishOnlyPermissions"
+            },
+            {
+              "$ref": "#/$defs/NoAgentPermissions"
+            }
+          ],
+          "title": "Permissions"
+        },
+        "reason": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Reason",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": "shipgate.agent_control/v1",
+          "default": "shipgate.agent_control/v1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "source": {
+          "enum": [
+            "run",
+            "refresh"
+          ],
+          "title": "Source",
+          "type": "string"
+        },
+        "verify_required": {
+          "title": "Verify Required",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "schema_version",
+        "contract_version",
+        "operation",
+        "source",
+        "execution",
+        "exit_code",
+        "input_id",
+        "decision",
+        "decision_source",
+        "control_state",
+        "permissions",
+        "verify_required",
+        "next_actor",
+        "next_action",
+        "human_review",
+        "pending_review",
+        "reason",
+        "current_control_id",
+        "artifacts"
+      ],
+      "title": "AgentActionControlEnvelope",
+      "type": "object"
+    },
+    "AgentControlArtifactRef": {
+      "additionalProperties": false,
+      "description": "A content-addressed pointer to one forensic artifact.\n\nPath and hash only. The envelope answers what to do; these answer where to\nlook if a human or a deeper tool needs the evidence behind it.\n\n``path`` is relative to the directory the command was invoked from, not to\nthe reports directory and not to the Git root, because the envelope is\nprinted to stdout and carries no other directory context. A reader must be\nable to open it exactly as given.",
+      "properties": {
+        "path": {
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "title": "AgentControlArtifactRef",
+      "type": "object"
+    },
+    "AgentControlPendingReview": {
+      "additionalProperties": false,
+      "description": "One review obligation the agent carries while it keeps working.\n\nA graded ``require_review`` boundary row routes the agent onward instead of\nending the turn, but the obligation is not cleared. The full row lives on\nthe boundary result; this is the compact restatement, because a projection\nthat keeps the route and drops the obligation tells the agent it is finished\nwith something it still owes a human.",
+      "properties": {
+        "path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Path"
+        },
+        "reviewers": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Reviewers",
+          "type": "array"
+        },
+        "risk_level": {
+          "minLength": 1,
+          "title": "Risk Level",
+          "type": "string"
+        },
+        "rule_id": {
+          "minLength": 1,
+          "title": "Rule Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "rule_id",
+        "risk_level"
+      ],
+      "title": "AgentControlPendingReview",
+      "type": "object"
+    },
+    "CodingAgentAction": {
+      "discriminator": {
+        "mapping": {
+          "configure": "#/$defs/CodingAgentCommandAction",
+          "discover": "#/$defs/CodingAgentCommandAction",
+          "fetch_base": "#/$defs/CodingAgentFetchBaseAction",
+          "initialize": "#/$defs/CodingAgentCommandAction",
+          "install": "#/$defs/CodingAgentCommandAction",
+          "repair": "#/$defs/CodingAgentCommandAction",
+          "rerun": "#/$defs/CodingAgentCommandAction",
+          "verify": "#/$defs/CodingAgentCommandAction"
+        },
+        "propertyName": "kind"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/CodingAgentCommandAction"
+        },
+        {
+          "$ref": "#/$defs/CodingAgentFetchBaseAction"
+        }
+      ]
+    },
+    "CodingAgentCommandAction": {
+      "additionalProperties": false,
+      "description": "An executable, exact next step owned by the coding agent.",
+      "properties": {
+        "actor": {
+          "const": "coding_agent",
+          "default": "coding_agent",
+          "title": "Actor",
+          "type": "string"
+        },
+        "command": {
+          "minLength": 1,
+          "title": "Command",
+          "type": "string"
+        },
+        "expects": {
+          "default": null,
+          "title": "Expects",
+          "type": "null"
+        },
+        "kind": {
+          "enum": [
+            "verify",
+            "discover",
+            "configure",
+            "initialize",
+            "repair",
+            "install",
+            "rerun"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "why": {
+          "minLength": 1,
+          "title": "Why",
+          "type": "string"
+        }
+      },
+      "required": [
+        "actor",
+        "kind",
+        "command",
+        "expects",
+        "why"
+      ],
+      "title": "CodingAgentCommandAction",
+      "type": "object"
+    },
+    "CodingAgentFetchBaseAction": {
+      "additionalProperties": false,
+      "description": "A structured input request when an exact fetch command is unavailable.\n\nShipgate never fetches refs itself.  ``expects`` therefore names the exact\nref or artifact a caller must make available before rerunning verification.",
+      "properties": {
+        "actor": {
+          "const": "coding_agent",
+          "default": "coding_agent",
+          "title": "Actor",
+          "type": "string"
+        },
+        "command": {
+          "default": null,
+          "title": "Command",
+          "type": "null"
+        },
+        "expects": {
+          "minLength": 1,
+          "title": "Expects",
+          "type": "string"
+        },
+        "kind": {
+          "const": "fetch_base",
+          "title": "Kind",
+          "type": "string"
+        },
+        "why": {
+          "minLength": 1,
+          "title": "Why",
+          "type": "string"
+        }
+      },
+      "required": [
+        "actor",
+        "kind",
+        "command",
+        "expects",
+        "why"
+      ],
+      "title": "CodingAgentFetchBaseAction",
+      "type": "object"
+    },
+    "CompleteControlEnvelope": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "else": {
+            "properties": {
+              "decision": {
+                "minLength": 1,
+                "type": "string"
+              }
+            }
+          },
+          "if": {
+            "properties": {
+              "decision_source": {
+                "const": "none"
+              }
+            },
+            "required": [
+              "decision_source"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "decision_source": {
+                "const": "setup"
+              }
+            },
+            "required": [
+              "decision_source"
+            ]
+          },
+          "then": {
+            "properties": {
+              "operation": {
+                "enum": [
+                  "detect",
+                  "init",
+                  "doctor"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "enum": [
+                  "detect",
+                  "init",
+                  "doctor"
+                ]
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "artifacts": {
+                "maxProperties": 0
+              },
+              "control_state": {
+                "enum": [
+                  "agent_action_required",
+                  "human_review_required"
+                ]
+              },
+              "current_control_id": {
+                "type": "null"
+              },
+              "decision": {
+                "enum": [
+                  "setup_complete",
+                  "setup_incomplete",
+                  "setup_not_applicable"
+                ]
+              },
+              "decision_source": {
+                "const": "setup"
+              },
+              "input_id": {
+                "minLength": 1,
+                "pattern": "\\S",
+                "type": "string"
+              },
+              "permissions": {
+                "properties": {
+                  "commit": {
+                    "const": false
+                  },
+                  "edit": {
+                    "const": false
+                  },
+                  "merge": {
+                    "const": false
+                  },
+                  "push": {
+                    "const": false
+                  },
+                  "report_complete": {
+                    "const": false
+                  },
+                  "update_pr": {
+                    "const": false
+                  }
+                },
+                "required": [
+                  "edit",
+                  "commit",
+                  "push",
+                  "update_pr",
+                  "merge",
+                  "report_complete"
+                ],
+                "type": "object"
+              },
+              "source": {
+                "const": "run"
+              }
+            },
+            "required": [
+              "input_id"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "decision": {
+                "enum": [
+                  "setup_complete",
+                  "setup_incomplete",
+                  "setup_not_applicable"
+                ]
+              }
+            },
+            "required": [
+              "decision"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "const": "setup"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "decision_source": {
+                "const": "release_decision"
+              }
+            },
+            "required": [
+              "decision_source"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision": {
+                "enum": [
+                  "passed",
+                  "review_required",
+                  "insufficient_evidence",
+                  "blocked"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "decision_source": {
+                "const": "agent_boundary"
+              }
+            },
+            "required": [
+              "decision_source"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision": {
+                "enum": [
+                  "allow",
+                  "warn",
+                  "require_review",
+                  "block"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "decision_source": {
+                "const": "setup"
+              }
+            },
+            "required": [
+              "decision_source"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision": {
+                "enum": [
+                  "setup_complete",
+                  "setup_incomplete",
+                  "setup_not_applicable"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "check"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "agent_boundary",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "verify"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "release_decision",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "preview"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "release_decision",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "scan"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "release_decision",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "detect"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "setup",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "init"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "setup",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "doctor"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "setup",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "else": {
+            "properties": {
+              "artifacts": {
+                "minProperties": 1
+              },
+              "current_control_id": {
+                "type": "string"
+              },
+              "decision_source": {
+                "const": "release_decision"
+              }
+            },
+            "required": [
+              "current_control_id"
+            ]
+          },
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "check"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "artifacts": {
+                "maxProperties": 0
+              },
+              "current_control_id": {
+                "type": "null"
+              },
+              "decision_source": {
+                "const": "agent_boundary"
+              },
+              "source": {
+                "const": "run"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "decision_source": {
+                "const": "release_decision"
+              }
+            },
+            "required": [
+              "decision_source"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision": {
+                "enum": [
+                  "passed"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "decision_source": {
+                "const": "agent_boundary"
+              }
+            },
+            "required": [
+              "decision_source"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision": {
+                "enum": [
+                  "allow",
+                  "warn"
+                ]
+              }
+            }
+          }
+        }
+      ],
+      "description": "The coding agent may merge and report the task complete.\n\nEvery authority-bearing field is pinned by the tag. ``execution`` narrows to\nthe statuses a completed evaluation can have, which is what makes\n\"a failed run can never authorize completion\" a schema rule rather than a\nvalidator a JSON Schema consumer never runs.",
+      "properties": {
+        "artifacts": {
+          "additionalProperties": {
+            "$ref": "#/$defs/AgentControlArtifactRef"
+          },
+          "title": "Artifacts",
+          "type": "object"
+        },
+        "contract_version": {
+          "minLength": 1,
+          "title": "Contract Version",
+          "type": "string"
+        },
+        "control_state": {
+          "const": "complete",
+          "title": "Control State",
+          "type": "string"
+        },
+        "current_control_id": {
+          "anyOf": [
+            {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Current Control Id"
+        },
+        "decision": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Decision",
+          "type": "string"
+        },
+        "decision_source": {
+          "enum": [
+            "release_decision",
+            "agent_boundary"
+          ],
+          "title": "Decision Source",
+          "type": "string"
+        },
+        "execution": {
+          "enum": [
+            "not_run",
+            "succeeded",
+            "skipped"
+          ],
+          "title": "Execution",
+          "type": "string"
+        },
+        "exit_code": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Exit Code"
+        },
+        "human_review": {
+          "$ref": "#/$defs/NoHumanReview"
+        },
+        "input_id": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Input Id",
+          "type": "string"
+        },
+        "next_action": {
+          "default": null,
+          "title": "Next Action",
+          "type": "null"
+        },
+        "next_actor": {
+          "const": "none",
+          "default": "none",
+          "title": "Next Actor",
+          "type": "string"
+        },
+        "operation": {
+          "enum": [
+            "verify",
+            "check"
+          ],
+          "title": "Operation",
+          "type": "string"
+        },
+        "pending_review": {
+          "items": {
+            "$ref": "#/$defs/AgentControlPendingReview"
+          },
+          "maxItems": 0,
+          "title": "Pending Review",
+          "type": "array"
+        },
+        "permissions": {
+          "$ref": "#/$defs/FullAgentPermissions"
+        },
+        "reason": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Reason",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": "shipgate.agent_control/v1",
+          "default": "shipgate.agent_control/v1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "source": {
+          "enum": [
+            "run",
+            "refresh"
+          ],
+          "title": "Source",
+          "type": "string"
+        },
+        "verify_required": {
+          "const": false,
+          "default": false,
+          "title": "Verify Required",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "schema_version",
+        "contract_version",
+        "operation",
+        "source",
+        "execution",
+        "exit_code",
+        "input_id",
+        "decision",
+        "decision_source",
+        "control_state",
+        "permissions",
+        "verify_required",
+        "next_actor",
+        "next_action",
+        "human_review",
+        "pending_review",
+        "reason",
+        "current_control_id",
+        "artifacts"
+      ],
+      "title": "CompleteControlEnvelope",
+      "type": "object"
+    },
+    "ConfirmDeclarationsAction": {
+      "additionalProperties": false,
+      "description": "Write the declarations the scan derived; name the ones it could not.\n\nDeclared **here** for the same reason :class:`SetupEditAction` is: the\nshared action union in :mod:`agents_shipgate.schemas.agent_control` is\nembedded by six durable published schemas, five of which record no\n``contract_version``, so widening it changes stored contracts a consumer\ncannot disambiguate. This envelope is emitted on stdout and never written\nas an artifact. The underlying control carries the same step as a\n``repair`` command \u2014 which it truthfully is \u2014 and the envelope publishes\nthe richer form.\n\nThe list is what makes this different from that ``repair``. An agent that\nruns the command has answered the questions tagged ``coding_agent``; what\nit then owes a human is the rest, **by name**. \"Human review required\" at\nthe end of a loop ends the turn without telling anyone what to do next,\nand that dead end is what this route exists to replace (#410 \u00a7D).\n\n``questions`` is a prefix, not the authority. It is capped so one repository\nwith a hundred undeclared actions cannot turn a 4 KiB control surface into a\nlisting; ``agent_authorable`` and ``human_authorable`` are the real counts,\nso a reader can always tell a complete list from a prefix without counting\nit. The cap reaches no decision: ``command`` applies every agent-authorable\nanswer in the report, whether or not its question is printed here, and the\nunabridged list is in the bound report artifact.",
+      "properties": {
+        "actor": {
+          "const": "coding_agent",
+          "default": "coding_agent",
+          "title": "Actor",
+          "type": "string"
+        },
+        "agent_authorable": {
+          "minimum": 1,
+          "title": "Agent Authorable",
+          "type": "integer"
+        },
+        "command": {
+          "minLength": 1,
+          "title": "Command",
+          "type": "string"
+        },
+        "expects": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Expects",
+          "type": "string"
+        },
+        "human_authorable": {
+          "minimum": 0,
+          "title": "Human Authorable",
+          "type": "integer"
+        },
+        "kind": {
+          "const": "confirm_declarations",
+          "title": "Kind",
+          "type": "string"
+        },
+        "questions": {
+          "items": {
+            "$ref": "#/$defs/EnvelopeDeclarationQuestion"
+          },
+          "maxItems": 6,
+          "minItems": 1,
+          "title": "Questions",
+          "type": "array"
+        },
+        "why": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Why",
+          "type": "string"
+        }
+      },
+      "required": [
+        "actor",
+        "kind",
+        "command",
+        "expects",
+        "why",
+        "questions",
+        "agent_authorable",
+        "human_authorable"
+      ],
+      "title": "ConfirmDeclarationsAction",
+      "type": "object"
+    },
+    "EnvelopeCodingAgentAction": {
+      "discriminator": {
+        "mapping": {
+          "configure": "#/$defs/CodingAgentAction",
+          "confirm_declarations": "#/$defs/ConfirmDeclarationsAction",
+          "discover": "#/$defs/CodingAgentAction",
+          "edit": "#/$defs/SetupEditAction",
+          "fetch_base": "#/$defs/CodingAgentAction",
+          "initialize": "#/$defs/CodingAgentAction",
+          "install": "#/$defs/CodingAgentAction",
+          "repair": "#/$defs/CodingAgentAction",
+          "rerun": "#/$defs/CodingAgentAction",
+          "verify": "#/$defs/CodingAgentAction"
+        },
+        "propertyName": "kind"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/CodingAgentAction"
+        },
+        {
+          "$ref": "#/$defs/SetupEditAction"
+        },
+        {
+          "$ref": "#/$defs/ConfirmDeclarationsAction"
+        }
+      ]
+    },
+    "EnvelopeDeclarationQuestion": {
+      "additionalProperties": false,
+      "description": "One declaration question, as the confirmation route publishes it.",
+      "properties": {
+        "answer_path": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Answer Path",
+          "type": "string"
+        },
+        "authorable_by": {
+          "enum": [
+            "coding_agent",
+            "human"
+          ],
+          "title": "Authorable By",
+          "type": "string"
+        },
+        "dimension": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Dimension",
+          "type": "string"
+        },
+        "subject": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Subject",
+          "type": "string"
+        }
+      },
+      "required": [
+        "subject",
+        "dimension",
+        "answer_path",
+        "authorable_by"
+      ],
+      "title": "EnvelopeDeclarationQuestion",
+      "type": "object"
+    },
+    "FullAgentPermissions": {
+      "additionalProperties": false,
+      "description": "Terminal authority: the verifier already authorizes merge.",
+      "properties": {
+        "commit": {
+          "const": true,
+          "default": true,
+          "title": "Commit",
+          "type": "boolean"
+        },
+        "edit": {
+          "const": true,
+          "default": true,
+          "title": "Edit",
+          "type": "boolean"
+        },
+        "merge": {
+          "const": true,
+          "default": true,
+          "title": "Merge",
+          "type": "boolean"
+        },
+        "push": {
+          "const": true,
+          "default": true,
+          "title": "Push",
+          "type": "boolean"
+        },
+        "report_complete": {
+          "const": true,
+          "default": true,
+          "title": "Report Complete",
+          "type": "boolean"
+        },
+        "update_pr": {
+          "const": true,
+          "default": true,
+          "title": "Update Pr",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "edit",
+        "commit",
+        "push",
+        "update_pr",
+        "merge",
+        "report_complete"
+      ],
+      "title": "FullAgentPermissions",
+      "type": "object"
+    },
+    "HumanControlAction": {
+      "additionalProperties": false,
+      "description": "A human-owned route.  Human actions never expose executable commands.",
+      "properties": {
+        "actor": {
+          "const": "human",
+          "default": "human",
+          "title": "Actor",
+          "type": "string"
+        },
+        "command": {
+          "default": null,
+          "title": "Command",
+          "type": "null"
+        },
+        "expects": {
+          "default": null,
+          "title": "Expects",
+          "type": "null"
+        },
+        "kind": {
+          "enum": [
+            "review",
+            "stop"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "why": {
+          "minLength": 1,
+          "title": "Why",
+          "type": "string"
+        }
+      },
+      "required": [
+        "actor",
+        "kind",
+        "command",
+        "expects",
+        "why"
+      ],
+      "title": "HumanControlAction",
+      "type": "object"
+    },
+    "HumanReviewAction": {
+      "additionalProperties": false,
+      "description": "A human *review* route, never a hard stop.\n\nA distinct type rather than a runtime check on ``kind``: the publishable\nreview state must reject a stop route in generated JSON Schema too, not\nonly in Pydantic.",
+      "properties": {
+        "actor": {
+          "const": "human",
+          "default": "human",
+          "title": "Actor",
+          "type": "string"
+        },
+        "command": {
+          "default": null,
+          "title": "Command",
+          "type": "null"
+        },
+        "expects": {
+          "default": null,
+          "title": "Expects",
+          "type": "null"
+        },
+        "kind": {
+          "const": "review",
+          "default": "review",
+          "title": "Kind",
+          "type": "string"
+        },
+        "why": {
+          "minLength": 1,
+          "title": "Why",
+          "type": "string"
+        }
+      },
+      "required": [
+        "actor",
+        "kind",
+        "command",
+        "expects",
+        "why"
+      ],
+      "title": "HumanReviewAction",
+      "type": "object"
+    },
+    "HumanReviewRequiredControlEnvelope": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "else": {
+            "properties": {
+              "decision": {
+                "minLength": 1,
+                "type": "string"
+              }
+            }
+          },
+          "if": {
+            "properties": {
+              "decision_source": {
+                "const": "none"
+              }
+            },
+            "required": [
+              "decision_source"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "decision_source": {
+                "const": "setup"
+              }
+            },
+            "required": [
+              "decision_source"
+            ]
+          },
+          "then": {
+            "properties": {
+              "operation": {
+                "enum": [
+                  "detect",
+                  "init",
+                  "doctor"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "enum": [
+                  "detect",
+                  "init",
+                  "doctor"
+                ]
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "artifacts": {
+                "maxProperties": 0
+              },
+              "control_state": {
+                "enum": [
+                  "agent_action_required",
+                  "human_review_required"
+                ]
+              },
+              "current_control_id": {
+                "type": "null"
+              },
+              "decision": {
+                "enum": [
+                  "setup_complete",
+                  "setup_incomplete",
+                  "setup_not_applicable"
+                ]
+              },
+              "decision_source": {
+                "const": "setup"
+              },
+              "input_id": {
+                "minLength": 1,
+                "pattern": "\\S",
+                "type": "string"
+              },
+              "permissions": {
+                "properties": {
+                  "commit": {
+                    "const": false
+                  },
+                  "edit": {
+                    "const": false
+                  },
+                  "merge": {
+                    "const": false
+                  },
+                  "push": {
+                    "const": false
+                  },
+                  "report_complete": {
+                    "const": false
+                  },
+                  "update_pr": {
+                    "const": false
+                  }
+                },
+                "required": [
+                  "edit",
+                  "commit",
+                  "push",
+                  "update_pr",
+                  "merge",
+                  "report_complete"
+                ],
+                "type": "object"
+              },
+              "source": {
+                "const": "run"
+              }
+            },
+            "required": [
+              "input_id"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "decision": {
+                "enum": [
+                  "setup_complete",
+                  "setup_incomplete",
+                  "setup_not_applicable"
+                ]
+              }
+            },
+            "required": [
+              "decision"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "const": "setup"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "decision_source": {
+                "const": "release_decision"
+              }
+            },
+            "required": [
+              "decision_source"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision": {
+                "enum": [
+                  "passed",
+                  "review_required",
+                  "insufficient_evidence",
+                  "blocked"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "decision_source": {
+                "const": "agent_boundary"
+              }
+            },
+            "required": [
+              "decision_source"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision": {
+                "enum": [
+                  "allow",
+                  "warn",
+                  "require_review",
+                  "block"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "decision_source": {
+                "const": "setup"
+              }
+            },
+            "required": [
+              "decision_source"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision": {
+                "enum": [
+                  "setup_complete",
+                  "setup_incomplete",
+                  "setup_not_applicable"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "check"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "agent_boundary",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "verify"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "release_decision",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "preview"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "release_decision",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "scan"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "release_decision",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "detect"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "setup",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "init"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "setup",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "doctor"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "setup",
+                  "none"
+                ]
+              }
+            }
+          }
+        }
+      ],
+      "description": "Nothing is authorized: Shipgate has no assessment it can stand behind.",
+      "properties": {
+        "artifacts": {
+          "additionalProperties": {
+            "$ref": "#/$defs/AgentControlArtifactRef"
+          },
+          "title": "Artifacts",
+          "type": "object"
+        },
+        "contract_version": {
+          "minLength": 1,
+          "title": "Contract Version",
+          "type": "string"
+        },
+        "control_state": {
+          "const": "human_review_required",
+          "title": "Control State",
+          "type": "string"
+        },
+        "current_control_id": {
+          "anyOf": [
+            {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Current Control Id"
+        },
+        "decision": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Decision"
+        },
+        "decision_source": {
+          "enum": [
+            "release_decision",
+            "agent_boundary",
+            "setup",
+            "none"
+          ],
+          "title": "Decision Source",
+          "type": "string"
+        },
+        "execution": {
+          "enum": [
+            "not_run",
+            "succeeded",
+            "skipped",
+            "failed"
+          ],
+          "title": "Execution",
+          "type": "string"
+        },
+        "exit_code": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Exit Code"
+        },
+        "human_review": {
+          "$ref": "#/$defs/RequiredHumanReview"
+        },
+        "input_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Input Id"
+        },
+        "next_action": {
+          "$ref": "#/$defs/HumanControlAction"
+        },
+        "next_actor": {
+          "const": "human",
+          "default": "human",
+          "title": "Next Actor",
+          "type": "string"
+        },
+        "operation": {
+          "enum": [
+            "verify",
+            "preview",
+            "scan",
+            "check",
+            "detect",
+            "init",
+            "doctor"
+          ],
+          "title": "Operation",
+          "type": "string"
+        },
+        "pending_review": {
+          "items": {
+            "$ref": "#/$defs/AgentControlPendingReview"
+          },
+          "title": "Pending Review",
+          "type": "array"
+        },
+        "permissions": {
+          "$ref": "#/$defs/NoAgentPermissions"
+        },
+        "reason": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Reason",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": "shipgate.agent_control/v1",
+          "default": "shipgate.agent_control/v1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "source": {
+          "enum": [
+            "run",
+            "refresh"
+          ],
+          "title": "Source",
+          "type": "string"
+        },
+        "verify_required": {
+          "title": "Verify Required",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "schema_version",
+        "contract_version",
+        "operation",
+        "source",
+        "execution",
+        "exit_code",
+        "input_id",
+        "decision",
+        "decision_source",
+        "control_state",
+        "permissions",
+        "verify_required",
+        "next_actor",
+        "next_action",
+        "human_review",
+        "pending_review",
+        "reason",
+        "current_control_id",
+        "artifacts"
+      ],
+      "title": "HumanReviewRequiredControlEnvelope",
+      "type": "object"
+    },
+    "NoAgentPermissions": {
+      "additionalProperties": false,
+      "description": "None of the six pull-request actions is authorized.\n\nTwo different states carry this vector, for the same underlying reason \u2014\nShipgate has no assessment it is willing to stand behind.\n``human_review_required`` additionally ends the turn.  An\n``agent_action_required`` route whose subject was never evaluated does not\nend the turn, but the only thing it authorizes is the named\n``next_action``: there is no evaluated change yet, so there is nothing to\npublish and no basis for saying publishing it is safe.",
+      "properties": {
+        "commit": {
+          "const": false,
+          "default": false,
+          "title": "Commit",
+          "type": "boolean"
+        },
+        "edit": {
+          "const": false,
+          "default": false,
+          "title": "Edit",
+          "type": "boolean"
+        },
+        "merge": {
+          "const": false,
+          "default": false,
+          "title": "Merge",
+          "type": "boolean"
+        },
+        "push": {
+          "const": false,
+          "default": false,
+          "title": "Push",
+          "type": "boolean"
+        },
+        "report_complete": {
+          "const": false,
+          "default": false,
+          "title": "Report Complete",
+          "type": "boolean"
+        },
+        "update_pr": {
+          "const": false,
+          "default": false,
+          "title": "Update Pr",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "edit",
+        "commit",
+        "push",
+        "update_pr",
+        "merge",
+        "report_complete"
+      ],
+      "title": "NoAgentPermissions",
+      "type": "object"
+    },
+    "NoHumanReview": {
+      "additionalProperties": false,
+      "description": "Exact negative human-review projection for non-stopping states.",
+      "properties": {
+        "required": {
+          "const": false,
+          "default": false,
+          "title": "Required",
+          "type": "boolean"
+        },
+        "required_reviewers": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 0,
+          "title": "Required Reviewers",
+          "type": "array"
+        },
+        "why": {
+          "default": null,
+          "title": "Why",
+          "type": "null"
+        }
+      },
+      "required": [
+        "required",
+        "why",
+        "required_reviewers"
+      ],
+      "title": "NoHumanReview",
+      "type": "object"
+    },
+    "PublishOnlyPermissions": {
+      "additionalProperties": false,
+      "description": "Progress authority without merge or completion authority.",
+      "properties": {
+        "commit": {
+          "const": true,
+          "default": true,
+          "title": "Commit",
+          "type": "boolean"
+        },
+        "edit": {
+          "const": true,
+          "default": true,
+          "title": "Edit",
+          "type": "boolean"
+        },
+        "merge": {
+          "const": false,
+          "default": false,
+          "title": "Merge",
+          "type": "boolean"
+        },
+        "push": {
+          "const": true,
+          "default": true,
+          "title": "Push",
+          "type": "boolean"
+        },
+        "report_complete": {
+          "const": false,
+          "default": false,
+          "title": "Report Complete",
+          "type": "boolean"
+        },
+        "update_pr": {
+          "const": true,
+          "default": true,
+          "title": "Update Pr",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "edit",
+        "commit",
+        "push",
+        "update_pr",
+        "merge",
+        "report_complete"
+      ],
+      "title": "PublishOnlyPermissions",
+      "type": "object"
+    },
+    "RequiredHumanReview": {
+      "additionalProperties": false,
+      "description": "Human-review evidence carried by the stopping state.",
+      "properties": {
+        "required": {
+          "const": true,
+          "default": true,
+          "title": "Required",
+          "type": "boolean"
+        },
+        "required_reviewers": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Required Reviewers",
+          "type": "array"
+        },
+        "why": {
+          "minLength": 1,
+          "title": "Why",
+          "type": "string"
+        }
+      },
+      "required": [
+        "required",
+        "why",
+        "required_reviewers"
+      ],
+      "title": "RequiredHumanReview",
+      "type": "object"
+    },
+    "ReviewPublishableControlEnvelope": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "else": {
+            "properties": {
+              "decision": {
+                "minLength": 1,
+                "type": "string"
+              }
+            }
+          },
+          "if": {
+            "properties": {
+              "decision_source": {
+                "const": "none"
+              }
+            },
+            "required": [
+              "decision_source"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "decision_source": {
+                "const": "setup"
+              }
+            },
+            "required": [
+              "decision_source"
+            ]
+          },
+          "then": {
+            "properties": {
+              "operation": {
+                "enum": [
+                  "detect",
+                  "init",
+                  "doctor"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "enum": [
+                  "detect",
+                  "init",
+                  "doctor"
+                ]
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "artifacts": {
+                "maxProperties": 0
+              },
+              "control_state": {
+                "enum": [
+                  "agent_action_required",
+                  "human_review_required"
+                ]
+              },
+              "current_control_id": {
+                "type": "null"
+              },
+              "decision": {
+                "enum": [
+                  "setup_complete",
+                  "setup_incomplete",
+                  "setup_not_applicable"
+                ]
+              },
+              "decision_source": {
+                "const": "setup"
+              },
+              "input_id": {
+                "minLength": 1,
+                "pattern": "\\S",
+                "type": "string"
+              },
+              "permissions": {
+                "properties": {
+                  "commit": {
+                    "const": false
+                  },
+                  "edit": {
+                    "const": false
+                  },
+                  "merge": {
+                    "const": false
+                  },
+                  "push": {
+                    "const": false
+                  },
+                  "report_complete": {
+                    "const": false
+                  },
+                  "update_pr": {
+                    "const": false
+                  }
+                },
+                "required": [
+                  "edit",
+                  "commit",
+                  "push",
+                  "update_pr",
+                  "merge",
+                  "report_complete"
+                ],
+                "type": "object"
+              },
+              "source": {
+                "const": "run"
+              }
+            },
+            "required": [
+              "input_id"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "decision": {
+                "enum": [
+                  "setup_complete",
+                  "setup_incomplete",
+                  "setup_not_applicable"
+                ]
+              }
+            },
+            "required": [
+              "decision"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "const": "setup"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "decision_source": {
+                "const": "release_decision"
+              }
+            },
+            "required": [
+              "decision_source"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision": {
+                "enum": [
+                  "passed",
+                  "review_required",
+                  "insufficient_evidence",
+                  "blocked"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "decision_source": {
+                "const": "agent_boundary"
+              }
+            },
+            "required": [
+              "decision_source"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision": {
+                "enum": [
+                  "allow",
+                  "warn",
+                  "require_review",
+                  "block"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "decision_source": {
+                "const": "setup"
+              }
+            },
+            "required": [
+              "decision_source"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision": {
+                "enum": [
+                  "setup_complete",
+                  "setup_incomplete",
+                  "setup_not_applicable"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "check"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "agent_boundary",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "verify"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "release_decision",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "preview"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "release_decision",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "scan"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "release_decision",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "detect"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "setup",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "init"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "setup",
+                  "none"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "doctor"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_source": {
+                "enum": [
+                  "setup",
+                  "none"
+                ]
+              }
+            }
+          }
+        }
+      ],
+      "description": "A human gates the merge; publishing the evidence for that review does not.\n\n``next_action`` is typed as the review-only action rather than the general\nhuman action, so a stop route cannot be published under a state that grants\npublication authority \u2014 in generated JSON Schema as well as in Pydantic.",
+      "properties": {
+        "artifacts": {
+          "additionalProperties": {
+            "$ref": "#/$defs/AgentControlArtifactRef"
+          },
+          "title": "Artifacts",
+          "type": "object"
+        },
+        "contract_version": {
+          "minLength": 1,
+          "title": "Contract Version",
+          "type": "string"
+        },
+        "control_state": {
+          "const": "review_publishable",
+          "title": "Control State",
+          "type": "string"
+        },
+        "current_control_id": {
+          "anyOf": [
+            {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Current Control Id"
+        },
+        "decision": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Decision"
+        },
+        "decision_source": {
+          "enum": [
+            "release_decision",
+            "agent_boundary",
+            "setup",
+            "none"
+          ],
+          "title": "Decision Source",
+          "type": "string"
+        },
+        "execution": {
+          "enum": [
+            "not_run",
+            "succeeded",
+            "skipped",
+            "failed"
+          ],
+          "title": "Execution",
+          "type": "string"
+        },
+        "exit_code": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Exit Code"
+        },
+        "human_review": {
+          "$ref": "#/$defs/RequiredHumanReview"
+        },
+        "input_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Input Id"
+        },
+        "next_action": {
+          "$ref": "#/$defs/HumanReviewAction"
+        },
+        "next_actor": {
+          "const": "human",
+          "default": "human",
+          "title": "Next Actor",
+          "type": "string"
+        },
+        "operation": {
+          "enum": [
+            "verify",
+            "preview",
+            "scan",
+            "check",
+            "detect",
+            "init",
+            "doctor"
+          ],
+          "title": "Operation",
+          "type": "string"
+        },
+        "pending_review": {
+          "items": {
+            "$ref": "#/$defs/AgentControlPendingReview"
+          },
+          "title": "Pending Review",
+          "type": "array"
+        },
+        "permissions": {
+          "$ref": "#/$defs/PublishOnlyPermissions"
+        },
+        "reason": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Reason",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": "shipgate.agent_control/v1",
+          "default": "shipgate.agent_control/v1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "source": {
+          "enum": [
+            "run",
+            "refresh"
+          ],
+          "title": "Source",
+          "type": "string"
+        },
+        "verify_required": {
+          "title": "Verify Required",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "schema_version",
+        "contract_version",
+        "operation",
+        "source",
+        "execution",
+        "exit_code",
+        "input_id",
+        "decision",
+        "decision_source",
+        "control_state",
+        "permissions",
+        "verify_required",
+        "next_actor",
+        "next_action",
+        "human_review",
+        "pending_review",
+        "reason",
+        "current_control_id",
+        "artifacts"
+      ],
+      "title": "ReviewPublishableControlEnvelope",
+      "type": "object"
+    },
+    "SetupEditAction": {
+      "additionalProperties": false,
+      "description": "A file a setup command needs changed, typed rather than described.\n\nDeclared **here** rather than in :mod:`agents_shipgate.schemas.agent_control`,\nand that placement is the whole design. The action union in that module is\nembedded by six durable published schemas \u2014 verifier, agent-handoff,\npreflight, agent-result, agent-boundary-result, verify-run \u2014 and five of those\nartifacts record no ``contract_version``, so widening it changes six stored\ncontracts a consumer cannot disambiguate. This envelope is emitted on stdout\nand never written as an artifact, so widening *it* changes nothing anybody\nholds.\n\nThe alternative tried first was to route an edit as the command that *checks*\nit. That is not the same work: an envelope-only consumer executing\n``control.next_action`` re-ran ``doctor`` against an unchanged file and got\nthe identical action back forever, with the actual instruction surviving only\nin ``why`` \u2014 rationale, not a typed step. A route the contract calls\nexecutable has to be the step, not its postcondition.\n\n``permissions.edit`` is ``false`` beside this, and that is not a\ncontradiction: the vector describes authority over *the change under review*,\nand a setup route \"authorizes only the named ``next_action``\" \u2014 the rule\n``NoAgentPermissions`` already states.",
+      "properties": {
+        "actor": {
+          "const": "coding_agent",
+          "default": "coding_agent",
+          "title": "Actor",
+          "type": "string"
+        },
+        "command": {
+          "default": null,
+          "title": "Command",
+          "type": "null"
+        },
+        "expects": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Expects",
+          "type": "string"
+        },
+        "kind": {
+          "const": "edit",
+          "title": "Kind",
+          "type": "string"
+        },
+        "path": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Path",
+          "type": "string"
+        },
+        "why": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Why",
+          "type": "string"
+        }
+      },
+      "required": [
+        "actor",
+        "kind",
+        "command",
+        "path",
+        "expects",
+        "why"
+      ],
+      "title": "SetupEditAction",
+      "type": "object"
+    }
+  },
+  "$id": "https://raw.githubusercontent.com/ThreeMoonsLab/agents-shipgate/main/docs/agent-control-schema.v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "JSON Schema for the compact shipgate.agent_control/v1 control envelope emitted by `verify --format control`, `check --format agent-control-json`, and `agents-shipgate agent control`. A projection of the authoritative control state, never a second decision. Generated from agents_shipgate.schemas.agent_control_envelope. Do not edit by hand.",
+  "discriminator": {
+    "mapping": {
+      "agent_action_required": "#/$defs/AgentActionControlEnvelope",
+      "complete": "#/$defs/CompleteControlEnvelope",
+      "human_review_required": "#/$defs/HumanReviewRequiredControlEnvelope",
+      "review_publishable": "#/$defs/ReviewPublishableControlEnvelope"
+    },
+    "propertyName": "control_state"
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/CompleteControlEnvelope"
+    },
+    {
+      "$ref": "#/$defs/AgentActionControlEnvelope"
+    },
+    {
+      "$ref": "#/$defs/ReviewPublishableControlEnvelope"
+    },
+    {
+      "$ref": "#/$defs/HumanReviewRequiredControlEnvelope"
+    }
+  ],
+  "title": "Agents Shipgate Agent Control Envelope v1"
+}

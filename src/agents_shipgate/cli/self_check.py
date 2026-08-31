@@ -15,7 +15,7 @@ from pathlib import Path
 import typer
 
 from agents_shipgate import __version__
-from agents_shipgate.cli.scan import run_scan
+from agents_shipgate.cli.scan.orchestrator import run_scan
 from agents_shipgate.core.errors import AgentsShipgateError, ConfigError, InputParseError
 from agents_shipgate.fixtures import (
     FixturesUnavailableError,
@@ -31,6 +31,7 @@ _DEFAULT_FIXTURES = (
     "google_adk_agent",
     "simple_langchain_agent",
     "simple_crewai_agent",
+    "conductor_agent",
 )
 
 
@@ -127,9 +128,11 @@ def _probe_cli_surface() -> dict[str, str]:
     results: dict[str, str] = {}
     probes = {
         "scan": "agents_shipgate.cli.scan",
+        "check": "agents_shipgate.cli.check",
+        "agent-result": "agents_shipgate.schemas.agent_result",
         "init": "agents_shipgate.cli.discovery",
         "doctor": "agents_shipgate.cli.scan",
-        "contract": "agents_shipgate.contract",
+        "contract": "agents_shipgate.schemas.contract",
         "explain": "agents_shipgate.checks.registry",
         "list-checks": "agents_shipgate.checks.registry",
         "baseline.save": "agents_shipgate.core.baseline",

@@ -8,16 +8,49 @@ after findings already exist.
 ```bash
 agents-shipgate baseline save \
   --config shipgate.yaml \
-  --out .agents-shipgate/baseline.json
+  --out .agents-shipgate/baseline.json \
+  --owner alice --reason "accepted pending Q3 fix" --expires 2026-09-30
 ```
 
 The baseline contains active, unsuppressed findings only. Suppressed findings
 are intentionally excluded because they already carry an explicit review reason
 in `shipgate.yaml`.
 
+`--owner`, `--reason`, and `--expires` (v0.6) record exception metadata on
+**newly-accepted** entries: who approved this debt, why, and by when it must
+be reviewed again. They are declared, never inferred — the same contract as
+`human_ack` (a coding agent must not manufacture approval). Entries already
+in the baseline keep their original metadata on re-save. To acknowledge
+**existing** unowned debt in one pass, add `--apply-to-existing`: it fills
+the given fields into entries that lack them, never overwrites a
+previously-set value, and preserves each entry's original
+`recorded_at`/`run_id` history. Use the CLI rather than hand-editing the
+JSON — hand-edits trip the integrity hash
+(`SHIP-BASELINE-INTEGRITY-MISMATCH`).
+
 Severity values in the baseline are the report-visible severities after
 `checks.severity_overrides` are applied. Matching still uses fingerprints, not
 severity, so changing an override does not create a new baseline identity.
+
+## Debt Status And Governance Gates
+
+```bash
+agents-shipgate baseline status --json          # aging report, advisory
+agents-shipgate baseline status \
+  --require-owner --require-expiry --max-age-days 180   # org gate: exit 20
+```
+
+`baseline status` reports accepted-debt aging per entry (owner, reason, age,
+days until expiry) plus a summary (owned/unowned, expired, expiring soon,
+oldest entry). With no gate flags it is advisory and always exits 0; with any
+of `--require-owner`, `--require-expiry`, or `--max-age-days N` it exits 20
+when entries violate the requirement — wire it into a scheduled workflow next
+to the host-grant drift gate to keep accepted debt owned and time-bound.
+An expired entry violates `--require-expiry` (an expired exception is no
+longer a valid exception), and entries without provenance (legacy 0.2–0.4
+files never re-saved) fail every active gate: unknown history is ungoverned
+debt, not exempt debt. `--as-of YYYY-MM-DD` pins the reference date for
+reproducible CI output.
 
 ## Apply The Baseline
 
@@ -37,13 +70,14 @@ fail CI.
 
 Reports keep the v0.1 payload contract and add baseline fields:
 
-- `report_schema_version: "0.13"` in current reports
+- `report_schema_version: "0.42"` in current reports
 - `baseline.path`
 - `baseline.matched_count`
 - `baseline.new_count`
 - `baseline.resolved_count`
 - `findings[].baseline_status`
-- `tool_surface_facts` in baselines saved with schema `0.3`
+- `tool_surface_facts` in baselines saved with schema `0.3+`
+- `action_surface_facts` in baselines saved with schema `0.4+`
 
 The public baseline comparison mode is `new-findings`:
 
@@ -60,22 +94,54 @@ rendered as `fp_<digest>`. It intentionally excludes severity overrides, report
 paths, warnings, timestamps, `default_severity` audit evidence, and baseline
 status.
 
+Baseline schema `0.8` additionally records `support_hash` for findings whose
+release contribution depends on typed policy evidence. The fingerprint remains
+stable, but both fingerprint and support hash must match. A change from
+heuristic, mixed, or unknown applicability to authoritative evidence is
+therefore reviewed as new evidence rather than silently inheriting old debt.
+Pre-`0.8` entries have no support binding, so supported findings intentionally
+re-gate as `new` after upgrading to `0.16.0b5`. Review the new evidence, then
+re-export accepted debt explicitly with:
+
+```bash
+agents-shipgate baseline save -c shipgate.yaml \
+  --out .agents-shipgate/baseline.json \
+  --owner <human> --reason "<reviewed reason>" --expires <YYYY-MM-DD>
+```
+
+Report schema v0.18 or higher computes public fingerprints after the default privacy
+redaction pass. Findings whose evidence contains a recognized secret-like value
+therefore get a new public fingerprint. To avoid surprise CI failures during
+upgrade, `scan --baseline` also compares the pre-v0.18 raw fingerprint in memory
+without writing it to public artifacts. After reviewing the v0.18 report, run
+`agents-shipgate baseline save` again to rewrite the baseline with redacted
+public fingerprints.
+
 ## Baseline Schema Versions
 
-`agents-shipgate baseline save` now writes baseline schema `0.3`. It preserves
-the existing finding fields and adds an optional `tool_surface_facts` snapshot so
-`agents-shipgate scan --baseline .agents-shipgate/baseline.json` can also show a
-tool-surface diff when `--diff-from` is not supplied.
+`agents-shipgate baseline save` now writes baseline schema `0.8`, which binds
+supported findings to `support_hash`. Schema `0.7` introduced provider-scoped
+finding identity and remains readable. Schema `0.6` adds
+the optional `provenance.owner` approver field alongside the reviewer-set
+`reason`/`expires` (all settable from `baseline save` flags). Schema `0.5`
+added per-entry provenance (`scanner_version`, `run_id`, `recorded_at`).
+Schema `0.4` preserves the existing finding fields, keeps the optional
+`tool_surface_facts` snapshot from schema `0.3`, and adds an optional
+`action_surface_facts` snapshot so
+`agents-shipgate scan --baseline .agents-shipgate/baseline.json` can also show
+tool-surface and action-surface diffs when `--diff-from` is not supplied.
 
-Schema `0.2` baselines still load for accepted-debt matching and strict-mode
-filtering. They do not contain `tool_surface_facts`, so using a `0.2` baseline
-as the only diff reference yields `tool_surface_diff.enabled=false` with a note.
-Newer baselines are not guaranteed to load in older package versions.
+Schema `0.3` baselines still load and can drive `tool_surface_diff`, but they
+do not contain `action_surface_facts`; using a `0.3` baseline as the only diff
+reference yields `action_surface_diff.enabled=false` with a note. Schema `0.2`
+baselines still load for accepted-debt matching and strict-mode filtering, but
+they cannot enable either surface diff. Newer baselines are not guaranteed to
+load in older package versions.
 
 `--baseline` and `--diff-from` have separate jobs: `--baseline` drives
 `findings[].baseline_status`, strict-mode filtering, and
-`release_decision.baseline_delta`; `--diff-from` drives only
-`tool_surface_diff`.
+`release_decision.baseline_delta`; `--diff-from` drives `tool_surface_diff` and
+`action_surface_diff`.
 
 Scope deltas distinguish tool-required scopes from manifest-declared scopes.
 If the same literal scope moves between those kinds, the diff reports one

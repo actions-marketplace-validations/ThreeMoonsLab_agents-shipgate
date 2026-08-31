@@ -1,0 +1,160 @@
+{
+  "schema_version": "shipgate.codex_boundary_result/v2",
+  "agent": "codex",
+  "tool": {
+    "name": "agents-shipgate",
+    "version": "0.16.0b6"
+  },
+  "subject": {
+    "agent": "codex"
+  },
+  "decision": "block",
+  "risk_level": "critical",
+  "audit_id": "codex_boundary_2af3a603590c5b22704905cd",
+  "policy_version": "1",
+  "summary": "1 Codex boundary change(s) block local continuation.",
+  "changed_files": [
+    "policies/codex-boundary.shipgate.yaml"
+  ],
+  "control": {
+    "state": "human_review_required",
+    "reason": "1 Codex boundary change(s) block local continuation.",
+    "completion_allowed": false,
+    "must_stop": true,
+    "verify_required": false,
+    "next_action": {
+      "actor": "human",
+      "kind": "stop",
+      "command": null,
+      "expects": null,
+      "why": "Codex boundary policy was weakened"
+    },
+    "allowed_next_commands": [],
+    "human_review": {
+      "required": true,
+      "why": "Codex boundary policy was weakened",
+      "required_reviewers": [
+        "agent-platform",
+        "security"
+      ]
+    },
+    "stop_reason": "Codex boundary policy was weakened"
+  },
+  "repair": {
+    "actor": "human",
+    "safe_to_attempt": false,
+    "instructions": [
+      "Do not weaken Shipgate policy to pass the gate; restore the stricter policy or get human approval."
+    ],
+    "forbidden_shortcuts": [
+      "Do not suppress the finding (checks.ignore in shipgate.yaml).",
+      "Do not lower severity or add a waiver just to pass the gate.",
+      "Do not invent or assume approval, idempotency, or audit evidence you cannot prove from the code.",
+      "Do not weaken the release policy, CI gate, or agent instructions that evaluate this change."
+    ]
+  },
+  "policy": {
+    "id": "codex-boundary-default",
+    "version": "1",
+    "source": "packaged_default",
+    "snapshot_sha256": "83ea4e4afeee1b003310f4f3ae88dbf986e0b24f64c339aaf3045dcb2b7746e8",
+    "discovery": [
+      "workspace_missing:policies/codex-boundary.shipgate.yaml",
+      "packaged_default"
+    ]
+  },
+  "violated_rules": [
+    {
+      "id": "CODEX-POLICY-WEAKENED",
+      "check_id": "SHIP-CODEX-BOUNDARY-POLICY-WEAKENED",
+      "action": "block",
+      "risk_level": "critical",
+      "title": "Codex boundary policy was weakened",
+      "path": "policies/codex-boundary.shipgate.yaml",
+      "evidence": {
+        "kind": "codex_boundary_policy_weakened",
+        "deleted": false,
+        "weakened_action": true,
+        "weakened_risk": false,
+        "weakened_rules": [
+          {
+            "id": "CODEX-MCP-AUTO-APPROVE-WRITE",
+            "old_action": "block",
+            "new_action": "require_review",
+            "old_risk_level": "critical",
+            "new_risk_level": "critical"
+          }
+        ]
+      },
+      "recommendation": "Do not weaken Shipgate policy to pass the gate; restore the stricter policy or get human approval."
+    }
+  ],
+  "affected_files": [
+    {
+      "path": "policies/codex-boundary.shipgate.yaml"
+    }
+  ],
+  "required_reviewers": [
+    "agent-platform",
+    "security"
+  ],
+  "explanation": "1 Codex boundary change(s) block local continuation.",
+  "suggested_fixes": [
+    "Do not weaken Shipgate policy to pass the gate; restore the stricter policy or get human approval."
+  ],
+  "agent_repair_instructions": [
+    "Do not weaken Shipgate policy to pass the gate; restore the stricter policy or get human approval."
+  ],
+  "diagnostics": [
+    {
+      "level": "warning",
+      "code": "content_source",
+      "message": "Evaluated Codex boundary file from workspace_file_missing.",
+      "path": "policies/codex-boundary.shipgate.yaml"
+    }
+  ],
+  "trace": [
+    {
+      "step": "policy_discovery",
+      "summary": "Loaded policy codex-boundary-default from packaged_default."
+    },
+    {
+      "step": "decision",
+      "summary": "Projected 1 violation(s) to block."
+    }
+  ],
+  "source_artifacts": {},
+  "trigger": {
+    "schema_version": "0.1",
+    "should_run": true,
+    "run_shipgate": true,
+    "skip": false,
+    "force_run": false,
+    "dry_run_recommended": false,
+    "skip_reason": null,
+    "stop_conditions_fired": false,
+    "stop_conditions_evaluated": false,
+    "rationale": "1 run_shipgate rule(s) matched.",
+    "matched_rules": [
+      {
+        "id": "TRIGGER-PROMPTS-OR-POLICIES",
+        "action": "run_shipgate",
+        "rationale": "Prompts and policy YAML carry approval / confirmation evidence. Trace findings reference these surfaces. The globs match at any depth, and case-insensitively, so a nested or differently-spelled workspace (`services/foo/policies/**`, `enterprise/lib/captain/Prompts/**`) routes exactly like a repo-root one. That is parity with the verifier: `SHIP-VERIFY-TRUST-ROOT-TOUCHED` classifies both surfaces off `TRUST_ROOT_SURFACES`, which has always carried `**/policies/**` and `**/prompts/**`, and the policy check's no-base fail-safe, `SHIP-VERIFY-POLICY-BASE-ABSENT`, additionally treats `**/policies/**` as a fail-safe trust root (its surface list covers the manifest, policies and `.agents-shipgate/`, not prompts). A root-only, case-sensitive trigger reported edits those checks call governance-bearing as `no_match`. The `**/`-prefixed and bare forms are both listed because a consumer applying this catalog with a glob engine where `**/` requires at least one leading segment would otherwise lose the repo-root match.",
+        "command": null
+      }
+    ],
+    "changed_files": [
+      "policies/codex-boundary.shipgate.yaml"
+    ],
+    "diff_tokens": [],
+    "next_action": {
+      "kind": "command",
+      "command": "agents-shipgate verify --preview --json",
+      "why": "This change looks agent-related; start with verify preview and adopt Shipgate if the preview routes setup."
+    }
+  },
+  "finding_fingerprints": [
+    "fp_db9eb20807fcce76"
+  ],
+  "policy_snapshot_sha256": "83ea4e4afeee1b003310f4f3ae88dbf986e0b24f64c339aaf3045dcb2b7746e8"
+}

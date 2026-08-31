@@ -14,12 +14,12 @@ import pytest
 from pydantic import ValidationError
 
 from agents_shipgate.cli.scan import run_scan
-from agents_shipgate.core.models import Finding
-from agents_shipgate.core.patches import (
+from agents_shipgate.schemas.patches import (
     ManualPatch,
     RemovePointerPatch,
     SetPointerPatch,
 )
+from agents_shipgate.schemas.report import Finding
 
 SAMPLE = Path(__file__).resolve().parent.parent / "samples" / "support_refund_agent" / "shipgate.yaml"
 
@@ -122,7 +122,7 @@ def test_run_id_identical_when_only_patches_field_differs(tmp_path: Path) -> Non
     baseline_run_id = report.run_id
 
     # Inject patches into a copy of the same findings; recompute run_id.
-    from agents_shipgate.cli.scan import _run_id
+    from agents_shipgate.cli.scan.run_identity import _run_id
 
     findings_with_patches = []
     for finding in report.findings:

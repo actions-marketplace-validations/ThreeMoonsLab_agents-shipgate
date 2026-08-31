@@ -4,14 +4,14 @@ from pathlib import Path
 from jsonschema import validate
 
 from agents_shipgate.cli.scan import run_scan
-from agents_shipgate.core.models import (
+from agents_shipgate.report.sarif import render_sarif_report
+from agents_shipgate.schemas.common import SourceReference
+from agents_shipgate.schemas.report import (
     Finding,
     ReadinessReport,
     ReportSummary,
-    SourceReference,
     ToolSurfaceSummary,
 )
-from agents_shipgate.report.sarif import render_sarif_report
 
 MINIMAL_SARIF_SCHEMA = {
     "type": "object",
@@ -59,6 +59,30 @@ def test_sarif_uses_canonical_rule_metadata_and_help_uri():
     assert rule["shortDescription"]["text"] == "Scope-requiring tool lacks declared auth scopes."
     assert rule["shortDescription"]["text"] != "payment.write lacks declared auth scopes"
     assert rule["helpUri"].endswith("docs/checks.md#ship-auth-missing-scope")
+
+
+def test_sarif_tags_action_surface_release_blockers():
+    report = _report_with_findings(
+        [
+            Finding(
+                check_id="SHIP-ACTION-POLICY-VIOLATION",
+                title="Action policy failed",
+                severity="medium",
+                category="action_surface",
+                tool_name="send_customer_email",
+                evidence={"policy_id": "require-audit"},
+                recommendation="Declare audit evidence.",
+                blocks_release=True,
+            )
+        ]
+    )
+
+    payload = render_sarif_report(report)
+    rule = payload["runs"][0]["tool"]["driver"]["rules"][0]
+    result = payload["runs"][0]["results"][0]
+
+    assert rule["properties"]["tags"] == ["action_surface", "release_blocker"]
+    assert result["properties"]["tags"] == ["action_surface", "release_blocker"]
 
 
 def test_sarif_summarizes_large_evidence_payloads():

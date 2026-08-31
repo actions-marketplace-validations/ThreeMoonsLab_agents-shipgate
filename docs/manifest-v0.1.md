@@ -4,7 +4,7 @@
 
 A manifest is valid when it declares at least one of:
 
-- `tool_sources` for MCP, OpenAPI, optional OpenAI Agents SDK metadata, Google ADK static metadata, LangChain/LangGraph Python, or CrewAI Python.
+- `tool_sources` for MCP, OpenAPI, optional OpenAI Agents SDK metadata, Google ADK static metadata, LangChain/LangGraph Python, CrewAI Python, or Conductor OSS workflow JSON.
 - `openai_api` for simple OpenAI API apps that use prompt files, OpenAI tool schemas, and structured output schemas directly.
 - `google_adk` for explicit Google ADK Agent Config, eval, trace, or inventory artifacts.
 - `langchain` and `crewai` for supplemental Python entrypoints and explicit local tool inventories.
@@ -63,6 +63,37 @@ openai_api:
     - path: policies/openai-api-policy.yaml
 ```
 
+## Environment target
+
+`environment.target` says where the agent this manifest describes actually
+runs: `local`, `staging`, `production_like`, `production`, or `template`.
+
+`template` is not a deployment. It is the honest answer for a sample, an
+example, or a scaffold that ships to be copied: there is no environment, so
+there are no credentials, and asking each action which credential it runs with
+asks a question the repository cannot answer in principle. Declaring it answers
+the authority dimension once, for every action that does not say otherwise:
+
+```yaml
+environment:
+  target: template
+```
+
+It is a default, never an override, and it applies only where nothing else
+answers the question. An action row's own `authority`, a
+`tool_sources[].authority` block, an action's own `scopes:` list, and anything
+the tool **source** publishes all win over it — each is the more specific
+statement. That last one is not a nicety: the reviewed record supplies the
+whole permission list, so applying it over a tool that publishes
+`oauth2 + docs:read` would empty that action's `required_scopes` and
+`SHIP-AUTH-SCOPE-COVERAGE-MISSING` would stop seeing anything to cover.
+Declaring `template` may add rows; it never removes one.
+
+And it is never silent. Every action it answers for is one semantic review
+concern, so a `template` repository can reach `review_required` and never
+`passed`: adopters have to state their real authority before a green gate is
+available at all.
+
 ## Supported Tool Sources
 
 - `openapi`: local OpenAPI 3.0/3.1 YAML or JSON.
@@ -71,6 +102,7 @@ openai_api:
 - `google_adk`: static Google ADK Python entrypoint or Agent Config YAML.
 - `langchain`: static LangChain/LangGraph Python entrypoint.
 - `crewai`: static CrewAI Python entrypoint.
+- `codex_config`: static repo-local Codex config and boundary metadata.
 - `codex_plugin`: static Codex plugin package or marketplace metadata.
 
 When two sources declare the same tool name, Agents Shipgate keeps the higher-fidelity source, merges non-schema metadata such as annotations, auth scopes, risk hints, and owner, and emits a source warning. Current precedence is OpenAI API artifacts, then OpenAPI, then Google ADK/LangChain/CrewAI inventories, then MCP JSON, then SDK/ADK/LangChain/CrewAI static extraction. Low-confidence framework stubs rank below static custom function/class tools.
@@ -101,7 +133,8 @@ google_adk:
   eval_sets:
     - evals/support.eval.json
   tool_inventories:
-    - inventories/adk-mcp-tools.json
+    - path: inventories/adk-mcp-tools.json
+      source_id: adk_agent
   trace_samples:
     - traces/adk-tool-calls.jsonl
 ```
@@ -123,6 +156,70 @@ Module-relative expressions such as `Path(__file__).parent / "spec.yaml"` or
 assignment-then-read patterns may be reported as dynamic. In those cases,
 declare the same spec or MCP inventory explicitly in `tool_sources` or
 `google_adk.tool_inventories`.
+
+## Tool Inventories
+
+Every framework block (`google_adk`, `langchain`, `crewai`, `n8n`) accepts
+`tool_inventories`: reviewed, local MCP-shaped JSON files that describe the
+tools static extraction could not fully enumerate. Each entry takes a `path`
+and, optionally, `source_id`.
+
+An inventory is for a surface the adapter genuinely could not read, not a
+transcription of one it already read correctly. A Google ADK Python entrypoint
+the adapter fully resolved now reaches high extraction confidence from source
+alone and asks for no inventory; when it does ask, the `low_confidence_tool`
+evidence gap names the construct that blocked it. Other framework adapters
+still report AST-extracted tools as `medium` and need the inventory.
+
+**`source_id` names the tool source this file completes.** With it, every entry
+whose name the source already exposes is joined to that source's observation:
+the catalog stays the same size, the merged tool inherits the inventory's high
+extraction confidence, and the `incomplete_surface` evidence gap that asked for
+the file is closed. Entries the source does *not* expose stay separate — an
+inventory exists precisely to disclose tools static extraction missed.
+
+```yaml
+tool_sources:
+  - id: adk_agent
+    type: google_adk
+    path: agent.py
+
+google_adk:
+  tool_inventories:
+    - path: inventories/adk-tools.json
+      source_id: adk_agent
+```
+
+Without `source_id` the inventory is an **independent source**. Its entries are
+added *beside* the extracted tools rather than completing them, so a file whose
+names duplicate an already-extracted surface grows the catalog, leaves the gap
+open, and can make `action_surface` selectors ambiguous. That spelling stays
+supported for inventories that genuinely describe a separate surface; where it
+shadows a low-confidence source, the scan now says so in `source_warnings` and
+names the `source_id` to add.
+
+Joining is never inferred from names alone. `source_id` is a manifest
+declaration — the trust root — desugared into the same reviewed-binding engine
+as `tool_identity.bindings`. Where a source exposes one name twice, no join is
+implied and the scan asks for an explicit `tool_identity.bindings` entry
+instead. A reviewed binding that already claims an observation always wins.
+
+Completing a source **adds** evidence and never removes it:
+
+- Rows already written against the completed source keep resolving. A canonical
+  tool answers to the identity of every observation bound into it — its
+  `source_type`/`source_id` *and* the `tool_id` it carried while unbound — so
+  `{tool: lookup_case, tool_id: tool_v2_…, source_id: adk_agent}`, exactly as
+  Shipgate scaffolds it, still matches. The same rule applies to
+  `policies.require_*_for_tools` entries and `checks.ignore` rows.
+- Evidence only the source knew — `output_schema`, `owner`, the function
+  signature, the auth type/mode/credential — is preserved wherever the
+  inventory is silent, and stays traceable to the observation that supplied it:
+  a finding raised on preserved evidence cites that artifact, not the
+  inventory. Where two observations both say something and disagree, that is a
+  `conflicting_tool_identity` issue which makes the identity non-pass-eligible,
+  not a silent pick. (`auth.source` is exempt: it names the extractor that read
+  the auth record, so two readings of one capability differ by construction.)
 
 ## LangChain And CrewAI Artifacts
 
@@ -150,13 +247,15 @@ langchain:
   python_entrypoints:
     - agents/graph.py
   tool_inventories:
-    - inventories/langchain-tools.json
+    - path: inventories/langchain-tools.json
+      source_id: support_langchain
 
 crewai:
   python_entrypoints:
     - agents/crew.py
   tool_inventories:
-    - inventories/crewai-tools.json
+    - path: inventories/crewai-tools.json
+      source_id: support_crewai
 ```
 
 Supported static LangChain/LangGraph signals:
@@ -177,6 +276,28 @@ Dynamic framework tool surfaces such as `tools=get_tools()`, list
 comprehensions, loop-built lists, unresolved imported toolkits, or unresolved
 external schema classes remain visible as source warnings and framework
 findings unless an explicit local inventory resolves the surface.
+
+## Codex Config Artifacts
+
+`codex_config` is local-only and static-only. Agents Shipgate parses repo-local
+Codex boundary surfaces such as `.codex/config.toml`, `.codex/hooks.json`,
+`AGENTS.md`, `.agents/skills/**/SKILL.md`, and Shipgate GitHub workflow files.
+It does not inspect user-global `~/.codex/config.toml`, execute hooks, launch
+MCP servers, authenticate connectors, call tools, call models, or make network
+requests.
+
+The canonical manifest form points at the workspace root:
+
+```yaml
+tool_sources:
+  - id: codex_repo_boundary
+    type: codex_config
+    path: .
+```
+
+`codex_config` feeds the Codex-local boundary check and verify-mode Codex
+boundary findings. It does not enumerate agent-callable tools into
+`tool_inventory[]`.
 
 ## Codex Plugin Artifacts
 
@@ -224,6 +345,13 @@ Supported static Codex plugin signals:
 Only tools loaded from explicit MCP inventories enter `tool_inventory[]` with
 `source_type: codex_plugin_mcp_inventory`. Apps, hooks, skills, and MCP server
 declarations are reported under `codex_plugin_surface`, not as tools.
+
+A fully parsed plugin package that contains one or more valid skills and no
+apps, MCP servers, hooks, MCP inventories, unknown manifest keys, component
+path issues, or source warnings establishes a structural package root with a
+complete zero-callable surface. It does not need a reviewed empty
+`agent_bindings` declaration. Any skipped, unknown, or degraded plugin input
+invalidates that structural proof and remains fail-closed.
 
 ## n8n
 
@@ -276,6 +404,33 @@ adapter-specific display text; the structured navigation fields are
 Human-review nodes such as n8n Send-and-Wait are recorded for reviewer context
 only. They do not satisfy `policies.approval`; high-risk n8n tools need
 explicit policy declarations in the manifest.
+
+## Conductor OSS
+
+Conductor OSS MCP/AI workflows use ordinary `tool_sources`; there is no
+top-level `conductor:` block.
+
+```yaml
+tool_sources:
+  - id: conductor_workflows
+    type: conductor
+    path: workflows/
+    optional: false
+```
+
+`path` may be one JSON workflow, a bulk array of workflows, or a directory
+recursively containing JSON. The adapter accepts `schemaVersion: 2` (or an
+omitted schema version), enumerates literal `CALL_MCP_TOOL.method` call sites,
+and records MCP discovery, LLM, HUMAN, branch/loop/fork, and sub-workflow facts.
+It never starts Conductor, connects to MCP/model endpoints, executes workflow
+expressions, or imports custom workers.
+
+Dynamic MCP targets, runtime-generated tasks, and unresolved sub-workflows are
+reported as non-enumerable surfaces. HTTP, custom worker, A2A, inline-code, and
+provider-native execution are recognized but intentionally unsupported in the
+MCP-core v1 adapter; their source warnings prevent a silent `passed` result.
+`HUMAN` is structural checkpoint evidence only and never satisfies an approval
+policy by itself.
 
 ## OpenAI API Artifacts
 
@@ -344,6 +499,501 @@ tool_output_schemas:
 
 Trace samples are JSON arrays or JSONL with simple normalized fields such as `tool_name`, `approved`, `confirmed`, `success`, and `error`. Unsupported raw logs produce source warnings rather than blockers.
 
+## Tool identity and reviewed bindings
+
+Tool names are display metadata, not identity. Each `tool_sources[].id` must be
+unique. Agents Shipgate derives a source-scoped observation identity from the
+source type, source ID, and adapter-native locator. Same-name tools from
+different sources/providers remain distinct.
+
+Declare a binding only when a human has reviewed that two extracted
+observations describe the same mounted capability:
+
+```yaml
+tool_identity:
+  bindings:
+    - id: support_lookup
+      provider: support-runtime
+      reason: reviewed inventory describes the bound LangChain function
+      primary:
+        source_id: reviewed_inventory
+        tool: lookup_case
+      members:
+        - source_id: langchain_agent
+          tool: lookup_case
+        - source_id: reviewed_inventory
+          tool: lookup_case
+```
+
+Every member and the primary must resolve exactly once; one observation may
+belong to at most one binding. Equal names or providers never imply
+equivalence. Invalid, overlapping, or structurally conflicting bindings join
+nothing and prevent `passed`.
+
+A `<framework>.tool_inventories[].source_id` entry (see
+[Tool Inventories](#tool-inventories)) is desugared into exactly these bindings,
+one per matched name, so an inventory completing a whole source does not have to
+be written out tool by tool. A binding declared here always wins over the
+desugared one.
+
+## Agent Binding Surface
+
+`agent_bindings` declares the exact root agent and, when framework wiring is
+not completely statically visible, a reviewed closed-world tool/handoff set:
+
+```yaml
+agent_bindings:
+  root:
+    source_id: ops_sdk
+    object: ops_assistant
+  declarations:
+    - agent: root
+      complete: true
+      tools:
+        - tool: docs.lookup
+          source_id: docs_tools
+      handoffs: []
+      reason: reviewed against the deployed agent wiring
+```
+
+`root.object` and `declarations[].agent` are matched against the agent names
+the scan reports in `binding_surface_facts.agents[].name`, so read that list
+from `report.json` rather than guessing: for frameworks that name agents
+explicitly it is the framework's own name (a Google ADK `LlmAgent(name=…)`),
+not the Python variable the agent was assigned to. `agent: root` is the one
+reserved spelling and always means the configured root. A declaration may
+introduce an agent the extractors never observed — a decorator-only project
+has no agent object to observe — but a name that two observed agents share
+resolves to neither, and the resulting `unresolved_agent_binding` says which
+sources collided.
+
+Catalog membership, action declarations, permissions, and controls never imply
+binding. `complete` must be `true`; the declaration is exact and may not erase
+positive structural edges. Empty `tools` and `handoffs` prove a zero-capability
+root. These are human-reviewed claims and must never be inferred or auto-filled
+by a coding agent.
+
+### A published tool surface, declared once per source
+
+Binding is real information for an agent: a catalog may hold 63 OpenAPI
+operations of which the agent wires 5, and catalog membership is deliberately
+never evidence of capability. For a **tool server** there is no such gap — the
+repository under review *is* the tool surface, anything in its published
+`tools/list` is callable by any client that connects, there is no root agent,
+and there is nothing to select between. Naming 116 tools individually to say so
+is the copy-paste that breeds wrong answers. Declare it once on the source:
+
+```yaml
+tool_sources:
+  - id: github_mcp
+    type: mcp
+    path: mcp/tools.json
+    binding:
+      complete: true
+      reason: >-
+        This repository is the server; every tool in its published tools/list
+        is callable by any client that connects to it.
+```
+
+`complete` is spelled exactly as `agent_bindings.declarations[].complete` and
+means the same thing: the block's presence is the closed-world claim, so `true`
+is the only value. `reason` records how the published surface was reviewed, and
+must not be blank.
+
+Every tool the source contributes enters the analysed surface — it is judged by
+every check, exactly as a tool an agent wires is. The source is an *entry point*
+of the binding graph rather than something a root agent reaches, which is what
+`binding_surface_facts.entry_point_agent_ids` names. The block is **additive and
+widening**: it can only move tools *into* the analysed surface, never out of it.
+It is per source, so a source without it resolves exactly as before, and an
+agent that wires a subset of some other catalog still reports the unbound
+remainder.
+
+A repository may declare more than one source. Each is its own entry point;
+none of them is elected the root of the others. `binding_surface_facts.agents[]`
+carries one node per declared source, named by `tool_sources[].id`, so
+`agent_bindings.root: {object: <id>, source_id: <id>}` resolves to it once the
+block is written. `root.object` still names a statically reviewed agent object
+first: where an observed agent and a declared source share a name, the agent
+wins the selector, so adding this block cannot make a selector that used to
+resolve ambiguous. Without the block, a catalog with no agent object anywhere
+reports that no root selector can match one and names this block as the route —
+a JSON tool export produces no code objects for any selector to match. A
+`tools:` selector spelled as a pattern (`{tool: "*"}`) says so too: selectors
+name one tool exactly, and this block is the statement that spelling was
+reaching for.
+
+A reviewed declaration that binds no tool is an error, not a no-op: it reports
+`missing_binding_evidence` naming the source, because the source contributed
+nothing to the catalog and a proven binding graph over an empty analysed
+surface is worse than no graph at all.
+
+Like every other reviewed claim, this one is a human's. It cannot be inferred
+from source content, it is refused in agent-authored `tool_sources` proposals,
+and `doctor` routes an unfilled placeholder inside it to a person.
+
+## Action Surface Diff
+
+The optional top-level `action_surface:` block adds reviewer-facing action
+metadata and deterministic action policies on top of the loaded tool surface.
+It requires a CLI whose `agents-shipgate contract --json` reports
+`report_schema_version >= 0.16`; older CLIs reject the unknown top-level field
+instead of silently ignoring release policy. It does not create new CLI
+commands; use this to compare the current action surface against a base report
+or baseline snapshot:
+
+```bash
+agents-shipgate scan --diff-from <path>
+```
+
+```yaml
+action_surface:
+  require_explicit_actions: false
+
+  actions:
+    - tool: stripe.create_refund
+      operation: refund_customer
+      effect: financial_write
+      risk_tags:
+        - financial_write
+        - external_communication
+      scopes:
+        - refunds:create
+      authority:
+        mode: scoped
+        auth_type: oauth2
+        credential_mode: delegated
+      approval:
+        required: true
+        threshold: "amount <= 100"
+      safeguards:
+        idempotency: true
+        audit_log: true
+        rollback: false
+        dry_run: false
+      evidence:
+        owner: support-platform
+        runbook: docs/runbooks/refunds.md
+        approval_ticket: SEC-123
+
+  policies:
+    - id: require-audit-for-external-communication
+      match:
+        risk_tags:
+          - external_communication
+      require:
+        safeguards.audit_log: true
+      severity: high
+      block: true
+```
+
+`actions[]` entries are one-to-one selectors. `tool` remains the display-name
+selector; add `tool_id`, `provider`, `source_type`, or `source_id` when the name
+is not unique. Resolution must produce exactly one canonical tool. Zero or
+multiple matches apply no declaration and create an unsuppressible identity
+evidence gap; there is no fallback to the first matching name. Starting with
+contract v12/report v0.30, `effect` and `authority` are reviewed static evidence
+used to establish pass eligibility. Agents Shipgate never auto-writes them.
+Scopes remain on `actions[].scopes`; do not duplicate them under `authority`.
+Authority modes are:
+
+- `none` — requires empty scopes and no `auth_type`;
+- `scoped` — requires `auth_type` and non-empty concrete scopes;
+- `unscoped` — requires `auth_type`, empty scopes, and a non-empty `reason`;
+- `ambient` — requires empty scopes and a non-empty `reason`.
+
+`none` and `scoped` can be pass-eligible after policy checks. `unscoped` and
+`ambient` always require review. Omitted, partial, invalid, or conflicting
+authority produces `insufficient_evidence`. Global `permissions.scopes` proves
+manifest coverage only; it does not fill missing per-action authority.
+
+`actions[].scopes` is the action's permission list with or without a reviewed
+authority: a row that lists scopes and declares no `authority` at either site
+still publishes them as the action's `required_scopes` *and* as its authority
+scopes. Listing scopes is not the same as reviewing authority — such a row
+still reports `missing_authority_evidence` and cannot be pass-eligible. A
+declared list replaces the source's own scopes, so it may broaden them;
+dropping a scope a `scoped` source proves is a conflict
+(`conflicting_authority_evidence`), on this route exactly as on a reviewed
+block's.
+
+### Authority declared once per source
+
+Authority is a fact about a deployment, not about a function: every action a
+tool source contributes normally runs with the same credential. Declare it once
+on the source instead of repeating it per action:
+
+```yaml
+tool_sources:
+  - id: salesforce
+    type: mcp
+    path: tools.json
+    authority:
+      mode: scoped
+      auth_type: oauth2
+      credential_mode: service_account
+      scopes: [api, refresh_token]
+```
+
+The modes and their co-requirements are exactly the ones listed above; the only
+difference is where `scopes` lives. (`authority.mode` is unrelated to the
+source's own `mode:` field, which selects the packaging shape of a
+`codex_plugin` source and means nothing for any other type.) An action row keeps its permission list in
+the sibling `actions[].scopes` field so the manifest has one canonical list per
+action; a source has no such sibling, so its scopes go inside the `authority`
+block.
+
+Precedence is most-specific-first, and both spellings are held to the same
+rules:
+
+- an `action_surface.actions[]` row that declares its own `authority` overrides
+  the source block for that action;
+- otherwise the source block applies to every action the source contributes;
+- otherwise the action's own published authority evidence stands.
+
+The two sites are alternatives, not a mixture: whichever one is operative
+supplies the **whole** authority record — mode, type, credential mode, and the
+permission list. An action that needs a list different from the rest of its
+source declares its own `authority` block alongside its `scopes`; a bare
+`scopes` list does not by itself make the action row operative.
+
+That one list is what every surface reports and judges: the action's
+`required_scopes`, the authority dimension's `scopes`, and the capability
+fact's — the capability standard requires them to agree — and it is the list
+the effect evidence reads, so a write-verb permission the manifest says an
+action requires still bounds that action's effect, whichever site asserted it.
+A source whose grant is wider than some of its actions need should say so per
+action; declaring the wider grant for all of them is the conservative reading
+and is treated as one.
+
+A reviewed declaration at either site may resolve missing source metadata and
+may broaden a scope set, but it may not replace a concrete published auth type
+or narrow a published scope set — that raises
+`conflicting_authority_evidence` on each action that disagrees, naming the
+block to correct. Neither site can stand in for authority a source publishes
+*ambiguously*: `partial_authority_evidence` is preserved whatever the manifest
+declares, and the repair is in the source.
+
+Because one block answers for every action of its source, the declaration
+questionnaire asks it once. `report.json` carries the block that answers each
+question as `declaration_questions.open_questions[].answer_path`, and the
+matching `evidence_gaps[]` row is emitted once for the source with
+`subject_kind: tool_source`, naming how many actions are waiting on it.
+
+Explicit declarations enrich operation, scopes, approval, safeguards, and
+evidence. Effect resolution remains monotonic across source and declaration
+claims: a declared effect may conservatively strengthen structural evidence,
+but a weaker declaration emits `SHIP-ACTION-EFFECT-DOWNGRADE-DECLARED` and
+cannot erase the stronger effect.
+
+Monotonicity also holds against evidence that is *not* policy-eligible, at the
+review tier rather than the blocking one. Escalating past a heuristic
+observation is silent. Declaring an effect **weaker** than one the scan
+inferred raises `declaration_below_inferred_evidence`: the declaration stays
+operative — a heuristic never drives the verdict — but the action is not
+evidence-backed-pass until a reviewer either raises `effect` to the inferred
+value or acknowledges the difference:
+
+```yaml
+action_surface:
+  actions:
+    - tool: send_email_preview
+      effect: read
+      override:
+        evidence: agents/refund_agent.py renders a template; no client is built
+        reason: the name matches the comms heuristic but nothing is sent
+```
+
+Both `evidence` and `reason` are required and must contain visible content — whitespace, controls, bidi marks, and zero-width or other Default_Ignorable
+code points render as nothing to the reviewer the block exists for — and
+`override` requires a declared `effect` to acknowledge. Both rules are
+published in [`docs/manifest-v0.1.json`](manifest-v0.1.json), so an editor
+validating live gives the same answer the CLI does. An acknowledged override is
+accepted — the action is pass-eligible again — and is always reported as one
+semantic review concern, so a run carrying one never reads `passed`.
+
+`override` acknowledges *inferred* evidence only. Where policy-eligible source
+evidence outranks the declaration the conflict remains
+`conflicting_effect_evidence`, blocking, and the row says the override does not
+reach it. Source evidence that agrees with the declared value does not exempt
+the row either — a tool declaring `read` beside `readOnlyHint: true` is still
+challenged by a heuristic that reads higher, because a scan with no declaration
+already refuses to pass on that annotation alone (`inferred_effect_only`), and
+because annotations are content the tool source supplies about itself. The
+agreeing source is named in the row instead, so the override is one line to
+write. The manifest row's own `effect`, `risk_tags`, `scopes`, and `override`
+never count as agreeing evidence for itself. Manual positive risk tags may escalate risk,
+but cannot prove read-only safety or independently close an effect gap. Setting
+inherited approval or safeguards from `true` to `false` emits
+`SHIP-ACTION-CONTROL-DOWNGRADE`.
+
+A reviewed `risk_tags` entry — and the `risk_overrides.tags` entry that says
+the same thing once for a whole selector — is the manifest **refining** the row
+it sits in, never source evidence contradicting it. Declaring
+`risk_tags: [destructive]` beside `effect: read` accounts for a destructive
+observation *and* makes the destructive controls apply. It is not a downgrade
+and it is not a conflict, which is what makes the second route out of
+`declaration_below_inferred_evidence` — "set `risk_tags: [X]` so the X controls
+apply to this action" — an edit that closes the row it is printed on.
+
+A tag **adds** a category to the declared effect rather than replacing it, so
+the obligations of both stand. Beside `effect: read`, which obliges nothing,
+that is the same answer as declaring the category as the effect; beside a
+positive effect it is not — `effect: external_communication` with a financial
+tag owes confirmation as well as approval, audit, and idempotency, where
+`effect: financial_write` alone owes no confirmation. The row's own repair
+therefore names the **whole** intended `risk_tags` value, existing entries
+included: `risk_tags` is one key, and a block naming it replaces it.
+
+A declared `scopes` grant is a different kind of statement and keeps its
+blocking behaviour: it asserts an independent fact about what the action is
+permitted to do, so a write-verb grant beside a weaker `effect` stays
+`conflicting_effect_evidence`. So does anything the source itself supplies —
+protocol annotations, the source's own scopes, a typed provider fact.
+
+### Pinning an answer to its evidence
+
+Declarations are matched by name, so without a pin a year-old `effect: write`
+keeps passing after the function stops writing — nothing ever re-opens a
+declaration. `basis` records **which evidence this row's effect answer was
+given against**:
+
+```yaml
+action_surface:
+  actions:
+    - tool: send_email
+      effect: external_communication
+      basis: confirmed:5c6cee20f81b
+```
+
+Every scan re-derives the value from what it reads about that action and
+compares. Equal is complete silence. Different re-opens the question as a
+`declaration_drift` evidence gap that names what the action reads as *now*,
+carries the new pin, and is closed by re-reading the evidence and writing it.
+
+The pin is a fact about the scan, not a judgement you own, so
+`suggested-declarations.yaml` fills it in beside any effect answer it offers —
+keep it as written. It records what was readable, never that anyone read it,
+and it can never make an action pass-eligible by itself.
+
+The digest covers the effects the scan **observed** for the action, not the
+producers that observed them: a second heuristic reading an effect you already
+answered is not new information, so shipgate releases that add one do not
+re-open every pinned declaration at once. A reading appearing or disappearing
+does move it.
+
+`basis` requires an `effect` or non-empty `risk_tags` to pin — the two routes
+that answer the effect dimension — and takes the shape `confirmed:<hex>`. To
+pin a declaration that predates the field, write any short placeholder
+(`basis: confirmed:0`) and rescan: the `declaration_drift` row it raises names
+the exact value to write. Omitting `basis` is always legal and behaves exactly
+as manifests did before it existed.
+
+`declaration_drift` is a different statement from
+`declaration_below_inferred_evidence`. That one asks whether the declaration is
+*weaker than* today's evidence; this one asks whether today's evidence is the
+evidence that was answered at all. A change that adds a stronger reading raises
+both, and each is closed by a different edit.
+
+Agents Shipgate still creates an action fact for every loaded tool when no
+declaration is present; set
+`require_explicit_actions: true` to emit `SHIP-ACTION-UNDECLARED` for tools
+that lack an explicit action declaration.
+
+Action facts are derived from loaded tool records after manifest enrichment and
+one normalized semantic assessment. Checks, policies, capability facts, and the
+release decision consume that same assessment; they do not independently infer
+a safer effect or mutate the action surface snapshot.
+
+Action IDs are deterministic. By default they use:
+
+```text
+{agent_id}:{source_type}:{source_id_or_provider}:{operation}
+```
+
+`source_id_or_provider` resolves as `actions[].provider`, then the loaded
+tool's `source_id`, then `source_type` when no source ID exists. Dotted tool
+names are treated as operation text, not provider metadata; declare
+`actions[].provider` when the source cannot provide one. OpenAPI operations
+normalize to `METHOD /path`. MCP and SDK-derived tools default to the loaded
+tool name. Treat `action_id` as an opaque stable identifier in downstream
+tools; use the structured `provider`, `source_type`, `source_id`, and
+`operation` fields on `action_surface_facts.actions[]` when you need to inspect
+components. You may set `actions[].id` when you need a stable explicit action
+ID across source refactors.
+
+`policies[]` rules match actions by `action_ids`, `tools`, `effects`,
+`risk_tags`, or `scopes`. User-declared policies and built-in control policies
+are evaluated against the full current action surface even when no base diff
+exists. Diff checks add change-specific findings for expansions, escalations,
+and removed controls; they do not decide whether current controls are
+evaluated. The `require` map uses dot paths over the action
+fact, with aliases for `approval.required`, `approval.threshold`, and `scopes`.
+Known `require` paths are type-checked at manifest load time; boolean controls
+such as `safeguards.audit_log` must use YAML booleans (`true`/`false`), not
+quoted strings.
+When `block: true`, policy findings set `findings[].blocks_release` and
+participate in `release_decision.blockers` when active and unbaselined.
+
+Canonical action risk tags are:
+
+| Tag | Meaning |
+|---|---|
+| `read_only` | Read-only action surface. |
+| `writes_data` | Mutates application or customer data. |
+| `destructive` | Deletes, cancels, revokes, terminates, or otherwise destroys state. |
+| `financial_write` | Creates or changes payments, refunds, invoices, charges, or billing state. |
+| `external_communication` | Sends or posts content outside the agent boundary, including customer email or messages. |
+| `production_ops` | Deploys, restarts, scales, rolls back, or changes production infrastructure. |
+| `privileged_data` | Reads privileged, sensitive, or regulated data. |
+| `identity_access` | Creates, changes, invites, revokes, or reads identity and permission state. |
+| `code_execution` | Executes code, shell commands, scripts, or dynamic runtime logic. |
+| `network_access` | Performs network access beyond a bounded local data source. |
+| `filesystem_write` | Writes to the filesystem. |
+| `customer_data` | Reads or writes customer data. |
+| `secret_access` | Reads or writes secrets, tokens, keys, or credentials. |
+| `irreversible` | Produces effects that cannot be rolled back reliably. |
+
+Manifest risk tag aliases accepted for compatibility are normalized before
+policy evaluation: `write` -> `writes_data`, `external_write`,
+`customer_communication`, and `external_side_effect` ->
+`external_communication`, `financial_action` -> `financial_write`,
+`infrastructure_change` and `production_operation` -> `production_ops`,
+`sensitive_data_access` and `privileged_data_access` -> `privileged_data`.
+
+Known `policies[].require` paths:
+
+| Path | Type |
+|---|---|
+| `approval.required` | boolean |
+| `approval.threshold` | string |
+| `safeguards.idempotency` | boolean |
+| `safeguards.audit_log` | boolean |
+| `safeguards.rollback` | boolean |
+| `safeguards.dry_run` | boolean |
+| `evidence.owner` | string |
+| `evidence.runbook` | string |
+| `evidence.approval_ticket` | string |
+| `effect` | one of `read`, `write`, `destructive`, `external_communication`, `financial_write`, `production_operation`, `privileged_data_access`, `code_execution`, `identity_access` |
+| `scopes` / `required_scopes` | list of strings |
+| `risk_tags` | list of strings |
+| `input_fields` | list of strings |
+| `required_input_fields` | list of strings |
+| `provider` | string |
+| `source_type` | string |
+| `source_id` | string |
+| `operation` | string |
+| `input_schema_hash` | string |
+
+Built-in current-surface action policies are the *control pack* selected by
+`policies.control_pack` (see [Control Packs](#control-packs)). Under the
+`default` pack they require approval, audit logging, and idempotency for
+financial writes; approval, confirmation, and rollback for destructive actions;
+confirmation and audit logging for external communication; and approval for
+production operations and code execution. They also cover wildcard/admin
+scopes. Diff-only findings add severity for effect escalation, declared
+effect/control downgrades, approval removal, and safeguard removal.
+
 ## Validation Evidence Artifacts
 
 The optional top-level `validation` block declares local human-in-the-loop
@@ -363,6 +1013,8 @@ validation:
   evidence:
     approval_traces:
       - path: validation/approval-traces.jsonl
+    agent_traces:
+      - path: validation/agent-traces.jsonl
     override_logs:
       - path: validation/override-log.jsonl
     high_risk_exclusions:
@@ -395,7 +1047,7 @@ promotion control is absent. Present local evidence does not certify runtime
 enforcement. Reports and packets include `source_provenance[]` entries so a
 reviewer can trace each HITL evidence source back to local files:
 
-- `type`: `approval_trace`, `override_log`, `high_risk_exclusion`,
+- `type`: `approval_trace`, `agent_trace`, `override_log`, `high_risk_exclusion`,
   `promotion_criteria`, or `manifest_requirement`
 - `ref`: relative local path, or the manifest filename
 - `location`: `ref#<json-pointer>`; whole-file sources use `path#`
@@ -403,16 +1055,23 @@ reviewer can trace each HITL evidence source back to local files:
   `loaded`, or `loaded_with_warnings`
 - `detail`: deterministic local context, with no timestamps or absolute paths
 
-`approval_traces` are JSON arrays or JSONL. They use the same normalized trace
-fields as OpenAI API traces:
+`approval_traces` and `agent_traces` are JSON arrays or JSONL. They use the
+same normalized trace fields as OpenAI API traces:
 
 ```json
-{"tool_name":"issue_refund","approved":true,"success":true}
+{"tool_name":"issue_refund","approved":true,"confirmed":true,"success":true}
 ```
 
 A JSON object without a recognized list key is treated as one trace event for
 compatibility with the existing trace loader; prefer arrays or JSONL for
 multi-event files.
+
+Trace normalization keeps only allowlisted scalar fields: `tool_name`, optional
+`provider`, `operation`, `capability_id`, `approved`, `confirmed`, `success`,
+`error`, `reason`, `actor`, `trace_id`, `run_id`, `call_id`, and `timestamp`.
+Prompts, messages, tool arguments, tool outputs, and arbitrary payload bodies
+are discarded before report/packet output. `agent_traces` are audit-only unless
+they support an existing validation evidence requirement.
 
 `override_logs` are JSON arrays or JSONL. The scanner reads only the
 framework-neutral fields below and preserves other fields for the producing
@@ -534,7 +1193,14 @@ If `wildcard: true` is combined with a non-empty `tools` array, the source is re
 
 ## Suppressions
 
-Suppressions require a reason and match by `check_id` plus optional `tool` name.
+Suppressions require a reason and match by `check_id` plus an optional tool
+selector (`tool`, `tool_id`, `provider`, `source_type`, or `source_id`). They
+operate only on Findings; unlike action declarations and control policies, an
+unresolved or ambiguous suppression selector is an inert no-op and does not
+create a semantic identity gap on an unrelated tool. Existing stale-
+suppression checks still surface the configuration as a catalog-level review
+finding, and the underlying target finding remains active, so a typo cannot
+hide a finding or make the verdict more permissive.
 
 ```yaml
 checks:
@@ -546,10 +1212,98 @@ checks:
 
 Suppressed findings remain in the JSON report with `suppressed: true`.
 
+## Control Packs
+
+`policies.control_pack` selects which controls each action effect requires. It
+is one answer for the repository, not one per tool: an organization's control
+requirements are a property of the organization, and asking per tool is what
+breeds the copy-paste that breeds wrong answers.
+
+```yaml
+policies:
+  control_pack: default   # default | financial-strict | read-only-agent
+```
+
+| Pack | The posture it encodes |
+|---|---|
+| `default` | Shipgate's built-in requirements. Money, destruction, production operations, code execution, and outbound communication carry controls; a plain write or a privileged read carries none. |
+| `financial-strict` | **Recoverability and record.** Every state change is logged and retry-safe, production operations are reversible, financial writes are confirmed, and privileged reads leave a trail. |
+| `read-only-agent` | **Permission.** This agent reads; any state change, outbound message, or privileged read is an exception carrying approval and an audit trail. Nothing is forbidden — a static scanner cannot forbid — but every non-read has to have been signed for. |
+
+Omitting the key means `default`; every existing manifest keeps its verdict.
+
+Row by row, with `—` meaning the pack requires no control for that effect
+(`test_the_documented_pack_matrix_matches_the_packs` keeps this table equal to
+the tables in `core/control_packs.py`):
+
+| Effect | `default` | `financial-strict` | `read-only-agent` |
+|---|---|---|---|
+| `read` | — | — | — |
+| `privileged_data_access` | — | `safeguards.audit_log` | `approval.required`, `safeguards.audit_log` |
+| `write` | — | `safeguards.audit_log`, `safeguards.idempotency` | `approval.required`, `safeguards.audit_log` |
+| `external_communication` | `confirmation policy`, `safeguards.audit_log` | `approval.required`, `confirmation policy`, `safeguards.audit_log` | `approval.required`, `confirmation policy`, `safeguards.audit_log` |
+| `code_execution` | `approval.required` | `approval.required`, `safeguards.audit_log` | `approval.required`, `safeguards.audit_log` |
+| `financial_write` | `approval.required`, `safeguards.audit_log`, `safeguards.idempotency` | `approval.required`, `confirmation policy`, `safeguards.audit_log`, `safeguards.idempotency` | `approval.required`, `confirmation policy`, `safeguards.audit_log`, `safeguards.idempotency` |
+| `identity_access` | — | `approval.required`, `safeguards.audit_log` | `approval.required`, `safeguards.audit_log` |
+| `production_operation` | `approval.required` | `approval.required`, `safeguards.audit_log`, `safeguards.rollback` | `approval.required`, `safeguards.audit_log` |
+| `destructive` | `approval.required`, `confirmation policy`, `safeguards.rollback` | `approval.required`, `confirmation policy`, `safeguards.audit_log`, `safeguards.rollback` | `approval.required`, `confirmation policy`, `safeguards.audit_log`, `safeguards.rollback` |
+
+`confirmation policy` is the one row-level control that is not an
+`action_surface.actions[]` field: it is satisfied from
+`policies.require_confirmation_for_tools`, which is why the finding names the
+policy rather than a key nobody can write.
+
+**A pack can only tighten the gate.** Every built-in pack requires at least
+what `default` requires, checked at import and pinned by a test, so choosing
+one can cost work but never coverage — and a report that passes under any pack
+would also have passed under `default`.
+
+**A pack decides which control findings fire, never what a declaration means.**
+The obligation lattice that decides whether a declared effect covers an
+inferred one is the built-in table, unaffected by the selection: a pack that
+required the same controls for two effects still cannot let a declaration of
+one discharge the other.
+
+Effects with no control check of their own — `write`, `privileged_data_access`,
+`identity_access` — report a pack obligation through
+`SHIP-ACTION-POLICY-VIOLATION` at `high`, with the rule named in
+`findings[].evidence.policy_id` as `control-pack:<effects>`. That prefix is
+reserved: an `action_surface.policies[].id` using it is rejected at manifest
+load, the same way `SHIP-` is reserved for built-in check ids. Like the four
+dedicated control families, these are mandatory current-surface controls — a
+`checks.ignore` entry records the exception but does not waive the blocker —
+and that is decided from `evidence.control_pack`, which only the engine
+writes, never from the id string alone.
+
+Switching to a stricter pack changes the `missing` list on a control finding
+whose requirements grew, and therefore its fingerprint — a baseline entry
+accepting the narrower gap stops matching and the finding re-opens. That is the
+intended direction: an acceptance recorded under looser rules should not carry
+into stricter ones. A move between two packs that require the *same* controls
+for an effect re-opens nothing, because the rule did not change.
+
+Moving to a pack that requires *less* of some effect is a release-policy
+weakening, and `verify --base` reports it: `SHIP-VERIFY-POLICY-WEAKENED` with
+`kind: control_pack_weakened`, one finding per pack move, naming every effect
+that lost a control. Changing the pack to make a scan pass is the thing that
+check exists to catch.
+
+`shipgate init --control-pack <id>` writes the selection. `init --json`
+reports it under `control_pack`: `requested` is what the invocation asked for,
+`selected` is what the manifest **on disk** carries (`null` when there is none
+or it does not load — a second `init` over an existing manifest writes
+nothing, and reporting the request there would describe a file it did not
+write), and `available` lists every pack this CLI knows. That list is also the
+capability probe: a CLI that predates control packs emits no `control_pack`
+key, and one that predates the *field* rejects a manifest carrying it with a
+routable config error rather than ignoring a release rule.
+
 ## Policy Packs
 
 v0.4 supports local declarative YAML policy packs for organization-specific
-rules. Policy packs are static data: Agents Shipgate reads YAML and never
+rules. These are *additional* rules matched against the tool surface, and are
+independent of the control pack above: the control pack parameterizes the
+built-in checks, while a policy pack adds rules of its own. Policy packs are static data: Agents Shipgate reads YAML and never
 imports Python or executes pack code.
 
 ```yaml
@@ -591,6 +1345,12 @@ Supported match fields are `risk_tags`, `source_types`,
 `missing_idempotency_policy`, and `parameters`. Parameter predicates support
 `name`, `names`, `types`, `missing_maximum`, and `required`.
 
+Policy-pack `owner`, `reviewers`, and `approval` fields are non-enforcing
+routing metadata. They appear in reports as `findings[].policy_routing`, not as
+`Finding.evidence`, and do not affect fingerprints, suppressions, baselines, or
+release decisions. Use deterministic `match` predicates to decide whether a
+rule fires, and `block: true` to make a matched rule release-blocking.
+
 ## Severity Overrides
 
 Teams can re-rank built-in and policy-pack checks without forking the scanner:
@@ -618,9 +1378,17 @@ risk_overrides:
       reason: "This endpoint only reads refund status."
 ```
 
+`remove_tags` may remove keyword/regex hints only. Attempting to remove an
+HTTP-method, protocol, scope, typed-provider, or manually declared risk claim
+is a configuration error. Removing a heuristic tag does not remove the
+underlying semantic claim or make an uncertain action pass-eligible.
+
 ## CI Failure Policy
 
-`ci.mode: advisory` exits `0` by default. `ci.mode: strict` exits `20` on unsuppressed `critical` findings by default. Configuration, input parsing, and internal scanner errors use `2`, `3`, and `4`.
+`ci.mode: advisory` exits `0` by default. `ci.mode: strict` exits `20` on
+unsuppressed `critical` findings by default and on a semantic
+`insufficient_evidence` decision regardless of finding severity. Configuration,
+input parsing, and internal scanner errors use `2`, `3`, and `4`.
 
 Override the failing severities with `ci.fail_on`:
 

@@ -1,0 +1,29 @@
+name: Agents Shipgate Self Dogfood
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-self:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+
+      - uses: ./
+        with:
+          config: shipgate-self.yaml
+          verify_mode: verify
+          ci_mode: advisory
+          diff_base: target
+          # Same advisory semantics as agents-shipgate.yml: fail only on
+          # blocked/unknown; human_review_required is decided by the PR
+          # reviewer, not by a CI state nothing can clear.
+          fail_on_merge_verdicts: "blocked,unknown"
+          upload_artifact: "true"
+          pr_comment: "false"

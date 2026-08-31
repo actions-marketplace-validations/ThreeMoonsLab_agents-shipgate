@@ -5,9 +5,9 @@ and AI search engines (ChatGPT, Claude, Perplexity, Google AI Overviews).
 
 ## What is agents-shipgate?
 
-agents-shipgate is a static, manifest-first scanner that catches risky
-agent tool configurations at PR time. It is a CLI and GitHub Action.
-Open source, Apache-2.0.
+agents-shipgate is the deterministic merge gate for AI-generated agent
+capability changes — a local-first, static Tool-Use Readiness review. It is a
+CLI and GitHub Action. Open source, Apache-2.0.
 
 ## What is agent release readiness?
 
@@ -15,6 +15,13 @@ Agent release readiness is the static pre-flight review of an AI agent's
 release artifact before promotion. For agents-shipgate, that artifact is the
 checked-in manifest, declared tool surface, schemas, scopes, policies, prompts,
 and release evidence that describe what the agent can do.
+
+## Is Agents Shipgate an agent release-readiness tool?
+
+Yes. Agents Shipgate fits the agent release-readiness slot in CI. Its current
+wedge is Tool-Use Readiness: reviewing tool inventory, schemas, scopes,
+approval policies, side effects, idempotency, and blast radius before an agent
+gets production-like permissions.
 
 ## What is tool-use readiness?
 
@@ -28,13 +35,14 @@ reviewable before production-like permissions are granted.
 An AI agent tool surface is the set of named, schemaed actions an agent can
 invoke at runtime. agents-shipgate reads tool surfaces from MCP exports,
 OpenAPI specs, OpenAI Agents SDK Python entrypoints, Anthropic Messages API
-artifacts, Google ADK, LangChain/LangGraph, CrewAI, and OpenAI API
-artifacts.
+artifacts, Google ADK, LangChain/LangGraph, CrewAI, OpenAI API artifacts,
+Codex repo config, Codex plugin packages and marketplaces, n8n workflow JSON,
+and Conductor OSS workflow JSON.
 
 ## How does agents-shipgate work?
 
 agents-shipgate reads `shipgate.yaml` plus declared local tool sources,
-normalizes them into a static inventory, runs deterministic release-readiness
+normalizes them into a static inventory, runs deterministic Tool-Use Readiness
 checks, and writes Markdown, JSON, and optional SARIF reports. It does not run
 the agent, call tools, invoke LLMs, connect to MCP servers, or collect scanner
 telemetry by default.
@@ -84,6 +92,10 @@ See [`docs/trust-model.md`](trust-model.md) for the full disclosure.
 - LangChain/LangGraph Python entrypoints
 - CrewAI Python entrypoints
 - OpenAI API artifacts (prompts + function schemas + response formats)
+- Codex repo config (static parsing)
+- Codex plugin packages and marketplaces (static parsing)
+- n8n workflow JSON and source-control stubs (static parsing)
+- Conductor OSS workflow JSON (static MCP-core extraction)
 
 See [`docs/manifest-v0.1.md`](manifest-v0.1.md) for the full manifest
 schema.
@@ -92,35 +104,55 @@ schema.
 
 - **Markdown** — `agents-shipgate-reports/report.md`, for human review.
 - **JSON** — `agents-shipgate-reports/report.json`, machine-readable
-  (schema v0.10, current). Always parse this for programmatic use.
+  (schema v0.42, current). Always parse this for programmatic use.
   For release gating, read `release_decision.decision`; the legacy
-  `summary.status` field is baseline-blind (kept for v0.7 callers).
+  `summary.status` field is baseline-blind (kept for v0.7 callers). A
+  `passed` decision requires complete, conflict-free static surface, effect,
+  and authority evidence for every action, evaluation of all applicable
+  controls, and no policy condition requiring review. It is not runtime proof;
+  see the [evidence-backed verdict contract](passed-verdict-contract.md).
 - **SARIF** — `agents-shipgate-reports/report.sarif`, compatible with
   GitHub's code-scanning UI on the Files Changed view.
 - **Release Evidence Packet** — `agents-shipgate-reports/packet.{md,json,html}`
-  (and `packet.pdf` with the `[pdf]` extras). Reviewer-shaped, ten
-  always-present sections. See the next question.
+  (and `packet.pdf` with the `[pdf]` extras). Reviewer-shaped fixed
+  sections. See the next question.
 
 ## What is the Release Evidence Packet?
 
 A reviewer-shaped synthesis of the scan, emitted alongside the report by
-default. The packet is governed by [`docs/packet-schema.v0.3.json`](packet-schema.v0.3.json)
-and has ten always-present sections (release decision, capability/intent,
-high-risk surface, approval coverage, idempotency risk, scope coverage,
-memory isolation, human-in-the-loop, dynamic scenarios, and a
+default. The packet is governed by [`docs/packet-schema.v0.17.json`](packet-schema.v0.17.json)
+and has fixed reviewer sections (release decision, evidence matrix, capability/intent,
+high-risk surface, tool-surface diff, action-surface diff, approval coverage,
+idempotency risk, scope coverage, memory isolation, human-in-the-loop,
+dynamic scenarios, and a
 `not_proven` section that always lists prompt robustness, runtime
 behavior, model correctness, and adversarial resistance verbatim). See
-[STABILITY.md §Release Evidence Packet](../STABILITY.md#release-evidence-packet-v03).
-Packet schema v0.3 also includes HITL runtime-control disclaimer text and
-local HITL source provenance when validation evidence artifacts are available.
+[STABILITY.md §Release Evidence Packet](../STABILITY.md#release-evidence-packet-v017).
+Packet schema `0.9` adds semantic coverage and gap remediation, and packet §1
+mirrors the report's `static_analysis_only: true`,
+`runtime_behavior_verified: false`, and canonical
+`static_verdict_disclaimer`. Frozen packet
+schema `0.7` added capability-linked local trace evidence summary and trace
+refs under the human-in-the-loop section. Frozen schema `0.6` preserved
+the v0.5 `action_surface_diff` section and added two additive extensions:
+`evidence_matrix`, a compact packet-only review aid derived from public
+`report.json` fields (never contributes to `release_decision`, CI exit
+behavior, severity, suppression, baseline matching, or `agent_summary`; blocker
+and review-item cells are copied from `release_decision`); and
+`ReleaseDecisionItem.{source, policy_evidence_source}` so packet §1 / §2 carry
+the same reviewer-grade dual-source provenance pointers `Finding.source` /
+`Finding.policy_evidence_source` expose in the report.
 Skip emission with `--no-packet`; re-render later with
 `agents-shipgate evidence-packet --from agents-shipgate-reports/packet.json`.
 
 ## Is it production-ready?
 
-v0.10.0 is the latest released version. The manifest schema is stable
-across the 0.x series; see [`STABILITY.md`](../STABILITY.md). Used by
-early design partners. Public preview.
+v0.15.0 is the latest published pre-1.0 beta. The in-tree runtime is
+`0.16.0b7`, which adds content-addressed verification receipts and reproducible
+distributed-execution boundaries on top of typed policy evidence, the
+multi-host boundary, and root-reachable binding contracts. The manifest schema
+remains stable across the 0.x series; see
+[`STABILITY.md`](../STABILITY.md). Public preview.
 
 ## How do I add it to GitHub Actions?
 
@@ -155,9 +187,9 @@ surfaced in the PR comment but doesn't fail the build.
 
 ## Does it certify my agent as safe?
 
-No. agents-shipgate is an advisory release-readiness scanner, not a
-safety or compliance certification. It produces evidence for human
-review; it does not replace human review. See
+No. agents-shipgate is an advisory Tool-Use Readiness release gate, not a
+safety or compliance certification. It produces evidence for human review; it
+does not replace human review. See
 [`docs/trust-model.md`](trust-model.md).
 
 ## Why "agents-shipgate" and not "agent-shipgate" or "agent shipcheck"?

@@ -1,18 +1,28 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar, Literal
 
-from agents_shipgate.config.schema import ToolSourceConfig
+from agents_shipgate.core.domain import (
+    AuthInfo,
+    LoadedToolSource,
+    SourceSurfaceOmission,
+    Tool,
+)
 from agents_shipgate.core.errors import InputParseError
-from agents_shipgate.core.models import AuthInfo, LoadedToolSource, Tool
 from agents_shipgate.inputs.common import (
     load_structured_file_with_positions,
     manifest_relative_path,
     resolve_input_path,
     schema_to_parameters,
     stable_tool_id,
+    strip_untrusted_binding_annotations,
     tool_name_warning,
+)
+from agents_shipgate.inputs.protocol import LoadedAdapterResult
+from agents_shipgate.schemas.manifest import (
+    AgentsShipgateManifest,
+    ToolSourceConfig,
 )
 
 
@@ -42,9 +52,7 @@ def load_mcp_tools(source: ToolSourceConfig, base_dir: Path) -> LoadedToolSource
             # branch so reviewers jump to the offending line — `wildcard:
             # true` and `tools: '*'` are different signals on different
             # lines.
-            wildcard_pointer = (
-                "/wildcard" if data.get("wildcard") is True else "/tools"
-            )
+            wildcard_pointer = "/wildcard" if data.get("wildcard") is True else "/tools"
             wildcard_pos = positions.lookup(wildcard_pointer)
             wildcard_start_line: int | None = None
             wildcard_start_column: int | None = None
@@ -78,14 +86,45 @@ def load_mcp_tools(source: ToolSourceConfig, base_dir: Path) -> LoadedToolSource
         raise InputParseError(f"MCP tools file must contain a tools array: {path}")
 
     tools: list[Tool] = []
+    omissions: list[SourceSurfaceOmission] = []
     seen_names: set[str] = set()
+
+    def _omit(index: int, reason: str, warning: str, detail: str) -> None:
+        """Record a dropped entry as a fact, not only as prose.
+
+        These two branches are real omissions: the entry is read, refused, and
+        never reaches the catalog. Saying so in a typed record is what lets the
+        exclusion ledger account for it without mapping every warning — most of
+        which are about tools that *did* load — to a missing subject.
+        """
+
+        warnings.append(warning)
+        omissions.append(
+            SourceSurfaceOmission(
+                subject=f"{pointer_prefix or '/tools'}/{index}",
+                reason=reason,
+                detail=detail,
+                warning=warning,
+            )
+        )
+
     for index, raw in enumerate(raw_tools):
         if not isinstance(raw, dict):
-            warnings.append("Skipping non-object MCP tool entry")
+            _omit(
+                index,
+                "unreadable_entry",
+                "Skipping non-object MCP tool entry",
+                "The entry is not an object, so no tool could be read from it.",
+            )
             continue
         name = raw.get("name")
         if not name:
-            warnings.append("Skipping MCP tool without name")
+            _omit(
+                index,
+                "unnamed_entry",
+                "Skipping MCP tool without name",
+                "The entry declares no name, so it cannot enter the catalog.",
+            )
             continue
         name_text = str(name)
         if name_text in seen_names:
@@ -95,8 +134,19 @@ def load_mcp_tools(source: ToolSourceConfig, base_dir: Path) -> LoadedToolSource
             warnings.append(warning)
         input_schema = _first_present(raw, ["inputSchema", "input_schema"]) or {}
         output_schema = _first_present(raw, ["outputSchema", "output_schema"]) or {}
-        annotations = raw.get("annotations") or {}
-        auth = raw.get("auth") or {}
+        raw_annotations = raw.get("annotations") or {}
+        annotations: dict[str, Any] = {}
+        if isinstance(raw_annotations, dict):
+            annotations, rejected_binding_keys = strip_untrusted_binding_annotations(
+                raw_annotations
+            )
+            if rejected_binding_keys:
+                warnings.append(
+                    f"MCP tool {name_text!r} contains reserved binding annotations "
+                    f"that were ignored: {', '.join(rejected_binding_keys)}"
+                )
+        raw_auth = raw.get("auth")
+        auth_explicit = "auth" in raw
         pointer = f"{pointer_prefix}/{index}"
         pos = positions.lookup(pointer)
         source_start_line: int | None = None
@@ -120,13 +170,8 @@ def load_mcp_tools(source: ToolSourceConfig, base_dir: Path) -> LoadedToolSource
             input_schema=input_schema if isinstance(input_schema, dict) else {},
             output_schema=output_schema if isinstance(output_schema, dict) else {},
             parameters=schema_to_parameters(input_schema),
-            annotations=annotations if isinstance(annotations, dict) else {},
-            auth=AuthInfo(
-                type=auth.get("type") if isinstance(auth, dict) else None,
-                scopes=list(auth.get("scopes") or []) if isinstance(auth, dict) else [],
-                credential_mode=auth.get("credential_mode") if isinstance(auth, dict) else None,
-                source="mcp",
-            ),
+            annotations=annotations,
+            auth=_mcp_auth_info(raw_auth, explicit=auth_explicit),
             owner=raw.get("owner"),
             extraction_confidence="high",
             extraction={"method": "mcp_json", "confidence": "high"},
@@ -138,6 +183,7 @@ def load_mcp_tools(source: ToolSourceConfig, base_dir: Path) -> LoadedToolSource
         source_type="mcp",
         tools=tools,
         warnings=warnings,
+        omissions=omissions,
     )
 
 
@@ -146,3 +192,100 @@ def _first_present(raw: dict[str, Any], names: list[str]) -> Any:
         if name in raw:
             return raw[name]
     return None
+
+
+def _mcp_auth_info(raw_auth: Any, *, explicit: bool) -> AuthInfo:
+    invalid: list[str] = []
+    if not explicit:
+        return AuthInfo(source="mcp")
+    if not isinstance(raw_auth, dict):
+        return AuthInfo(
+            source="mcp",
+            explicit=True,
+            invalid_annotations=["auth must be an object"],
+        )
+
+    raw_type = raw_auth.get("type")
+    auth_type = raw_type.strip() if isinstance(raw_type, str) else None
+    if raw_type is not None and not auth_type:
+        invalid.append("auth.type must be a non-blank string")
+
+    raw_scopes = raw_auth.get("scopes", [])
+    scopes: list[str] = []
+    if not isinstance(raw_scopes, list):
+        invalid.append("auth.scopes must be a list of non-blank strings")
+    else:
+        for raw_scope in raw_scopes:
+            if not isinstance(raw_scope, str) or not raw_scope.strip():
+                invalid.append("auth.scopes must contain non-blank strings")
+                continue
+            scopes.append(raw_scope.strip())
+
+    required = raw_auth.get("required")
+    if "required" in raw_auth and type(required) is not bool:
+        invalid.append("auth.required must be an exact boolean")
+
+    raw_credential_mode = raw_auth.get("credential_mode")
+    credential_mode = (
+        raw_credential_mode.strip()
+        if isinstance(raw_credential_mode, str)
+        else None
+    )
+    if raw_credential_mode is not None and not credential_mode:
+        invalid.append("auth.credential_mode must be a non-blank string")
+
+    raw_mode = raw_auth.get("mode")
+    valid_modes = {"none", "scoped", "unscoped", "ambient"}
+    if raw_mode is not None and (not isinstance(raw_mode, str) or raw_mode not in valid_modes):
+        invalid.append("auth.mode must be one of none, scoped, unscoped, ambient")
+        mode = "unknown"
+    elif isinstance(raw_mode, str):
+        mode = raw_mode
+    elif required is False:
+        mode = "none"
+    elif auth_type and scopes:
+        mode = "scoped"
+    elif auth_type:
+        mode = "unscoped"
+    else:
+        mode = "unknown"
+
+    if mode == "none" and (required is True or auth_type or scopes):
+        invalid.append("auth.mode none conflicts with required credentials")
+    elif required is False and mode != "none":
+        invalid.append("auth.required false conflicts with authenticated mode")
+    elif mode == "scoped" and (not auth_type or not scopes):
+        invalid.append("auth.mode scoped requires auth.type and concrete scopes")
+    elif mode == "unscoped" and (not auth_type or scopes):
+        invalid.append("auth.mode unscoped requires auth.type and empty scopes")
+    elif mode == "ambient" and scopes:
+        invalid.append("auth.mode ambient requires empty scopes")
+
+    if invalid:
+        mode = "unknown"
+    return AuthInfo(
+        type=auth_type,
+        scopes=scopes,
+        credential_mode=credential_mode,
+        source="mcp",
+        mode=mode,
+        explicit=True,
+        invalid_annotations=invalid,
+    )
+
+
+class MCPAdapter:
+    """``ToolSourceAdapter`` wrapping :func:`load_mcp_tools`."""
+
+    source_type: ClassVar[str] = "mcp"
+    scope: ClassVar[Literal["per_source", "per_scan"]] = "per_source"
+    artifact_class: ClassVar[type | None] = None
+
+    def load(
+        self,
+        source: ToolSourceConfig | None,
+        base_dir: Path,
+        manifest: AgentsShipgateManifest,
+    ) -> LoadedAdapterResult:
+        assert source is not None, "per_source adapter requires a source"
+        return LoadedAdapterResult(tool_sources=[load_mcp_tools(source, base_dir)])

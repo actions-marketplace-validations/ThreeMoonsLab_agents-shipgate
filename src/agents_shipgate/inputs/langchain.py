@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar, Literal
 
-from agents_shipgate.config.schema import AgentsShipgateManifest
-from agents_shipgate.core.models import LangChainArtifacts, LoadedToolSource, Tool
+from agents_shipgate.core.artifact_models import LangChainArtifacts
+from agents_shipgate.core.domain import (
+    LoadedToolSource,
+    Tool,
+)
 from agents_shipgate.inputs._python_framework import (
     assignment_call,
     assignment_target,
@@ -18,6 +21,8 @@ from agents_shipgate.inputs._python_framework import (
     unique_tools,
 )
 from agents_shipgate.inputs.common import tool_name_warning
+from agents_shipgate.inputs.config_trace import trace_config_binding
+from agents_shipgate.inputs.protocol import LoadedAdapterResult
 from agents_shipgate.inputs.python_static import (
     dotted_name,
     first_string_arg,
@@ -27,6 +32,10 @@ from agents_shipgate.inputs.python_static import (
     keyword_string,
     last_name,
     pydantic_model_schemas,
+)
+from agents_shipgate.schemas.manifest import (
+    AgentsShipgateManifest,
+    ToolSourceConfig,
 )
 
 TOOL_DECORATOR_MODULES = {"langchain.tools", "langchain_core.tools"}
@@ -83,6 +92,11 @@ class _LangChainExtractor:
         self.tool_vars: dict[str, Tool] = {}
         self.discovered_tools: list[Tool] = []
         self.list_vars: dict[str, list[str] | None] = {}
+        self.call_targets = {
+            id(call): assignment_target(node)
+            for node in ordered_nodes(self.tree, (ast.Assign, ast.AnnAssign))
+            if (call := assignment_call(node)) is not None
+        }
         self.warnings: list[str] = []
 
     def extract(self) -> tuple[list[Tool], list[str]]:
@@ -186,24 +200,37 @@ class _LangChainExtractor:
 
     def _record_tool_surface(self, call: ast.Call) -> None:
         call_kind = last_name(call.func)
+        agent_name = self.call_targets.get(id(call)) or "root"
         if call_kind in AGENT_BINDING_CALLS:
             tools_expr = keyword(call, "tools")
             if tools_expr is None and len(call.args) > 1:
                 tools_expr = call.args[1]
-            self._record_binding("agent", call, tools_expr)
+            self._record_binding("agent", call, tools_expr, agent_name)
         elif call_kind == "ToolNode":
-            self._record_binding("tool_node", call, call.args[0] if call.args else None)
+            self._record_binding("tool_node", call, call.args[0] if call.args else None, agent_name)
         elif isinstance(call.func, ast.Attribute) and call.func.attr == "bind_tools":
-            self._record_binding("bind_tools", call, call.args[0] if call.args else keyword(call, "tools"))
+            self._record_binding("bind_tools", call, call.args[0] if call.args else keyword(call, "tools"), agent_name)
 
-    def _record_binding(self, kind: str, call: ast.Call, tools_expr: ast.AST | None) -> None:
+    def _record_binding(
+        self,
+        kind: str,
+        call: ast.Call,
+        tools_expr: ast.AST | None,
+        agent_name: str,
+    ) -> None:
         if tools_expr is None:
             return
         names = self._resolve_tool_names(tools_expr)
         if names is None:
-            self._dynamic(kind, call.lineno, dynamic_reason(tools_expr))
+            self._dynamic(kind, call.lineno, dynamic_reason(tools_expr), expr=tools_expr)
             return
-        record = {"source_ref": self.source_ref, "line": call.lineno, "tools": names}
+        record = {
+            "agent": agent_name,
+            "source_id": self.source_id,
+            "source_ref": self.source_ref,
+            "line": call.lineno,
+            "tools": names,
+        }
         if kind == "tool_node":
             self.artifacts.tool_nodes.append(record)
         else:
@@ -260,8 +287,25 @@ class _LangChainExtractor:
             {"name": tool.name, "source_ref": self.source_ref, "line": source_line(tool.source_location)}
         )
 
-    def _dynamic(self, kind: str, line: int, reason: str) -> None:
-        surface = {"kind": kind, "source_ref": self.source_ref, "line": line, "reason": reason}
+    def _dynamic(
+        self, kind: str, line: int, reason: str, *, expr: ast.AST | None = None
+    ) -> None:
+        surface: dict[str, Any] = {
+            "kind": kind,
+            "source_ref": self.source_ref,
+            "line": line,
+            "reason": reason,
+        }
+        # Config-bound capability detection: when the dynamic tools
+        # expression is statically traceable to a config read, record the
+        # binding on the surface fact. Purely additive — an untraceable
+        # expression leaves the fact byte-identical to the legacy shape.
+        if isinstance(expr, ast.expr):
+            trace = trace_config_binding(expr, tree=self.tree, line=line)
+            if trace.binding == "config":
+                surface["config_binding"] = "config"
+                if trace.config_path:
+                    surface["config_path"] = trace.config_path
         self.artifacts.dynamic_tool_surfaces.append(surface)
         self.warnings.append(
             f"LangChain {kind} at {self.source_ref}:{line} has dynamic tool surface: {reason}."
@@ -303,3 +347,25 @@ def _decorator_tool_name(decorator: ast.Call | ast.Name) -> str | None:
 
 def _decorator_description(decorator: ast.Call | ast.Name) -> str | None:
     return keyword_string(decorator, "description") if isinstance(decorator, ast.Call) else None
+
+
+class LangChainAdapter:
+    """``ToolSourceAdapter`` wrapping :func:`load_langchain_artifacts`.
+
+    Framework-scoped. The dispatcher invokes ``load()`` once per scan
+    when either a ``tool_sources`` entry of type ``langchain`` or the
+    top-level ``manifest.langchain`` section is configured.
+    """
+
+    source_type: ClassVar[str] = "langchain"
+    scope: ClassVar[Literal["per_source", "per_scan"]] = "per_scan"
+    artifact_class: ClassVar[type | None] = LangChainArtifacts
+
+    def load(
+        self,
+        source: ToolSourceConfig | None,
+        base_dir: Path,
+        manifest: AgentsShipgateManifest,
+    ) -> LoadedAdapterResult:
+        loaded_sources, artifacts = load_langchain_artifacts(manifest, base_dir)
+        return LoadedAdapterResult(tool_sources=loaded_sources, artifact=artifacts)

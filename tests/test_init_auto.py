@@ -4,14 +4,17 @@ The auto-default produces a *valid* shipgate.yaml that scans cleanly
 against the real loaders, replacing v0.5's CHANGE_ME-heavy template for
 workspaces that already look like agent projects.
 
-``--minimal`` preserves byte-exact compatibility with the v0.5 output.
+``--minimal`` preserves the v0.5 output, except for the ``tool_sources``
+ids it shares with the auto renderer (see the issue #307 section below).
 """
 
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 
+import pytest
 import yaml
 from typer.testing import CliRunner
 
@@ -19,9 +22,16 @@ from agents_shipgate.cli.discovery import (
     detect_workspace,
     render_auto_manifest,
     render_manifest_template,
+    source_ids,
+)
+from agents_shipgate.cli.discovery.source_ids import (
+    MAX_SOURCE_ID_LENGTH,
+    _digest,
+    assign_source_ids,
+    source_id_for,
 )
 from agents_shipgate.cli.main import app
-from agents_shipgate.config.schema import AgentsShipgateManifest
+from agents_shipgate.schemas.manifest import AgentsShipgateManifest
 
 SAMPLES = Path(__file__).resolve().parent.parent / "samples"
 
@@ -48,7 +58,7 @@ def _validates(text: str) -> AgentsShipgateManifest:
 def test_auto_init_langchain_emits_valid_manifest_with_python_source(tmp_path: Path) -> None:
     workspace = _copy_sample("simple_langchain_agent", tmp_path / "lc")
     detect = detect_workspace(workspace)
-    text = render_auto_manifest(workspace, detect)
+    text = render_auto_manifest(workspace, detect).text
     manifest = _validates(text)
     assert any(
         s.type == "langchain" and s.path == "agent.py"
@@ -61,7 +71,7 @@ def test_auto_init_anthropic_emits_artifact_block_not_tool_source(tmp_path: Path
     NOT as a tool_sources entry."""
     workspace = _copy_sample("simple_anthropic_agent", tmp_path / "anth")
     detect = detect_workspace(workspace)
-    text = render_auto_manifest(workspace, detect)
+    text = render_auto_manifest(workspace, detect).text
     manifest = _validates(text)
     # Must NOT have an "anthropic" tool source (no such type).
     assert not any(s.type == "anthropic" for s in manifest.tool_sources)
@@ -78,7 +88,7 @@ def test_auto_init_adk_extracts_agent_name_from_literal(tmp_path: Path) -> None:
     must use this for ``agent.name`` (not the dir name, not pyproject)."""
     workspace = _copy_sample("google_adk_agent", tmp_path / "adk")
     detect = detect_workspace(workspace)
-    text = render_auto_manifest(workspace, detect)
+    text = render_auto_manifest(workspace, detect).text
     manifest = _validates(text)
     assert manifest.agent.name == "adk_support_agent"
     assert any(s.type == "google_adk" for s in manifest.tool_sources)
@@ -87,7 +97,7 @@ def test_auto_init_adk_extracts_agent_name_from_literal(tmp_path: Path) -> None:
 def test_auto_init_openai_api_emits_full_artifact_block(tmp_path: Path) -> None:
     workspace = _copy_sample("simple_openai_api_agent", tmp_path / "openai")
     detect = detect_workspace(workspace)
-    text = render_auto_manifest(workspace, detect)
+    text = render_auto_manifest(workspace, detect).text
     manifest = _validates(text)
     assert manifest.openai_api is not None
     assert manifest.openai_api.prompt_files == ["prompts/support_refund.md"]
@@ -98,7 +108,7 @@ def test_auto_init_empty_workspace_falls_back_to_change_me_stub(tmp_path: Path) 
     """No detected framework → emit a CHANGE_ME tool_sources entry so the
     schema (which requires ≥ 1 source/config block) still passes."""
     detect = detect_workspace(tmp_path)
-    text = render_auto_manifest(tmp_path, detect)
+    text = render_auto_manifest(tmp_path, detect).text
     manifest = _validates(text)
     assert any(s.id == "CHANGE_ME" for s in manifest.tool_sources)
 
@@ -110,7 +120,7 @@ def test_minimal_template_byte_exact_to_legacy_output(tmp_path: Path) -> None:
         "openapi: 3.1.0\ninfo:\n  title: T\n  version: '1'\npaths: {}\n",
         encoding="utf-8",
     )
-    legacy = render_manifest_template(tmp_path.resolve())
+    legacy = render_manifest_template(tmp_path.resolve()).text
     runner = CliRunner()
     result = runner.invoke(
         app,
@@ -158,7 +168,7 @@ def test_artifact_only_openai_workspace_emits_openai_api_block(tmp_path: Path) -
     (workspace / "tools" / "openai-tools.json").write_text("[]", encoding="utf-8")
 
     detect = detect_workspace(workspace)
-    text = render_auto_manifest(workspace, detect)
+    text = render_auto_manifest(workspace, detect).text
     manifest = _validates(text)
     assert manifest.openai_api is not None
     assert manifest.openai_api.prompt_files == ["prompts/support.md"]
@@ -176,7 +186,7 @@ def test_artifact_only_openai_workspace_does_not_emit_anthropic_block(tmp_path: 
     (workspace / "tools" / "openai-tools.json").write_text("[]", encoding="utf-8")
 
     detect = detect_workspace(workspace)
-    text = render_auto_manifest(workspace, detect)
+    text = render_auto_manifest(workspace, detect).text
     assert "openai_api:" in text
     assert "anthropic:" not in text
 
@@ -244,3 +254,530 @@ def test_init_auto_flag_is_accepted_as_no_op(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0
     assert (workspace / "shipgate.yaml").exists()
+
+
+# --- Cold-start regression: unparseable glob matches must never be written ---
+# Found by mining stripe/ai at cd8cee5 (PR #232 era): a Cursor plugin
+# `mcp.json` is an mcpServers-style host config that matches the `*mcp*.json`
+# suggestion glob. init --write used to declare it as an `mcp` tool source,
+# and the very next documented step — `scan -c shipgate.yaml` — exited 3 with
+# "MCP tools file must contain a tools array".
+
+_CURSOR_PLUGIN_MCP = """{
+  "mcpServers": {
+    "stripe": {
+      "command": "npx",
+      "args": ["-y", "@stripe/mcp", "--tools=all"],
+      "env": {"STRIPE_SECRET_KEY": "sk_test_CHANGE_ME"}
+    }
+  }
+}
+"""
+
+_MCP_TOOLS_EXPORT = """{
+  "tools": [
+    {
+      "name": "create_payment_link",
+      "description": "Create a payment link for an order checkout flow.",
+      "inputSchema": {"type": "object", "properties": {"amount": {"type": "integer"}}}
+    }
+  ]
+}
+"""
+
+
+def _cursor_config_workspace(tmp_path: Path, *, with_export: bool) -> Path:
+    workspace = tmp_path / "ws"
+    plugin_dir = workspace / "providers" / "cursor" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "mcp.json").write_text(_CURSOR_PLUGIN_MCP, encoding="utf-8")
+    if with_export:
+        tools = workspace / "tools"
+        tools.mkdir()
+        (tools / "payments-mcp.json").write_text(_MCP_TOOLS_EXPORT, encoding="utf-8")
+    return workspace
+
+
+def test_cold_start_init_then_scan_with_mcpservers_config_present(tmp_path: Path) -> None:
+    """init must never write a tool_sources entry the scan input adapters
+    reject: the documented cold-start flow is `init --write` → `scan`, and
+    one poison entry breaks it out of the box on real repos."""
+    import json as _json
+
+    workspace = _cursor_config_workspace(tmp_path, with_export=True)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app, ["init", "--workspace", str(workspace), "--write", "--json"]
+    )
+    assert result.exit_code == 0, result.output
+    payload = _json.loads(result.output)
+    assert payload["created"] is True
+    excluded = payload["auto_detected"]["excluded_sources"]
+    assert [entry["path"] for entry in excluded] == ["providers/cursor/plugin/mcp.json"]
+    assert "mcpServers" in excluded[0]["reason"]
+
+    manifest_text = (workspace / "shipgate.yaml").read_text(encoding="utf-8")
+    manifest = _validates(manifest_text)
+    # The real export is declared; the host config is hinted, never declared.
+    assert [s.path for s in manifest.tool_sources] == ["tools/payments-mcp.json"]
+    assert "#   providers/cursor/plugin/mcp.json" in manifest_text
+
+    scan_result = runner.invoke(
+        app, ["scan", "--config", str(workspace / "shipgate.yaml")]
+    )
+    assert scan_result.exit_code == 0, scan_result.output
+    assert "Input parsing error" not in scan_result.output
+
+
+def test_init_config_only_workspace_writes_stub_not_poison_source(tmp_path: Path) -> None:
+    """With ONLY the host config present, init falls back to the CHANGE_ME
+    stub (pre-existing empty-workspace contract) and hints the excluded
+    file — it must not declare the config as a tool source."""
+    workspace = _cursor_config_workspace(tmp_path, with_export=False)
+    runner = CliRunner()
+    result = runner.invoke(app, ["init", "--workspace", str(workspace), "--write"])
+    assert result.exit_code == 0, result.output
+    assert "Excluded 1 detected file(s)" in result.output
+    manifest_text = (workspace / "shipgate.yaml").read_text(encoding="utf-8")
+    manifest = _validates(manifest_text)
+    assert all(
+        s.path != "providers/cursor/plugin/mcp.json" for s in manifest.tool_sources
+    )
+    assert any(s.id == "CHANGE_ME" for s in manifest.tool_sources)
+    assert "#   providers/cursor/plugin/mcp.json" in manifest_text
+
+
+def test_minimal_template_excludes_mcpservers_config(tmp_path: Path) -> None:
+    """The legacy --minimal discovery path shares the parse probe: the host
+    config must not appear as a tool source there either."""
+    workspace = _cursor_config_workspace(tmp_path, with_export=True)
+    template = render_manifest_template(workspace.resolve()).text
+    assert "tools/payments-mcp.json" in template
+    assert "providers/cursor/plugin/mcp.json" not in template
+
+
+# --- Repeated basenames must not collide into one id (issue #307) ---
+# Found on usestrix/strix, a real OpenAI Agents SDK project: one `tool.py`
+# per tool package (`strix/tools/finish/tool.py`, `.../respond/tool.py`, …)
+# plus several `*/tools.py` modules. Ids derived from the basename alone
+# produced `openai_sdk_tool` three times, and the schema rejects a manifest
+# whose `tool_sources[].id` values repeat — so auto-init wrote nothing at
+# all on a conventional Python layout.
+
+_FUNCTION_TOOL_MODULE = """from agents import function_tool
+
+
+@function_tool
+def do_thing(target: str) -> str:
+    \"\"\"Do the thing.\"\"\"
+    return target
+"""
+
+
+def _openai_sdk_workspace(root: Path, relative_paths: list[str]) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "pyproject.toml").write_text(
+        '[project]\nname = "strixlike"\ndependencies = ["openai-agents"]\n',
+        encoding="utf-8",
+    )
+    for relative in relative_paths:
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(_FUNCTION_TOOL_MODULE, encoding="utf-8")
+    return root
+
+
+_REPEATED_BASENAMES = [
+    "strix/tools/finish/tool.py",
+    "strix/tools/load_skill/tool.py",
+    "strix/tools/respond/tool.py",
+    "strix/agents/tools.py",
+    "strix/runtime/tools.py",
+]
+
+
+def test_auto_init_repeated_basenames_emit_unique_source_ids(tmp_path: Path) -> None:
+    workspace = _openai_sdk_workspace(tmp_path / "strixlike", _REPEATED_BASENAMES)
+    detect = detect_workspace(workspace)
+    manifest = _validates(render_auto_manifest(workspace, detect).text)
+
+    declared = {s.path for s in manifest.tool_sources}
+    assert declared == set(_REPEATED_BASENAMES)
+    ids = [s.id for s in manifest.tool_sources]
+    assert len(set(ids)) == len(ids)
+    # Derived from the whole relative path, so the id still names its file.
+    by_path = {s.path: s.id for s in manifest.tool_sources}
+    assert by_path["strix/tools/finish/tool.py"] == "openai_sdk_strix_tools_finish_tool"
+    assert by_path["strix/agents/tools.py"] == "openai_sdk_strix_agents_tools"
+
+
+def test_cold_start_init_then_scan_with_repeated_basenames(tmp_path: Path) -> None:
+    """The documented cold-start flow — `init --write` → `scan` — must
+    survive a repo that ships one `tool.py` per tool package. Before the
+    fix, `init` exited 4 with `internal_error` and wrote no manifest."""
+    import json as _json
+
+    workspace = _openai_sdk_workspace(tmp_path / "strixlike", _REPEATED_BASENAMES)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app, ["init", "--workspace", str(workspace), "--write", "--json"]
+    )
+    assert result.exit_code == 0, result.output
+    payload = _json.loads(result.output)
+    assert payload["created"] is True
+
+    scan_result = runner.invoke(
+        app, ["scan", "--config", str(workspace / "shipgate.yaml")]
+    )
+    assert scan_result.exit_code == 0, scan_result.output
+    assert "Config error" not in scan_result.output
+
+
+def test_preview_then_init_scan_removes_preview_handoff(tmp_path: Path) -> None:
+    """A later scan must not expose the preview route as current evidence."""
+
+    workspace = _openai_sdk_workspace(
+        tmp_path / "preview-then-scan",
+        ["agent/tools.py"],
+    )
+    runner = CliRunner()
+
+    preview = runner.invoke(
+        app,
+        ["verify", "--workspace", str(workspace), "--preview", "--json"],
+    )
+    assert preview.exit_code == 0, preview.output
+    reports = workspace / "agents-shipgate-reports"
+    handoff_path = reports / "agent-handoff.json"
+    verifier_path = reports / "verifier.json"
+    pr_comment_path = reports / "pr-comment.md"
+    preview_handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+    assert preview_handoff["operation"] == "verify_preview"
+    assert preview_handoff["control"]["state"] == "agent_action_required"
+    assert verifier_path.is_file()
+    assert pr_comment_path.is_file()
+
+    initialized = runner.invoke(
+        app,
+        ["init", "--workspace", str(workspace), "--write", "--json"],
+    )
+    assert initialized.exit_code == 0, initialized.output
+
+    scanned = runner.invoke(
+        app,
+        [
+            "scan",
+            "--config",
+            str(workspace / "shipgate.yaml"),
+            "--suggest-patches",
+        ],
+    )
+    assert scanned.exit_code == 0, scanned.output
+    report = json.loads((reports / "report.json").read_text(encoding="utf-8"))
+    assert report["release_decision"]["decision"] == "insufficient_evidence"
+    assert not handoff_path.exists()
+    assert not verifier_path.exists()
+    assert not pr_comment_path.exists()
+
+
+def test_auto_init_source_ids_are_stable_when_a_sibling_appears(tmp_path: Path) -> None:
+    """Ids carry no positional component: a file added earlier in the walk
+    must not renumber the entries after it, the way a `_2`/`_3` suffix
+    would. (The one case that does shift an existing id — a path that
+    sanitizes to the same string — is pinned below.)"""
+    before_ws = _openai_sdk_workspace(
+        tmp_path / "before", ["pkg/beta/tool.py", "pkg/gamma/tool.py"]
+    )
+    after_ws = _openai_sdk_workspace(
+        tmp_path / "after",
+        ["pkg/alpha/tool.py", "pkg/beta/tool.py", "pkg/gamma/tool.py"],
+    )
+
+    def ids_by_path(workspace: Path) -> dict[str, str]:
+        manifest = _validates(
+            render_auto_manifest(workspace, detect_workspace(workspace)).text
+        )
+        return {s.path: s.id for s in manifest.tool_sources}
+
+    before = ids_by_path(before_ws)
+    after = ids_by_path(after_ws)
+    assert before == {path: after[path] for path in before}
+
+
+def test_minimal_template_repeated_basenames_emit_unique_source_ids(
+    tmp_path: Path,
+) -> None:
+    """`--minimal` is the documented recovery path, and it had the same
+    basename-only id rule — with no validation gate, so it wrote the
+    invalid manifest and `scan` failed on it with a config error."""
+    workspace = tmp_path / "services"
+    spec = (
+        "openapi: 3.1.0\ninfo:\n  title: T\n  version: '1'\npaths:\n"
+        "  /thing:\n    get:\n      operationId: get_thing\n"
+        "      responses:\n        '200':\n          description: ok\n"
+    )
+    for service in ("billing", "support"):
+        target = workspace / service / "openapi.yaml"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(spec, encoding="utf-8")
+
+    manifest = _validates(render_manifest_template(workspace.resolve()).text)
+    ids = [s.id for s in manifest.tool_sources]
+    assert sorted(ids) == ["openapi_billing_openapi", "openapi_support_openapi"]
+
+
+def test_source_id_helper_disambiguates_identically_sanitized_paths() -> None:
+    # Sanitizing is lossy: `a-b/` and `a_b/` fold to the same string. Every
+    # member of the group takes a digest of its own path, so walk order
+    # never decides which one is renamed.
+    entries = [("openapi", "a-b/spec.yaml"), ("openapi", "a_b/spec.yaml")]
+    collided = assign_source_ids(entries)
+    assert len(set(collided)) == 2
+    assert all(value.startswith("openapi_a_b_spec_") for value in collided)
+    # Assignment is a pure function of the entries, not of the call.
+    assert collided == assign_source_ids(entries)
+    # Reordering the same set renames the same files, not different ones.
+    assert dict(zip([p for _t, p in entries], collided, strict=True)) == dict(
+        zip(
+            [p for _t, p in reversed(entries)],
+            assign_source_ids(list(reversed(entries))),
+            strict=True,
+        )
+    )
+
+    # Unknown source types (third-party adapters) keep their own name.
+    assert source_id_for("my_custom_source", "specs/api.yaml") == (
+        "my_custom_source_specs_api"
+    )
+
+
+def test_source_ids_shift_only_for_entries_whose_ids_collide(
+    tmp_path: Path,
+) -> None:
+    """The narrowed stability guarantee, pinned in both directions.
+
+    An id is a pure function of its own path *unless it collides* with
+    another entry's id; then both members take a digest, so the one that
+    was already there changes too. Making that file-local would mean a
+    digest on every id, including the readable common ones. Nothing
+    outside the collision is re-keyed.
+    """
+    alone = assign_source_ids([("openapi", "a-b/spec.yaml")])
+    assert alone == ["openapi_a_b_spec"]
+
+    with_twin = assign_source_ids(
+        [("openapi", "a-b/spec.yaml"), ("openapi", "a_b/spec.yaml")]
+    )
+    assert with_twin[0] != alone[0]
+    assert with_twin[0].startswith("openapi_a_b_spec_")
+
+    # An unrelated third source is untouched by that group's rename.
+    with_bystander = assign_source_ids(
+        [
+            ("openapi", "a-b/spec.yaml"),
+            ("openapi", "a_b/spec.yaml"),
+            ("openapi", "billing/openapi.yaml"),
+        ]
+    )
+    assert with_bystander[:2] == with_twin
+    assert with_bystander[2] == "openapi_billing_openapi"
+
+
+def test_source_id_length_bound_holds_after_disambiguation() -> None:
+    """The cap is enforced on the value that ships, not on the value before
+    the collision digest is appended: two near-limit paths that sanitize
+    alike used to render 67-character ids."""
+    near_limit = ["a" * 20 + "/" + "b" * 20 + f"/spec{sep}one.yaml" for sep in "-_"]
+    plain = [source_id_for("openapi", path) for path in near_limit]
+    assert len(plain[0]) == 58 and plain[0] == plain[1]  # fits, and collides
+
+    resolved = assign_source_ids([("openapi", path) for path in near_limit])
+    assert len(set(resolved)) == 2
+    assert all(len(value) <= MAX_SOURCE_ID_LENGTH for value in resolved)
+
+    # A source-type prefix long enough to crowd out the digest is truncated
+    # too, so the bound holds for third-party adapter names of any length.
+    long_type = "my_" + "very_" * 15 + "custom_source"
+    assert len(source_id_for(long_type, "specs/api.yaml")) <= MAX_SOURCE_ID_LENGTH
+    long_prefix_collision = assign_source_ids(
+        [(long_type, "a-b/spec.yaml"), (long_type, "a_b/spec.yaml")]
+    )
+    assert len(set(long_prefix_collision)) == 2
+    assert all(len(v) <= MAX_SOURCE_ID_LENGTH for v in long_prefix_collision)
+
+    # Deep monorepo paths stay readable: most specific segments, then a
+    # digest of the full path so truncation cannot merge two files.
+    deep = source_id_for(
+        "openai_agents_sdk",
+        "packages/services/payments/src/agents/tools/refunds/tools.py",
+    )
+    assert len(deep) <= MAX_SOURCE_ID_LENGTH
+    assert deep.startswith("openai_sdk_")
+    assert "refunds_tools" in deep
+    assert deep != source_id_for(
+        "openai_agents_sdk",
+        "packages/services/billing/src/agents/tools/refunds/tools.py",
+    )
+
+
+def test_source_ids_stay_unique_when_a_plain_id_matches_a_digest_form() -> None:
+    """Contrived but constructible: a file named after the digest another
+    entry will be given. `--minimal` has no validation gate behind it, so
+    the assignment must not hand a duplicate to the render — and it must
+    settle that conflict without re-keying anything else."""
+    twin_digest = _digest("a-b/spec.yaml", 8)
+    entries = [
+        ("openapi", "a-b/spec.yaml"),
+        ("openapi", "a_b/spec.yaml"),
+        ("openapi", f"a_b/spec_{twin_digest}.yaml"),
+        ("openapi", "billing/openapi.yaml"),
+    ]
+    # The third file's plain id is exactly what the first one is renamed to.
+    assert source_id_for(*entries[2]) == f"openapi_a_b_spec_{twin_digest}"
+
+    resolved = assign_source_ids(entries)
+    assert len(set(resolved)) == 4
+    assert all(len(value) <= MAX_SOURCE_ID_LENGTH for value in resolved)
+    # Only the two entries that actually tied move to the wider digest: the
+    # third member of the sanitized class keeps its 8-hex id, and the
+    # bystander keeps the id its own path produced.
+    assert resolved[1] == f"openapi_a_b_spec_{_digest('a_b/spec.yaml', 8)}"
+    assert resolved[3] == "openapi_billing_openapi"
+
+
+# The pair below shares an 8-hex SHA-256 prefix *and* one sanitized class,
+# so the first disambiguation round hands both entries the same id. Found by
+# enumerating the 2**17 `-`/`_` spellings of one path and looking for a
+# repeated digest — seconds of work, which is why a digest prefix cannot be
+# treated as a unique key.
+_DIGEST_PREFIX_TWINS = (
+    "a_b_c-d_e-f-g_h_i-j_k_l_m-n-o-p_q_r/spec.yaml",
+    "a-b_c_d-e_f_g_h-i-j-k_l-m_n_o-p_q-r/spec.yaml",
+)
+
+
+def test_source_ids_survive_a_real_digest_prefix_collision() -> None:
+    first, second = _DIGEST_PREFIX_TWINS
+    assert source_id_for("openapi", first) == source_id_for("openapi", second)
+    assert _digest(first, 8) == _digest(second, 8)
+
+    resolved = assign_source_ids([("openapi", first), ("openapi", second)])
+    assert len(set(resolved)) == 2
+    assert all(len(value) <= MAX_SOURCE_ID_LENGTH for value in resolved)
+    # Settled by widening, not by numbering: still a digest of each path.
+    assert resolved[0].endswith(_digest(first, 16))
+    assert resolved[1].endswith(_digest(second, 16))
+
+
+def test_source_ids_number_tied_paths_when_every_digest_width_collides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Uniqueness must not rest on an assumption about the hash. With the
+    digest forced to collide at every width, the tied paths are numbered in
+    sorted-path order — a property of the set, not of the walk."""
+    monkeypatch.setattr(source_ids, "_digest", lambda path, width: "f" * width)
+    entries = [
+        ("openapi", "a-b/spec.yaml"),
+        ("openapi", "a_b/spec.yaml"),
+        ("openapi", "a.b/spec.yaml"),
+    ]
+
+    resolved = assign_source_ids(entries)
+    assert len(set(resolved)) == 3
+    assert all(len(value) <= MAX_SOURCE_ID_LENGTH for value in resolved)
+    # "a-b" < "a.b" < "a_b" by path, so that is the numbering order.
+    assert [resolved[0][-2:], resolved[2][-2:], resolved[1][-2:]] == ["_0", "_1", "_2"]
+    assert assign_source_ids(list(reversed(entries))) == list(reversed(resolved))
+
+
+def test_init_writes_the_adk_root_agent_not_the_first_sub_agent(tmp_path: Path) -> None:
+    """End-to-end for #324. The failure this guards is not a crash: the
+    manifest was schema-valid and named a real agent in the repository, just
+    the wrong one. A reviewer skimming ``agent.name`` had no signal that the
+    declared identity was a worker rather than the coordinator — which is
+    why the JSON now carries the rank and the reason behind it.
+    """
+    workspace = tmp_path / "smart_closer"
+    workspace.mkdir()
+    (workspace / "config.py").write_text(
+        'import os\n\nAGENT_NAME = os.environ.get("AGENT_NAME", "SmartCloserAgent")\n',
+        encoding="utf-8",
+    )
+    (workspace / "agent.py").write_text(
+        "from config import AGENT_NAME\n"
+        "from google.adk.agents import LlmAgent\n"
+        "from google.adk.apps import App\n"
+        "from google.adk.tools import FunctionTool\n\n"
+        'salesforce_agent = LlmAgent(name="SalesforceAgent")\n'
+        'sap_agent = LlmAgent(name="SapAgent")\n'
+        "root_agent = LlmAgent(\n"
+        "    name=AGENT_NAME,\n"
+        "    sub_agents=[salesforce_agent, sap_agent],\n"
+        "    tools=[FunctionTool(func=lambda: None)],\n"
+        ")\n"
+        'app = App(name="smart_closer_app", root_agent=root_agent)\n',
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app, ["init", "--workspace", str(workspace), "--write", "--json"]
+    )
+    assert result.exit_code == 0, result.output
+
+    payload = json.loads(result.output)
+    auto = payload["auto_detected"]
+    assert auto["agent_name"] == "SmartCloserAgent"
+
+    yaml_text = (workspace / "shipgate.yaml").read_text(encoding="utf-8")
+    assert "name: SmartCloserAgent" in yaml_text
+    assert "SalesforceAgent" not in yaml_text
+    _validates(yaml_text)
+
+    candidates = auto["agent_name_candidates"]
+    assert candidates[0]["value"] == "SmartCloserAgent"
+    assert candidates[0]["role"] == "root_agent"
+    assert candidates[0]["rank_score"] > candidates[1]["rank_score"]
+    # The ranking has to be explicable from the output alone, or the next
+    # ordering regression is indistinguishable from correct behaviour.
+    assert candidates[0]["rationale"]
+    assert {c["role"] for c in candidates if c["value"].endswith("Agent")} == {
+        "root_agent",
+        "sub_agent",
+    }
+
+
+def test_init_leaves_change_me_when_every_candidate_fails_the_floor(
+    tmp_path: Path,
+) -> None:
+    """#320's fail-closed path. A context-poor literal must not be asserted
+    as the agent identity; the manifest keeps its placeholder, the JSON
+    reports no name, and the placeholder list carries ``agent.name`` so the
+    caller is told what to fix."""
+    workspace = tmp_path / "scaffold"
+    workspace.mkdir()
+    (workspace / "main.py").write_text(
+        "from agents import Agent, function_tool\n\n"
+        "@function_tool\ndef ping() -> str:\n    return 'pong'\n\n"
+        'agent = Agent(name="t", tools=[ping])\n',
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app, ["init", "--workspace", str(workspace), "--write", "--json"]
+    )
+    assert result.exit_code == 0, result.output
+
+    payload = json.loads(result.output)
+    assert payload["auto_detected"]["agent_name"] is None
+    assert "name: CHANGE_ME" in (workspace / "shipgate.yaml").read_text(
+        encoding="utf-8"
+    )
+    assert "agent.name" in {entry["path"] for entry in payload["placeholders"]}
+
+    rejected = next(
+        c for c in payload["auto_detected"]["agent_name_candidates"] if c["value"] == "t"
+    )
+    assert rejected["selectable"] is False
+    assert any("context-poor" in reason for reason in rejected["rationale"])

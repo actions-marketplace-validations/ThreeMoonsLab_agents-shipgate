@@ -1,0 +1,577 @@
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import Any
+
+from agents_shipgate.core.verification_identity import validate_receipt_artifacts
+from agents_shipgate.schemas.agent_control import validate_agent_control
+from agents_shipgate.schemas.verification_identity import VerificationReceipt
+
+TRUST_ROOT_CHECK_ID = "SHIP-VERIFY-TRUST-ROOT-TOUCHED"
+POLICY_WEAKENING_CHECK_ID = "SHIP-VERIFY-POLICY-WEAKENED"
+POLICY_BASE_ABSENT_CHECK_ID = "SHIP-VERIFY-POLICY-BASE-ABSENT"
+# Both reason codes report on the release-policy surface; only a git-proven
+# first adoption clears the weakened flag. Mirrors
+# ``agents_shipgate.core.policy_reason_codes``, restated here because this
+# script reads emitted JSON and must stay importable on its own.
+POLICY_REASON_CODES = frozenset(
+    {POLICY_WEAKENING_CHECK_ID, POLICY_BASE_ABSENT_CHECK_ID}
+)
+ADOPTION_EVIDENCE_KIND = "manifest_introduced"
+MERGE_VERDICTS = {
+    "blocked",
+    "human_review_required",
+    "insufficient_evidence",
+    "unknown",
+    "mergeable",
+}
+
+
+#: Evaluation states in which the trigger published no verdict at all. A
+#: workflow must not read either as a skip.
+_WITHHELD_STATUSES = frozenset({"unclassified", "not_evaluated"})
+
+
+def clean(value: object) -> str:
+    # `value or ""` would emit 0 as "", which breaks workflow checks
+    # like `if: outputs.blocker_count == '0'`. Treat None as empty;
+    # stringify everything else, including 0 and False.
+    text = "" if value is None else str(value)
+    return text.replace("\r", "").replace("\n", "")
+
+
+def bool_clean(value: object) -> str:
+    if isinstance(value, bool):
+        return str(value).lower()
+    return clean(value)
+
+
+def trigger_action(trigger: dict[str, Any]) -> str:
+    """Project the trigger's *winning* verdict for workflow consumption.
+
+    Two ways this used to disagree with the runtime it projects:
+
+    - it read the raw ``stop_conditions_fired`` bit first, so the stop+run
+      case — a matched capability rule overriding a whole-workspace negative,
+      which is exactly the ``.snap`` shape the catalog gained content
+      recognition for — was published as ``skip_shipgate`` while the runtime
+      said run. The Action reinstated the skip the runtime had just refused
+      (PR #404 review 2).
+    - both withheld states collapsed into ``none``, indistinguishable from a
+      trigger that ran and matched nothing. ``evaluation_status`` is exported
+      alongside so a workflow can tell them apart, and this now returns
+      ``withheld`` rather than a value that reads as a decision.
+
+    ``stop_conditions_terminal`` is absent from payloads written before that
+    field existed; there, a fired stop *was* terminal, which is the fallback.
+    """
+
+    if trigger and trigger.get("evaluation_status") in _WITHHELD_STATUSES:
+        return "withheld"
+    stop_decided = trigger.get(
+        "stop_conditions_terminal", trigger.get("stop_conditions_fired")
+    )
+    if trigger.get("force_run"):
+        return "force_run"
+    if trigger.get("should_run") or trigger.get("run_shipgate"):
+        return "run_shipgate"
+    if stop_decided:
+        return "skip_shipgate"
+    if trigger.get("dry_run_recommended"):
+        return "dry_run"
+    if trigger.get("skip_reason") in {"skip_rule", "stop_conditions"}:
+        return "skip_shipgate"
+    if trigger:
+        return "none"
+    return ""
+
+
+def merge_verdict_policy_exit_code(
+    merge_verdict: str,
+    fail_on_merge_verdicts: str,
+) -> int:
+    """Exit 20 when the merge verdict matches the opt-in policy."""
+    if not fail_on_merge_verdicts.strip():
+        return 0
+    normalized = _normalize_merge_verdict_token(merge_verdict)
+    if not normalized:
+        return 21
+    for raw in fail_on_merge_verdicts.split(","):
+        token = _normalize_merge_verdict_token(raw)
+        if token not in MERGE_VERDICTS:
+            raise ValueError(
+                f"Unsupported fail_on_merge_verdicts value {raw!r}; "
+                f"expected one of {', '.join(sorted(MERGE_VERDICTS))}."
+            )
+        if token == normalized:
+            return 20
+    return 0
+
+
+def extract_outputs(output_dir: Path) -> dict[str, object]:
+    report_json = output_dir / "report.json"
+    report_markdown = output_dir / "report.md"
+    report_sarif = output_dir / "report.sarif"
+    verifier_json = output_dir / "verifier.json"
+    verify_run_json = output_dir / "verify-run.json"
+    agent_handoff_json = output_dir / "agent-handoff.json"
+    verification_receipt_json = output_dir / "verification-receipt.json"
+    pr_comment_markdown = output_dir / "pr-comment.md"
+    check_annotations_json = output_dir / "check-annotations.json"
+    capability_lock_json = output_dir / "capabilities.lock.json"
+    base_capability_lock_json = output_dir / "base.capabilities.lock.json"
+    capability_lock_diff_json = output_dir / "capability-lock-diff.json"
+    attestation_json = output_dir / "attestation.json"
+    org_evidence_bundle_json = output_dir / "org-evidence-bundle.json"
+    host_grants_json = output_dir / "host-grants.json"
+    org_status_json = output_dir / "org-status.json"
+
+    payload = _load_json(report_json)
+    verifier_payload = _load_json(verifier_json)
+    verify_run = _load_json(verify_run_json)
+    receipt: VerificationReceipt | None = None
+    if verifier_json.is_file() and verify_run.get("schema_version") == "shipgate.verify_run/v3":
+        receipt = VerificationReceipt.model_validate(_load_json(verification_receipt_json))
+        validate_receipt_artifacts(receipt, root=output_dir)
+        identities = {
+            "request_id": receipt.request_id,
+            "decision_id": receipt.decision_id,
+        }
+        for name, document in (
+            ("report", payload),
+            ("verifier", verifier_payload),
+            ("verify-run", verify_run),
+        ):
+            for key, expected in identities.items():
+                actual = document.get(key)
+                if actual != expected:
+                    raise ValueError(
+                        f"{name} {key} does not match the terminal verification receipt"
+                    )
+    summary = payload.get("summary") or {}
+    baseline = payload.get("baseline") or {}
+    adk_surface = (payload.get("frameworks") or {}).get("google_adk") or {}
+    release_decision = payload.get("release_decision") or {}
+    fail_policy = release_decision.get("fail_policy") or {}
+    tool_surface_diff = payload.get("tool_surface_diff") or {}
+    diff_summary = tool_surface_diff.get("summary") or {}
+    action_surface_diff = payload.get("action_surface_diff") or {}
+    action_diff_summary = action_surface_diff.get("summary") or {}
+    trigger = verifier_payload.get("trigger") or {}
+    matched_rules = trigger.get("matched_rules") or []
+    verifier_summary = payload.get("verifier_summary") or {}
+
+    capability_added, capability_modified, capability_removed = _capability_counts(
+        payload,
+        verifier_payload,
+        action_diff_summary,
+        diff_summary,
+    )
+    trust_root_touched, policy_weakened = _verifier_flags(
+        payload,
+        verifier_payload,
+    )
+    verifier_verdict = _verifier_verdict(release_decision, verifier_summary, verifier_payload)
+    merge_verdict = verifier_payload.get("merge_verdict") or _merge_verdict(verifier_verdict)
+    control, can_merge_without_human = _control_projection(
+        verifier_payload,
+        release_decision,
+    )
+
+    return {
+        "status": summary.get("status", ""),
+        "critical_count": summary.get("critical_count", 0),
+        "high_count": summary.get("high_count", 0),
+        "medium_count": summary.get("medium_count", 0),
+        "baseline_new_count": baseline.get("new_count", 0),
+        "baseline_matched_count": baseline.get("matched_count", 0),
+        "baseline_resolved_count": baseline.get("resolved_count", 0),
+        "adk_agent_count": adk_surface.get("agent_count", 0),
+        "adk_dynamic_toolset_count": adk_surface.get("dynamic_toolset_count", 0),
+        "report_json": report_json,
+        "report_markdown": report_markdown,
+        "report_sarif": report_sarif,
+        "verifier_json": verifier_json,
+        "verify_run_json": verify_run_json,
+        "agent_handoff_json": agent_handoff_json,
+        "verification_receipt_json": verification_receipt_json,
+        "run_id": verify_run.get("run_id", ""),
+        "request_id": receipt.request_id if receipt is not None else "",
+        "receipt_id": receipt.receipt_id if receipt is not None else "",
+        "decision_id": receipt.decision_id if receipt is not None else "",
+        "artifact_set_id": receipt.artifact_set_id if receipt is not None else "",
+        "pr_comment_markdown": pr_comment_markdown,
+        "check_annotations_json": check_annotations_json,
+        "capability_lock_json": capability_lock_json,
+        "base_capability_lock_json": base_capability_lock_json,
+        "capability_lock_diff_json": capability_lock_diff_json,
+        "attestation_json": attestation_json,
+        "org_evidence_bundle_json": org_evidence_bundle_json,
+        "host_grants_json": host_grants_json,
+        "org_status_json": org_status_json,
+        "decision": release_decision.get("decision", ""),
+        "blocker_count": len(release_decision.get("blockers") or []),
+        "review_item_count": len(release_decision.get("review_items") or []),
+        # v0.8+ output. Pinned older package versions emit no release_decision,
+        # so this stays false until the workflow installs v0.8+.
+        "ci_would_fail": str(bool(fail_policy.get("would_fail_ci"))).lower(),
+        "diff_enabled": str(bool(tool_surface_diff.get("enabled"))).lower(),
+        "action_diff_enabled": str(bool(action_surface_diff.get("enabled"))).lower(),
+        "actions_added": action_diff_summary.get("actions_added", 0),
+        "actions_modified": action_diff_summary.get("actions_modified", 0),
+        "actions_removed": action_diff_summary.get("actions_removed", 0),
+        "should_run": bool_clean(trigger.get("should_run", trigger.get("run_shipgate", ""))),
+        "trigger_action": trigger_action(trigger),
+        # Exported so a workflow can recover *why* `should_run` is empty:
+        # `unclassified` (read in full, classified nothing — run the scan) and
+        # `not_evaluated` (the diff could not be read — repair the input) call
+        # for different handling, and `trigger_action` alone cannot say which.
+        "trigger_evaluation_status": clean(trigger.get("evaluation_status")),
+        "trigger_rule_ids": ",".join(
+            clean(rule.get("id"))
+            for rule in matched_rules
+            if isinstance(rule, dict) and rule.get("id")
+        ),
+        "verifier_verdict": verifier_verdict,
+        "merge_verdict": merge_verdict,
+        "can_merge_without_human": str(can_merge_without_human).lower(),
+        "agent_control_state": control.get("state", ""),
+        "agent_control_reason": control.get("reason", ""),
+        "agent_controller_must_stop": str(bool(control.get("must_stop"))).lower(),
+        "agent_controller_stop_reason": control.get("stop_reason", ""),
+        "agent_controller_completion_allowed": str(bool(control.get("completion_allowed"))).lower(),
+        "trust_root_touched": str(trust_root_touched).lower(),
+        "policy_weakened": str(policy_weakened).lower(),
+        "capability_changes_added": capability_added,
+        "capability_changes_modified": capability_modified,
+        "capability_changes_removed": capability_removed,
+    }
+
+
+def _control_projection(
+    verifier_payload: dict[str, Any],
+    report_release_decision: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """Validate current control once and derive every compatibility mirror.
+
+    Legacy verifier artifacts have no ``control`` and retain their old
+    top-level fallback.  A current artifact with a malformed or contradictory
+    control fails closed instead of publishing mutually inconsistent GitHub
+    outputs.
+    """
+
+    raw = verifier_payload.get("control")
+    if raw is None:
+        legacy = verifier_payload.get("agent_controller") or {}
+        return (
+            legacy if isinstance(legacy, dict) else {},
+            bool(verifier_payload.get("can_merge_without_human")),
+        )
+
+    control_model = validate_agent_control(raw)
+    control = control_model.model_dump(mode="json")
+    execution = verifier_payload.get("execution") or verifier_payload.get("head_status")
+    applicability = verifier_payload.get("applicability")
+    embedded_release = verifier_payload.get("release_decision") or {}
+    decision = (
+        verifier_payload.get("decision")
+        or (embedded_release.get("decision") if isinstance(embedded_release, dict) else None)
+        or report_release_decision.get("decision")
+    )
+    expected = bool(
+        control_model.state == "complete"
+        and (
+            (execution == "succeeded" and decision == "passed")
+            or (
+                execution == "skipped"
+                and decision is None
+                and applicability in {None, "not_applicable"}
+            )
+        )
+    )
+    declared = verifier_payload.get("can_merge_without_human")
+    if declared is not None and bool(declared) != expected:
+        raise ValueError(
+            "verifier can_merge_without_human contradicts the canonical control projection"
+        )
+    if control_model.completion_allowed != expected:
+        raise ValueError(
+            "verifier control completion authority contradicts execution/applicability"
+        )
+    return control, expected
+
+
+def append_step_summary(output_dir: Path, values: dict[str, object]) -> None:
+    step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not step_summary:
+        return
+
+    payload = _load_json(output_dir / "report.json")
+    verifier_payload = _load_json(output_dir / "verifier.json")
+    verify_run = _load_json(output_dir / "verify-run.json")
+    release_decision = payload.get("release_decision") or {}
+    summary = payload.get("summary") or {}
+    fail_policy = release_decision.get("fail_policy") or {}
+    action_surface_diff = payload.get("action_surface_diff") or {}
+    action_diff_summary = action_surface_diff.get("summary") or {}
+    tool_surface_diff = payload.get("tool_surface_diff") or {}
+    diff_summary = tool_surface_diff.get("summary") or {}
+
+    blocker_count = len(release_decision.get("blockers") or [])
+    review_item_count = len(release_decision.get("review_items") or [])
+    would_fail_ci = str(bool(fail_policy.get("would_fail_ci"))).lower()
+    control = verifier_payload.get("control") or verifier_payload.get("agent_controller") or {}
+    first_next_action = (
+        control.get("next_action") or verifier_payload.get("first_next_action") or {}
+    )
+    with open(step_summary, "a", encoding="utf-8") as summary_file:
+        summary_file.write("## Agents Shipgate\n\n")
+        if verifier_payload:
+            summary_file.write(
+                f"- Merge verdict: `{clean(verifier_payload.get('merge_verdict'))}`\n"
+            )
+            if verify_run.get("run_id"):
+                summary_file.write(f"- Run ID: `{clean(verify_run.get('run_id'))}`\n")
+            summary_file.write(
+                f"- Can merge without human: `{clean(values.get('can_merge_without_human'))}`\n"
+            )
+            if isinstance(control, dict) and control:
+                summary_file.write(
+                    "- Agent control: "
+                    f"state=`{clean(values.get('agent_control_state'))}`, "
+                    f"must_stop=`{clean(values.get('agent_controller_must_stop'))}`, "
+                    f"completion_allowed="
+                    f"`{clean(values.get('agent_controller_completion_allowed'))}`"
+                )
+                if values.get("agent_controller_stop_reason"):
+                    summary_file.write(
+                        f", stop_reason=`{clean(values.get('agent_controller_stop_reason'))}`"
+                    )
+                summary_file.write("\n")
+            if isinstance(first_next_action, dict) and first_next_action:
+                actor = clean(first_next_action.get("actor"))
+                kind = clean(first_next_action.get("kind"))
+                action = "/".join(part for part in (actor, kind) if part)
+                if action:
+                    summary_file.write(f"- First next action: `{action}`\n")
+        if release_decision:
+            summary_file.write(f"- Release gate: `{clean(release_decision.get('decision'))}`\n")
+            agent_summary = payload.get("agent_summary") or {}
+            if agent_summary.get("headline"):
+                summary_file.write(f"- Summary: {clean(agent_summary.get('headline'))}\n")
+            summary_file.write(f"- Blockers: {blocker_count}\n")
+            summary_file.write(f"- Review items: {review_item_count}\n")
+            evidence = release_decision.get("evidence_coverage") or {}
+            ev_parts = []
+            if evidence.get("low_confidence_tool_count"):
+                ev_parts.append(
+                    f"{clean(evidence.get('low_confidence_tool_count'))} low-confidence tool(s)"
+                )
+            if evidence.get("source_warning_count"):
+                ev_parts.append(f"{clean(evidence.get('source_warning_count'))} source warning(s)")
+            if evidence.get("human_review_recommended"):
+                ev_parts.append("human review recommended")
+            ev_suffix = f" ({'; '.join(ev_parts)})" if ev_parts else ""
+            summary_file.write(
+                f"- Evidence coverage: {clean(evidence.get('level', 'unknown'))}{ev_suffix}\n"
+            )
+            summary_file.write(
+                "- Fail policy: "
+                f"would_fail_ci=`{would_fail_ci}` "
+                f"(exit {clean(fail_policy.get('exit_code'))})\n"
+            )
+        else:
+            summary_file.write(f"- Status: `{clean(summary.get('status'))}`\n")
+            summary_file.write(
+                f"- Critical: {clean(summary.get('critical_count', 0))} - "
+                f"High: {clean(summary.get('high_count', 0))} - "
+                f"Medium: {clean(summary.get('medium_count', 0))}\n"
+            )
+        if action_surface_diff.get("enabled"):
+            summary_file.write(
+                "- Action Surface Diff: "
+                f"+{clean(action_diff_summary.get('actions_added', 0))} actions, "
+                f"-{clean(action_diff_summary.get('actions_removed', 0))} actions, "
+                f"{clean(action_diff_summary.get('actions_modified', 0))} modified, "
+                f"{clean(action_diff_summary.get('blocking_findings', 0))} "
+                "blocking finding(s)\n"
+            )
+        elif action_surface_diff.get("notes"):
+            summary_file.write(
+                f"- Action-surface diff: {clean(action_surface_diff.get('notes')[0])}\n"
+            )
+        if tool_surface_diff.get("enabled"):
+            summary_file.write(
+                "- What changed: "
+                f"+{clean(diff_summary.get('tools_added', 0))} tools, "
+                f"-{clean(diff_summary.get('tools_removed', 0))} tools, "
+                f"{clean(diff_summary.get('tools_changed', 0))} changed, "
+                f"{clean(diff_summary.get('new_high_risk_effects', 0))} "
+                "new high-risk effect(s), "
+                f"{clean(diff_summary.get('new_findings', 0))} new finding(s)\n"
+            )
+        elif tool_surface_diff.get("notes"):
+            summary_file.write(f"- Tool-surface diff: {clean(tool_surface_diff.get('notes')[0])}\n")
+        summary_file.write(f"- Report JSON: `{clean(values.get('report_json'))}`\n")
+        if values.get("verifier_json"):
+            summary_file.write(f"- Verifier JSON: `{clean(values.get('verifier_json'))}`\n")
+        if values.get("verify_run_json"):
+            summary_file.write(f"- Verify-run JSON: `{clean(values.get('verify_run_json'))}`\n")
+        if values.get("agent_handoff_json"):
+            summary_file.write(
+                f"- Agent handoff JSON: `{clean(values.get('agent_handoff_json'))}`\n"
+            )
+        if values.get("pr_comment_markdown"):
+            summary_file.write(
+                f"- PR comment Markdown: `{clean(values.get('pr_comment_markdown'))}`\n"
+            )
+        if values.get("attestation_json"):
+            summary_file.write(f"- Attestation JSON: `{clean(values.get('attestation_json'))}`\n")
+        if values.get("org_evidence_bundle_json"):
+            summary_file.write(
+                f"- Org evidence bundle JSON: `{clean(values.get('org_evidence_bundle_json'))}`\n"
+            )
+        if values.get("host_grants_json"):
+            summary_file.write(f"- Host grants JSON: `{clean(values.get('host_grants_json'))}`\n")
+        if values.get("org_status_json"):
+            summary_file.write(f"- Org status JSON: `{clean(values.get('org_status_json'))}`\n")
+
+
+def write_github_outputs(values: dict[str, object]) -> None:
+    output_path = os.environ["GITHUB_OUTPUT"]
+    with open(output_path, "a", encoding="utf-8") as output:
+        for key, value in values.items():
+            output.write(f"{key}={clean(value)}\n")
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    with path.open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _normalize_merge_verdict_token(value: object) -> str:
+    return str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def _capability_counts(
+    payload: dict[str, Any],
+    verifier_payload: dict[str, Any],
+    action_diff_summary: dict[str, Any],
+    diff_summary: dict[str, Any],
+) -> tuple[int, int, int]:
+    capability_change = payload.get("capability_change")
+    if isinstance(capability_change, dict):
+        return (
+            len(capability_change.get("added") or []),
+            len(capability_change.get("broadened") or [])
+            + len(capability_change.get("narrowed") or []),
+            len(capability_change.get("removed") or []),
+        )
+
+    capability_review = verifier_payload.get("capability_review")
+    if isinstance(capability_review, dict) and capability_review:
+        return (
+            int(capability_review.get("added") or 0),
+            int(capability_review.get("modified") or 0),
+            int(capability_review.get("removed") or 0),
+        )
+
+    return (
+        int(action_diff_summary.get("actions_added") or 0)
+        + int(diff_summary.get("tools_added") or 0)
+        + int(diff_summary.get("new_scopes") or 0)
+        + int(diff_summary.get("controls_added") or 0),
+        int(action_diff_summary.get("actions_modified") or 0)
+        + int(diff_summary.get("tools_changed") or 0)
+        + int(diff_summary.get("metadata_changes") or 0)
+        + int(diff_summary.get("policy_drift_items") or 0),
+        int(action_diff_summary.get("actions_removed") or 0)
+        + int(diff_summary.get("tools_removed") or 0)
+        + int(diff_summary.get("removed_scopes") or 0)
+        + int(diff_summary.get("controls_removed") or 0),
+    )
+
+
+def _verifier_flags(
+    payload: dict[str, Any],
+    verifier_payload: dict[str, Any],
+) -> tuple[bool, bool]:
+    verifier_summary = payload.get("verifier_summary")
+    if isinstance(verifier_summary, dict) and verifier_summary:
+        return (
+            bool(verifier_summary.get("protected_surface_touched")),
+            bool(verifier_summary.get("policy_weakened")),
+        )
+
+    capability_review = verifier_payload.get("capability_review")
+    if isinstance(capability_review, dict) and capability_review:
+        return (
+            bool(capability_review.get("trust_root_touched")),
+            bool(capability_review.get("policy_weakened")),
+        )
+
+    active_findings = [
+        finding
+        for finding in (payload.get("findings") or [])
+        if isinstance(finding, dict) and not finding.get("suppressed")
+    ]
+    return (
+        bool(payload.get("protected_surface_changes"))
+        or any(finding.get("check_id") == TRUST_ROOT_CHECK_ID for finding in active_findings),
+        # Mirrors ``verifier_summary.policy_weakened``: the no-base fail-safe
+        # keeps the flag raised because the direction is unprovable, except on
+        # a proven first adoption, where there was no prior gate to weaken.
+        # Both reason codes are read so a report written before the split
+        # projects to the same answer it did then.
+        any(
+            finding.get("check_id") in POLICY_REASON_CODES
+            and (finding.get("evidence") or {}).get("kind") != ADOPTION_EVIDENCE_KIND
+            for finding in active_findings
+        ),
+    )
+
+
+def _verifier_verdict(
+    release_decision: dict[str, Any],
+    verifier_summary: dict[str, Any],
+    verifier_payload: dict[str, Any],
+) -> str:
+    verdict = release_decision.get("decision") or verifier_summary.get("verdict")
+    if verdict:
+        return str(verdict)
+    head_status = verifier_payload.get("head_status")
+    if head_status == "skipped":
+        return "skipped"
+    if head_status == "failed":
+        return "failed"
+    return ""
+
+
+def _merge_verdict(verdict: object) -> str:
+    if verdict == "passed":
+        return "mergeable"
+    if verdict == "review_required":
+        return "human_review_required"
+    if verdict in {"blocked", "insufficient_evidence"}:
+        return str(verdict)
+    if verdict in {"skipped", "mergeable"}:
+        return "mergeable"
+    if verdict:
+        return "unknown"
+    return ""
+
+
+def main() -> None:
+    output_dir = Path(os.environ.get("OUTPUT_DIR") or "agents-shipgate-reports")
+    values = extract_outputs(output_dir)
+    write_github_outputs(values)
+    append_step_summary(output_dir, values)
+
+
+if __name__ == "__main__":
+    main()

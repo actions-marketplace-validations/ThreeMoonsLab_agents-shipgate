@@ -36,6 +36,7 @@ from typing import Any
 import typer
 
 from agents_shipgate.cli.agent_mode import emit_agent_mode_error
+from agents_shipgate.cli.workspace_guard import require_workspace
 
 _ENV_VAR = "AGENTS_SHIPGATE_AGENT_MODE"
 
@@ -159,17 +160,36 @@ def bootstrap_run(
     is_agent_project = bool(detect_payload.get("is_agent_project"))
     suggested = detect_payload.get("suggested_sources") or []
     manifest_already = manifest_path.is_file()
+    # Codex plugin packages and marketplaces are adoptable surfaces that
+    # deliberately leave `is_agent_project` false — they have no Python
+    # framework import — so a plugin-only repository stopping here never ran
+    # `init` at all. The published stop contract has always listed them; this
+    # guard did not read them (#399 review).
+    plugin_candidates = detect_payload.get("codex_plugin_candidates") or []
+    # "Nothing to do" also rests on detect having looked at the whole
+    # workspace. When its Python parse stopped at the cap it looked at part of
+    # one, and `is_agent_project: false` is then a statement about the files
+    # that were read rather than about the repository. Fall through instead:
+    # `init` refuses with the cap, the project-scope census, and the higher-cap
+    # recovery, and `_stop_with_failure` forwards that structured error
+    # verbatim — the same routing a manual `init` gives. The raw parse bit is
+    # the guard, not `agent_scope_truncated`: a single-scope workspace whose
+    # only agent sits past the cap has the narrow flag false.
+    parse_truncated = bool(detect_payload.get("python_parse_truncated"))
 
     if (
         not is_agent_project
         and not suggested
+        and not plugin_candidates
         and not manifest_already
+        and not parse_truncated
     ):
         return {
             "verdict": "no_agent_surface",
             "stopped": True,
             "stop_reason": (
                 "detect says is_agent_project=false, suggested_sources=[], "
+                "codex_plugin_candidates=[], python_parse_truncated=false, "
                 "and no shipgate.yaml exists. Bootstrap has nothing to do."
             ),
             "steps": steps,
@@ -278,15 +298,7 @@ def bootstrap_run(
             return _stop_with_failure(steps, apply_step, "apply-patches")
 
     # --- Verdict -----------------------------------------------------
-    verdict = "complete"
-    if release_decision is None:
-        verdict = "complete_no_report"
-    elif release_decision.get("decision") == "blocked":
-        verdict = "complete_blocked"
-    elif release_decision.get("decision") == "review_required":
-        verdict = "complete_review_required"
-    elif release_decision.get("decision") == "passed":
-        verdict = "complete_passed"
+    verdict = _verdict_for_release_decision(release_decision)
 
     return {
         "verdict": verdict,
@@ -296,6 +308,39 @@ def bootstrap_run(
         "release_decision": release_decision,
         "report_path": str(report_path) if report_path else None,
     }
+
+
+_VERDICT_BY_DECISION = {
+    "blocked": "complete_blocked",
+    "review_required": "complete_review_required",
+    "insufficient_evidence": "complete_insufficient_evidence",
+    "passed": "complete_passed",
+}
+
+
+def _verdict_for_release_decision(
+    release_decision: dict[str, Any] | None,
+) -> str:
+    """Map a parsed ``release_decision`` payload to the bootstrap
+    top-level ``verdict`` string.
+
+    Returns ``"complete_no_report"`` when no release_decision was
+    emitted, ``"complete_{decision}"`` for any of the four
+    ReleaseDecisionStatus values, and ``"complete_review_required"``
+    as the safe fallback for unknown future enum values — matching
+    the consumer-side fallback rule documented in STABILITY.md
+    ("Consumers that switch on the enum MUST fall back to
+    review_required for unrecognized values"). Bootstrap is itself
+    one of those switching consumers, so honoring the same fallback
+    means a future scan adding a value still surfaces a review-
+    required signal to the agent invoking bootstrap.
+    """
+    if release_decision is None:
+        return "complete_no_report"
+    decision = release_decision.get("decision")
+    if not decision:
+        return "complete_no_report"
+    return _VERDICT_BY_DECISION.get(decision, "complete_review_required")
 
 
 def _stop_with_failure(
@@ -484,6 +529,7 @@ def bootstrap(
     keep using the GitHub Action — bootstrap is the one-shot
     convenience layer for first-time setup.
     """
+    require_workspace(workspace)
     result = bootstrap_run(
         workspace=workspace,
         confidence=confidence,

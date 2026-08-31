@@ -2,20 +2,71 @@
 
 Copy-pasteable workflows for AI coding agents (Claude Code, Codex, Cursor,
 Aider) that need to drive `agents-shipgate` end-to-end without prompting
-the user. Every command is read-only or schema-validated; no agent
-execution, no LLM calls, no network access.
+the user. Every command is read-only or schema-validated;
+static-by-default, with audited exceptions pinned in
+[`tests/test_adapter_static_only.py::ALLOWED_EXCEPTIONS`](../tests/test_adapter_static_only.py).
 
 > If you are a human, [`quickstart.md`](quickstart.md) is the friendlier
 > entry point. This page is structured for agents that consume `--json`.
 
 ---
 
-## Recipe 1 · Single-turn adoption (the canonical 4-call flow)
+## Recipe 0 · Verify an agent-related PR
 
-Use this when a repo doesn't yet have `shipgate.yaml`. Four calls in
-one user turn take it from "looks like an agent project" to "Shipgate
-is integrated, scan green or with safe trivial findings auto-applied,
-CI workflow optionally drafted."
+Use this before claiming completion on a PR or local diff that changes tools,
+MCP/OpenAPI surfaces, prompts, permissions, policies, release gates, or
+`shipgate.yaml`.
+
+```bash
+agents-shipgate verify --preview --json
+agents-shipgate preflight --workspace . --plan - --json
+agents-shipgate verify --workspace . --config shipgate.yaml \
+  --base origin/main --head HEAD --ci-mode advisory --format json
+```
+
+For local uncommitted work, omit `--base`/`--head`. For committed PR/CI refs,
+make the base ref available first because `verify` never fetches. `--preview`
+additionally wants `--head` **checked out**: it reads project markers from the
+working tree, because that is the tree the `init` it recommends would write to.
+Previewing some other ref establishes no project and returns
+`agent_action_required` with a `fetch_base` action whose `expects` names the
+missing input as a **commit id**, together with the pinned `--base`/`--head` to
+re-run with — read them from `expects`, which is never truncated, because a
+revision expression re-resolves against the new `HEAD`. Plain `verify` reads
+`--head` from the object database and needs no checkout. Read
+`agents-shipgate-reports/agent-handoff.json` first and lead with
+`control.state`, `gate.merge_verdict`, `gate.can_merge_without_human`,
+`next_action`, `fix_task`, and `capability_review.top_changes[]`. Fall back to
+`verifier.json` only for older installed CLIs that do not report runtime
+contract 14.
+Then read `report.json.release_decision.decision`, which remains the only
+release gate.
+
+Before editing `shipgate.yaml`, Shipgate CI, AGENTS/CLAUDE/Cursor rules,
+policy packs, baselines, waivers, suppressions, Codex hooks/config, Codex
+plugin manifests, `.mcp.json`, `.app.json`, or `SKILL.md`, run
+`agents-shipgate preflight --workspace . --plan - --json` with a
+`PreflightPlanV1` object. Legacy `--changed-files` remains available. Switch on
+`control.state`. If it is `review_publishable`, a human must approve the merge
+and you may still commit, push, and update the PR; if it is
+`human_review_required`, stop for a human; if it is
+`agent_action_required`, perform only the exact coding-agent action in
+`control.next_action` — its `command` when it names one, and otherwise the
+input its `expects` names, which is the shape a `fetch_base` route carries.
+
+Do not claim completion unless `control.state` is `complete`. Conversation-level
+acknowledgement never changes control state; only a newly generated verifier
+artifact can clear an obligation.
+
+## Recipe 1 · First adoption helper
+
+Use this when a repo doesn't yet have `shipgate.yaml` and the user wants a
+scan-oriented first pass. The verifier-first path is
+`verify --preview --json` →
+`init --write --json` →
+`verify --base origin/main --head HEAD`. The helper below remains useful when a
+coding agent should also apply high-confidence manifest cleanup in the same
+turn. Ongoing PR work should use Recipe 0.
 
 ```bash
 agents-shipgate detect --json
@@ -30,28 +81,116 @@ agents-shipgate apply-patches \
 
 Consume the response to decide whether to proceed. Key fields:
 
+- Detection silently skips common fixture corpus directories such as
+  `fixtures/`, `_fixtures/`, `__fixtures__/`, `testdata/`, `test_data/`,
+  `test-fixtures/`, `test_fixtures/`, `golden/`, and `goldens/` when they
+  are below the selected workspace. Point `--workspace` directly at a
+  fixture project if you intentionally want to classify that fixture itself.
 - `is_agent_project` — `true` when at least one Python framework
   scored ≥ 2.0 with a strong signal.
 - `frameworks[]` — per-framework scores + evidence + candidate file
   paths.
-- `agent_name_candidates[]` — ranked `{value, source}`. Source values:
-  `Agent_name_literal` (highest), `ADK_name_field`, `workspace_dir`
-  (lowest).
-- `project_name_candidates[]` — same shape; `pyproject` source seeds
-  `project.name` only.
-- `suggested_sources[]` — MCP/OpenAPI files matched by glob. These do
-  NOT bump `is_agent_project` on their own.
+- `agent_name_candidates[]` — ranked best-first, each
+  `{value, source, role, path, rank_score, selectable, rationale[]}`.
+  **Take the first entry whose `selectable` is `true`** — that is the value
+  `init` writes as `agent.name`. When none is selectable the manifest keeps
+  its `CHANGE_ME` placeholder rather than asserting an identity nothing
+  reliably declares. Ordering is decided by, in effect:
+  - `role` — `root_agent` (bound as `App(root_agent=…)`, or assigned to the
+    conventional `root_agent` symbol) outranks `agent`, which outranks
+    `sub_agent` (named inside another agent's `sub_agents=[…]` /
+    `handoffs=[…]`). `workspace_dir` is the directory-name fallback and is
+    never selectable.
+  - `path` — a name declared in product code outranks one declared in test
+    code, which names fixtures. This dominates: a test fixture that builds
+    an `App(root_agent=…)` still ranks below a plain agent the shipped code
+    declares.
+  - corroboration — a value the project name independently agrees with
+    ranks above one only a single site declares.
+  - a quality floor — values under three significant characters, and
+    generic scaffolding names (`agent`, `foo`, `test`, …), are ranked last
+    and marked `selectable: false`.
+
+  One rule overrides all four: if the workspace declares an application root
+  whose name cannot be resolved statically — a dynamic expression, a factory
+  call, a symbol bound more than once — then **nothing** is selectable, and
+  the `rationale[]` says why. Anything still ranked is by construction not
+  the root, so writing it would declare a worker as the reviewed identity.
+
+  `rationale[]` states which of those applied, so a ranking change is
+  visible in the output rather than silently changing what the manifest
+  claims. `name=` values that come from a module constant or an
+  `os.environ.get("…", "…")` default in the same package are resolved
+  statically (one hop, no code executed) and say so in `rationale[]`.
+
+  All of this reads Python's binding rules or declines — a spelling is never
+  taken as provenance. `Agent`/`LlmAgent`/`App` are resolved through the
+  binding that reaches *the call site*: a framework constructor imported
+  under an alias is recognised, and one shadowed by a local `def`/`class`,
+  bound only after the call, bound conditionally, or replaced through an
+  attribute (`adk.Agent = fake`) is not. Dotted spellings are held to the
+  same standard — the head must prove a framework module.
+  Left unresolved rather than guessed: a symbol bound more than once
+  anywhere in the file; one assigned under an `if`/`try`/loop; one rebound
+  in an enclosing scope (a function body executes when it is called, not
+  where it is written);
+  one whose import could resolve to two different in-workspace modules; an
+  `os.getenv` spelling that is not a provably unshadowed stdlib import; and
+  anything at all in a file carrying `from x import *` — until a later
+  explicit binding re-establishes what a spelling means. Bindings that carry
+  no assignment count too: `del`, `class`, `except … as`, `case`, and a
+  `global`/`nonlocal` store routed to another scope all retire the agent a
+  name used to hold. Scopes follow Python's own — comprehensions have their
+  own, definition headers (defaults, decorators, annotations, class bases)
+  are evaluated in the enclosing one, and a root declared inside a
+  conditionally defined function is contingent on that branch.
+- `project_name_candidates[]` — `{value, source}` only. Project names have
+  no hierarchy to rank, so they carry none of the fields above. The
+  `pyproject` source seeds `project.name`, never `agent.name`.
+- `suggested_sources[]` — MCP/OpenAPI files matched by glob AND accepted
+  by the real input adapters, so `init` never writes a `tool_sources`
+  entry that `scan` rejects at parse time. These do NOT bump
+  `is_agent_project` on their own.
+- `excluded_sources[]` — `{type, path, reason}` for glob matches the
+  input adapters reject (e.g. an `mcpServers`-style host config such as
+  a Cursor plugin `mcp.json`, or a Swagger 2.0 document). Do not add
+  these to `tool_sources`; the `reason` says what `scan` would fail on.
 - `codex_plugin_candidates[]` — Codex plugin package or marketplace
   artifacts matched by convention. These also do NOT bump
   `is_agent_project` on their own.
+- `next_actions[]` — the ranked route. On `agent_scope: "ambiguous"` rank 1 is
+  the decision (`kind: "review"`, `command: null`) and every entry below it is
+  one exact `init --workspace <candidate> --write --json`, with `executable`
+  and `args`, in candidate order — the list `init --write` publishes when it
+  refuses the same workspace, minus the setup flags: `detect` asked for no
+  setup, so it promises none. Add `--ci` or `--agent-instructions` yourself if
+  you want them, or take the command from `init`'s own refusal, which repeats
+  the flags the run asked for. Match on the path rather than the ordering.
+  Every candidate gets an entry; the workspace root is never offered, since it
+  is the scope `init` refuses. A candidate that already carries a manifest gets
+  `doctor --config <that manifest> --json` rather than an `init` that would
+  refuse to overwrite it — unless you asked for setup it still owes: with
+  `--agent-instructions` the full `init --write` is the advertised refresh and
+  exits 0, and with `--ci` the command drops `--write` so the workflow is
+  installed and the manifest is left alone. The workspace root, when listed, is
+  a `review` entry rather than a command.
 
 **Stop condition.** Stop and skip `init` only when ALL of:
 
 - `is_agent_project` is `false`, AND
 - `suggested_sources` is empty, AND
 - `codex_plugin_candidates` is empty, AND
+- `python_parse_truncated` is `false` — each negative above is a claim about
+  the whole workspace, and a run whose Python parse stopped at its cap read
+  only part of one. This is the raw parse bit, not `agent_scope_truncated`,
+  which additionally requires more than one candidate scope, AND
 - no `shipgate.yaml` already exists, AND
 - the user did not explicitly request a scan.
+
+A payload that does not carry every one of those keys leaves the condition
+unevaluable — `trigger` reports `stop_conditions_evaluated: false` and infers
+no stop. Re-run `detect` with the current CLI rather than reading an absent
+key as `false`.
 
 Otherwise proceed. MCP/OpenAPI-only tool-surface repos and Codex plugin
 package repos surface as `is_agent_project: false` but should still be
@@ -69,20 +208,85 @@ Auto-detection runs again inside `init` and writes:
 
 Key response fields:
 
-- `manifest_status`: `"written"` | `"skipped_existing"` | `"not_attempted"`.
+- `manifest_status`: `"written"` | `"skipped_existing"` |
+  `"refused_unresolved_scope"` | `"not_attempted"`.
 - `workflow.status` (when `--ci`): `"written"` | `"skipped_existing_target"`
   | `"skipped_cross_reference"`.
 - `placeholders[]` — entries the template intentionally leaves as
   `CHANGE_ME` because no high-confidence signal was available. Each has
   a `path` (YAML-pointer-ish location) and `current` value. Replace
-  these before scanning.
+  these before scanning. Every field the template chose without evidence is
+  in here, `tool_sources[].type` included (#441).
+- `tool_surface_origin`: `"detected"` | `"scaffold"` | `null`. `"scaffold"`
+  means this render read no tool surface and the `tool_sources` block is a
+  placeholder — `id`, `type`, and `path` are all `CHANGE_ME` and all three
+  are in `placeholders[]`. `null` means this run's render reached neither disk
+  nor this payload, so it describes no file you can open: `skipped_existing`
+  and `refused_unresolved_scope` report it, on the same authority rule
+  `placeholders` follows. `manifest_message` always states the same fact in
+  prose; `control.reason` states it only where init's own reason is the
+  envelope's, because on a freshly written manifest the human-owned
+  `declared_purpose` declaration outranks it. Do **not** run `scan` on a
+  scaffold — fill in the block first; until then there is nothing for the gate
+  to read.
+
+  In the default (auto) mode a `"scaffold"` also means full discovery found
+  nothing, and `detect` on the same workspace agrees: `is_agent_project: false`
+  with no suggested sources. Under `--minimal` it means only that the minimal
+  template skips framework detection entirely — `detect` may well report a
+  framework for the same workspace — and the summary it emits says so.
 - `auto_detected.agent_name` — the value the manifest carries
   (`null` when the template fell back to `CHANGE_ME`; matches the YAML
   exactly).
+- `auto_detected.agent_scope`: `"single"` | `"ambiguous"` | `"unknown"`,
+  with `auto_detected.agent_project_candidates[]` naming every self-contained
+  project (project-marker directory) that defines an agent. `"unknown"` means
+  discovery hit its Python-file cap in a workspace with several project roots,
+  so the verdict would otherwise have depended on which files were read
+  first.
+- `auto_detected.python_parse_truncated`: whether the Python parse stopped at
+  its cap at all. Every whole-workspace negative — `is_agent_project: false`
+  included — is unsafe to act on while this is `true`, and `--write` refuses,
+  because the agent name and tool surface a manifest would declare were read
+  from part of the tree. The recovery is mechanical and the emitted
+  `next_actions[0]` carries it: the *same command you ran*, plus
+  `--max-python-files <workspace_signals.python_file_total>` — a bound that
+  covers every Python file and so cannot hit the cap again. From `detect` that
+  is a `detect`; from `init --write` it is an `init --write`, carrying the
+  setup flags the run asked for, so one step both settles the scan and
+  completes the setup.
+- `auto_detected.agent_scope_truncated`: whether that candidate list is an
+  enumeration or a lower bound. `true` means the Python parse stopped at its
+  cap in a workspace holding more than one candidate project scope, so any
+  project in the part of the tree that was not read is missing from the list —
+  do **not** conclude a project is absent from it. Re-run
+  `detect --max-python-files <n> --json` first.
+- `auto_detected.workspace_signals.project_root_count` bounds that claim: an
+  uncapped, filename-only census of the directories that could be a manifest
+  scope (every project-marker directory, plus the workspace root itself, which
+  is a candidate whether or not it carries a marker). `init` emits the same
+  block `detect` does, so the number its refusal message quotes is readable
+  structurally.
 
 `--ci` is orthogonal to `--write`: each gets its own overwrite-refusal.
 Exit code is the max of per-action outcomes; manifest-error and
-workflow-skip can co-occur.
+workflow-skip can co-occur. The workflow lands at the repository root —
+GitHub loads workflows from nowhere else — named `agents-shipgate.yml` for a
+root manifest and `agents-shipgate-<project>.yml` for a scoped one, because
+the action takes a single `config` scalar and one shared file would leave
+every project after the first ungated. Read `workflow.path`.
+
+`refused_unresolved_scope` (exit `2`) is the one outcome where **nothing**
+is written — not the manifest, not the workflow, not the agent-instruction
+snippets, not the reports `.gitignore` block. It fires when agents live in
+more than one project under this workspace (because one `agent.name` and one
+`declared_purpose` cannot describe them all) and when discovery was capped
+before it could tell. Re-run with `--workspace` pointed at one of
+`agent_project_candidates[].path` rather than retrying the same command — the
+emitted `next_actions[]` commands repeat whatever setup flags you passed.
+`--allow-unresolved-scope` accepts a single manifest for the workspace as a
+whole, and `--minimal` is never scope-gated because it adopts no detected name
+or tool surface.
 
 ### Step 3 · `scan -c shipgate.yaml --suggest-patches --format json`
 
@@ -135,9 +339,11 @@ mutate files. Containment-checked: any `target_file` outside
 
 When the flow completes, summarize `report.json`:
 
-- `release_decision.decision` (`"blocked" | "review_required" | "passed"`)
-  — the v0.8+ release-gate signal. Prefer this over `summary.status`,
-  which stays baseline-blind for backwards compat.
+- `release_decision.decision` (`"blocked" | "review_required" | "insufficient_evidence" | "passed"`)
+  — the v0.8+ release-gate signal (`insufficient_evidence` added v0.14).
+  Prefer this over `summary.status`, which stays baseline-blind for
+  backwards compat. Switch on the value with a `review_required`
+  fallback for unknown future values.
 - `release_decision.reason` (one-sentence explanation).
 - Top 3 active critical/high findings with their `check_id`,
   `tool_name` (when present), and `recommendation`.

@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+from agents_shipgate.checks._framework_common import (
+    DynamicSurfaceConfig,
+    collect_dynamic_surface_findings,
+)
 from agents_shipgate.checks.base import agent_finding, tool_finding
+from agents_shipgate.core.artifact_models import N8nArtifacts
 from agents_shipgate.core.context import ScanContext
-from agents_shipgate.core.models import Finding, SourceReference
+from agents_shipgate.schemas.common import SourceReference
+from agents_shipgate.schemas.report import Finding
 
 N8N_TOOL_SOURCE_TYPES = {
     "n8n_ai_tool",
@@ -14,33 +20,37 @@ N8N_TOOL_SOURCE_TYPES = {
 
 
 def run(context: ScanContext) -> list[Finding]:
-    artifacts = context.n8n_artifacts
+    artifacts = context.artifact("n8n", N8nArtifacts)
     if not artifacts:
         return []
 
     findings: list[Finding] = []
     has_inventory = bool(artifacts.tool_inventory_files)
 
-    for surface in artifacts.dynamic_tool_surfaces:
-        kind = surface.get("kind")
-        if kind in {"mcp_client_wildcard", "mcp_server_wildcard", "community_tool"} and has_inventory:
-            continue
-        findings.append(
-            Finding(
+    findings.extend(
+        collect_dynamic_surface_findings(
+            context,
+            surfaces=artifacts.dynamic_tool_surfaces,
+            config=DynamicSurfaceConfig(
                 check_id="SHIP-N8N-DYNAMIC-TOOL-SURFACE-NOT-ENUMERABLE",
                 title="n8n tool surface cannot be statically enumerated",
                 severity="high",
                 category="n8n",
-                agent_id=context.agent.id,
-                evidence={"surface": surface, "explicit_inventory": has_inventory},
                 confidence="medium",
-                source=_n8n_source(surface),
+                evidence_key="surface",
                 recommendation=(
                     "Provide explicit local n8n/MCP tool inventory metadata or "
                     "replace runtime/wildcard n8n tool exposure before release review."
                 ),
-            )
+                suppress=lambda surface: _inventory_suppresses_dynamic_surface(
+                    surface, has_inventory
+                ),
+                explicit_inventory_value=lambda _surface: has_inventory,
+                source_for=_n8n_source,
+                provenance_kind="static_declaration",
+            ),
         )
+    )
 
     if not has_inventory:
         for toolset in artifacts.mcp_client_tools:
@@ -63,6 +73,7 @@ def run(context: ScanContext) -> list[Finding]:
                         "explicit_inventory": False,
                     },
                     confidence="high",
+                    provenance_kind="static_declaration",
                     source=_n8n_source(toolset),
                     recommendation=(
                         "Select an explicit MCP tool allowlist in n8n or provide a "
@@ -98,6 +109,7 @@ def run(context: ScanContext) -> list[Finding]:
                     f"workflow input schemas, or explicit inventory metadata for {tool.name}."
                 ),
                 context=context,
+                provenance_kind="static_declaration",
             )
         )
 
@@ -122,6 +134,7 @@ def run(context: ScanContext) -> list[Finding]:
                     "verify credential types without exposing secret values."
                 ),
                 context=context,
+                provenance_kind="static_declaration",
             )
         )
 
@@ -146,6 +159,7 @@ def run(context: ScanContext) -> list[Finding]:
                     "tool-use trajectories for this release."
                 ),
                 context=context,
+                provenance_kind="static_declaration",
             )
         )
 
@@ -163,6 +177,7 @@ def run(context: ScanContext) -> list[Finding]:
                     "secret_kind": exposure.get("secret_kind"),
                 },
                 confidence="high",
+                provenance_kind="regex_heuristic",
                 source=_n8n_source(exposure),
                 recommendation=(
                     "Move secret values into n8n credentials or variables and "
@@ -172,6 +187,18 @@ def run(context: ScanContext) -> list[Finding]:
         )
 
     return findings
+
+
+def _inventory_suppresses_dynamic_surface(surface: object, has_inventory: bool) -> bool:
+    if not isinstance(surface, dict):
+        raise TypeError("n8n dynamic tool surface must be a dictionary")
+    if not has_inventory:
+        return False
+    return surface.get("kind") in {
+        "mcp_client_wildcard",
+        "mcp_server_wildcard",
+        "community_tool",
+    }
 
 
 def _n8n_source(record: dict[str, object]) -> SourceReference:

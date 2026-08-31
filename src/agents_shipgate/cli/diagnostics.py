@@ -18,12 +18,40 @@ blocking *condition*; the caller decides what to do.
 from __future__ import annotations
 
 import shlex
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
-
-from agents_shipgate.cli.discovery.signals import DetectResult
+from agents_shipgate.core.adopter_text import (
+    DUPLICATE_ACROSS_ARTIFACTS,
+    DUPLICATE_TOOL_IN_SOURCE,
+    REPEATED_SOURCE_ENTRY,
+    source_label,
+)
+from agents_shipgate.core.errors import InputParseError
+from agents_shipgate.invocation import render_command
+from agents_shipgate.schemas.detect import DetectResult, WorkspaceSignals
+from agents_shipgate.schemas.diagnostics import (
+    DIAG_CHANGE_ME_PLACEHOLDERS,
+    DIAG_CODEX_PLUGIN_PACKAGE_DETECTED,
+    DIAG_DYNAMIC_TOOLSETS_ONLY,
+    DIAG_INVALID_MANIFEST,
+    DIAG_MCP_OPENAPI_ARTIFACT_ONLY,
+    DIAG_MISSING_MANIFEST,
+    DIAG_MISSING_SOURCE_FILE,
+    DIAG_NO_AGENT_SURFACE,
+    DIAG_NO_PRODUCTION_PERMISSIONS,
+    DIAG_NON_AGENT_LIBRARY,
+    DIAG_PURE_PROMPT_EXPERIMENT,
+    DIAG_UNKNOWN_ADAPTER_SOURCE_TYPE,
+    DIAG_ZERO_TOOLS,
+    Diagnostic,
+    NextAction,
+)
+from agents_shipgate.schemas.manifest import (
+    MANIFEST_PLACEHOLDER_VALUE,
+    builtin_tool_source_types_text,
+)
 
 
 def _quote_path(value: str | Path) -> str:
@@ -37,104 +65,16 @@ def _quote_path(value: str | Path) -> str:
     """
     return shlex.quote(str(value))
 
-# --- Public models ----------------------------------------------------------
-
-
-NextActionKind = Literal["command", "edit", "review", "stop"]
-DiagnosticSeverity = Literal["block", "warn", "info"]
-
-
-class NextAction(BaseModel):
-    """One ranked recovery step.
-
-    Ordered list position is the rank — there is no separate ``rank`` field.
-
-    - ``kind="command"`` → ``command`` is a runnable shell string.
-    - ``kind="edit"`` → ``path`` points at a file (optionally
-      ``shipgate.yaml:<line>``).
-    - ``kind="review"`` → no command, just a sentence in ``why``.
-    - ``kind="stop"`` → negative-control; ``command`` is None.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    kind: NextActionKind
-    command: str | None = None
-    path: str | None = None
-    why: str
-    expects: str | None = None
-
-    @model_validator(mode="after")
-    def _check_kind_fields(self) -> NextAction:
-        if self.kind == "command" and not self.command:
-            raise ValueError("kind='command' requires a non-empty command")
-        if self.kind == "edit" and not self.path:
-            raise ValueError("kind='edit' requires a non-empty path")
-        if self.kind == "stop" and self.command is not None:
-            raise ValueError("kind='stop' must not carry a command")
-        return self
-
-    def to_legacy_string(self) -> str:
-        """Project to the back-compat single-string ``next_action`` field."""
-        if self.kind == "command":
-            assert self.command is not None
-            return self.command
-        if self.kind == "edit":
-            return f"Edit {self.path}"
-        if self.kind == "review":
-            return f"Review: {self.why}"
-        return f"Stop: {self.why}"
-
-
-class Diagnostic(BaseModel):
-    """A first-run failure mode with at least one ranked recovery step."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    title: str
-    severity: DiagnosticSeverity
-    next_actions: list[NextAction] = Field(min_length=1)
-
-
 # --- Catalog of diagnostic IDs ---------------------------------------------
 # Stable identifiers; surfaced in JSON and cross-linked from
 # docs/diagnostics.md. See tests/test_diagnostics.py for stability checks.
-
-DIAG_MISSING_MANIFEST = "SHIP-DIAG-MISSING-MANIFEST"
-DIAG_INVALID_MANIFEST = "SHIP-DIAG-INVALID-MANIFEST"
-DIAG_NO_AGENT_SURFACE = "SHIP-DIAG-NO-AGENT-SURFACE"
-DIAG_NON_AGENT_LIBRARY = "SHIP-DIAG-NON-AGENT-LIBRARY"
-DIAG_PURE_PROMPT_EXPERIMENT = "SHIP-DIAG-PURE-PROMPT-EXPERIMENT"
-DIAG_MCP_OPENAPI_ARTIFACT_ONLY = "SHIP-DIAG-MCP-OPENAPI-ARTIFACT-ONLY"
-DIAG_CODEX_PLUGIN_PACKAGE_DETECTED = "SHIP-DIAG-CODEX-PLUGIN-PACKAGE-DETECTED"
-DIAG_ZERO_TOOLS = "SHIP-DIAG-ZERO-TOOLS"
-DIAG_DYNAMIC_TOOLSETS_ONLY = "SHIP-DIAG-DYNAMIC-TOOLSETS-ONLY"
-DIAG_MISSING_SOURCE_FILE = "SHIP-DIAG-MISSING-SOURCE-FILE"
-DIAG_CHANGE_ME_PLACEHOLDERS = "SHIP-DIAG-CHANGE-ME-PLACEHOLDERS"
-DIAG_NO_PRODUCTION_PERMISSIONS = "SHIP-DIAG-NO-PRODUCTION-PERMISSIONS"
-
-ALL_DIAGNOSTIC_IDS: tuple[str, ...] = (
-    DIAG_MISSING_MANIFEST,
-    DIAG_INVALID_MANIFEST,
-    DIAG_NO_AGENT_SURFACE,
-    DIAG_NON_AGENT_LIBRARY,
-    DIAG_PURE_PROMPT_EXPERIMENT,
-    DIAG_MCP_OPENAPI_ARTIFACT_ONLY,
-    DIAG_CODEX_PLUGIN_PACKAGE_DETECTED,
-    DIAG_ZERO_TOOLS,
-    DIAG_DYNAMIC_TOOLSETS_ONLY,
-    DIAG_MISSING_SOURCE_FILE,
-    DIAG_CHANGE_ME_PLACEHOLDERS,
-    DIAG_NO_PRODUCTION_PERMISSIONS,
-)
 
 
 # --- Public resolvers -------------------------------------------------------
 
 
 def diagnose_missing_manifest(workspace: Path) -> list[Diagnostic]:
-    """``shipgate.yaml`` is absent. The agent should detect, then init."""
+    """``shipgate.yaml`` is absent. The agent should start with verify preview."""
     workspace_q = _quote_path(workspace)
     return [
         Diagnostic(
@@ -144,14 +84,14 @@ def diagnose_missing_manifest(workspace: Path) -> list[Diagnostic]:
             next_actions=[
                 NextAction(
                     kind="command",
-                    command=f"agents-shipgate detect --workspace {workspace_q} --json",
+                    command=f"agents-shipgate verify --workspace {workspace_q} --preview --json",
                     why=(
-                        "Confirm this is an agent project before writing a "
-                        "manifest. detect is read-only."
+                        "Ask the verify flow whether this workspace needs "
+                        "Shipgate configuration before writing a manifest."
                     ),
                     expects=(
-                        "JSON with is_agent_project, suggested_sources, and "
-                        "diagnostics."
+                        "JSON preview result with the next setup or skip "
+                        "action."
                     ),
                 ),
                 NextAction(
@@ -166,6 +106,347 @@ def diagnose_missing_manifest(workspace: Path) -> list[Diagnostic]:
             ],
         )
     ]
+
+
+def diagnose_unknown_adapter_source_type(
+    manifest_path: Path,
+    *,
+    source_type: str,
+    plugins_enabled: bool,
+    message: str,
+) -> list[Diagnostic]:
+    """v0.20 (PR #111 review follow-up #5): ``shipgate.yaml`` references
+    a ``tool_sources[].type`` value that no registered adapter handles.
+
+    Distinct from ``SHIP-DIAG-INVALID-MANIFEST``: the manifest passes
+    Pydantic validation (``type`` is open ``str`` for third-party
+    adapter support) but the dispatcher can't resolve the source type.
+    The right rank-1 action depends on whether plugin discovery is
+    currently enabled:
+
+    - **plugins disabled**: install the third-party adapter package
+      AND enable discovery via ``AGENTS_SHIPGATE_ENABLE_PLUGINS=1``
+      (or remove ``--no-plugins``).
+    - **plugins enabled**: install the adapter package, or fix a typo
+      against a built-in name.
+
+    The "edit shipgate.yaml" path that ``diagnose_invalid_manifest``
+    emits would be misleading here — the manifest itself is valid;
+    the user just needs to install/enable the matching adapter.
+
+    Unless the type is the manifest placeholder, in which case the edit *is*
+    the answer and both other routes are wrong: there is no package to install
+    for ``CHANGE_ME`` and no typo to fix. It is the value ``init`` writes when
+    discovery found no tool surface, and it is the first failure a scaffolded
+    manifest hits — ahead of the missing ``path``, which ``input_parse_recovery``
+    has always routed as a placeholder (#441).
+    """
+
+    if source_type == MANIFEST_PLACEHOLDER_VALUE:
+        next_actions = [
+            NextAction(
+                kind="edit",
+                path=str(manifest_path),
+                why=(
+                    f"tool_sources[].type is still {source_type!r} — the "
+                    "placeholder `agents-shipgate init` writes when it finds "
+                    "no tool surface to read. Nothing was inferred here: name "
+                    "the source this repository publishes and the path to it. "
+                    f"Built-ins: {builtin_tool_source_types_text()}; an "
+                    "installed third-party adapter's own source type is "
+                    "equally valid."
+                ),
+                expects=(
+                    "tool_sources[].type names a built-in source type or one "
+                    "an installed adapter registers, and tool_sources[].path "
+                    "resolves to a file in this workspace."
+                ),
+            ),
+            NextAction(
+                kind="command",
+                command=render_command(
+                    ["doctor", "--config", str(manifest_path), "--json"]
+                ),
+                why=(
+                    "List every field this manifest still leaves unresolved, "
+                    "not only the one the scan stopped on."
+                ),
+                expects=(
+                    "A doctor payload whose placeholders[] is empty for this "
+                    "manifest."
+                ),
+            ),
+        ]
+    elif plugins_enabled:
+        next_actions = [
+            NextAction(
+                kind="command",
+                command="pip install <third-party-adapter-package>",
+                why=(
+                    f"Install the third-party package that ships an "
+                    f"adapter for {source_type!r} via the "
+                    f"`agents_shipgate.adapters` entry-point group. "
+                    f"Re-run the scan to confirm it appears in "
+                    f"`report.loaded_adapters[]` with "
+                    f"`validation_status=\"valid\"`."
+                ),
+                expects=(
+                    f"`agents-shipgate doctor -c {_quote_path(manifest_path)} "
+                    f"--json` lists {source_type!r} under sources[] "
+                    f"with no warning."
+                ),
+            ),
+            NextAction(
+                kind="edit",
+                path=str(manifest_path),
+                why=(
+                    f"If {source_type!r} is a typo, fix it. Built-in "
+                    f"source types: {builtin_tool_source_types_text()}."
+                ),
+                expects=(
+                    "Manifest references only built-in source types or "
+                    "source types registered by installed third-party "
+                    "adapter packages."
+                ),
+            ),
+        ]
+    else:
+        next_actions = [
+            NextAction(
+                kind="command",
+                command=(
+                    "AGENTS_SHIPGATE_ENABLE_PLUGINS=1 agents-shipgate "
+                    f"scan -c {_quote_path(manifest_path)}"
+                ),
+                why=(
+                    "Enable third-party adapter discovery and re-run "
+                    "the scan. If the adapter package is also "
+                    "installed, this resolves the shipgate.yaml "
+                    "tool_sources[].type."
+                ),
+                expects=(
+                    f"Scan completes; `report.loaded_adapters[]` "
+                    f"contains an entry for {source_type!r} with "
+                    f"`validation_status=\"valid\"`."
+                ),
+            ),
+            NextAction(
+                kind="command",
+                command="pip install <third-party-adapter-package>",
+                why=(
+                    f"If discovery is already enabled and "
+                    f"{source_type!r} still doesn't resolve, the "
+                    "adapter package isn't installed. Install it, "
+                    "then re-run."
+                ),
+                expects=(
+                    f"`pip show <package>` succeeds; `agents-shipgate "
+                    f"doctor -c {_quote_path(manifest_path)} --json` "
+                    f"lists {source_type!r} under sources[]."
+                ),
+            ),
+            NextAction(
+                kind="edit",
+                path=str(manifest_path),
+                why=(
+                    f"If {source_type!r} is a typo, fix it. Built-in "
+                    f"source types: {builtin_tool_source_types_text()}."
+                ),
+                expects=(
+                    "Manifest references only built-in source types or "
+                    "source types registered by installed third-party "
+                    "adapter packages."
+                ),
+            ),
+        ]
+
+    return [
+        Diagnostic(
+            id=DIAG_UNKNOWN_ADAPTER_SOURCE_TYPE,
+            # The title names the remedy the selected route actually is. The
+            # single "(install/enable the adapter, or fix a typo)" title named,
+            # for the placeholder, exactly the two remedies its own branch says
+            # do not apply — and a title is what a reader sees before any
+            # `next_actions[]` entry (#441 review).
+            title=(
+                f"tool_sources[].type is still the {source_type!r} placeholder "
+                "in shipgate.yaml (name the source this repository publishes)"
+                if source_type == MANIFEST_PLACEHOLDER_VALUE
+                else (
+                    f"No adapter handles tool_sources[].type {source_type!r} "
+                    "in shipgate.yaml (install/enable the adapter, or fix a typo)"
+                )
+            ),
+            severity="block",
+            next_actions=next_actions,
+        )
+    ]
+
+
+def input_parse_recovery(
+    exc: InputParseError, *, manifest_path: Path | None = None
+) -> list[NextAction]:
+    """The ranked recovery for an ``input_parse_error``, for every command.
+
+    ``scan``, ``verify``, and the verifier assembly path each caught this
+    exception and each wrote its own recovery, so a failure that had a precise
+    route on one command got "inspect the file referenced in the error" on the
+    next — the second-implementation bug class (#322). One resolver, three
+    call sites.
+
+    Routing is on the exception's typed ``details["failure"]`` where it has
+    one. That is what lets the *message* be rewritten for a human without
+    breaking the route (#329): prose is for the reader, ``details`` is for the
+    caller, and neither is parsed to derive the other. The ``CHANGE_ME`` branch
+    predates typed details and still sniffs the text, because the placeholder
+    is genuinely a property of the manifest's contents rather than of a failure
+    site.
+    """
+
+    details = exc.details
+    # The manifest the run actually read, which is not always the one the CLI
+    # was spelled with: `--workspace` discovery can select a sole nested
+    # `services/billing/shipgate.yaml`, and `verify` may be invoked with no
+    # `--config` at all. `run_scan` records the resolved path on the way out,
+    # so an `edit` action cannot name an unrelated trust root in the caller's
+    # working directory (#329 review). The argument is the fallback for the
+    # failures raised before a scan started.
+    manifest = str(details.get("manifest_path") or manifest_path or "shipgate.yaml")
+    # A failure evaluated against a ref that is not the checked-out tree has no
+    # file the reader can open: the archive is gone and the working tree may
+    # already hold the fix. Say which commit and which path within it, and
+    # publish no `path` at all (#329 review 3).
+    evaluated_ref = details.get("evaluated_ref")
+    manifest_in_ref = details.get("manifest_in_ref")
+    if evaluated_ref and manifest_in_ref:
+        return [
+            NextAction(
+                kind="review",
+                why=(
+                    f"This failure is in {manifest_in_ref} as of {evaluated_ref}, "
+                    "which is not the tree you have checked out. Inspect that "
+                    "commit — the working copy may already differ."
+                ),
+                expects=(
+                    f"{manifest_in_ref} at {evaluated_ref} no longer produces "
+                    "this failure."
+                ),
+            )
+        ]
+    if details.get("failure") == DUPLICATE_TOOL_IN_SOURCE:
+        return [_duplicate_tool_action(details, manifest=manifest)]
+    # `init --write` on a workspace where detect found no sources leaves
+    # CHANGE_ME placeholders; scanning then fails here. Route to the
+    # placeholder fix, not the generic missing-file advice.
+    #
+    # Decided on typed manifest state, not on a substring of the failure text:
+    # a filled-in manifest pointing at a missing file named
+    # `CHANGE_ME-tools.json` matched the old search and was told it still held
+    # template placeholders (#329 review 3). A caller that recorded nothing
+    # gets the generic route — "we did not look" is not "there are none".
+    placeholders = details.get("manifest_placeholders")
+    if placeholders:
+        fields = ", ".join(str(field) for field in list(placeholders)[:4])
+        return [
+            NextAction(
+                kind="edit",
+                # The manifest the run read: `--workspace` can select a nested
+                # one, and this branch discarding it sent the reader to a
+                # different file than the one holding the placeholders.
+                path=manifest,
+                why=(
+                    f"{manifest} still declares CHANGE_ME at {fields}. Edit "
+                    "those fields to point at real artifacts, or run "
+                    "`agents-shipgate doctor` to list every placeholder."
+                ),
+                expects=(
+                    "tool_sources entries reference files that exist in this "
+                    "workspace."
+                ),
+            )
+        ]
+    return [
+        NextAction(
+            kind="review",
+            why=(
+                "Inspect the file referenced in the error; ensure it exists, is "
+                "valid, and resolves under the manifest directory."
+            ),
+            expects=(
+                "Referenced file is present, parseable, and inside the manifest "
+                "directory."
+            ),
+        )
+    ]
+
+
+def _duplicate_tool_action(
+    details: Mapping[str, Any], *, manifest: str
+) -> NextAction:
+    """One target, chosen from the cause the duplicate check reported.
+
+    A repeated entry is repaired in the manifest and a duplicate definition is
+    repaired in the artifact, so naming both would leave a consumer routing on
+    ``path`` free to delete a source declaration when the file was the problem.
+    Only the manifest is ever an ``edit`` target. A declared artifact path has
+    no single base — the manifest's for most sources, the *entrypoint's* for an
+    inventory a framework file mounts — so publishing one as a routable path
+    named a file that did not exist (#329 review 3). The artifact still
+    appears in the sentence, where it is a name to grep for rather than a path
+    to open, and the duplicate-inside-an-artifact case routes to review.
+    """
+
+    tool_name = str(details.get("tool_name") or "")
+    source_id = str(details.get("source_id") or "")
+    source_file = details.get("source_file")
+    where = source_label(
+        file_path=source_file if isinstance(source_file, str) else None,
+        source_id=source_id,
+    )
+    if details.get("cause") == DUPLICATE_ACROSS_ARTIFACTS:
+        other_file = details.get("other_source_file")
+        other = source_label(
+            file_path=other_file if isinstance(other_file, str) else None,
+            source_id=source_id,
+        )
+        # Review, not edit. Two repairs are available and they live in
+        # different files — rename one of the declarations, or bring both under
+        # one tool_sources entry — so publishing either as a routable `path`
+        # would send a consumer to change the file the reader had not chosen.
+        return NextAction(
+            kind="review",
+            why=(
+                f"{other} and {where} both declare the tool {tool_name!r} "
+                "under one name, so one capability arrived twice. Either "
+                "rename one declaration, or cover both files with a single "
+                f"tool_sources entry in {manifest} so they are reconciled as "
+                "one."
+            ),
+            expects=(
+                "Each capability is declared once, or the files declaring it "
+                "are read by one tool source."
+            ),
+        )
+    if details.get("cause") == REPEATED_SOURCE_ENTRY:
+        return NextAction(
+            kind="edit",
+            path=manifest,
+            why=(
+                f"{manifest} reads {where} twice as one tool source, so the "
+                f"tool {tool_name!r} arrived twice. Remove the repeated entry."
+            ),
+            expects="Each tool source names its artifact exactly once.",
+        )
+    return NextAction(
+        kind="review",
+        why=(
+            f"{where} produced the tool {tool_name!r} twice, so one artifact "
+            f"defines it more than once. Find it under the tool source "
+            f"{source_id!r} declared in {manifest} and remove the duplicate "
+            "definition; the manifest entry itself is correct."
+        ),
+        expects=f"The artifact behind {source_id!r} defines each tool once.",
+    )
 
 
 def diagnose_invalid_manifest(
@@ -218,6 +499,55 @@ def diagnose_invalid_manifest(
     ]
 
 
+def _at_workspace_root(signals: WorkspaceSignals, name: str) -> bool:
+    """Whether that conventional directory sits at the workspace root.
+
+    ``has_prompts_dir`` / ``has_tools_dir`` answer "anywhere in this workspace",
+    which is the question #441 needed. A negative control that describes the
+    *shape* of the workspace needs the narrower one, and
+    ``conventional_dirs`` holds workspace-relative paths whose root spelling is
+    the bare name.
+    """
+
+    return name in signals.conventional_dirs
+
+
+def _no_agent_surface_why(signals: WorkspaceSignals) -> str:
+    """Why nothing here is a Shipgate target, naming what *was* found.
+
+    The flat "no framework imports, no tool artifacts, and no prompt directory"
+    is a list of absences, and it stopped being the whole truth once the
+    conventional-dir signal started reading below the workspace root (#441): a
+    repository whose tools live at
+    ``awslabs/billing_cost_management_mcp_server/tools/`` was told nothing
+    tool-shaped was found, while ``workspace_signals.has_tools_dir`` in the
+    same payload said otherwise. A reader deciding whether to trust the verdict
+    needs the signal that was seen and *not* found sufficient, because that is
+    the one they would otherwise go looking for.
+    """
+
+    # `conventional_dirs` holds workspace-relative paths, so this names the
+    # directory a reader can actually open: `awslabs/…/tools/`, not `tools/`
+    # for a repository whose root has no `tools/` at all.
+    found = [f"{path}/" for path in signals.conventional_dirs]
+    if not found:
+        return (
+            "Workspace has no framework imports, no tool artifacts, and no "
+            "prompt directory."
+        )
+    return (
+        f"Workspace has {_join_and(found)} but no framework imports and no "
+        "parseable tool artifact, so there is no declared surface to gate. "
+        "A conventional directory alone is not one."
+    )
+
+
+def _join_and(items: list[str]) -> str:
+    if len(items) == 1:
+        return items[0]
+    return f"{', '.join(items[:-1])} and {items[-1]}"
+
+
 def diagnose_detect(
     result: DetectResult, *, has_manifest: bool, workspace: Path
 ) -> list[Diagnostic]:
@@ -236,10 +566,39 @@ def diagnose_detect(
     # diagnostics here are interesting — the agent is past detect. Only
     # surface the artifact-only nudge when relevant.
     if not has_manifest:
-        if not is_agent and not has_suggested and not has_codex_plugin:
+        # Every negative control below is a claim about the *whole* workspace,
+        # and a capped parse read part of one. On a truncated walk each of them
+        # publishes a `stop` action, which routing turns into
+        # `setup_not_applicable` — a terminal machine route for a scan that
+        # said it was inconclusive, on exactly the repositories the cap cuts
+        # (#399 review). Emitting nothing here hands the route to
+        # `_detect_advance`, which returns the higher-cap retry.
+        #
+        # The guard is the *raw* parse-completeness bit, not
+        # `agent_scope_truncated`. That one also requires more than one
+        # candidate scope, which is right for a claim about the candidate list
+        # and wrong for a claim about the workspace: a single-scope repository
+        # with a root `pyproject.toml` and its only agent past the cap reports
+        # `agent_scope_truncated: false`, and gating on it published exactly
+        # the terminal negative this is here to prevent.
+        if (
+            not is_agent
+            and not has_suggested
+            and not has_codex_plugin
+            and not result.python_parse_truncated
+        ):
             # Negative-control precedence
             if (
-                signals.has_prompts_dir
+                # A *root* `prompts/`, not one anywhere in the tree. "Only
+                # prompts/ is present" is a claim about the shape of the
+                # workspace, and #441 widened `has_prompts_dir` to mean
+                # "somewhere" — which made this fire on a thirty-file
+                # TypeScript MCP server with `src/prompts/`, a repository that
+                # flatly contradicts the sentence below. `conventional_dirs`
+                # carries located paths, and a root directory is spelled as its
+                # bare name, so this is the same question the field answered
+                # before the widening.
+                _at_workspace_root(signals, "prompts")
                 and not signals.has_tools_dir
                 and signals.python_file_count == 0
             ):
@@ -292,16 +651,24 @@ def diagnose_detect(
                         next_actions=[
                             NextAction(
                                 kind="stop",
-                                why=(
-                                    "Workspace has no framework imports, no "
-                                    "tool artifacts, and no prompt directory."
-                                ),
+                                why=_no_agent_surface_why(signals),
                             )
                         ],
                     )
                 )
 
-        if not is_agent and has_suggested and not has_codex_plugin:
+        # Both nudges below name a root `init --write`, and setup routing
+        # ranks a diagnostic ahead of the advance — so anything unsettled here
+        # published a command over the top of the route that would have said
+        # so (#399 review). They fire only where that command both succeeds
+        # and adopts a complete surface: a settled scope says the workspace is
+        # one manifest's boundary, and a complete parse says the tool surface
+        # that manifest would declare was actually read. A settled scope does
+        # not imply the second — a one-project workspace is `"single"` however
+        # early the parse stopped — and gating on it alone let the artifact
+        # nudge outrank the full-count retry and adopt a truncated surface.
+        settled = result.agent_scope == "single" and not result.python_parse_truncated
+        if not is_agent and has_suggested and not has_codex_plugin and settled:
             diagnostics.append(
                 Diagnostic(
                     id=DIAG_MCP_OPENAPI_ARTIFACT_ONLY,
@@ -327,7 +694,7 @@ def diagnose_detect(
                 )
             )
 
-        if not is_agent and has_codex_plugin:
+        if not is_agent and has_codex_plugin and settled:
             diagnostics.append(
                 Diagnostic(
                     id=DIAG_CODEX_PLUGIN_PACKAGE_DETECTED,
@@ -595,26 +962,36 @@ def diagnose_doctor(
     return diagnostics
 
 
+def ranked_diagnostics(diagnostics: list[Diagnostic]) -> list[Diagnostic]:
+    """Order diagnostics by urgency: block > warn > info.
+
+    Within each severity bucket the input order is preserved, so callers can
+    shape the catalog output deterministically.
+
+    Split out from :func:`top_next_actions` because the control projection needs
+    the *diagnostic* — its id decides who owns the route and which action kind
+    it is — not just its rank-1 action. Two orderings of the same list would
+    eventually disagree about which condition is primary, and then the JSON
+    payload's ``next_actions[0]`` and its ``control.next_action`` would name
+    different work.
+    """
+
+    severity_rank = {"block": 0, "warn": 1, "info": 2}
+    return [
+        diag
+        for _, diag in sorted(
+            enumerate(diagnostics),
+            key=lambda item: (severity_rank[item[1].severity], item[0]),
+        )
+    ]
+
+
 def top_next_actions(
     diagnostics: list[Diagnostic], *, limit: int = 3
 ) -> list[NextAction]:
-    """Flatten ranked rank-1 actions across diagnostics.
+    """Flatten ranked rank-1 actions across diagnostics."""
 
-    Severity order: block > warn > info. Within each severity bucket,
-    the input order is preserved so callers can shape the catalog
-    output deterministically.
-    """
-    severity_rank = {"block": 0, "warn": 1, "info": 2}
-    ordered = sorted(
-        enumerate(diagnostics),
-        key=lambda item: (severity_rank[item[1].severity], item[0]),
-    )
-    actions: list[NextAction] = []
-    for _, diag in ordered:
-        actions.append(diag.next_actions[0])
-        if len(actions) >= limit:
-            break
-    return actions
+    return [diag.next_actions[0] for diag in ranked_diagnostics(diagnostics)[:limit]]
 
 
 # --- Internals --------------------------------------------------------------
@@ -640,5 +1017,10 @@ def _has_dynamic_toolsets_only(payload: dict[str, Any]) -> bool:
     if isinstance(crewai, dict):
         dynamic_total += int(
             crewai.get("dynamic_tool_surface_count", 0) or 0
+        )
+    conductor = frameworks.get("conductor") or {}
+    if isinstance(conductor, dict):
+        dynamic_total += int(
+            conductor.get("dynamic_tool_surface_count", 0) or 0
         )
     return dynamic_total >= 1

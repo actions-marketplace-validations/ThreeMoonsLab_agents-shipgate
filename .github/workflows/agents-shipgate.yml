@@ -1,0 +1,31 @@
+name: Agents Shipgate
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+
+      - uses: ./
+        with:
+          config: shipgate.yaml
+          ci_mode: advisory
+          diff_base: target
+          # Advisory semantics: human_review_required means "the PR reviewer
+          # decides" — no verifier mechanism can clear that verdict, so failing
+          # CI on it makes every trust-root-touching PR (release pin sweeps,
+          # AGENTS.md edits) permanently red. CI fails only on blocked and on
+          # unknown (fail-closed against parse/contract breakage); review
+          # routing stays visible in the uploaded verifier artifact.
+          fail_on_merge_verdicts: "blocked,unknown"
+          upload_artifact: "true"
+          pr_comment: "false"

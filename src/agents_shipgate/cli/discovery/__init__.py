@@ -37,23 +37,32 @@ from agents_shipgate.cli.discovery.ci_workflow import (
     CiWorkflowResult,
     write_ci_workflow,
 )
+from agents_shipgate.cli.discovery.manifest_scaffold import RenderedManifest
 from agents_shipgate.cli.discovery.signals import (
+    DEFAULT_MAX_PYTHON_FILES,
+    detect_workspace,
+    select_agent_name,
+    weak_marker_evidence_dirs,
+)
+from agents_shipgate.cli.discovery.template import render_auto_manifest
+from agents_shipgate.schemas.detect import (
+    AgentNameCandidate,
     CodexPluginCandidate,
     DetectResult,
     FrameworkDetection,
     NameCandidate,
     WorkspaceSignals,
-    detect_workspace,
 )
-from agents_shipgate.cli.discovery.template import render_auto_manifest
 
 __all__ = [
     "ANTHROPIC_POLICY_PATTERNS",
     "ANTHROPIC_TOOL_PATTERNS",
+    "AgentNameCandidate",
     "CiWorkflowResult",
     "CodexPluginCandidate",
     "DetectResult",
     "FrameworkDetection",
+    "DEFAULT_MAX_PYTHON_FILES",
     "MCP_PATTERNS",
     "MODEL_CONFIG_PATTERNS",
     "NameCandidate",
@@ -72,7 +81,10 @@ __all__ = [
     "discover_manifest_paths",
     "discover_openai_api_artifacts",
     "discover_tool_sources",
+    "RenderedManifest",
     "render_auto_manifest",
     "render_manifest_template",
+    "select_agent_name",
+    "weak_marker_evidence_dirs",
     "write_ci_workflow",
 ]

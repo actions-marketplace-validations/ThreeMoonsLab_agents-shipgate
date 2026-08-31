@@ -1,11 +1,11 @@
 [build-system]
-requires = ["hatchling>=1.25"]
+requires = ["hatchling>=1.32.0"]
 build-backend = "hatchling.build"
 
 [project]
 name = "agents-shipgate"
-version = "0.10.0"
-description = "Static release-readiness gate for AI agent tool surfaces. CLI + GitHub Action. Scans MCP, OpenAPI, OpenAI Agents SDK, Anthropic, Google ADK, LangChain, CrewAI, n8n."
+version = "0.16.0b7"
+description = "The deterministic merge gate for AI-generated agent capability changes. Agent release readiness for tool-using AI agents. CLI + GitHub Action. Scans MCP, OpenAPI, OpenAI Agents SDK, Anthropic, Google ADK, LangChain, CrewAI, OpenAI API, Codex config, Codex plugin, n8n, Conductor OSS workflow JSON."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
@@ -17,10 +17,14 @@ keywords = [
   "ai-agent",
   "agent-release",
   "agent-release-readiness",
+  "ai-agent-cicd",
   "tool-use",
+  "tool-surface",
+  "tool-surface-scanning",
   "release-readiness",
   "release-gate",
   "mcp",
+  "mcp-security",
   "openai-agents-sdk",
   "google-adk",
   "openapi",
@@ -45,10 +49,12 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "pydantic>=2.7,<3",
+  "cryptography>=50.0.0,<51",
+  "packaging>=26.3,<27",
+  "pydantic>=2.13.4,<3",
   "pyyaml>=6.0.3,<7",
-  "ruamel.yaml>=0.18,<1",
-  "typer>=0.12,<1",
+  "ruamel.yaml>=0.19.1,<1",
+  "typer>=0.27.0,<1",
 ]
 
 [project.urls]
@@ -58,7 +64,10 @@ Issues = "https://github.com/ThreeMoonsLab/agents-shipgate/issues"
 Documentation = "https://github.com/ThreeMoonsLab/agents-shipgate/wiki"
 Changelog = "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/CHANGELOG.md"
 "Agent Instructions" = "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/AGENTS.md"
+"Agent Entry Points" = "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/agents/README.md"
+"Agent Protocol" = "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/agents/protocol.md"
 "Stability Contract" = "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/STABILITY.md"
+"Agent Feedback" = "https://github.com/ThreeMoonsLab/agents-shipgate/issues/new?template=agent_feedback.yml"
 "LLMs.txt" = "https://raw.githubusercontent.com/ThreeMoonsLab/agents-shipgate/main/llms.txt"
 "LLMs Full" = "https://raw.githubusercontent.com/ThreeMoonsLab/agents-shipgate/main/llms-full.txt"
 "Trigger Catalog" = "https://raw.githubusercontent.com/ThreeMoonsLab/agents-shipgate/main/docs/triggers.json"
@@ -69,24 +78,36 @@ pdf = [
   # Optional dependency for `agents-shipgate scan --packet-format ...,pdf`
   # and `agents-shipgate evidence-packet --format pdf`. Skipped with a
   # warning if not installed; the rest of the packet still renders.
-  "weasyprint>=62,<70",
+  "weasyprint>=69.0,<70",
+]
+mcp = [
+  # Optional dependency for `agents-shipgate mcp-serve`: a local stdio MCP
+  # server exposing read-only Shipgate projection tools; it does not broker
+  # general MCP permissions or start implicitly.
+  # Floor is 1.14: the server registers every tool with `ToolAnnotations`
+  # (readOnlyHint / openWorldHint) via `FastMCP.tool(..., annotations=...)`,
+  # which earlier 1.x releases either lack (ToolAnnotations import fails) or
+  # do not accept on the tool decorator (registration fails).
+  "mcp>=2.0.0,<3",
 ]
 dev = [
   "build>=1.5.0,<2",
-  "cyclonedx-bom>=5,<8",
-  "hypothesis>=6.152.4,<7",
-  "jsonschema>=4,<5",
-  "pip-audit>=2.7,<3",
-  "pytest>=9.0.3,<10",
-  "pytest-cov>=5,<8",
-  "ruff>=0.8,<1",
-  "sigstore>=3,<5",
-  "twine>=5,<7",
+  "cyclonedx-bom>=7.3.1,<8",
+  "hypothesis>=6.165.1,<7",
+  "jsonschema>=4.26.0,<5",
+  "pip-audit>=2.10.1,<3",
+  "pytest>=9.1.1,<10",
+  "pytest-cov>=7.1.0,<8",
+  "pytest-xdist>=3.8,<4",
+  "ruff>=0.16.1,<1",
+  "sigstore>=4.5.0,<5",
+  "twine>=7.0.0,<8",
 ]
 
 [project.scripts]
 agents-shipgate = "agents_shipgate.cli.main:app"
 shipgate = "agents_shipgate.cli.main:app"
+agents-shipgate-mcp = "agents_shipgate.mcp_server.server:main"
 
 [project.entry-points."agents_shipgate.checks"]
 inventory = "agents_shipgate.checks.inventory:run"
@@ -104,13 +125,37 @@ crewai = "agents_shipgate.checks.crewai:run"
 codex_plugin = "agents_shipgate.checks.codex_plugin:run"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/agents_shipgate"]
+only-include = [
+  "src/agents_shipgate",
+  "samples",
+]
+dev-mode-dirs = ["src"]
+exclude = [
+  "/samples/**/agents-shipgate-reports/**",
+]
+
+[tool.hatch.build.targets.wheel.sources]
+"src" = ""
+"samples" = "agents_shipgate/_fixtures"
 
 [tool.hatch.build.targets.wheel.force-include]
-"samples" = "agents_shipgate/_fixtures"
 "AGENTS.md" = "agents_shipgate/_meta/AGENTS.md"
 "STABILITY.md" = "agents_shipgate/_meta/STABILITY.md"
 "docs/triggers.json" = "agents_shipgate/_meta/triggers.json"
+".claude/commands/shipgate.md" = "agents_shipgate/_meta/claude-command/shipgate.md"
+# Per-category check metadata YAMLs. Loaded at import time by
+# agents_shipgate.checks._metadata_loader to build CHECK_METADATA.
+# Without this entry the wheel ships without the catalog and the
+# loader's RuntimeError fires on first import — see the loader's
+# `_resolve_checks_dir` for the two-mode resolution (packaged vs
+# source-checkout dev path).
+"docs/checks" = "agents_shipgate/_meta/checks"
+"policies/codex-boundary.shipgate.yaml" = "agents_shipgate/_meta/policies/codex-boundary.shipgate.yaml"
+"policies/mcp-permissions.shipgate.yaml" = "agents_shipgate/_meta/policies/mcp-permissions.shipgate.yaml"
+"policies/host-boundary.shipgate.yaml" = "agents_shipgate/_meta/policies/host-boundary.shipgate.yaml"
+"policies/templates/agent-boundary-default.shipgate.yaml" = "agents_shipgate/_meta/policies/agent-boundary.shipgate.yaml"
+"policies/templates" = "agents_shipgate/_meta/policies/templates"
+"adoption-kits" = "agents_shipgate/_adoption_kits"
 
 [tool.hatch.build.targets.sdist]
 exclude = [
@@ -123,24 +168,26 @@ exclude = [
   "/.venv-py312",
   "/build",
   "/dist",
-  "/docs/decks",
-  "/docs/decks/**",
+  "/harness",
+  "/harness/**",
   "/htmlcov",
-  "/marketing",
-  "/marketing/**",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 addopts = "-q"
+markers = [
+  "perf: latency-budget / benchmark tests. Skip with `pytest -m 'not perf'`.",
+]
 
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-exclude = [
-  "docs/decks",
-]
+# The repository launcher is a command, not a module, so it has no `.py`
+# suffix and ruff's default file selection would skip it. It is Python that
+# every contributor runs; it is linted like Python.
+extend-include = ["shipgate"]
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I", "B", "UP"]

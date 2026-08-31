@@ -19,14 +19,12 @@ import json
 from pathlib import Path
 
 from agents_shipgate.checks.base import tool_finding
-from agents_shipgate.cli.scan import _run_id
+from agents_shipgate.cli.scan import run_scan
+from agents_shipgate.cli.scan.run_identity import _run_id
 from agents_shipgate.config.loader import load_manifest
-from agents_shipgate.config.schema import ToolSourceConfig
 from agents_shipgate.core.context import ScanContext
-from agents_shipgate.core.models import (
+from agents_shipgate.core.domain import (
     Agent,
-    Finding,
-    SourceReference,
     Tool,
 )
 from agents_shipgate.inputs.common import (
@@ -38,6 +36,17 @@ from agents_shipgate.inputs.common import (
 )
 from agents_shipgate.report.json_report import report_json_payload
 from agents_shipgate.report.sarif import _location
+from agents_shipgate.schemas.common import SourceReference
+from agents_shipgate.schemas.manifest import ToolSourceConfig
+from agents_shipgate.schemas.report import Finding
+from agents_shipgate.schemas.surfaces import (
+    ActionApprovalFact,
+    ActionEvidenceFact,
+    ActionFact,
+    ActionSafeguardsFact,
+    ActionSurfaceFacts,
+    ActionSurfaceHashes,
+)
 
 # --- json_pointer_escape / unescape ----------------------------------------
 
@@ -214,6 +223,7 @@ def test_tool_finding_forwards_provenance_into_source_reference():
         confidence="high",
         recommendation="rec",
         context=_scan_context(),
+        provenance_kind="static_declaration",
     )
     src = finding.source
     assert src is not None
@@ -264,7 +274,12 @@ def test_sarif_location_prefers_structured_path_and_line():
     assert region["startLine"] == 42
     assert region["endLine"] == 58
     assert region["startColumn"] == 5
-    assert location["properties"] == {"shipgatePointer": "/paths/~1pets/get"}
+    assert location["properties"] == {
+        "shipgatePointer": "/paths/~1pets/get",
+        "shipgateSourceRef": "spec.yaml#/paths/~1pets/get",
+        "shipgateSourceSelector": "spec.yaml#/paths/~1pets/get",
+        "shipgateSourceType": "openapi",
+    }
 
 
 def test_sarif_location_falls_back_to_legacy_line_when_path_set_but_line_missing():
@@ -303,7 +318,11 @@ def test_sarif_location_falls_back_to_legacy_split_location():
     assert location is not None
     assert location["physicalLocation"]["artifactLocation"]["uri"] == "agents.py"
     assert location["physicalLocation"]["region"] == {"startLine": 42}
-    assert "properties" not in location  # no pointer when absent
+    assert location["properties"] == {
+        "shipgateSourceRef": "agents.py:42",
+        "shipgateSourceSelector": "agents.py:42",
+        "shipgateSourceType": "openai_sdk",
+    }
 
 
 def test_sarif_location_omits_region_when_no_position():
@@ -321,7 +340,11 @@ def _minimal_report():
     """Build a minimal ReadinessReport-ish payload by dumping a Finding
     with no provenance and asserting the wire shape — we don't need a
     full ReadinessReport for the strip behavior."""
-    from agents_shipgate.core.models import ReadinessReport, ReportSummary, ToolSurfaceSummary
+    from agents_shipgate.schemas.report import (
+        ReadinessReport,
+        ReportSummary,
+        ToolSurfaceSummary,
+    )
 
     finding = _finding(
         SourceReference(type="manifest", ref="shipgate.yaml")
@@ -411,6 +434,62 @@ def test_run_id_unchanged_when_only_provenance_changes():
     assert rid_bare == rid_provenance
 
 
+def test_run_id_unchanged_when_only_action_fact_provenance_changes():
+    manifest = _make_manifest_for_run_id()
+    hashes = ActionSurfaceHashes(
+        identity_hash="identity",
+        schema_hash="schema",
+        policy_hash="policy",
+        risk_hash="risk",
+    )
+    action = ActionFact(
+        action_id="agent:demo/tool:refund",
+        agent_id="agent:demo",
+        tool_id="tool:refund",
+        tool_name="refund",
+        provider="openapi",
+        source_type="openapi",
+        source_id="api",
+        operation="refund",
+        effect="financial_write",
+        risk_tags=["financial_write"],
+        required_scopes=["payments:write"],
+        approval_policy=ActionApprovalFact(required=True),
+        safeguards=ActionSafeguardsFact(audit_log=True),
+        evidence=ActionEvidenceFact(owner="payments"),
+        input_fields=["payment_id"],
+        required_input_fields=["payment_id"],
+        input_schema_hash=hashes.schema_hash,
+        hashes=hashes,
+    )
+    action_with_provenance = action.model_copy(
+        update={
+            "source_ref": "api.yaml",
+            "source_location": "api.yaml#/paths/~1refunds/post",
+            "source_path": "api.yaml",
+            "source_start_line": 42,
+            "source_end_line": 58,
+            "source_start_column": 5,
+            "source_pointer": "/paths/~1refunds/post",
+        }
+    )
+
+    rid_bare = _run_id(
+        manifest=manifest,
+        tools=[],
+        findings=[],
+        action_surface_facts=ActionSurfaceFacts(actions=[action]),
+    )
+    rid_provenance = _run_id(
+        manifest=manifest,
+        tools=[],
+        findings=[],
+        action_surface_facts=ActionSurfaceFacts(actions=[action_with_provenance]),
+    )
+
+    assert rid_bare == rid_provenance
+
+
 # --- Loader-level provenance ------------------------------------------------
 
 
@@ -482,11 +561,11 @@ def test_mcp_loader_pointer_for_array_root(tmp_path):
 def test_openai_tools_loader_preserves_original_index_after_filter(tmp_path):
     """A non-dict entry must NOT shift the pointer of surviving items.
     v0.10 ``_tool_items``+``enumerate`` produced drift here."""
-    from agents_shipgate.config.schema import (
+    from agents_shipgate.inputs.openai_api import load_openai_api_artifacts
+    from agents_shipgate.schemas.manifest import (
         ArtifactPathConfig,
         OpenAIApiConfig,
     )
-    from agents_shipgate.inputs.openai_api import load_openai_api_artifacts
 
     tools_yaml = tmp_path / "tools.yaml"
     tools_yaml.write_text(
@@ -516,11 +595,11 @@ def test_openai_tools_loader_preserves_original_index_after_filter(tmp_path):
 
 
 def test_anthropic_tools_loader_populates_pointer_and_line(tmp_path):
-    from agents_shipgate.config.schema import (
+    from agents_shipgate.inputs.anthropic_api import load_anthropic_artifacts
+    from agents_shipgate.schemas.manifest import (
         AnthropicConfig,
         ArtifactPathConfig,
     )
-    from agents_shipgate.inputs.anthropic_api import load_anthropic_artifacts
 
     tools_yaml = tmp_path / "tools.yaml"
     tools_yaml.write_text(
@@ -658,11 +737,11 @@ def test_singleton_yaml_tool_keeps_line_provenance(tmp_path):
     """Anthropic / OpenAI singleton-tool YAML files (one object at the
     document root) must still emit ``source_start_line`` even though the
     natural pointer for the singleton is the empty (root) string."""
-    from agents_shipgate.config.schema import (
+    from agents_shipgate.inputs.anthropic_api import load_anthropic_artifacts
+    from agents_shipgate.schemas.manifest import (
         AnthropicConfig,
         ArtifactPathConfig,
     )
-    from agents_shipgate.inputs.anthropic_api import load_anthropic_artifacts
 
     tools_yaml = tmp_path / "tool.yaml"
     tools_yaml.write_text(
@@ -680,6 +759,53 @@ def test_singleton_yaml_tool_keeps_line_provenance(tmp_path):
     assert tool.source_start_line == 1
 
 
+def test_sarif_emits_dual_locations_for_policy_evidence_source():
+    """v0.19 reviewer-grade provenance: a finding with both
+    ``source`` (tool location) and ``policy_evidence_source``
+    (manifest pointer) emits two SARIF locations so the reviewer can
+    jump to either site from the same code-scanning result."""
+    from agents_shipgate.report.sarif import _result
+
+    finding = Finding(
+        check_id="SHIP-POLICY-APPROVAL-MISSING",
+        title="stripe.create_refund lacks an approval policy",
+        severity="critical",
+        category="policy",
+        tool_name="stripe.create_refund",
+        evidence={},
+        confidence="high",
+        recommendation="r",
+        source=SourceReference(
+            type="openapi",
+            ref="api.yaml#/paths/~1refunds/post",
+            path="api.yaml",
+            start_line=42,
+            pointer="/paths/~1refunds/post",
+        ),
+        policy_evidence_source=SourceReference(
+            type="manifest",
+            ref="shipgate.yaml#/policies/require_approval_for_tools",
+            path="shipgate.yaml",
+            start_line=17,
+            pointer="/policies/require_approval_for_tools",
+        ),
+    )
+    result = _result(finding)
+    locations = result["locations"]
+    assert len(locations) == 2
+    tool_loc, policy_loc = locations
+    assert tool_loc["physicalLocation"]["artifactLocation"]["uri"] == "api.yaml"
+    assert tool_loc["physicalLocation"]["region"]["startLine"] == 42
+    assert policy_loc["physicalLocation"]["artifactLocation"]["uri"] == "shipgate.yaml"
+    assert policy_loc["physicalLocation"]["region"]["startLine"] == 17
+    assert policy_loc["properties"] == {
+        "shipgatePointer": "/policies/require_approval_for_tools",
+        "shipgateSourceRef": "shipgate.yaml#/policies/require_approval_for_tools",
+        "shipgateSourceSelector": "shipgate.yaml#/policies/require_approval_for_tools",
+        "shipgateSourceType": "manifest",
+    }
+
+
 def test_sarif_emits_empty_pointer_for_root_document_singleton():
     """``""`` is a valid RFC 6901 pointer (root). SARIF must surface it
     under ``properties.shipgatePointer`` — dropping it loses the
@@ -695,7 +821,39 @@ def test_sarif_emits_empty_pointer_for_root_document_singleton():
     )
     location = _location(finding)
     assert location is not None
-    assert location["properties"] == {"shipgatePointer": ""}
+    assert location["properties"] == {
+        "shipgatePointer": "",
+        "shipgateSourceRef": "tool.yaml#0",
+        "shipgateSourceSelector": "tool.yaml#",
+        "shipgateSourceType": "anthropic_api",
+    }
+
+
+def test_blocker_findings_are_source_backed_for_refund_sample(tmp_path):
+    report, _exit_code = run_scan(
+        config_path=Path("samples/support_refund_agent/shipgate.yaml"),
+        output_dir=tmp_path,
+        formats=["json"],
+        ci_mode="advisory",
+        plugins_enabled=False,
+    )
+
+    blockers = report.release_decision.blockers
+    assert blockers
+    source_backed = [
+        item
+        for item in blockers
+        if _is_source_backed(item.source) or _is_source_backed(item.policy_evidence_source)
+    ]
+    assert len(source_backed) / len(blockers) >= 0.9
+
+
+def _is_source_backed(source):
+    return bool(
+        source
+        and source.path
+        and (source.start_line is not None or source.pointer is not None)
+    )
 
 
 # --- function_schemas now carries provenance --------------------------------
@@ -781,11 +939,11 @@ def test_openai_function_schemas_carries_root_pointer_and_line(tmp_path):
     """``openai_api.function_schemas`` files are a single function
     definition; the loader must emit ``source_path``, the root pointer,
     and a YAML line just like ``openai_api.tools``."""
-    from agents_shipgate.config.schema import (
+    from agents_shipgate.inputs.openai_api import load_openai_api_artifacts
+    from agents_shipgate.schemas.manifest import (
         NamedArtifactPathConfig,
         OpenAIApiConfig,
     )
-    from agents_shipgate.inputs.openai_api import load_openai_api_artifacts
 
     schema_yaml = tmp_path / "fn.yaml"
     schema_yaml.write_text(

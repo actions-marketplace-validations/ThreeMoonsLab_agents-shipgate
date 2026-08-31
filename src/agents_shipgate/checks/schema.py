@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from agents_shipgate.checks.base import tool_finding
 from agents_shipgate.core.context import ScanContext
+from agents_shipgate.core.domain import (
+    Tool,
+    ToolParameter,
+)
 from agents_shipgate.core.heuristics import (
     BROAD_FREE_TEXT_PARAMETER_NAMES,
     RISKY_NUMERIC_PARAMETER_NAMES,
 )
-from agents_shipgate.core.models import Tool, ToolParameter
 from agents_shipgate.core.risk_hints import has_risk_tag, is_effectively_read_only, is_write_tool
 
 
@@ -22,12 +25,17 @@ def run(context: ScanContext):
                     severity="medium",
                     category="schema",
                     evidence={"output_schema": tool.output_schema or {"type": "string"}},
+                    # The judged schema may have been preserved from a bound
+                    # member, in which case the reviewer needs the artifact that
+                    # declares it, not the primary's (#386 review).
+                    evidence_field="output_schema",
                     confidence="medium",
                     recommendation=(
                         f"Prefer a structured output schema for {tool.name}, especially when output "
                         "is later passed back into model context."
                     ),
                     context=context,
+                    provenance_kind="static_declaration",
                 )
             )
         for parameter in tool.parameters:
@@ -43,6 +51,7 @@ def run(context: ScanContext):
                         confidence="medium",
                         recommendation=f"Constrain {tool.name}.{parameter.name} with an enum, structured schema, or narrower field-specific parameters.",
                         context=context,
+                        provenance_kind="keyword_heuristic",
                     )
                 )
             if _is_missing_bound(parameter) and _bounded_tool(tool):
@@ -57,6 +66,7 @@ def run(context: ScanContext):
                         confidence="high",
                         recommendation=f"Add a maximum bound to {tool.name}.{parameter.name} or document an equivalent limit in the tool policy.",
                         context=context,
+                        provenance_kind="keyword_heuristic",
                     )
                 )
     return findings

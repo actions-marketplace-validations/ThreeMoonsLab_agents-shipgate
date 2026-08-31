@@ -1,6 +1,6 @@
 """Release Evidence Packet — reviewer-shaped artifact derived from a scan.
 
-The packet condenses a scan into ten fixed sections so a security,
+The packet condenses a scan into fixed reviewer sections so a security,
 platform, or release reviewer can read a single file end-to-end and make
 a release decision.
 
@@ -9,7 +9,7 @@ to the in-memory manifest and per-source artifacts) and persisted as a
 sibling family of files alongside ``report.{md,json}``::
 
     agents-shipgate-reports/packet.md
-    agents-shipgate-reports/packet.json    (schema: docs/packet-schema.v0.3.json)
+    agents-shipgate-reports/packet.json    (schema: docs/packet-schema.v0.9.json)
     agents-shipgate-reports/packet.html
     agents-shipgate-reports/packet.pdf     (only with the [pdf] extras)
 
@@ -28,8 +28,8 @@ from agents_shipgate.packet.json_packet import (
     serialize_packet_json,
 )
 from agents_shipgate.packet.markdown import render_packet_markdown
-from agents_shipgate.packet.models import EvidencePacket
 from agents_shipgate.packet.pdf import PdfRendererUnavailable, render_packet_pdf
+from agents_shipgate.schemas.packet import EvidencePacket
 
 __all__ = [
     "EvidencePacket",

@@ -1,0 +1,51 @@
+version: "0.1"
+
+project:
+  name: agent-weakens-gate
+
+agent:
+  name: docs-assistant
+  declared_purpose:
+    - look up documentation metadata and answer policy questions
+  prohibited_actions:
+    - weaken or remove the Shipgate release gate
+
+environment:
+  target: production_like
+
+tool_sources:
+  - id: docs_tools
+    type: mcp
+    path: tools.json
+
+agent_bindings:
+  declarations:
+    - agent: root
+      complete: true
+      tools:
+        - {tool: docs.lookup, source_id: docs_tools}
+      handoffs: []
+      reason: reviewed local fixture binding
+
+permissions:
+  scopes:
+    - docs:read
+
+action_surface:
+  actions:
+    - tool: docs.lookup
+      effect: read
+      scopes: [docs:read]
+      authority:
+        mode: scoped
+        auth_type: oauth2
+        credential_mode: delegated
+
+ci:
+  mode: advisory
+
+output:
+  directory: agents-shipgate-reports
+  formats:
+    - markdown
+    - json

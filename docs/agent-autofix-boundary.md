@@ -2,7 +2,7 @@
 
 Where the line is between what an AI coding agent may do mechanically with Agents Shipgate and what it must defer to a human.
 
-> **Audience.** AI coding agents driving the canonical 4-call flow (see [`agent-recipes.md`](agent-recipes.md)) and CI integrators framing reviewer-facing copy.
+> **Audience.** AI coding agents driving verify-first PR checks or first-adoption helper flows (see [`agent-recipes.md`](agent-recipes.md)) and CI integrators framing reviewer-facing copy.
 
 [`autofix-policy.md`](autofix-policy.md) answers "will `apply-patches` run this?". This page answers "what may an agent assert in a PR comment, commit message, or review summary?". The two are related but not the same — `apply-patches` is a *mechanical* filter; this page is a *behavioral* boundary that holds even when an agent never invokes `apply-patches`.
 
@@ -13,7 +13,7 @@ Where the line is between what an AI coding agent may do mechanically with Agent
 Without further human approval, an agent driving Agents Shipgate may:
 
 - **Install** the CLI (`pipx install agents-shipgate` or fallbacks) — see [`AGENTS.md`](../AGENTS.md) §Install.
-- **Detect / init / doctor / scan / summarize** — every command in this set is read-only with respect to user code, except `init --write` which writes only `shipgate.yaml`. See [`agent-recipes.md`](agent-recipes.md) Recipe 1 for the canonical 4-call flow.
+- **Detect / init / doctor / scan / verify / summarize** — every command in this set is read-only with respect to user code, except `init --write` which writes only `shipgate.yaml`. See [`agent-recipes.md`](agent-recipes.md) for the verify-first PR flow and first-adoption helper.
 - **Add advisory CI** — drop in [`examples/github-actions/01-advisory-pr-comment.yml`](../examples/github-actions/01-advisory-pr-comment.yml) (or run `init --ci`). Advisory mode reports findings without blocking merge.
 - **Apply high-confidence mechanical patches** via `apply-patches --confidence high --apply`. By the [strict derivation rule](autofix-policy.md#strict-derivation-rule) this only fires when every patch on a finding is non-manual AND `confidence == "high"`. Today that's the three stale-manifest removals (`SHIP-MANIFEST-STALE-{SUPPRESSION,POLICY,RISK-OVERRIDE}`).
 - **Summarize the report** for the user — `release_decision.decision`, `release_decision.reason`, blocker / review-item counts, top active findings by severity. See [`report-reading-for-agents.md`](report-reading-for-agents.md).
@@ -27,6 +27,13 @@ These are all reversible (the manifest patches are containment-checked to `manif
 
 An agent must not write into a PR comment, commit message, code comment, or summary that any of the following are *enforced*, *verified*, *correct*, *idempotent*, or *safe*:
 
+- **Action effect** — that an undeclared or inferred-only action is read-only,
+  write, destructive, financial, or otherwise pass-eligible. Effect
+  declarations close a semantic evidence gap and require human review.
+- **Action authority** — that an action uses no credentials, scoped authority,
+  unscoped authority, or ambient authority when the source does not establish
+  it. Authority declarations close a semantic evidence gap and require human
+  review.
 - **Approval policy** — that a tool requires human approval at runtime, or that approval is being granted correctly.
 - **Confirmation policy** — that a tool waits for explicit user confirmation, or that confirmation is being captured correctly.
 - **Idempotency** — that retrying a tool call is safe, that a tool is idempotent in practice, or that idempotency keys are being honored.
@@ -34,7 +41,12 @@ An agent must not write into a PR comment, commit message, code comment, or summ
 - **Prohibited-action enforcement** — that an `agent.prohibited_actions[]` entry will not fire at runtime, or that a runtime guardrail blocks it.
 - **Runtime trace evidence** — that a recorded trace proves runtime control behavior, that `human_in_the_loop` evidence in the packet is runtime-enforcement proof, or that a trace finding has been "fixed" by editing the trace.
 
-The canonical six-item phrase from [`target-repo-agent-snippets.md:53-54`](target-repo-agent-snippets.md) is "approval, confirmation, idempotency, broad-scope, or prohibited-action policy decisions." Runtime trace evidence is the seventh category here — flipping a trace patches the *evidence record*, not the runtime gate. See [`autofix-policy.md`](autofix-policy.md) class four ("never auto-fix").
+The machine-readable source of truth is contract v12's
+`do_not_auto_assert[]`, which includes `action_effect`, `action_authority`, and
+`agent_binding`.
+Runtime trace evidence is also non-automatable: flipping a trace patches the
+*evidence record*, not the runtime gate. See
+[`autofix-policy.md`](autofix-policy.md) class four ("never auto-fix").
 
 ---
 
@@ -44,14 +56,35 @@ For each "must not assert" category, the check IDs that surface it in `agents-sh
 
 | Category | Canonical check IDs | Where it surfaces in `report.json` | What an agent should write |
 |---|---|---|---|
+| Action effect | Not a Finding/check ID | `release_decision.evidence_coverage.evidence_gaps[]` with an effect-related `kind`; normalized assessment on `action_surface_facts.actions[]` and `capability_facts[]` | "Human declaration required: static evidence does not establish a pass-eligible effect." Do **not** infer or auto-fill `effect`. |
+| Action authority | Not a Finding/check ID | `release_decision.evidence_coverage.evidence_gaps[]` with an authority-related `kind`; normalized assessment on `action_surface_facts.actions[]` and `capability_facts[]` | "Human declaration required: static evidence does not establish pass-eligible authority." Do **not** infer or auto-fill `authority`. |
 | Approval policy | [`SHIP-POLICY-APPROVAL-MISSING`](checks.md#ship-policy-approval-missing) | `findings[]` with matching `check_id`; appears in `release_decision.{blockers,review_items}` | "Human review required: approval policy not asserted by static scan." Do **not** write "approval enforced" or "approval verified." |
 | Confirmation policy | [`SHIP-POLICY-CONFIRMATION-MISSING`](checks.md#ship-policy-confirmation-missing) | `findings[]`; `release_decision.{blockers,review_items}` | "Human review required: confirmation policy missing for this tool." Do **not** write "user confirms before each call." |
 | Idempotency | [`SHIP-SIDEFX-IDEMPOTENCY-MISSING`](checks.md#ship-sidefx-idempotency-missing), [`SHIP-API-RETRY-WITHOUT-IDEMPOTENCY`](checks.md#ship-api-retry-without-idempotency) | `findings[]`; `release_decision.{blockers,review_items}` | "Human review required: idempotency evidence missing — retries may double-apply." Do **not** write "tool is idempotent" or "safe to retry." |
 | Broad-scope authorization | [`SHIP-AUTH-MANIFEST-BROAD-SCOPE`](checks.md#ship-auth-manifest-broad-scope), [`SHIP-AUTH-TOOL-BROAD-SCOPE`](checks.md#ship-auth-tool-broad-scope), [`SHIP-SCOPE-TOOL-OUTSIDE-PURPOSE`](checks.md#ship-scope-tool-outside-purpose) | `findings[]`; `release_decision.{blockers,review_items}` | "Human review required: broad scope (e.g. `*`, `admin`) declared — narrow or document." Do **not** write "scope is acceptable" or "compensated by other controls." |
 | Prohibited-action enforcement | [`SHIP-SCOPE-PROHIBITED-TOOL-PRESENT`](checks.md#ship-scope-prohibited-tool-present); manifest field `agent.prohibited_actions[]` in [`shipgate.yaml`](manifest-v0.1.md) | `findings[]`; `capability_facts[]`; `misalignments[]` (v0.9+) | "Human review required: a tool overlaps a declared `prohibited_actions` entry; static scan does not prove a runtime guardrail blocks it." Do **not** write "guardrail blocks this." |
-| Runtime trace evidence | [`SHIP-API-TRACE-APPROVAL-MISSING`](checks.md#ship-api-trace-approval-missing), [`SHIP-API-TRACE-CONFIRMATION-MISSING`](checks.md#ship-api-trace-confirmation-missing), [`SHIP-EVIDENCE-APPROVAL-TRACE-MISSING`](checks.md#ship-evidence-approval-trace-missing) | `findings[]`; packet `human_in_the_loop` (schema 0.3) | "Human review required: trace evidence missing or shows a policy-controlled call without approval/confirmation. Local HITL evidence is not runtime-enforcement proof." Do **not** edit the trace to make the finding go away. |
+| Runtime trace evidence | [`SHIP-API-TRACE-APPROVAL-MISSING`](checks.md#ship-api-trace-approval-missing), [`SHIP-API-TRACE-CONFIRMATION-MISSING`](checks.md#ship-api-trace-confirmation-missing), [`SHIP-EVIDENCE-APPROVAL-TRACE-MISSING`](checks.md#ship-evidence-approval-trace-missing) | `findings[]`; packet `human_in_the_loop` (schema 0.4) | "Human review required: trace evidence missing or shows a policy-controlled call without approval/confirmation. Local HITL evidence is not runtime-enforcement proof." Do **not** edit the trace to make the finding go away. |
 
-These findings carry `requires_human_review: true` and `suggested_patch_kind: "manual"` (or are derived to safe-closed when patches are absent — see [`autofix-policy.md`](autofix-policy.md) §"Three patch states"). They do **not** auto-apply via `apply-patches --confidence high`.
+The Finding-backed rows carry `requires_human_review: true` and
+`suggested_patch_kind: "manual"` (or are derived to safe-closed when patches
+are absent — see [`autofix-policy.md`](autofix-policy.md) §"Three patch
+states"). Semantic effect/authority gaps instead carry
+`next_action.auto_apply: false` and `next_action.requires_human_review: true`;
+they never enter `apply-patches` through `findings[].patches`.
+
+One narrow exception, added in report v0.39 and scoped by content rather than
+by check ID: a row the scan filled in completely — an **effect** it read
+directly, from the closed vocabulary, never weaker than any reading it observed
+— carries `next_action.authorable_by: "coding_agent"` and a `declare_action`
+patch. That is a licence to draft, not to decide: the patch is outside the
+default `--kinds`, it only ever writes into fields the manifest leaves silent,
+`requires_human_review` stays `true`, and writing the manifest touches the trust
+root so a person still merges it. Authority, overrides, and inventories are
+never drafted — those templates keep their `<REVIEW_REQUIRED>` blanks and their
+`"human"` tag, and the "do not infer or auto-fill `authority`" rule in the table
+above is unchanged.
+
+The catalog enforces this boundary independently of the per-patch derivation: each check in the table above sets `requires_human_review_regardless_of_patch=True` in its `CheckMetadata` entry, so `annotate_remediation` forces `autofix_safe=False` even when a third-party patch generator emits a high-confidence non-manual patch for one of these check IDs. `agent_action` for such a finding lands at `propose_patch_for_review` (the patch is still surfaced for the human to apply) rather than `auto_apply`.
 
 ---
 
@@ -61,7 +94,13 @@ Static analysis can prove what is *declared* in a manifest, schema, prompt, or t
 
 > Static analysis does not verify runtime tool routing, actual model behavior, external authorization enforcement, tool execution results, or prompt-injection resistance of returned tool content.
 
-The Release Evidence Packet schema 0.3 carries this disclaimer in machine-readable form — `human_in_the_loop.runtime_control_disclaimer` — and the [`docs/agent-contract-current.md`](agent-contract-current.md) entry for the packet (lines 51-54) states explicitly: "local HITL evidence is not runtime-enforcement proof." An agent that asserts approval/confirmation/idempotency/scope/prohibited-action/trace evidence as enforced is making a claim Agents Shipgate cannot back.
+The Release Evidence Packet schema 0.8 carries this disclaimer in
+machine-readable form — `human_in_the_loop.runtime_control_disclaimer` — and
+the [`docs/agent-contract-current.md`](agent-contract-current.md) packet entry
+states explicitly that local HITL evidence is not runtime-enforcement proof.
+An agent that asserts effect, authority, approval, confirmation, idempotency,
+scope, prohibited-action, or trace evidence as enforced is making a claim
+Agents Shipgate cannot back.
 
 If the user has a runtime gateway, observability layer, or guardrail that does enforce these — point at that system in the human review note, do not infer enforcement from the static scan.
 
@@ -69,11 +108,18 @@ If the user has a runtime gateway, observability layer, or guardrail that does e
 
 ## When the user asks you to override
 
-If a user asks the agent to commit a change asserting any of the seven categories — for example "just say approval is enforced, we know it is" or "edit the trace to make the finding go away" — refuse and explain:
+If a user asks the agent to commit an unsupported assertion from this boundary
+— for example "mark this unknown tool read-only", "say it uses no auth", "just
+say approval is enforced", or "edit the trace to make the finding go away" —
+refuse and explain:
 
 1. The static scan does not back the assertion. Cite [`trust-model.md`](trust-model.md) §Known Limits.
 2. The relevant finding's `requires_human_review: true` flag is the policy boundary, not a heuristic.
-3. Offer the alternatives: (a) a human reviewer signs off and writes the assertion themselves; (b) suppress the finding in [`shipgate.yaml`](manifest-v0.1.md) `checks.ignore` with a `reason` (this records the override but does not assert enforcement); (c) add the runtime evidence the check is looking for and re-scan.
+3. Offer the applicable alternatives: a human supplies the reviewed
+   effect/authority declaration or complete source inventory; a human reviews
+   a Finding-backed policy exception; or the required runtime evidence is
+   added and the scan is rerun. A baseline or suppression cannot waive a
+   semantic evidence gap.
 
 Editing a trace artifact to flip an `SHIP-API-TRACE-APPROVAL-MISSING` finding is the canonical anti-pattern. The `ManualPatch.instructions` for these checks call this out explicitly. See [`autofix-policy.md`](autofix-policy.md) class four.
 
@@ -85,6 +131,6 @@ Editing a trace artifact to flip an `SHIP-API-TRACE-APPROVAL-MISSING` finding is
 - [`agent-contract-current.md`](agent-contract-current.md) — current statement of which `report.json` fields agents and CI integrations should read.
 - [`report-reading-for-agents.md`](report-reading-for-agents.md) — reader's primer for `report.json`.
 - [`trust-model.md`](trust-model.md) — what the scanner does and doesn't do; the source of the runtime-enforcement boundary.
-- [`agent-recipes.md`](agent-recipes.md) — copy-pasteable workflows for the canonical 4-call flow.
+- [`agent-recipes.md`](agent-recipes.md) — copy-pasteable workflows for verify-first PRs and first adoption.
 - [`target-repo-agent-snippets.md`](target-repo-agent-snippets.md) — the same boundary in copy-paste form for downstream repos (`AGENTS.md`, `CLAUDE.md`, `.cursor/rules/`, PR template).
 - [`AGENTS.md`](../AGENTS.md) §"What you can't do" — CLI invariants (no MCP connect, no code modification, 10 MB cap, etc.). That section is about the *CLI*'s boundary; this page is about the *agent consuming the CLI*.

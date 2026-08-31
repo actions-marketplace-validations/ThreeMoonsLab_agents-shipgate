@@ -1,0 +1,84 @@
+{
+  "schema_version": "shipgate.codex_boundary_result/v2",
+  "agent": "codex",
+  "tool": {
+    "name": "agents-shipgate",
+    "version": "0.16.0b6"
+  },
+  "subject": {
+    "agent": "codex"
+  },
+  "decision": "block",
+  "risk_level": "none",
+  "audit_id": "stale_install_pipx",
+  "policy_version": "unavailable",
+  "summary": "Installed Agents Shipgate is older than the required version.",
+  "changed_files": [],
+  "control": {
+    "state": "agent_action_required",
+    "reason": "Installed Agents Shipgate is older than the required contract v14; a stale binary can emit an outdated schema or miss commands.",
+    "completion_allowed": false,
+    "must_stop": false,
+    "verify_required": false,
+    "next_action": {
+      "actor": "coding_agent",
+      "kind": "install",
+      "command": "pipx upgrade agents-shipgate",
+      "expects": null,
+      "why": "Installed Agents Shipgate is older than the required contract v14; a stale binary can emit an outdated schema or miss commands."
+    },
+    "allowed_next_commands": [
+      "pipx upgrade agents-shipgate"
+    ],
+    "human_review": {
+      "required": false,
+      "why": null,
+      "required_reviewers": []
+    },
+    "stop_reason": null
+  },
+  "repair": {
+    "actor": "coding_agent",
+    "safe_to_attempt": false,
+    "instructions": [],
+    "forbidden_shortcuts": [
+      "Do not suppress Shipgate findings to continue with a stale gate.",
+      "Do not weaken policy, baselines, waivers, CI, or agent instructions to bypass the upgrade.",
+      "Do not trust the stale binary's output instead of upgrading."
+    ]
+  },
+  "policy": {
+    "id": "unavailable",
+    "version": "unavailable",
+    "source": "missing",
+    "discovery": [
+      "binary_stale"
+    ]
+  },
+  "violated_rules": [],
+  "affected_files": [],
+  "required_reviewers": [],
+  "explanation": "Upgrade Agents Shipgate to contract v14, then rerun shipgate check.",
+  "suggested_fixes": [
+    "Install or upgrade agents-shipgate to contract v14"
+  ],
+  "agent_repair_instructions": [
+    "Install or upgrade Agents Shipgate, then confirm agents-shipgate contract --json reports contract_version >= 14.",
+    "Rerun shipgate check --agent codex --workspace . --format codex-boundary-json."
+  ],
+  "diagnostics": [
+    {
+      "level": "error",
+      "code": "shipgate_stale_install",
+      "message": "The installed shipgate binary is older than the required contract v14."
+    }
+  ],
+  "trace": [
+    {
+      "step": "version_preflight",
+      "summary": "Agent instruction fallback emitted a schema-valid upgrade action because the installed binary was stale."
+    }
+  ],
+  "source_artifacts": {},
+  "finding_fingerprints": []
+}

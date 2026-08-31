@@ -4,9 +4,30 @@ Which Agents Shipgate findings are safe to apply automatically, which
 need human review, and how the per-finding metadata in `report.json`
 maps to `apply-patches --confidence` flag semantics.
 
-> **Audience.** AI coding agents driving the canonical 4-call flow
+> **Audience.** AI coding agents driving verify-first PR checks or first-adoption helper flows
 > (see [`agent-recipes.md`](agent-recipes.md)) and CI integrators
 > deciding what to gate on.
+
+---
+
+## Semantic evidence gaps are outside the patch system
+
+Starting with report v0.30, effect and authority evidence gaps live under
+`release_decision.evidence_coverage.evidence_gaps[]`; they are not Findings and
+never carry a `Patch`. Their `next_action` may show a reviewed declaration
+template, accepted values, manifest path, and rerun command, but always carries
+`suggested_patch_kind: "manual"`, `auto_apply: false`, and
+`requires_human_review: true`.
+
+An agent may route `declare_action_effect`, `declare_action_authority`,
+`provide_complete_inventory`, or `resolve_semantic_conflict` to a human. It
+must never invent or auto-fill the declaration. These two assertions are
+published as `action_effect` and `action_authority` in contract v12's
+`do_not_auto_assert[]`. Baselines, suppressions, severity overrides,
+`--no-heuristics`, and human acknowledgement cannot close a semantic gap.
+
+The Finding classes below apply only after this separate evidence-coverage
+boundary has been checked.
 
 ---
 
@@ -88,6 +109,22 @@ manual: `"manual"`. If the patches list is empty: `"none"`.)
 
 `docs_url` always comes from `CheckMetadata.docs_url`. Patches
 don't carry per-instance documentation URLs.
+
+### Catalog-driven escalation override
+
+The strict derivation rule above can be **forced safe-closed** by a
+per-check policy flag. When `CheckMetadata.requires_human_review_regardless_of_patch`
+is `True`, `annotate_remediation` sets `autofix_safe=False` and
+`requires_human_review=True` regardless of the per-patch derivation,
+so `agent_action` lands at `propose_patch_for_review` (the patch is
+still surfaced) instead of `auto_apply`. This catches the
+approval/confirmation/idempotency, broad-scope, prohibited-action,
+runtime-trace and HITL-evidence categories listed in
+[`agent-autofix-boundary.md`](agent-autofix-boundary.md) §"Check-ID
+mapping"; even a third-party patch generator emitting a clean
+high-confidence non-manual patch on one of those check IDs cannot
+auto-apply. The catalog is the contract: those check IDs always
+escalate, regardless of how the patches were derived.
 
 ### Three patch states
 
@@ -204,7 +241,7 @@ from the hash so toggling `--suggest-patches` doesn't shift it.
 - [`checks.md`](checks.md) — full check catalog with rationale.
 - [`minimal-real-configs.md`](minimal-real-configs.md) — per-framework
   minimal manifests to build from.
-- [`report-schema.v0.13.json`](report-schema.v0.13.json) — current JSON
+- [`report-schema.v0.42.json`](report-schema.v0.42.json) — current JSON
   Schema for `report.json`.
 - [`AGENTS.md`](../AGENTS.md) — top-level agent instructions, install,
   trigger table.

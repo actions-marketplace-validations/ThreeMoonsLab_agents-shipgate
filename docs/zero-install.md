@@ -27,18 +27,33 @@ The script's output is a **structural subset** of `agents-shipgate detect --json
   "frameworks": [{"type": "openai_agents_sdk", "score": 4.5, ...}],
   "agent_name_candidates": [...],
   "suggested_sources": [{"type": "mcp", "path": "..."}],
+  "excluded_sources": [{"type": "mcp", "path": "...", "reason": "..."}],
   "codex_plugin_candidates": [{"mode": "package", "path": "..."}],
+  "agent_scope": "single",
+  "agent_project_candidates": [{"path": ".", "marker": "pyproject.toml", "agent_names": [...]}],
+  "agent_scope_truncated": false,
+  "python_parse_truncated": false,
   "next_action": "agents-shipgate init --workspace .",
   "workspace_signals": {...},
-  "script_version": "0.1.0"
+  "script_version": "0.4.0"
 }
 ```
 
-The script and the canonical CLI are pinned to **structural verdict parity** by [`tests/test_zero_install_detector.py`](https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/tests/test_zero_install_detector.py): same `is_agent_project`, same fired frameworks, same suggested sources, and same Codex plugin candidates for every sample in `samples/`. Field-by-field byte parity is not pinned and not promised — the script is not a drop-in replacement for the CLI.
+Like the canonical CLI, the script parse-probes each glob-matched MCP/OpenAPI candidate before suggesting it — a filename match is not a guarantee. A Cursor plugin `mcp.json` is an `mcpServers`-style host config, not an MCP tools-array export; suggesting it would make the next `init --write` → `scan` step fail. Rejected candidates appear under `excluded_sources` (`{type, path, reason}`) instead of `suggested_sources`. The probe is **JSON-only** (stdlib has no YAML parser): a `.json` candidate the adapters would reject is excluded here too, while a `.yaml`/`.yml` OpenAPI spec is always kept as a suggestion (never wrongly dropped). The real-world miss this guards against — `mcpServers`-style host configs — is always JSON, so the probe is exact where it matters.
+
+Like `agents-shipgate detect`, the script silently skips common fixture corpus directories such as `fixtures/`, `_fixtures/`, `__fixtures__/`, `testdata/`, `test_data/`, `test-fixtures/`, `test_fixtures/`, `golden/`, and `goldens/` when they are below the selected workspace. Point `--workspace` directly at a fixture project if you intentionally want to classify that fixture itself.
+
+The script and the canonical CLI are pinned to **structural verdict parity** by [`tests/test_zero_install_detector.py`](https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/tests/test_zero_install_detector.py): same `is_agent_project`, same fired frameworks, same suggested sources, same excluded sources, same Codex plugin candidates, and the same manifest-scope verdict (`agent_scope`, `agent_scope_truncated`, `python_parse_truncated`, plus `agent_project_candidates[]`) for every sample in `samples/`. The scope verdict is pinned because an agent that consults the zero-install path must not adopt a scope the CLI would refuse: on a workspace whose agents live in several self-contained projects, both report `agent_scope: "ambiguous"` and neither recommends initializing the root. `agent_scope_truncated` is pinned for the same reason one step down: when the Python parse stopped at its cap in a workspace holding more than one project root, `agent_project_candidates[]` is a lower bound rather than an enumeration, and a caller that reads a truncated list as complete concludes its own project is not an agent project. `python_parse_truncated` is the wider fact both detectors carry: whether the parse stopped at its cap at all, which is what makes every whole-workspace negative — `is_agent_project: false` included — unsafe to act on. Field-by-field byte parity is not pinned and not promised — the script is not a drop-in replacement for the CLI.
+
+`agent_name_candidates` is the one field pinned byte for byte, including its ranking and each entry's `rationale[]`. It is not a yes/no signal: it names the agent a generated manifest would declare as the reviewed identity, so a script that ranked differently would point you at a different agent than `init` does.
 
 **When to use this:** you're a coding agent (Claude Code, Codex, Cursor) deciding *whether* to propose Shipgate. The script tells you in one fetch + one Python invocation. The full flow (`init`, `scan`, `apply-patches`) requires the actual install.
 
-**Constraints:** Python 3.12+ on the runner. No git fast path (uses `os.walk` only). Evidence strings and absolute scores are simplified — the verdict is what's pinned, not the prose.
+**Constraints:** Python 3.12+ on the runner. Evidence/reason strings and absolute framework scores are simplified — the verdict is what's pinned, not the prose.
+
+The workspace inventory does match the canonical CLI's — `git ls-files` when Git can read the workspace, a contained filesystem walk otherwise. That is a correctness requirement, not a speed one: a `.gitignore`d module is invisible to `init`, so a script that walked it anyway could name an agent `init` will never write. Paths escaping the workspace through a symlink are dropped for the same reason.
+
+Git's output is read incrementally against a 16 MiB bound. If that bound is exceeded the script **exits non-zero** rather than falling back to a filesystem walk — the same failure the canonical CLI raises. A fallback would do exactly the work the bound exists to refuse, and would answer from a different inventory than `init` used.
 
 ## 2. `uvx` (no permanent install)
 
@@ -76,12 +91,12 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           fetch-depth: 0
-      - uses: ThreeMoonsLab/agents-shipgate@v0.10.0
+      - uses: ThreeMoonsLab/agents-shipgate@v0.15.0
         with:
           ci_mode: advisory
           diff_base: target
           pr_comment: 'true'
-          shipgate_version: '0.10.0'
+          shipgate_version: '0.15.0'
 ```
 
 The full template lives at [`examples/github-actions/01-advisory-pr-comment.yml`](https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/examples/github-actions/01-advisory-pr-comment.yml).
@@ -101,7 +116,7 @@ The full template lives at [`examples/github-actions/01-advisory-pr-comment.yml`
 
 ## Going from zero-install to full install
 
-When the detector script returns `is_agent_project: true`, the natural next step is the canonical 4-call flow ([AGENTS.md § Single-turn agent flow](https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/AGENTS.md#single-turn-agent-flow-v06)):
+When the detector script returns `is_agent_project: true`, the natural next step is the first-adoption helper flow ([AGENTS.md § Single-turn agent flow](https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/AGENTS.md#single-turn-agent-flow-v06)); after adoption, use `agents-shipgate verify` for ongoing PRs:
 
 ```bash
 pipx install agents-shipgate

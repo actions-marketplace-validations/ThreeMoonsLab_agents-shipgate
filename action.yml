@@ -1,10 +1,14 @@
 name: Agents Shipgate
 description: >-
-  Static release-readiness gate for AI agent tool surfaces. Scans MCP, OpenAPI,
-  OpenAI Agents SDK, Anthropic, Google ADK, LangChain, and CrewAI artifacts.
-  Writes a Tool-Use Readiness Report (Markdown / JSON / SARIF) before your
-  agent gets production-like permissions. No LLM calls. No agent execution.
-  Apache-2.0.
+  The deterministic merge gate for AI-generated agent capability changes.
+  Verifies PRs that change MCP, OpenAPI, OpenAI Agents SDK, Anthropic,
+  Google ADK, LangChain, CrewAI, OpenAI API, Codex config, Codex plugin, n8n,
+  and Conductor OSS workflow JSON
+  artifacts. Writes verifier.json, report.json, pr-comment.md, capability
+  lock/diff review artifacts, and SARIF before your agent-capability change
+  lands. Local-first and
+  static-by-default. Audited exceptions are pinned per call site in
+  tests/test_adapter_static_only.py::ALLOWED_EXCEPTIONS. Apache-2.0.
 author: ThreeMoonsLab
 
 branding:
@@ -24,6 +28,10 @@ inputs:
     required: false
     default: ""
     description: Optional comma-separated severities that fail CI, for example critical,high.
+  fail_on_merge_verdicts:
+    required: false
+    default: ""
+    description: "Optional comma-separated merge verdicts that fail CI. Supported values: blocked, human_review_required, insufficient_evidence, unknown, mergeable."
   baseline:
     required: false
     default: ""
@@ -31,11 +39,23 @@ inputs:
   diff_from:
     required: false
     default: ""
-    description: Optional prior report.json or v0.3 baseline JSON for tool-surface diff.
+    description: Optional prior report.json or v0.4 baseline JSON for tool/action surface diff.
   diff_base:
     required: false
     default: ""
-    description: Set to target to best-effort scan the pull request base branch for diff.
+    description: Set to target to use the locally available pull request base branch for diff.
+  verify_mode:
+    required: false
+    default: verify
+    description: "Verifier mode for the Action. Supported values: verify (default) or scan for legacy direct-scan execution."
+  base_ref:
+    required: false
+    default: ""
+    description: Optional local base ref/SHA for PR diff. With diff_base=target on pull_request, defaults to origin/<github.base_ref>. The action never fetches.
+  head_ref:
+    required: false
+    default: ""
+    description: Optional local head ref/SHA for PR diff and scan. Omit to scan the checked-out workspace.
   baseline_mode:
     required: false
     default: new-findings
@@ -56,10 +76,39 @@ inputs:
     required: false
     default: "true"
     description: Upload reports as a workflow artifact.
+  check_annotations:
+    required: false
+    default: "true"
+    description: Emit GitHub Actions job annotations for source-backed blockers and review items.
+  check_annotation_limit:
+    required: false
+    default: "50"
+    description: Maximum number of GitHub Actions annotations to emit.
   pr_comment:
     required: false
     default: "false"
     description: Post a short PR comment when running on pull_request.
+  pr_comment_style:
+    required: false
+    default: capability-review
+    description: "PR comment renderer. Supported values: capability-review (default) or findings for the legacy v1 findings comment."
+  check_run:
+    required: false
+    default: "false"
+    description: >-
+      Create/update a GitHub Check Run named by check_run_name with the
+      merge verdict as the check conclusion (mergeable=success,
+      blocked=failure, otherwise neutral) and up to 50 line-level
+      annotations from the PR projection. Requires `checks: write`
+      permission on the workflow.
+  check_run_policy:
+    required: false
+    default: advisory
+    description: "Check Run conclusion policy: advisory, blocked-fails, or require-mergeable."
+  check_run_name:
+    required: false
+    default: "Agents Shipgate"
+    description: Name of the check run created when check_run is true.
   github_token:
     required: false
     default: ""
@@ -68,10 +117,36 @@ inputs:
     required: false
     default: ""
     description: Optional Agents Shipgate PyPI version to install. Empty installs this action source.
+  attestation:
+    required: false
+    default: "false"
+    description: Emit agents-shipgate-reports/attestation.json from verifier.json/report.json.
+  registry_repo_label:
+    required: false
+    default: ""
+    description: Optional repository label copied into attestation org context.
+  org_bundle:
+    required: false
+    default: "false"
+    description: Emit agents-shipgate-reports/org-evidence-bundle.json for org/fleet aggregation.
+  host_audit:
+    required: false
+    default: "false"
+    description: Emit agents-shipgate-reports/host-grants.json from audit --host.
+  org_status:
+    required: false
+    default: "false"
+    description: Emit agents-shipgate-reports/org-status.json from org status.
+  registry_path:
+    required: false
+    default: ""
+    description: Optional registry path label embedded in org bundle metadata; never mutated by this action.
 
 outputs:
+  # Legacy v0.7-caller output; baseline-blind. Prefer release_decision.decision
+  # via the `decision` output below for gating.
   status:
-    description: Agents Shipgate summary status.
+    description: Agents Shipgate summary status (legacy v0.7 caller; baseline-blind).
     value: ${{ steps.report_outputs.outputs.status }}
   critical_count:
     description: Number of unsuppressed critical findings.
@@ -106,11 +181,65 @@ outputs:
   report_sarif:
     description: Path to the generated SARIF report.
     value: ${{ steps.report_outputs.outputs.report_sarif }}
+  verifier_json:
+    description: Path to verifier.json.
+    value: ${{ steps.report_outputs.outputs.verifier_json }}
+  verify_run_json:
+    description: Path to verify-run.json.
+    value: ${{ steps.report_outputs.outputs.verify_run_json }}
+  agent_handoff_json:
+    description: Path to agent-handoff.json.
+    value: ${{ steps.report_outputs.outputs.agent_handoff_json }}
+  verification_receipt_json:
+    description: Path to the validated terminal verification receipt.
+    value: ${{ steps.report_outputs.outputs.verification_receipt_json }}
+  request_id:
+    description: Content-addressed verification request identity.
+    value: ${{ steps.report_outputs.outputs.request_id }}
+  receipt_id:
+    description: Content-addressed terminal receipt identity.
+    value: ${{ steps.report_outputs.outputs.receipt_id }}
+  decision_id:
+    description: Content-addressed assembled decision identity.
+    value: ${{ steps.report_outputs.outputs.decision_id }}
+  artifact_set_id:
+    description: Content-addressed artifact-set identity.
+    value: ${{ steps.report_outputs.outputs.artifact_set_id }}
+  run_id:
+    description: Deterministic verify-run input identity from verify-run.json.
+    value: ${{ steps.report_outputs.outputs.run_id }}
+  pr_comment_markdown:
+    description: Path to the generated PR comment Markdown.
+    value: ${{ steps.report_outputs.outputs.pr_comment_markdown }}
+  check_annotations_json:
+    description: Path to generated GitHub Actions annotation payload.
+    value: ${{ steps.report_outputs.outputs.check_annotations_json }}
+  capability_lock_json:
+    description: Path to generated head capability lock JSON.
+    value: ${{ steps.report_outputs.outputs.capability_lock_json }}
+  base_capability_lock_json:
+    description: Path to generated base capability lock JSON when base diff is available.
+    value: ${{ steps.report_outputs.outputs.base_capability_lock_json }}
+  capability_lock_diff_json:
+    description: Path to generated capability lock diff JSON when base and head locks are available.
+    value: ${{ steps.report_outputs.outputs.capability_lock_diff_json }}
+  attestation_json:
+    description: Path to generated release attestation JSON when attestation is true.
+    value: ${{ steps.report_outputs.outputs.attestation_json }}
+  org_evidence_bundle_json:
+    description: Path to generated organization evidence bundle JSON when org_bundle is true.
+    value: ${{ steps.report_outputs.outputs.org_evidence_bundle_json }}
+  host_grants_json:
+    description: Path to generated host-grants inventory JSON when host_audit is true.
+    value: ${{ steps.report_outputs.outputs.host_grants_json }}
+  org_status_json:
+    description: Path to generated organization status JSON when org_status is true.
+    value: ${{ steps.report_outputs.outputs.org_status_json }}
   exit_code:
     description: Agents Shipgate CLI exit code.
     value: ${{ steps.scan.outputs.exit_code }}
   decision:
-    description: Release decision (`blocked`, `review_required`, or `passed`). v0.8+.
+    description: Release decision (`blocked`, `review_required`, `insufficient_evidence`, or `passed`). v0.8+; `insufficient_evidence` added v0.14.
     value: ${{ steps.report_outputs.outputs.decision }}
   blocker_count:
     description: Number of blockers in release_decision (v0.8+).
@@ -124,12 +253,83 @@ outputs:
   diff_enabled:
     description: Whether tool_surface_diff was enabled in report.json.
     value: ${{ steps.report_outputs.outputs.diff_enabled }}
+  action_diff_enabled:
+    description: Whether action_surface_diff was enabled in report.json.
+    value: ${{ steps.report_outputs.outputs.action_diff_enabled }}
+  actions_added:
+    description: Number of actions added by Action Surface Diff.
+    value: ${{ steps.report_outputs.outputs.actions_added }}
+  actions_modified:
+    description: Number of actions modified by Action Surface Diff.
+    value: ${{ steps.report_outputs.outputs.actions_modified }}
+  actions_removed:
+    description: Number of actions removed by Action Surface Diff.
+    value: ${{ steps.report_outputs.outputs.actions_removed }}
+  should_run:
+    description: Trigger evaluator should_run value from verifier.json (`true`/`false`).
+    value: ${{ steps.report_outputs.outputs.should_run }}
+  trigger_action:
+    description: >-
+      Final trigger action (`force_run`, `run_shipgate`, `skip_shipgate`,
+      `dry_run`, `withheld`, or `none`). `withheld` means the evaluator
+      published no verdict — read `trigger_evaluation_status` to tell which
+      of the two withheld states applies. Never treat it as a skip.
+    value: ${{ steps.report_outputs.outputs.trigger_action }}
+  trigger_evaluation_status:
+    description: >-
+      Trigger evaluation status (`evaluated`, `unclassified`, or
+      `not_evaluated`). `unclassified` means the diff was read in full and no
+      rule classified it — run the scan. `not_evaluated` means the diff could
+      not be read — repair the input. `should_run` is empty for both.
+    value: ${{ steps.report_outputs.outputs.trigger_evaluation_status }}
+  trigger_rule_ids:
+    description: Comma-separated trigger rule IDs that matched.
+    value: ${{ steps.report_outputs.outputs.trigger_rule_ids }}
+  verifier_verdict:
+    description: Verifier convenience verdict. Prefer `decision` for CI gating; projected from release_decision.
+    value: ${{ steps.report_outputs.outputs.verifier_verdict }}
+  merge_verdict:
+    description: "PR/controller verdict projected from release_decision (`mergeable`, `human_review_required`, `insufficient_evidence`, `blocked`, or `unknown`). Use `decision` for CI gating."
+    value: ${{ steps.report_outputs.outputs.merge_verdict }}
+  can_merge_without_human:
+    description: True only for a verified passed result or a completed deterministic not-applicable skip.
+    value: ${{ steps.report_outputs.outputs.can_merge_without_human }}
+  agent_control_state:
+    description: Authoritative agent control state (`complete`, `agent_action_required`, `review_publishable`, or `human_review_required`). `review_publishable` authorizes commit/push/PR updates while denying merge and completion.
+    value: ${{ steps.report_outputs.outputs.agent_control_state }}
+  agent_control_reason:
+    description: Deterministic reason for the authoritative agent control state.
+    value: ${{ steps.report_outputs.outputs.agent_control_reason }}
+  agent_controller_must_stop:
+    description: Compatibility mirror of verifier.json.control.must_stop (`true`/`false`).
+    value: ${{ steps.report_outputs.outputs.agent_controller_must_stop }}
+  agent_controller_stop_reason:
+    description: Compatibility mirror of verifier.json.control.stop_reason.
+    value: ${{ steps.report_outputs.outputs.agent_controller_stop_reason }}
+  agent_controller_completion_allowed:
+    description: Compatibility mirror of verifier.json.control.completion_allowed (`true`/`false`).
+    value: ${{ steps.report_outputs.outputs.agent_controller_completion_allowed }}
+  trust_root_touched:
+    description: Whether verifier_summary reports a touched release trust root (`true`/`false`). Review signal; not a second gate.
+    value: ${{ steps.report_outputs.outputs.trust_root_touched }}
+  policy_weakened:
+    description: Whether verifier_summary reports a policy weakening (`true`/`false`). Review signal; not a second gate.
+    value: ${{ steps.report_outputs.outputs.policy_weakened }}
+  capability_changes_added:
+    description: Supporting/provisional count of added members in the capability delta; not a second gate.
+    value: ${{ steps.report_outputs.outputs.capability_changes_added }}
+  capability_changes_modified:
+    description: Supporting/provisional count of broadened plus narrowed capability delta members; not a second gate.
+    value: ${{ steps.report_outputs.outputs.capability_changes_modified }}
+  capability_changes_removed:
+    description: Supporting/provisional count of removed members in the capability delta; not a second gate.
+    value: ${{ steps.report_outputs.outputs.capability_changes_removed }}
 
 runs:
   using: composite
   steps:
     - name: Set up Python
-      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: "3.12"
 
@@ -155,70 +355,63 @@ runs:
         BASELINE_MODE: ${{ inputs.baseline_mode }}
         DIFF_FROM: ${{ inputs.diff_from }}
         DIFF_BASE: ${{ inputs.diff_base }}
+        VERIFY_MODE: ${{ inputs.verify_mode }}
+        INPUT_BASE_REF: ${{ inputs.base_ref }}
+        INPUT_HEAD_REF: ${{ inputs.head_ref }}
         BASE_REF: ${{ github.base_ref }}
         EVENT_NAME: ${{ github.event_name }}
+        EVALUATED_HEAD_SHA: ${{ github.sha }}
         POLICY_PACKS: ${{ inputs.policy_packs }}
         NO_PLUGINS: ${{ inputs.no_plugins }}
         OUTPUT_DIR: ${{ inputs.output_dir }}
+        PR_COMMENT_STYLE: ${{ inputs.pr_comment_style }}
       run: |
-        args=(
-          scan
-          --config "${CONFIG}"
-          --ci-mode "${CI_MODE}"
-          --out "${OUTPUT_DIR}"
-          --format markdown,json,sarif
-        )
+        if [ "${VERIFY_MODE}" = "verify" ]; then
+          args=(
+            verify
+            --workspace "."
+            --config "${CONFIG}"
+            --ci-mode "${CI_MODE}"
+            --out "${OUTPUT_DIR}"
+            --format json
+            --pr-comment-style "${PR_COMMENT_STYLE}"
+          )
+        elif [ "${VERIFY_MODE}" = "scan" ]; then
+          args=(
+            scan
+            --config "${CONFIG}"
+            --ci-mode "${CI_MODE}"
+            --out "${OUTPUT_DIR}"
+            --format markdown,json,sarif
+            --packet-format json
+          )
+        else
+          echo "verify_mode must be 'verify' or 'scan'." >&2
+          echo "exit_code=2" >> "${GITHUB_OUTPUT}"
+          exit 2
+        fi
         if [ -n "${FAIL_ON}" ]; then
           args+=(--fail-on "${FAIL_ON}")
         fi
         if [ -n "${BASELINE}" ]; then
           args+=(--baseline "${BASELINE}" --baseline-mode "${BASELINE_MODE}")
         fi
-        resolved_diff_from="${DIFF_FROM}"
-        diff_tmp_to_cleanup=""
-        diff_worktree_to_cleanup=""
-        if [ -z "${resolved_diff_from}" ] && [ "${DIFF_BASE}" = "target" ]; then
-          if [ "${EVENT_NAME}" = "pull_request" ] && [ -n "${BASE_REF}" ]; then
-            base_tmp="$(mktemp -d)"
-            base_worktree="${base_tmp}/base"
-            base_out="${base_tmp}/reports"
-            diff_tmp_to_cleanup="${base_tmp}"
-            diff_worktree_to_cleanup="${base_worktree}"
-            diff_note=""
-            if ! git fetch --depth=1 origin "${BASE_REF}"; then
-              diff_note="tool-surface diff disabled: could not fetch base ref ${BASE_REF}"
-            elif ! git worktree add --detach "${base_worktree}" "FETCH_HEAD"; then
-              diff_note="tool-surface diff disabled: could not create base worktree"
-            elif [ ! -f "${base_worktree}/${CONFIG}" ]; then
-              diff_note="tool-surface diff disabled: base branch lacks ${CONFIG}"
-            else
-              set +e
-              (
-                cd "${base_worktree}"
-                agents-shipgate scan \
-                  --config "${CONFIG}" \
-                  --ci-mode advisory \
-                  --out "${base_out}" \
-                  --format json \
-                  --no-packet
-              )
-              base_exit=$?
-              set -e
-              if [ "${base_exit}" -eq 0 ] && [ -f "${base_out}/report.json" ]; then
-                resolved_diff_from="${base_out}/report.json"
-              else
-                diff_note="tool-surface diff disabled: base branch scan failed with exit ${base_exit}"
-              fi
-            fi
-            if [ -n "${diff_note}" ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-              printf '## Agents Shipgate\n\n- %s\n\n' "${diff_note}" >> "${GITHUB_STEP_SUMMARY}"
-            fi
-          elif [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-            printf '## Agents Shipgate\n\n- tool-surface diff disabled: diff_base=target requires a pull_request event with github.base_ref\n\n' >> "${GITHUB_STEP_SUMMARY}"
-          fi
+        if [ -n "${DIFF_FROM}" ]; then
+          args+=(--diff-from "${DIFF_FROM}")
         fi
-        if [ -n "${resolved_diff_from}" ]; then
-          args+=(--diff-from "${resolved_diff_from}")
+        if [ "${VERIFY_MODE}" = "verify" ]; then
+          resolved_base_ref="${INPUT_BASE_REF}"
+          if [ -z "${resolved_base_ref}" ] && [ "${DIFF_BASE}" = "target" ] && [ "${EVENT_NAME}" = "pull_request" ] && [ -n "${BASE_REF}" ]; then
+            resolved_base_ref="origin/${BASE_REF}"
+          fi
+          if [ -n "${resolved_base_ref}" ]; then
+            args+=(--base "${resolved_base_ref}")
+          fi
+          if [ -n "${INPUT_HEAD_REF}" ]; then
+            args+=(--head "${INPUT_HEAD_REF}")
+          elif [ -n "${EVALUATED_HEAD_SHA}" ]; then
+            args+=(--head "${EVALUATED_HEAD_SHA}")
+          fi
         fi
         if [ -n "${POLICY_PACKS}" ]; then
           while IFS= read -r policy_pack; do
@@ -232,14 +425,88 @@ runs:
         set +e
         agents-shipgate "${args[@]}"
         exit_code=$?
-        if [ -n "${diff_worktree_to_cleanup}" ] && [ -d "${diff_worktree_to_cleanup}" ]; then
-          git worktree remove --force "${diff_worktree_to_cleanup}" >/dev/null 2>&1 || true
-        fi
-        if [ -n "${diff_tmp_to_cleanup}" ]; then
-          rm -rf "${diff_tmp_to_cleanup}"
-        fi
         echo "exit_code=${exit_code}" >> "${GITHUB_OUTPUT}"
         exit 0
+
+    - name: Build Agents Shipgate attestation
+      if: ${{ always() && inputs.attestation == 'true' }}
+      shell: bash
+      env:
+        OUTPUT_DIR: ${{ inputs.output_dir }}
+        CONFIG: ${{ inputs.config }}
+        REGISTRY_REPO_LABEL: ${{ inputs.registry_repo_label }}
+      run: |
+        if [ -f "${OUTPUT_DIR}/verifier.json" ]; then
+          args=(
+            attest
+            --from "${OUTPUT_DIR}/verifier.json"
+            --out "${OUTPUT_DIR}/attestation.json"
+            --config "${CONFIG}"
+            --ci-context github-actions
+          )
+          if [ -n "${REGISTRY_REPO_LABEL}" ]; then
+            args+=(--repo "${REGISTRY_REPO_LABEL}")
+          fi
+          agents-shipgate "${args[@]}"
+        else
+          echo "Agents Shipgate verifier.json not found; attestation skipped." >&2
+        fi
+
+    - name: Build Agents Shipgate host audit
+      if: ${{ always() && inputs.host_audit == 'true' }}
+      shell: bash
+      env:
+        OUTPUT_DIR: ${{ inputs.output_dir }}
+      run: |
+        mkdir -p "${OUTPUT_DIR}"
+        shipgate audit --host --workspace "." --json \
+          --out "${OUTPUT_DIR}/host-grants.json" >/dev/null || \
+          echo "Agents Shipgate host audit failed; artifact skipped." >&2
+
+    - name: Build Agents Shipgate org status
+      if: ${{ always() && inputs.org_status == 'true' }}
+      shell: bash
+      env:
+        OUTPUT_DIR: ${{ inputs.output_dir }}
+        CONFIG: ${{ inputs.config }}
+      run: |
+        mkdir -p "${OUTPUT_DIR}"
+        set +e
+        agents-shipgate org status --config "${CONFIG}" --workspace "." --json \
+          > "${OUTPUT_DIR}/org-status.json"
+        status_code=$?
+        set -e
+        if [ "${status_code}" != "0" ] && [ "${status_code}" != "20" ]; then
+          echo "Agents Shipgate org status failed with ${status_code}." >&2
+        fi
+
+    - name: Build Agents Shipgate org evidence bundle
+      if: ${{ always() && inputs.org_bundle == 'true' }}
+      shell: bash
+      env:
+        OUTPUT_DIR: ${{ inputs.output_dir }}
+        CONFIG: ${{ inputs.config }}
+        REGISTRY_PATH: ${{ inputs.registry_path }}
+      run: |
+        mkdir -p "${OUTPUT_DIR}"
+        if [ -f "${OUTPUT_DIR}/verifier.json" ]; then
+          args=(
+            org
+            bundle
+            --config "${CONFIG}"
+            --workspace "."
+            --from "${OUTPUT_DIR}/verifier.json"
+            --out "${OUTPUT_DIR}/org-evidence-bundle.json"
+            --json
+          )
+          if [ -n "${REGISTRY_PATH}" ]; then
+            args+=(--registry "${REGISTRY_PATH}")
+          fi
+          agents-shipgate "${args[@]}" >/dev/null || \
+            echo "Agents Shipgate org evidence bundle failed; artifact skipped." >&2
+        else
+          echo "Agents Shipgate verifier.json not found; org bundle skipped." >&2
+        fi
 
     - name: Extract Agents Shipgate outputs
       id: report_outputs
@@ -248,107 +515,16 @@ runs:
       env:
         OUTPUT_DIR: ${{ inputs.output_dir }}
       run: |
-        python - <<'PY'
-        import json
-        import os
-        from pathlib import Path
+        python "${GITHUB_ACTION_PATH}/scripts/github_action_outputs.py"
 
-        output_dir = Path(os.environ.get("OUTPUT_DIR") or "agents-shipgate-reports")
-        report_json = output_dir / "report.json"
-        report_markdown = output_dir / "report.md"
-        report_sarif = output_dir / "report.sarif"
-        summary = {}
-        baseline = {}
-        adk_surface = {}
-        release_decision = {}
-        fail_policy = {}
-        tool_surface_diff = {}
-        diff_summary = {}
-        if report_json.exists():
-            with report_json.open(encoding="utf-8") as handle:
-                payload = json.load(handle)
-                summary = payload.get("summary") or {}
-                baseline = payload.get("baseline") or {}
-                adk_surface = (payload.get("frameworks") or {}).get("google_adk") or {}
-                release_decision = payload.get("release_decision") or {}
-                fail_policy = release_decision.get("fail_policy") or {}
-                tool_surface_diff = payload.get("tool_surface_diff") or {}
-                diff_summary = tool_surface_diff.get("summary") or {}
-
-        def clean(value: object) -> str:
-            # `value or ""` would emit 0 as "", which breaks workflow
-            # checks like `if: outputs.blocker_count == '0'`. Treat None
-            # as empty; stringify everything else (including 0 and False).
-            text = "" if value is None else str(value)
-            return text.replace("\r", "").replace("\n", "")
-
-        values = {
-            "status": summary.get("status", ""),
-            "critical_count": summary.get("critical_count", 0),
-            "high_count": summary.get("high_count", 0),
-            "medium_count": summary.get("medium_count", 0),
-            "baseline_new_count": baseline.get("new_count", 0),
-            "baseline_matched_count": baseline.get("matched_count", 0),
-            "baseline_resolved_count": baseline.get("resolved_count", 0),
-            "adk_agent_count": adk_surface.get("agent_count", 0),
-            "adk_dynamic_toolset_count": adk_surface.get("dynamic_toolset_count", 0),
-            "report_json": report_json,
-            "report_markdown": report_markdown,
-            "report_sarif": report_sarif,
-            "decision": release_decision.get("decision", ""),
-            "blocker_count": len(release_decision.get("blockers") or []),
-            "review_item_count": len(release_decision.get("review_items") or []),
-            # v0.8+ output. Pinned older package versions emit no release_decision,
-            # so this stays false until the workflow installs v0.8+.
-            "ci_would_fail": str(bool(fail_policy.get("would_fail_ci"))).lower(),
-            "diff_enabled": str(bool(tool_surface_diff.get("enabled"))).lower(),
-        }
-        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-            for key, value in values.items():
-                output.write(f"{key}={clean(value)}\n")
-
-        step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
-        if step_summary:
-            blocker_count = len(release_decision.get("blockers") or [])
-            review_item_count = len(release_decision.get("review_items") or [])
-            would_fail_ci = str(bool(fail_policy.get("would_fail_ci"))).lower()
-            with open(step_summary, "a", encoding="utf-8") as summary_file:
-                summary_file.write("## Agents Shipgate\n\n")
-                if release_decision:
-                    summary_file.write(
-                        f"- Decision: `{clean(release_decision.get('decision'))}`\n"
-                    )
-                    summary_file.write(f"- Blockers: {blocker_count}\n")
-                    summary_file.write(f"- Review items: {review_item_count}\n")
-                    summary_file.write(
-                        "- Fail policy: "
-                        f"would_fail_ci=`{would_fail_ci}` "
-                        f"(exit {clean(fail_policy.get('exit_code'))})\n"
-                    )
-                else:
-                    summary_file.write(f"- Status: `{clean(summary.get('status'))}`\n")
-                    summary_file.write(
-                        f"- Critical: {clean(summary.get('critical_count', 0))} · "
-                        f"High: {clean(summary.get('high_count', 0))} · "
-                        f"Medium: {clean(summary.get('medium_count', 0))}\n"
-                    )
-                if tool_surface_diff.get("enabled"):
-                    summary_file.write(
-                        "- What changed: "
-                        f"+{clean(diff_summary.get('tools_added', 0))} tools, "
-                        f"-{clean(diff_summary.get('tools_removed', 0))} tools, "
-                        f"{clean(diff_summary.get('tools_changed', 0))} changed, "
-                        f"{clean(diff_summary.get('new_high_risk_effects', 0))} "
-                        "new high-risk effect(s), "
-                        f"{clean(diff_summary.get('new_findings', 0))} "
-                        "new finding(s)\n"
-                    )
-                elif tool_surface_diff.get("notes"):
-                    summary_file.write(
-                        f"- Tool-surface diff: {clean(tool_surface_diff.get('notes')[0])}\n"
-                    )
-                summary_file.write(f"- Report JSON: `{clean(report_json)}`\n")
-        PY
+    - name: Emit Agents Shipgate annotations
+      if: ${{ always() && inputs.check_annotations == 'true' }}
+      shell: bash
+      env:
+        OUTPUT_DIR: ${{ inputs.output_dir }}
+        CHECK_ANNOTATION_LIMIT: ${{ inputs.check_annotation_limit }}
+      run: |
+        python "${GITHUB_ACTION_PATH}/scripts/github_action_annotations.py"
 
     - name: Upload Agents Shipgate report
       if: ${{ always() && inputs.upload_artifact == 'true' }}
@@ -368,99 +544,21 @@ runs:
         script: |
           const fs = require("fs");
           const path = require("path");
-          const reportPath = path.join(process.env.OUTPUT_DIR || "agents-shipgate-reports", "report.json");
-          if (!fs.existsSync(reportPath)) {
-            core.warning(`Agents Shipgate report not found at ${reportPath}`);
+          const outputDir = process.env.OUTPUT_DIR || "agents-shipgate-reports";
+          const commentPath = path.join(outputDir, "pr-comment.md");
+          if (!fs.existsSync(commentPath)) {
+            core.warning(`Agents Shipgate PR comment not found at ${commentPath}`);
             return;
           }
-          const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
-          const summary = report.summary || {};
-          const decision = report.release_decision || null;
-          const adk = ((report.frameworks || {}).google_adk) || null;
-          const diff = report.tool_surface_diff || {};
-          const diffSummary = diff.summary || {};
-          const escapeMarkdown = (value) =>
-            String(value || "")
-              .replace(/\\/g, "\\\\")
-              .replace(/([\[\]\(\)`*_{}#+\-.!|>])/g, "\\$1");
-          const truncate = (value, limit) => {
-            const text = String(value || "");
-            return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
-          };
-          const top = (report.findings || [])
-            .filter((finding) => !finding.suppressed && ["critical", "high"].includes(finding.severity))
-            .slice(0, 3)
-            .map((finding, index) => `${index + 1}. ${escapeMarkdown(truncate(finding.title || finding.check_id, 240))}`)
-            .join("\n");
-          const ciModeLine = decision && decision.fail_policy
-            ? `CI mode: \`${decision.fail_policy.ci_mode || "advisory"}\` — ${decision.fail_policy.would_fail_ci ? "this PR would fail CI" : "this PR is not blocked by Shipgate"}`
-            : "";
-          const decisionLines = decision
-            ? [
-                `Decision: \`${decision.decision}\``,
-                `Reason: ${escapeMarkdown(decision.reason || "")}`,
-                `Blockers: ${(decision.blockers || []).length} · Review items: ${(decision.review_items || []).length}`,
-                `Fail policy: would_fail_ci=\`${(decision.fail_policy || {}).would_fail_ci ? "true" : "false"}\` (exit ${(decision.fail_policy || {}).exit_code ?? "?"})`,
-                ciModeLine,
-              ].filter(Boolean)
-            : [
-                `Status: ${summary.status || "unknown"}`,
-                `Critical: ${summary.critical_count || 0} · High: ${summary.high_count || 0} · Medium: ${summary.medium_count || 0}`,
-                `Human review: ${summary.human_review_recommended ? "recommended" : "not required"}`,
-              ];
           const STICKY = "<!-- agents-shipgate-pr-comment -->";
-          const diffHighlights = () => {
-            if (!diff.enabled) {
-              const note = (diff.notes || [])[0];
-              const lines = note ? [`Tool-surface diff: ${escapeMarkdown(note)}`] : [];
-              if ((diffSummary.new_findings || 0) || (diffSummary.resolved_findings || 0) || (diffSummary.accepted_debt || 0)) {
-                lines.push(`Finding deltas: ${diffSummary.new_findings || 0} new, ${diffSummary.resolved_findings || 0} resolved, ${diffSummary.accepted_debt || 0} accepted debt`);
-              }
-              return lines;
-            }
-            const lines = [
-              "### What changed",
-              `Tools: +${diffSummary.tools_added || 0}, -${diffSummary.tools_removed || 0}, ${diffSummary.tools_changed || 0} changed`,
-              `Risk/control drift: ${diffSummary.new_high_risk_effects || 0} new high-risk effect(s), ${diffSummary.controls_removed || 0} removed control(s)`,
-              `Findings: ${diffSummary.new_findings || 0} new, ${diffSummary.resolved_findings || 0} resolved, ${diffSummary.accepted_debt || 0} accepted debt`,
-            ];
-            const riskHighlights = [];
-            const controlHighlights = [];
-            const toolHighlights = [];
-            for (const item of diff.high_risk_effects || []) {
-              if (item.kind === "added") riskHighlights.push(`- New high-risk tag \`${escapeMarkdown(item.tag)}\` on \`${escapeMarkdown(item.tool)}\``);
-            }
-            for (const item of diff.controls || []) {
-              if (item.kind === "removed") controlHighlights.push(`- Removed \`${escapeMarkdown(item.control)}\` for \`${escapeMarkdown(item.tool)}\``);
-            }
-            for (const item of diff.tools || []) {
-              if (item.kind === "added") toolHighlights.push(`- Added tool \`${escapeMarkdown(item.name)}\``);
-              if (item.kind === "removed") toolHighlights.push(`- Removed tool \`${escapeMarkdown(item.name)}\``);
-            }
-            const highlights = [];
-            const groups = [controlHighlights, riskHighlights, toolHighlights];
-            while (highlights.length < 5 && groups.some((group) => group.length)) {
-              for (const group of groups) {
-                if (group.length && highlights.length < 5) highlights.push(group.shift());
-              }
-            }
-            return [...lines, ...highlights];
-          };
-          const whatChanged = truncate(diffHighlights().join("\n"), 1500);
-          const body = truncate([
-            STICKY,
-            "## Agents Shipgate",
-            "",
-            ...decisionLines,
-            whatChanged,
-            adk ? `Google ADK: ${adk.agent_count || 0} agents · ${adk.dynamic_toolset_count || 0} dynamic toolsets` : "",
-            "",
-            top ? `Top findings:\n${top}` : "No critical or high findings.",
-            "",
-            "Artifacts (in `agents-shipgate-report` workflow artifact):",
-            "- Tool-Use Readiness Report: `report.md` / `report.json`",
-            "- Release Evidence Packet: `packet.md` / `packet.json` / `packet.html`",
-          ].join("\n"), 6000);
+          let body = fs.readFileSync(commentPath, "utf8").slice(0, 6000);
+          const serverUrl = process.env.GITHUB_SERVER_URL || "https://github.com";
+          const runId = process.env.GITHUB_RUN_ID;
+          const runUrl = `${serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${runId}`;
+          const artifactLine = `\n\nWorkflow artifacts: ${runUrl}`;
+          if (body.length + artifactLine.length <= 6000) {
+            body = `${body}${artifactLine}`;
+          }
           // Upsert via sticky marker so re-runs update the existing comment instead of spamming the PR.
           // Paginate the lookup — single-page (per_page=100) misses the marker on PRs with >100
           // earlier comments before Shipgate's first run, which would silently regress to append-only.
@@ -486,6 +584,88 @@ runs:
               body,
             });
           }
+
+    - name: Build Agents Shipgate check-run payload
+      if: ${{ always() && inputs.check_run == 'true' }}
+      shell: bash
+      env:
+        OUTPUT_DIR: ${{ inputs.output_dir }}
+        CHECK_RUN_NAME: ${{ inputs.check_run_name }}
+        CHECK_RUN_POLICY: ${{ inputs.check_run_policy }}
+      run: |
+        python "${GITHUB_ACTION_PATH}/scripts/github_check_run.py"
+
+    - name: Create Agents Shipgate check run
+      if: ${{ always() && inputs.check_run == 'true' }}
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
+      env:
+        OUTPUT_DIR: ${{ inputs.output_dir }}
+      with:
+        github-token: ${{ inputs.github_token || github.token }}
+        script: |
+          const fs = require("fs");
+          const path = require("path");
+          const outputDir = process.env.OUTPUT_DIR || "agents-shipgate-reports";
+          const payloadPath = path.join(outputDir, "check-run-payload.json");
+          if (!fs.existsSync(payloadPath)) {
+            core.warning(`Agents Shipgate check-run payload not found at ${payloadPath}`);
+            return;
+          }
+          const payload = JSON.parse(fs.readFileSync(payloadPath, "utf8"));
+          // Attach to the PR head SHA, not the synthetic merge commit, so the
+          // check shows up on the PR's checks tab and branch protection.
+          const headSha = context.payload.pull_request
+            ? context.payload.pull_request.head.sha
+            : context.sha;
+          try {
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head_sha: headSha,
+              status: "completed",
+              ...payload,
+            });
+          } catch (error) {
+            // Forks and minimal tokens lack `checks: write`; degrade to a
+            // warning rather than failing the gate step.
+            core.warning(`Agents Shipgate check-run creation failed: ${error.message}`);
+          }
+
+    - name: Apply Agents Shipgate merge verdict policy
+      if: ${{ always() && inputs.fail_on_merge_verdicts != '' }}
+      shell: bash
+      env:
+        FAIL_ON_MERGE_VERDICTS: ${{ inputs.fail_on_merge_verdicts }}
+        MERGE_VERDICT: ${{ steps.report_outputs.outputs.merge_verdict }}
+      run: |
+        python - <<'PY'
+        import os
+        import sys
+
+        sys.path.insert(0, os.environ["GITHUB_ACTION_PATH"])
+
+        from scripts.github_action_outputs import merge_verdict_policy_exit_code
+
+        code = merge_verdict_policy_exit_code(
+            os.environ.get("MERGE_VERDICT", ""),
+            os.environ.get("FAIL_ON_MERGE_VERDICTS", ""),
+        )
+        if code:
+            verdict = os.environ.get("MERGE_VERDICT", "")
+            if verdict:
+                print(
+                    "Agents Shipgate merge verdict "
+                    f"{verdict!r} matched fail_on_merge_verdicts.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "Agents Shipgate fail_on_merge_verdicts was configured, but "
+                    "verifier.json did not expose a merge verdict.",
+                    file=sys.stderr,
+                )
+        raise SystemExit(code)
+        PY
 
     - name: Apply Agents Shipgate exit code
       if: ${{ always() && steps.scan.outputs.exit_code != '' && steps.scan.outputs.exit_code != '0' }}

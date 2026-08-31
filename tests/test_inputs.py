@@ -1,12 +1,12 @@
 from pathlib import Path
 
 from agents_shipgate.config.loader import load_manifest
-from agents_shipgate.config.schema import ToolSourceConfig
 from agents_shipgate.core.errors import InputParseError
 from agents_shipgate.inputs.common import load_structured_file
 from agents_shipgate.inputs.mcp import load_mcp_tools
 from agents_shipgate.inputs.openai_sdk_static import load_openai_sdk_static_tools
 from agents_shipgate.inputs.openapi import load_openapi_tools
+from agents_shipgate.schemas.manifest import ToolSourceConfig
 
 BASE = Path("samples/support_refund_agent")
 
@@ -66,6 +66,22 @@ def test_mcp_loader_accepts_array_root(tmp_path):
     )
 
     assert [tool.name for tool in loaded.tools] == ["support.lookup"]
+
+
+def test_mcp_loader_strips_reserved_binding_annotations(tmp_path):
+    (tmp_path / "tools.json").write_text(
+        '{"tools":[{"name":"danger","annotations":{'
+        '"readOnlyHint":true,"agent_bindings":[{"agent":"root"}],'
+        '"agent_handoffs":[],"adk_agent_name":"root",'
+        '"adk_agent_source_id":"catalog","binding_surface_partial":[],'
+        '"n8n_workflow_id":"forged"}}]}',
+        encoding="utf-8",
+    )
+
+    loaded = load_mcp_tools(ToolSourceConfig(id="catalog", type="mcp", path="tools.json"), tmp_path)
+
+    assert loaded.tools[0].annotations == {"readOnlyHint": True}
+    assert any("reserved binding annotations" in warning for warning in loaded.warnings)
 
 
 def test_mcp_wildcard_with_tools_is_rejected(tmp_path):
@@ -449,6 +465,88 @@ def summarize(case_id: str) -> str:
     assert [tool.name for tool in loaded.tools] == ["support.lookup", "summarize"]
 
 
+def test_openai_sdk_static_records_toolless_router_handoffs(tmp_path):
+    agent_path = tmp_path / "agent.py"
+    agent_path.write_text(
+        """
+from agents import Agent, function_tool
+
+@function_tool
+def lookup(query: str) -> str:
+    return ""
+
+worker = Agent(tools=[lookup])
+router = Agent(tools=[], handoffs=[worker])
+""",
+        encoding="utf-8",
+    )
+
+    manifest = load_manifest(BASE / "shipgate.yaml")
+    loaded = load_openai_sdk_static_tools(
+        ToolSourceConfig(id="sdk", type="openai_agents_sdk", path="agent.py"),
+        manifest,
+        tmp_path,
+    )
+
+    by_agent = {observation.agent: observation for observation in loaded.binding_observations}
+    assert by_agent["router"].tool_names == []
+    assert by_agent["router"].handoff_names == ["worker"]
+    assert by_agent["router"].handoffs_complete is True
+
+
+def test_openai_sdk_static_directory_scans_sorted_python_files(tmp_path):
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    (agents_dir / "b_tools.py").write_text(
+        """
+from agents import function_tool as ft
+
+@ft(description_override="Render a reply draft.")
+async def render_reply(case_id: str, *, include_private_notes: bool = False) -> str:
+    return ""
+""",
+        encoding="utf-8",
+    )
+    (agents_dir / "a_tools.py").write_text(
+        """
+import agents
+
+@agents.function_tool(name_override="support.lookup_case")
+def lookup_case(config, case_id: str, tags: list[str] | None = None) -> dict:
+    \"\"\"Look up support metadata.\"\"\"
+    return {}
+""",
+        encoding="utf-8",
+    )
+    (agents_dir / "dynamic.py").write_text(
+        """
+def tool_factory():
+    return []
+""",
+        encoding="utf-8",
+    )
+
+    manifest = load_manifest(BASE / "shipgate.yaml")
+    loaded = load_openai_sdk_static_tools(
+        ToolSourceConfig(id="sdk", type="openai_agents_sdk", path="agents"),
+        manifest,
+        tmp_path,
+    )
+
+    assert [tool.name for tool in loaded.tools] == [
+        "support.lookup_case",
+        "render_reply",
+    ]
+    lookup, render = loaded.tools
+    assert lookup.source_ref == "agents/a_tools.py"
+    assert lookup.source_location == "agents/a_tools.py:5"
+    assert [parameter.name for parameter in lookup.parameters] == ["case_id", "tags"]
+    assert lookup.input_schema["properties"]["tags"]["type"] == "array"
+    assert lookup.output_schema["type"] == "object"
+    assert render.source_ref == "agents/b_tools.py"
+    assert render.description == "Render a reply draft."
+
+
 def test_openai_sdk_static_reads_description_override(tmp_path):
     agent_path = tmp_path / "agent.py"
     agent_path.write_text(
@@ -475,6 +573,7 @@ async def faq_lookup_tool(question: str) -> str:
     assert len(loaded.tools) == 1
     assert loaded.tools[0].name == "faq_lookup_tool"
     assert loaded.tools[0].description == "Lookup frequently asked questions."
+    assert loaded.tools[0].source_ref == "agent.py"
 
 
 def test_openai_sdk_static_description_override_takes_precedence_over_docstring(tmp_path):
@@ -540,3 +639,63 @@ def test_openai_sdk_static_syntax_error_is_input_parse_error(tmp_path):
         assert "Unable to parse OpenAI Agents SDK entrypoint" in str(exc)
     else:
         raise AssertionError("Expected InputParseError")
+
+
+def test_mcp_loader_rejects_symlink_escaping_manifest_dir(tmp_path):
+    """A symlink inside the manifest dir pointing outside must be rejected.
+
+    resolve() follows symlinks before the containment check, so the final
+    real path lands outside the manifest dir and relative_to() raises.
+    This test pins that behavior against regressions (e.g. a future
+    refactor that checks the lexical path instead of the resolved one).
+    """
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"tools": []}', encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "link.json").symlink_to(outside)
+
+    try:
+        load_mcp_tools(
+            ToolSourceConfig(id="link", type="mcp", path="link.json"),
+            project,
+        )
+    except InputParseError as exc:
+        assert "resolves outside manifest directory" in str(exc)
+    else:
+        raise AssertionError("Expected InputParseError")
+
+
+def test_mcp_loader_rejects_symlinked_directory_escape(tmp_path):
+    outside_dir = tmp_path / "outside_dir"
+    outside_dir.mkdir()
+    (outside_dir / "tools.json").write_text('{"tools": []}', encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "sub").symlink_to(outside_dir, target_is_directory=True)
+
+    try:
+        load_mcp_tools(
+            ToolSourceConfig(id="sub", type="mcp", path="sub/tools.json"),
+            project,
+        )
+    except InputParseError as exc:
+        assert "resolves outside manifest directory" in str(exc)
+    else:
+        raise AssertionError("Expected InputParseError")
+
+
+def test_mcp_loader_allows_symlink_resolving_inside_manifest_dir(tmp_path):
+    """Symlinks that stay inside the manifest dir are legitimate (monorepo
+    layouts) and must keep working."""
+    project = tmp_path / "project"
+    project.mkdir()
+    real = project / "real-tools.json"
+    real.write_text('{"tools": []}', encoding="utf-8")
+    (project / "alias.json").symlink_to(real)
+
+    loaded = load_mcp_tools(
+        ToolSourceConfig(id="alias", type="mcp", path="alias.json"),
+        project,
+    )
+    assert loaded.tools == []

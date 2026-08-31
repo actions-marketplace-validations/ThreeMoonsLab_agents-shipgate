@@ -10,8 +10,11 @@ config block populated from glob discovery. OpenAPI/MCP suggested sources
 are emitted as ``tool_sources`` entries.
 
 The ``--minimal`` mode in ``main.py`` bypasses this module and uses
-``artifacts.render_manifest_template`` directly to preserve byte-exact
-backwards-compatibility with v0.5.x.
+``artifacts.render_manifest_template`` directly to preserve
+backwards-compatibility with the v0.5.x template. Both renderers derive
+``tool_sources[].id`` from the same helper (``source_ids.py``) — the one
+place where v0.16 changed the legacy output, because a basename-only id
+made both of them render manifests the schema rejects (#307).
 """
 
 from __future__ import annotations
@@ -20,22 +23,47 @@ import re
 from pathlib import Path
 
 from agents_shipgate.cli.discovery.artifacts import (
+    OPENAI_API_ANCHOR_KEYS,
     discover_anthropic_artifacts,
     discover_n8n_artifacts,
     discover_openai_api_artifacts,
 )
-from agents_shipgate.cli.discovery.signals import DetectResult
+from agents_shipgate.cli.discovery.manifest_scaffold import (
+    DISCOVERY_SCAFFOLD_DETAIL,
+    DISCOVERY_SCAFFOLD_SUMMARY,
+    RenderedManifest,
+    ToolSurfaceOrigin,
+    scaffold_tool_sources_block,
+)
+from agents_shipgate.cli.discovery.signals import select_agent_name
+from agents_shipgate.cli.discovery.source_ids import assign_source_ids
+from agents_shipgate.core.control_packs import (
+    DEFAULT_CONTROL_PACK_ID,
+    manifest_control_pack_block,
+)
+from agents_shipgate.schemas.detect import DetectResult
 
 # Frameworks that register one tool_sources entry per candidate file.
 PYTHON_AST_FRAMEWORKS = {"langchain", "crewai", "google_adk", "openai_agents_sdk"}
 
 
-def render_auto_manifest(workspace: Path, detect_result: DetectResult) -> str:
+def render_auto_manifest(
+    workspace: Path,
+    detect_result: DetectResult,
+    *,
+    control_pack: str = DEFAULT_CONTROL_PACK_ID,
+) -> RenderedManifest:
     """Build a schema-valid ``shipgate.yaml`` for a detected workspace.
 
-    Falls back to a CHANGE_ME-heavy template when no framework was
+    Falls back to a CHANGE_ME-heavy scaffold when no framework was
     detected (mirroring today's static-init behavior; ``--minimal`` is
-    the dedicated path for byte-exact pre-v0.6 output).
+    the dedicated path for the pre-v0.6 template).
+
+    Returns the text together with :attr:`RenderedManifest.tool_surface_origin`, because
+    whether the tool surface was *read* or *scaffolded* is decided here — by
+    the four block builders below — and a caller that re-derived it would be
+    answering the same question a second time, from less. ``init`` needs the
+    answer to say plainly what it wrote (#441).
     """
     workspace = workspace.resolve()
     project_name = _project_name(workspace, detect_result)
@@ -76,17 +104,23 @@ def render_auto_manifest(workspace: Path, detect_result: DetectResult) -> str:
     openai_lines = _openai_api_block(workspace, detect_result)
     n8n_lines = _n8n_block(workspace, detect_result)
 
+    tool_surface_origin: ToolSurfaceOrigin = "detected"
     if not tool_source_lines and not anthropic_lines and not openai_lines and not n8n_lines:
-        # Schema requires ≥ 1 of tool_sources / openai_api / anthropic /
-        # google_adk / langchain / crewai. Empty workspace → emit a
-        # CHANGE_ME stub identical to the legacy --minimal template's
-        # fallback so users get an actionable starting point.
-        tool_source_lines = [
-            "tool_sources:",
-            "  - id: CHANGE_ME",
-            "    type: openapi",
-            "    path: CHANGE_ME.yaml",
-        ]
+        # The schema requires at least one source block. Nothing was read, so
+        # the manifest
+        # carries a scaffold — and says so, in the YAML and in the caller's
+        # return value alike.
+        tool_surface_origin = "scaffold"
+        # Auto mode ran full discovery, so it is entitled to say nothing was
+        # found. `--minimal` is not; see `manifest_scaffold`.
+        tool_source_lines = scaffold_tool_sources_block(
+            summary=DISCOVERY_SCAFFOLD_SUMMARY, detail=DISCOVERY_SCAFFOLD_DETAIL
+        )
+
+    # Excluded-source hints are comments, appended only after the fallback
+    # decision above so they can never stand in for a real tool_sources
+    # block in the schema-requirement check.
+    tool_source_lines.extend(_excluded_sources_hint(detect_result.excluded_sources))
 
     if tool_source_lines:
         lines.extend(tool_source_lines)
@@ -104,13 +138,19 @@ def render_auto_manifest(workspace: Path, detect_result: DetectResult) -> str:
         lines.extend(n8n_lines)
         lines.append("")
 
-    lines.extend(_policies_block())
+    lines.extend(_policies_block(control_pack))
     lines.append("")
     lines.extend(_permissions_block())
     lines.append("")
     lines.extend(_ci_and_output_block())
     lines.append("")
-    return "\n".join(lines)
+    return RenderedManifest(
+        "\n".join(lines),
+        tool_surface_origin=tool_surface_origin,
+        scaffold_summary=(
+            DISCOVERY_SCAFFOLD_SUMMARY if tool_surface_origin == "scaffold" else None
+        ),
+    )
 
 
 def _project_name(workspace: Path, detect_result: DetectResult) -> str:
@@ -121,10 +161,10 @@ def _project_name(workspace: Path, detect_result: DetectResult) -> str:
 
 
 def _agent_name(detect_result: DetectResult) -> str:
-    for candidate in detect_result.agent_name_candidates:
-        if candidate.source in {"Agent_name_literal", "ADK_name_field"}:
-            return _safe_yaml_scalar(candidate.value)
-    return "CHANGE_ME"
+    selected = select_agent_name(detect_result.agent_name_candidates)
+    if selected is None:
+        return "CHANGE_ME"
+    return _safe_yaml_scalar(selected.value)
 
 
 def _safe_yaml_scalar(value: str) -> str:
@@ -144,7 +184,7 @@ def _tool_sources_block(
     suppress duplicate config blocks downstream)."""
     lines: list[str] = []
     used: set[str] = set()
-    entries: list[tuple[str, str, str, str | None]] = []  # (type, id, path, mode)
+    entries: list[tuple[str, str, str | None]] = []  # (type, path, mode)
     seen_paths: set[str] = set()
 
     for framework in detect_result.frameworks:
@@ -154,8 +194,7 @@ def _tool_sources_block(
             if candidate in seen_paths:
                 continue
             seen_paths.add(candidate)
-            entry_id = _source_id_for(framework.type, candidate)
-            entries.append((framework.type, entry_id, candidate, None))
+            entries.append((framework.type, candidate, None))
             used.add(framework.type)
 
     for source in detect_result.suggested_sources:
@@ -163,22 +202,25 @@ def _tool_sources_block(
         if path in seen_paths:
             continue
         seen_paths.add(path)
-        entry_id = _source_id_for(source["type"], path)
-        entries.append((source["type"], entry_id, path, None))
+        entries.append((source["type"], path, None))
 
     for candidate in detect_result.codex_plugin_candidates:
         path = candidate.path
         if path in seen_paths:
             continue
         seen_paths.add(path)
-        entry_id = _source_id_for("codex_plugin", path)
-        entries.append(("codex_plugin", entry_id, path, candidate.mode))
+        entries.append(("codex_plugin", path, candidate.mode))
 
     if not entries:
         return [], used
 
+    # Ids are assigned for the block as a whole: paths are deduplicated
+    # above, but two distinct paths must not end up sharing an id — the
+    # manifest schema rejects the whole render when they do (#307).
+    entry_ids = assign_source_ids([(entry[0], entry[1]) for entry in entries])
+
     lines.append("tool_sources:")
-    for framework_type, entry_id, path, mode in entries:
+    for (framework_type, path, mode), entry_id in zip(entries, entry_ids, strict=True):
         lines.append(f"  - id: {entry_id}")
         lines.append(f"    type: {framework_type}")
         lines.append(f"    path: {path}")
@@ -187,19 +229,26 @@ def _tool_sources_block(
     return lines, used
 
 
-def _source_id_for(framework_type: str, path: str) -> str:
-    path_obj = Path(path)
-    stem = (path_obj.stem or path_obj.name or "root").lower().replace("-", "_").replace(".", "_")
-    prefix = {
-        "langchain": "lc",
-        "crewai": "crewai",
-        "google_adk": "adk",
-        "openai_agents_sdk": "openai_sdk",
-        "mcp": "mcp",
-        "openapi": "openapi",
-        "codex_plugin": "codex_plugin",
-    }.get(framework_type, framework_type)
-    return f"{prefix}_{stem}"
+def _excluded_sources_hint(excluded: list[dict[str, str]]) -> list[str]:
+    """Comment-only hint for glob-matched files the input adapters reject.
+
+    These were dropped from ``tool_sources`` because writing them would
+    guarantee a ``scan`` input-parse failure (exit 3) on the very next step
+    of the cold-start flow. The hint keeps them reviewable without making
+    the manifest unscannable.
+    """
+    if not excluded:
+        return []
+    lines = [
+        "# Detected but excluded — `scan` cannot parse these as tool sources:",
+    ]
+    for entry in excluded:
+        lines.append(f"#   {entry['path']} ({entry['type']}): {entry['reason']}")
+    lines.append(
+        "# If one of these is a real tools export, fix its format and add it "
+        "to tool_sources."
+    )
+    return lines
 
 
 def _anthropic_block(workspace: Path, detect_result: DetectResult) -> list[str]:
@@ -250,8 +299,7 @@ def _openai_api_block(workspace: Path, detect_result: DetectResult) -> list[str]
     # OpenAI-specific artifact patterns (tools/openai-tools.json,
     # openai-config.json, tests/*openai*cases*.json,
     # policies/*openai*.yaml, policies/*api*.yaml) anchor the block.
-    openai_specific_keys = ("tools", "model_config", "test_cases", "policy_rules")
-    if not any(artifacts.get(key) for key in openai_specific_keys):
+    if not any(artifacts.get(key) for key in OPENAI_API_ANCHOR_KEYS):
         return []
     lines = ["openai_api:"]
     if artifacts["prompt_files"]:
@@ -326,10 +374,11 @@ def _append_artifact_paths(
         lines.append(f"    - path: {path}")
 
 
-def _policies_block() -> list[str]:
+def _policies_block(control_pack: str) -> list[str]:
     return [
         "# ADD policies for write/high-risk tools (approval, confirmation, idempotency).",
         "policies:",
+        *manifest_control_pack_block(control_pack),
         "  require_approval_for_tools: []",
         "  require_confirmation_for_tools: []",
         "  require_idempotency_for_tools: []",

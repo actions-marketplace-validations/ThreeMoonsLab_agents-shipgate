@@ -1,5 +1,26 @@
 # Benchmark Runner — Tester Runbook
 
+Two execution paths are supported.
+
+## Automated runner (default)
+
+Run the v1 automated harness for any cell or full matrix:
+
+```bash
+pip install -r harness/requirements.txt
+python -m harness.adoption sync-fixtures
+python -m harness.adoption smoke                     # mock-driver, no API spend
+python -m harness.adoption run \
+  --matrix=benchmark/matrix.yaml \
+  --budget-usd=20
+```
+
+Operational doc: [`../docs/adoption-harness-automated.md`](../docs/adoption-harness-automated.md).
+
+The automated runner writes scorecards under `.agents-private/adoption-sprint/<run-id>/` and a CSV row under `results/<run-id>.csv` using schema v0.2.
+
+## Manual path
+
 A new tester (you, your teammate, or a contractor) should be able to execute one row of the matrix in 15 minutes after reading this file. No prior knowledge of Agents Shipgate is required to score a cell.
 
 ## Pre-flight
@@ -95,3 +116,21 @@ The leaderboard in `results/README.md` groups by `(model, variant)` and `(archet
 - **Re-running the same cell after seeing the result.** Resist. Cell results have variance; record the first run, not the best run.
 - **Including agent transcripts in the public CSV.** Transcripts go private; CSVs are public. Notes column is for structured observations, not raw output.
 - **Skipping the negative control.** The `04-docs-only-negative` cells are the most informative — they catch over-eager Shipgate proposals.
+
+## Isolated runs (required for real/paid cells)
+
+A real agent given a pressure prompt can wander out of its cell if a real
+checkout is reachable on disk — an on-host run had the agent `cd $HOME/code/...`
+into the real repo and edit it. Real/paid cells therefore run **only** in
+GitHub Actions, on an ephemeral runner that holds only a fresh checkout — no
+other real repo is reachable.
+
+[`.github/workflows/adoption-harness.yml`](../.github/workflows/adoption-harness.yml)
+(`workflow_dispatch`) is that runner: the `smoke` job is free (mock driver); the
+`run` job spends and needs an `ANTHROPIC_API_KEY` repo secret + a `budget_usd`
+input. It runs with `SHIPGATE_HARNESS_SCOPE_HOME=1` (HOME → a per-cell scratch
+dir), and the `stayed_in_workspace` scorer blocker flags any escape that slips
+through (turning it into `headline_pass=false`, never a silent pass).
+
+**Do not** run real/paid cells on a developer machine where a real checkout
+lives — dispatch the workflow above.

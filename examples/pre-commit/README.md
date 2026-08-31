@@ -13,7 +13,7 @@ In your repo's `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/ThreeMoonsLab/agents-shipgate
-    rev: v0.10.0
+    rev: v0.15.0
     hooks:
       - id: agents-shipgate
 ```
@@ -40,48 +40,69 @@ repos:
     hooks:
       - id: agents-shipgate
         name: Agents Shipgate release-readiness gate
-        entry: agents-shipgate scan -c shipgate.yaml --ci-mode advisory
+        entry: agents-shipgate verify --config shipgate.yaml --ci-mode advisory --format text
         language: system
         pass_filenames: false
+        # pre-commit's default `types: [file]` drops a tracked symlink
+        # before `files:` runs; governance paths can be symlinks.
+        types: []
+        types_or: [file, symlink]
         files: |
-          (?x)^(
-            shipgate\.yaml|
+          (?ix)^(
+            (.*/)?shipgate\.yaml|
             .*tools.*\.json|
             .*mcp.*\.json|
-            .*\.codex-plugin/.*|
-            .*\.agents/plugins/.*|
+            .*n8n.*\.json|
+            (.*/)?\.n8n(/.*)?|
+            (.*/)?conductor/.*\.json|
+            (.*/)?ai/examples/.*\.json|
+            (.*/)?\.codex/(config\.toml|hooks\.json|requirements\.toml)|
+            (.*/)?\.claude/(settings(\.local)?\.json|commands(/.*)?)|
+            (.*/)?\.cursor/(cli\.json|mcp\.json|rules(/.*)?)|
+            (.*/)?\.vscode/mcp\.json|
+            (.*/)?\.shipgate/agent-contract\.json|
+            (.*/)?(AGENTS(\.override)?|CLAUDE)\.md|
+            \.(agents|claude)/skills/.*|
+            (.*/)?\.codex-plugin(/.*)?|
+            (.*/)?\.agents/plugins(/.*)?|
             .*\.app\.json|
             (.*/)?SKILL\.md|
             .*openapi.*\.(yaml|yml|json)|
             .*swagger.*\.(yaml|yml|json)|
             \.agents-shipgate/.*\.json|
-            prompts/.*|
-            policies/.*|
-            \.github/workflows/agents-shipgate\.(yaml|yml)
+            (.*/)?prompts(/.*)?|
+            (.*/)?policies(/.*)?|
+            (.*/)?\.github/workflows/.*\.(yaml|yml)
           )$
 ```
 
 ## When the hook fires
 
-The `files:` regex in [`/.pre-commit-hooks.yaml`](../../.pre-commit-hooks.yaml) covers every **path-based** trigger from [`docs/triggers.json`](../../docs/triggers.json), so the hook activates when a staged change touches:
+The `files:` regex in [`/.pre-commit-hooks.yaml`](../../.pre-commit-hooks.yaml) covers the path leg of every trigger in [`docs/triggers.json`](../../docs/triggers.json) that a path alone can decide, so the hook activates when a staged change touches:
 
 - `shipgate.yaml` (`TRIGGER-SHIPGATE-MANIFEST`)
 - MCP exports — `**/*mcp*.json`, `.agents-shipgate/*.json` (`TRIGGER-MCP-EXPORT-CHANGED`)
 - OpenAPI/Swagger specs — `**/*openapi*.{yaml,yml,json}`, `**/*swagger*.{yaml,yml,json}` (`TRIGGER-OPENAPI-SPEC-CHANGED`)
 - Static tool inventories — `**/*tools*.json` (`TRIGGER-STATIC-TOOL-INVENTORY-CHANGED`)
+- n8n workflow JSON — `**/*n8n*.json`, `**/.n8n/**` (`TRIGGER-N8N-WORKFLOW-CHANGED`, path leg)
+- Conductor OSS workflow JSON — `**/conductor/**/*.json`, `**/ai/examples/**/*.json` (`TRIGGER-CONDUCTOR-WORKFLOW-CHANGED`, path leg)
+- Coding-agent host configuration and instructions — Codex/Claude/Cursor/VS Code config, `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, skills (`TRIGGER-*-BOUNDARY-*`)
 - Codex plugin package files — `.codex-plugin/**`, `.agents/plugins/**`, `**/.app.json`, `**/.mcp.json`, `**/SKILL.md` (`TRIGGER-CODEX-PLUGIN-CHANGED`)
 - Prompts and policies — `prompts/**`, `policies/**` (`TRIGGER-PROMPTS-OR-POLICIES`)
 - Shipgate CI workflow — `.github/workflows/agents-shipgate.{yml,yaml}` (`TRIGGER-SHIPGATE-CI-WORKFLOW`, path leg)
 
+Matching is case-insensitive, and every clause whose catalog glob is recursive is recursive too: `services/foo/policies/refund.yaml`, `enterprise/lib/captain/Prompts/system.md`, and a nested `AGENTS.md` all stage the same as a repo-root copy. A `dir/**` glob also matches a tracked path named exactly `dir`, so the regex does too. That coverage claim is pinned exhaustively — a catalog rule with a path leg must be listed in the hook fixture table or in its documented exclusion set, so a new rule cannot land uncovered and unnoticed.
+
 ### What the hook can't catch
 
-pre-commit's `files:` regex is purely path-based; it cannot inspect diff content. Two triggers in `docs/triggers.json` are diff-only and therefore **not** covered by this hook:
+pre-commit's `files:` regex is purely path-based; it cannot inspect diff content. Several triggers in `docs/triggers.json` need the diff body and are therefore **not** covered by this hook:
 
 - `TRIGGER-FUNCTION-TOOL-DECORATOR` — fires when `@function_tool`, `@tool`, or `FunctionTool(` is added to a diff.
-- `TRIGGER-FRAMEWORK-VERSION-BUMP` — fires when `openai-agents`, `langchain`, `crewai`, or `google-adk` appears in a dependency-change diff.
+- `TRIGGER-GOOGLE-ADK-AGENT-TOOLS-CHANGED` — fires when a `google.adk` module path, an `Agent(`/`LlmAgent(` construction, and a `tools=[...]` argument all appear in a diff.
+- `TRIGGER-FRAMEWORK-VERSION-BUMP` — fires when `openai-agents`, `langchain`, `crewai`, `google-adk`, or `conductor-oss` appears in the diff **and** a dependency manifest (`pyproject.toml`, `requirements*.txt`, `package.json`, a lockfile, …) is among the changed files. The path leg alone can't decide it, so the regex can't either.
 - `TRIGGER-SHIPGATE-CI-WORKFLOW` also has a diff-only leg (`ThreeMoonsLab/agents-shipgate` string match) that this hook doesn't see.
 
-For full trigger coverage on PRs, rely on the GitHub Action — it runs `agents-shipgate scan` unconditionally on the configured event, so diff content doesn't gate it. For local diff-aware checks, `python -m agents_shipgate.triggers --git-diff HEAD` (or `--diff-text "..."`) evaluates the full catalog against any file set or diff payload.
+For full trigger coverage on PRs, rely on the GitHub Action — it runs `agents-shipgate verify` on the configured event and evaluates the full trigger catalog (including the diff-only legs) itself, so diff content doesn't gate discovery the way the path-based `files:` regex does. For local diff-aware checks, `python -m agents_shipgate.triggers --git-diff HEAD` (or `--diff-text "..."`) evaluates the full catalog against any file set or diff payload.
 
 A pure docs/test commit doesn't trigger the scan — same semantic as the AGENTS.md trigger table (`TRIGGER-DOCS-ONLY-NEGATIVE`).
 
@@ -92,10 +113,10 @@ Use the `agents-shipgate-strict` hook ID for the strict variant, or override the
 ```yaml
 repos:
   - repo: https://github.com/ThreeMoonsLab/agents-shipgate
-    rev: v0.10.0
+    rev: v0.15.0
     hooks:
       - id: agents-shipgate
-        entry: agents-shipgate scan -c shipgate.yaml --ci-mode strict --fail-on critical
+        entry: agents-shipgate verify --config shipgate.yaml --ci-mode strict --fail-on critical --format text
 ```
 
 Pair strict mode with a baseline ([`baseline.md`](../../docs/baseline.md)) so existing accepted findings don't fail every commit.

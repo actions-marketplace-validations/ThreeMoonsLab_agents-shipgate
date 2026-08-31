@@ -1,0 +1,162 @@
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from agents_shipgate.schemas.common import Confidence, ProvenanceKind
+
+BindingStatus = Literal["declared", "structural", "partial", "unknown", "conflicting"]
+BindingEdgeType = Literal[
+    "direct_tool",
+    "tool_node",
+    "toolset",
+    "workflow",
+    "subagent",
+    "handoff",
+]
+
+
+#: What a node in the binding graph *is*. The array is called ``agents`` and
+#: was, for a long time, only agents — so a consumer reading it had no way to
+#: tell a runtime agent from something else the projection represents there.
+#: ``tool_source`` is a published tool surface a human reviewed under
+#: ``tool_sources[].binding``: it has no agent object anywhere, it is named by
+#: its configured source id, and it is an entry point rather than something an
+#: agent reaches (#432).
+BindingNodeKind = Literal["agent", "tool_source"]
+
+
+class AgentBindingNode(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    agent_id: str
+    name: str
+    # v0.42. Additive and defaulted, so every node any prior release emitted
+    # reads back as what it was.
+    kind: BindingNodeKind = "agent"
+    source_id: str | None = None
+    source_ref: str | None = None
+    source_pointer: str | None = None
+
+
+class AgentToolBindingEdge(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    agent_id: str
+    tool_id: str
+    edge_type: BindingEdgeType
+    confidence: Confidence
+    provenance_kind: ProvenanceKind
+    source: str
+    source_pointer: str | None = None
+    complete: bool = True
+
+
+class AgentHandoffBindingEdge(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_agent_id: str
+    target_agent_id: str
+    edge_type: Literal["subagent", "handoff"]
+    confidence: Confidence
+    provenance_kind: ProvenanceKind
+    source: str
+    source_pointer: str | None = None
+    complete: bool = True
+
+
+class AgentBindingIssue(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal[
+        "missing_binding_evidence",
+        "partial_binding_evidence",
+        "conflicting_binding_evidence",
+        "ambiguous_root_agent",
+        "unresolved_agent_binding",
+        "unresolved_bound_tool",
+        "incomplete_handoff_graph",
+        "invalid_binding_annotation",
+    ]
+    message: str
+    agent_id: str | None = None
+    tool_id: str | None = None
+    source: str | None = None
+    source_pointer: str | None = None
+
+
+class AgentBindingGraphAssessment(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    root_agent_id: str | None = None
+    # v0.42: every node the reachability walk started from, root included.
+    #
+    # ``root_agent_id`` alone cannot distinguish two opposite states, and one
+    # of them is now reachable with `pass_eligible: true`: a graph nothing
+    # rooted, and a graph rooted by declared published surfaces where no agent
+    # object exists to name (#432). A repository publishing two servers has two
+    # entry points and no root agent, which is not the same fact as "the root
+    # could not be identified" and must not read as it.
+    #
+    # Empty exactly when nothing rooted the graph. Non-empty and equal to
+    # ``[root_agent_id]`` for every graph a prior release could produce, so a
+    # consumer reading it need not special-case the old shape.
+    entry_point_agent_ids: list[str] = Field(default_factory=list)
+    status: BindingStatus
+    agents: list[AgentBindingNode] = Field(default_factory=list)
+    tool_edges: list[AgentToolBindingEdge] = Field(default_factory=list)
+    handoff_edges: list[AgentHandoffBindingEdge] = Field(default_factory=list)
+    reachable_tool_ids: list[str] = Field(default_factory=list)
+    possible_tool_ids: list[str] = Field(default_factory=list)
+    unbound_tool_ids: list[str] = Field(default_factory=list)
+    issues: list[AgentBindingIssue] = Field(default_factory=list)
+    pass_eligible: bool = False
+
+
+class BindingSurfaceDiff(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    # v0.35: whether this run *asked* for a base comparison. ``enabled`` alone
+    # conflates two states that must route differently: nobody asked (a plain
+    # ``scan``), and somebody asked and it could not be done — a supplied base
+    # report predating v0.31, a baseline with no binding facts, or a verify
+    # base scan that failed. Reading the second as the first let a head scan
+    # conclude an unbound tool was pre-existing using a comparison it never
+    # performed, which is the fail-open
+    # ``docs/engineering/ai-coding-workflow-verifier.md`` §2.3 forbids: base
+    # failure may disable enrichment, never weaken the head gate.
+    base_comparison_requested: bool = False
+    base_report_schema_version: str | None = None
+    added_reachable_tool_ids: list[str] = Field(default_factory=list)
+    removed_reachable_tool_ids: list[str] = Field(default_factory=list)
+    # v0.35: tools this change *newly excluded* from the analysed surface —
+    # head ``unbound_tool_ids`` minus base ``unbound_tool_ids``. Both halves
+    # of the narrowing land here: a tool the diff added to a source and left
+    # unwired, and a tool that was reachable at base and is not any more.
+    #
+    # It is a separate list rather than a derivation of the reachable ones
+    # because it answers a different question. ``removed_reachable_tool_ids``
+    # says the agent lost a capability, which is a *narrowing of what the
+    # agent can do*; this says the gate lost a subject, which is a narrowing
+    # of *what the gate looked at*. A pre-existing unbound catalog entry stays
+    # out of both — catalog membership is not evidence of capability (#385) —
+    # so this is exactly the set that arrived without ever being judged.
+    added_unbound_tool_ids: list[str] = Field(default_factory=list)
+    added_handoffs: list[str] = Field(default_factory=list)
+    removed_handoffs: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+__all__ = [
+    "AgentBindingGraphAssessment",
+    "AgentBindingIssue",
+    "AgentBindingNode",
+    "BindingNodeKind",
+    "AgentHandoffBindingEdge",
+    "AgentToolBindingEdge",
+    "BindingEdgeType",
+    "BindingStatus",
+    "BindingSurfaceDiff",
+]

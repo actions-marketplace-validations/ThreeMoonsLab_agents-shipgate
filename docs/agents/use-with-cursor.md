@@ -1,5 +1,18 @@
 # Use Agents Shipgate with Cursor
 
+This page is the compatibility guide for Cursor rules. For the normative agent
+protocol, use [cursor.md](cursor.md) and [protocol.md](protocol.md). The
+canonical Cursor control command is:
+
+```bash
+shipgate check --agent cursor --workspace . --format agent-boundary-json
+```
+
+Parse stdout as `shipgate.agent_boundary_result/v2`, switch on
+`control.state`, and follow `control.next_action`,
+`control.allowed_next_commands`, and `control.human_review`. Treat `decision`
+as diagnostic context only; do not infer local control from prose.
+
 Cursor's discoverability surface is the auto-attach project rule: a Markdown file under `.cursor/rules/*.mdc` with frontmatter that lists which globs cause it to attach to a chat. The canonical Shipgate rule already exists as a copy-paste snippet — drop it in and Cursor will load it whenever a chat touches `shipgate.yaml`, an OpenAPI/MCP spec, a tools JSON, or any `.py` file.
 
 | Surface | What it does | Source path in this repo |
@@ -47,11 +60,60 @@ Do **not** edit the `description:` field unless you mean to change what Cursor's
 Open Cursor in the project. Two checks:
 
 1. Open `shipgate.yaml` (or any matching tool source — an MCP/OpenAPI spec, a tools JSON, a `.py` file in the agent) in the editor and start a chat. Confirm Cursor shows the `agents-shipgate` rule as auto-attached in the rule list.
-2. In the same chat, with the matching file still in context (open in the editor or referenced via `@filename`), ask "add release-readiness checks for this agent" without saying the word "shipgate." Cursor should run `agents-shipgate detect --workspace . --json` per the rule and proceed to the canonical 4-call flow.
+2. In the same chat, with the matching file still in context (open in the editor or referenced via `@filename`), ask "add Tool-Use Readiness checks for this agent" without saying the word "shipgate." Cursor should run the preview/detect path per the rule and proceed only when Shipgate is relevant.
+3. In a repo that already has `shipgate.yaml`, ask Cursor to finish an
+   agent-tool change. Cursor should run
+   `agents-shipgate verify --workspace . --config shipgate.yaml --base origin/main --head HEAD --ci-mode advisory --format json`
+   or report the exact `agents-shipgate trigger` skip verdict.
+
+   For local uncommitted work, omit `--base`/`--head` so uncommitted edits are
+   scanned. For committed PR/CI refs, make the base ref available first because
+   `verify` never fetches.
 
 The rule's `alwaysApply: false` setting means it only fires when a matching file is in chat context. A chat with no matching file referenced will not auto-attach the rule — that is the intended behavior, not a bug.
 
 If both checks pass, you are done.
+
+---
+
+## Verify an agent PR
+
+The rule above makes Shipgate discoverable. When a chat touches a PR that
+changes agent tools, MCP exports, OpenAPI specs, prompts, permissions, policies,
+CI gates, or `shipgate.yaml`, Cursor should run the local control check before
+treating the change as finished, then run `verify` for PR/reviewer evidence:
+
+```bash
+shipgate check --agent cursor --workspace . --format agent-boundary-json
+agents-shipgate preflight --workspace . --plan - --json
+agents-shipgate verify --base origin/main --head HEAD --json
+```
+
+If preflight returns `control.state="human_review_required"`, Cursor must stop for a human
+before editing the protected surface or asserting missing high-risk evidence.
+
+Read `agents-shipgate-reports/agent-handoff.json` and switch on
+`control.state`, then read `verifier.json` and `merge_verdict`
+(`mergeable` / `human_review_required` / `insufficient_evidence` / `blocked` /
+`unknown`). It is a deterministic projection of `release_decision.decision`,
+which stays the gate in `agents-shipgate-reports/report.json`. Read
+`capability_review.top_changes[]` next for the highest-signal tool/action access
+changes, and check `trust_root_touched`, `policy_weakened`, and `fix_task`.
+`agent-result.json` is a supporting/provisional compact projection; Cursor should
+not read it ahead of `verifier.json`.
+
+Cursor must not claim the change is complete unless `control.state` is
+`complete`. Conversation-level acknowledgement cannot clear a human-review
+route. When `control.next_action.actor`
+or `fix_task.actor` is `human`, surface the decision for a person rather than
+inventing action effect, action authority, approval, confirmation,
+idempotency, waiver, baseline, or policy evidence.
+
+Never weaken `shipgate.yaml`, the Shipgate CI workflow, `AGENTS.md`, policy
+packs, baselines, waivers, or suppressions just to make Shipgate pass — that
+edit is itself a trust-root change the gate flags. See
+[`../use-cases/ai-generated-agent-prs.md`](../use-cases/ai-generated-agent-prs.md)
+for the full PR-verification walkthrough.
 
 ---
 
@@ -77,11 +139,18 @@ See [`prompts/README.md`](../../prompts/README.md) for the full convention.
 Cursor must follow the same boundary as any other agent driving Shipgate:
 
 - **What it may do mechanically** — install, detect, init, doctor, scan, summarize, add advisory CI, apply high-confidence mechanical patches (`apply-patches --confidence high --apply`), add `agents-shipgate-reports/` to `.gitignore`.
-- **What it must not assert without human review** — approval, confirmation, idempotency, broad-scope, prohibited-action, or runtime trace evidence.
+- **What it must not assert without human review** — action effect, action
+  authority, approval, confirmation, idempotency, broad-scope,
+  prohibited-action, or runtime trace evidence.
 
-Both are spelled out in [`agent-autofix-boundary.md`](../agent-autofix-boundary.md). For the right order to read `report.json`, see [`report-reading-for-agents.md`](../report-reading-for-agents.md) — read `release_decision.decision` first.
+Both are spelled out in [`agent-autofix-boundary.md`](../agent-autofix-boundary.md). For ongoing PRs, read `agent-handoff.json.gate.merge_verdict` first, then `report.json.release_decision.decision`; see [`report-reading-for-agents.md`](../report-reading-for-agents.md).
 
 For the stable CLI / JSON contract, see [`STABILITY.md`](../../STABILITY.md).
+
+Do not bypass the verifier by suppressing findings, lowering severity,
+expanding baselines or waivers, removing Shipgate CI, or weakening agent
+instructions to make a run pass. Verify-mode `SHIP-VERIFY-*` checks make those
+trust-root edits release-visible and route them to human review.
 
 ---
 

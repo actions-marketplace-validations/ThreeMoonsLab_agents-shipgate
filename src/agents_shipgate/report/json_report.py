@@ -4,7 +4,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from agents_shipgate.core.models import ReadinessReport
+from agents_shipgate.core.privacy import sanitize_report_payload
+from agents_shipgate.schemas.report import ReadinessReport
 
 _PROVENANCE_KEYS = ("path", "start_line", "end_line", "start_column", "pointer")
 
@@ -33,12 +34,18 @@ def report_json_payload(report: ReadinessReport) -> dict[str, Any]:
             for key in _PROVENANCE_KEYS:
                 if source.get(key) is None:
                     source.pop(key, None)
-    return data
+    return sanitize_report_payload(data)
 
 
-def write_json_report(report: ReadinessReport, path: Path) -> None:
+def write_json_report(
+    report: ReadinessReport,
+    path: Path,
+    *,
+    sanitized_payload: dict[str, Any] | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    payload = report_json_payload(report) if sanitized_payload is None else sanitized_payload
     path.write_text(
-        json.dumps(report_json_payload(report), indent=2),
+        json.dumps(payload, indent=2),
         encoding="utf-8",
     )

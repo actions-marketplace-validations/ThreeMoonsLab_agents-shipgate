@@ -1,15 +1,16 @@
+import shutil
 from pathlib import Path
 
 import pytest
 
 from agents_shipgate.cli.scan import inspect_sources, run_scan
 from agents_shipgate.config.loader import load_manifest
-from agents_shipgate.config.schema import (
+from agents_shipgate.core.errors import ConfigError
+from agents_shipgate.inputs.anthropic_api import load_anthropic_artifacts
+from agents_shipgate.schemas.manifest import (
     AnthropicConfig,
     ArtifactPathConfig,
 )
-from agents_shipgate.core.errors import ConfigError
-from agents_shipgate.inputs.anthropic_api import load_anthropic_artifacts
 
 SAMPLE = Path("samples/simple_anthropic_agent/shipgate.yaml")
 
@@ -190,7 +191,7 @@ def test_anthropic_loader_skips_unknown_typed_tools_with_warning(tmp_path):
 def test_anthropic_client_tool_fires_high_risk_release_findings(tmp_path):
     """End-to-end: a manifest declaring `bash_20250124` with no approval
     policy must NOT silently pass; it should fire SHIP-POLICY-APPROVAL-MISSING
-    and SHIP-AUTH-MISSING-SCOPE just like any other write-shaped tool."""
+    while missing authority is carried as an unsuppressible semantic gap."""
     (tmp_path / "prompt.md").write_text(
         "You are a coding assistant that runs shell commands.", encoding="utf-8"
     )
@@ -214,6 +215,13 @@ anthropic:
     - prompt.md
   tools:
     - path: tools.json
+agent_bindings:
+  declarations:
+    - agent: root
+      complete: true
+      tools: [{tool: bash}]
+      handoffs: []
+      reason: reviewed Anthropic client-tool fixture binding
 """,
         encoding="utf-8",
     )
@@ -231,11 +239,14 @@ anthropic:
         if finding.tool_name == "bash" and not finding.suppressed
     }
     assert "SHIP-POLICY-APPROVAL-MISSING" in bash_findings
-    assert "SHIP-AUTH-MISSING-SCOPE" in bash_findings
+    assert report.release_decision is not None
+    assert any(
+        gap.subject.startswith("bash [") and gap.kind == "missing_authority_evidence"
+        for gap in report.release_decision.evidence_coverage.evidence_gaps
+    )
     # The bash tool should be in the inventory (not skipped).
     inventory_names = {
-        (tool.name if hasattr(tool, "name") else tool["name"])
-        for tool in report.tool_inventory
+        (tool.name if hasattr(tool, "name") else tool["name"]) for tool in report.tool_inventory
     }
     assert "bash" in inventory_names
 
@@ -326,10 +337,7 @@ anthropic:
         "SHIP-API-RETRY-WITHOUT-IDEMPOTENCY",
     }
     for finding in report.findings:
-        if (
-            finding.check_id in openai_only_check_ids
-            and finding.tool_name == "create_refund"
-        ):
+        if finding.check_id in openai_only_check_ids and finding.tool_name == "create_refund":
             raise AssertionError(
                 f"OpenAI-only check {finding.check_id} fired on Anthropic tool create_refund"
             )
@@ -410,9 +418,23 @@ def test_anthropic_scan_runs_existing_framework_agnostic_checks(tmp_path):
     # Existing framework-agnostic + generalized SHIP-API-* checks fire on
     # Anthropic tools without any new check IDs.
     assert "SHIP-API-FUNCTION-SCHEMA-STRICTNESS" in fingerprints
-    assert "SHIP-API-PROMPT-TOOL-SCOPE-MISMATCH" in fingerprints
-    assert "SHIP-AUTH-MISSING-SCOPE" in fingerprints
-    assert "SHIP-SCHEMA-MISSING-BOUNDS" in fingerprints
+    assert "SHIP-API-PROMPT-TOOL-SCOPE-MISMATCH" not in fingerprints
+    assert any(
+        gap.kind == "inferred_policy_applicability"
+        and gap.why.startswith("SHIP-API-PROMPT-TOOL-SCOPE-MISMATCH:")
+        for gap in report.policy_evidence_gaps
+    )
+    assert report.release_decision is not None
+    semantic = report.release_decision.evidence_coverage.semantic_coverage
+    assert semantic.gap_count == 0
+    assert semantic.review_concern_count == 2
+    assert semantic.reason_counts == {"unscoped_authority": 2}
+    assert "SHIP-SCHEMA-MISSING-BOUNDS" not in fingerprints
+    assert any(
+        gap.kind == "inferred_policy_applicability"
+        and gap.why.startswith("SHIP-SCHEMA-MISSING-BOUNDS:")
+        for gap in report.policy_evidence_gaps
+    )
     assert "SHIP-MANIFEST-HIGH-RISK-OWNER-MISSING" in fingerprints
     # Approval is satisfied by anthropic.policy_rules so the check should NOT fire.
     assert "SHIP-POLICY-APPROVAL-MISSING" not in fingerprints
@@ -420,12 +442,51 @@ def test_anthropic_scan_runs_existing_framework_agnostic_checks(tmp_path):
     assert not any(check_id.startswith("SHIP-ANTHROPIC-") for check_id in fingerprints)
 
 
-def test_anthropic_function_strictness_does_not_emit_missing_strict_true():
+def test_anthropic_policy_rules_satisfy_capability_native_policy_pack_match(tmp_path):
+    project = tmp_path / "anthropic"
+    shutil.copytree(SAMPLE.parent, project)
+    (project / "approval-covered-pack.yaml").write_text(
+        """
+name: Anthropic Approval Coverage
+rules:
+  - id: ORG-ANTHROPIC-APPROVAL-COVERED
+    title: Anthropic approval policy is recognized
+    severity: low
+    recommendation: Keep the Anthropic policy artifact in sync.
+    match:
+      source_types: [anthropic_api]
+      risk_tags: [financial_action]
+      missing_approval_policy: false
+""",
+        encoding="utf-8",
+    )
+
+    report, _ = run_scan(
+        config_path=project / "shipgate.yaml",
+        output_dir=tmp_path / "reports",
+        formats=["json"],
+        ci_mode="advisory",
+        policy_pack_paths=[Path("approval-covered-pack.yaml")],
+    )
+
+    finding = next(
+        item for item in report.findings if item.check_id == "ORG-ANTHROPIC-APPROVAL-COVERED"
+    )
+    assert finding.tool_name == "create_refund"
+    assert finding.evidence["missing_approval_policy"] is False
+    assert finding.capability_policy_evidence is not None
+    assert finding.capability_policy_evidence.controls["effective_approval_required"] is True
+
+
+def test_anthropic_function_strictness_does_not_emit_missing_strict_true(
+    tmp_path: Path,
+) -> None:
     """OpenAI's `strict: true` field is not part of Anthropic's Messages API,
     so the function-schema-strictness check must not list it as an issue
     for Anthropic tools."""
     report, _ = run_scan(
         config_path=SAMPLE,
+        output_dir=tmp_path / "reports",
         formats=["json"],
         ci_mode="advisory",
     )

@@ -7,10 +7,10 @@ contracts on both endpoints should validate against the current schema.
 
 Specifically:
 
-1. ``list-checks --json`` carries non-None ``docs_url``,
+1. ``list-checks --json`` carries non-None ``mvp_tier``, ``docs_url``,
    ``autofix_safe``, ``requires_human_review``, ``suggested_patch_kind``
    for every built-in check.
-2. ``report.json`` carries the same four fields populated for every
+2. ``report.json`` carries the same metadata fields populated for every
    active finding from a real scan against
    ``samples/support_refund_agent``, both with and without
    ``--suggest-patches``.
@@ -33,7 +33,7 @@ from typer.testing import CliRunner
 
 from agents_shipgate.cli.main import app
 from agents_shipgate.cli.scan import run_scan
-from agents_shipgate.core.models import ReadinessReport
+from agents_shipgate.schemas.report import ReadinessReport
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SAMPLES = REPO_ROOT / "samples"
@@ -54,6 +54,7 @@ REQUIRED_REMEDIATION_KEYS = (
     "suggested_patch_kind",
     "docs_url",
 )
+REQUIRED_CATALOG_KEYS = ("mvp_tier", *REQUIRED_REMEDIATION_KEYS)
 
 
 # --- list-checks --json end-to-end -----------------------------------------
@@ -66,14 +67,13 @@ def test_list_checks_json_carries_remediation_metadata_for_every_check():
     catalog = json.loads(result.output)
     assert catalog, "empty catalog from list-checks --json"
     for entry in catalog:
-        for key in REQUIRED_REMEDIATION_KEYS:
+        for key in REQUIRED_CATALOG_KEYS:
             assert key in entry, (
-                f"{entry['id']} missing remediation key {key!r} in "
-                "list-checks --json"
+                f"{entry['id']} missing remediation key {key!r} in list-checks --json"
             )
             assert entry[key] is not None, (
                 f"{entry['id']}.{key} is None in list-checks --json — "
-                "all four fields must be populated for every catalog entry"
+                "all required catalog fields must be populated for every entry"
             )
 
 
@@ -82,12 +82,10 @@ def test_explain_json_carries_remediation_metadata():
     agents use when they want full context on one finding ID. It must
     surface the same remediation fields as the catalog."""
     runner = CliRunner()
-    result = runner.invoke(
-        app, ["explain", "SHIP-MANIFEST-STALE-SUPPRESSION", "--json"]
-    )
+    result = runner.invoke(app, ["explain", "SHIP-MANIFEST-STALE-SUPPRESSION", "--json"])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    for key in REQUIRED_REMEDIATION_KEYS:
+    for key in REQUIRED_CATALOG_KEYS:
         assert key in payload, f"explain --json missing {key!r}"
         assert payload[key] is not None, f"explain --json {key!r} is None"
 
@@ -209,9 +207,7 @@ def test_stale_finding_with_unique_match_is_per_finding_autofix_safe(tmp_path):
         suggest_patches=True,
     )
     payload = json.loads(
-        (workspace / "agents-shipgate-reports" / "report.json").read_text(
-            encoding="utf-8"
-        )
+        (workspace / "agents-shipgate-reports" / "report.json").read_text(encoding="utf-8")
     )
     stale = [
         f
@@ -237,15 +233,14 @@ def test_stale_finding_with_unique_match_is_per_finding_autofix_safe(tmp_path):
     )
 
 
-# --- v0.10 release version sanity check ------------------------------------
+# --- release version sanity check ------------------------------------------
 
 
-def test_package_version_is_v010():
-    """Final-polish guard: catches the case where the schema bumped to
-    v0.10 but the package version was left behind. Both move together."""
+def test_package_version_is_current_in_tree_runtime():
+    """Guard against bumping schemas while leaving package metadata behind."""
     import agents_shipgate
 
-    assert agents_shipgate.__version__ == "0.10.0", (
+    assert agents_shipgate.__version__ == "0.16.0b7", (
         f"package version is {agents_shipgate.__version__!r}; "
-        "expected 0.10.0 for the v0.10 release"
+        "expected 0.16.0b7 for the current in-tree runtime"
     )

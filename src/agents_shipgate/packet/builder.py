@@ -14,7 +14,29 @@ findings are excluded from §1–§9 (only §10 surfaces them).
 
 from __future__ import annotations
 
-from agents_shipgate.config.schema import (
+from agents_shipgate.core.artifact_models import (
+    AnthropicArtifacts,
+    OpenAIApiArtifacts,
+    ValidationArtifacts,
+)
+from agents_shipgate.core.domain import (
+    AuthInfo,
+    Tool,
+    ToolRiskHint,
+)
+from agents_shipgate.core.findings import provenance_kind_counts
+from agents_shipgate.core.risk_hints import is_high_risk_tool, risk_tags
+from agents_shipgate.packet.disclaimer import (
+    PACKET_NON_PROOF,
+    PACKET_NON_PROOF_HEADLINE,
+)
+from agents_shipgate.packet.evidence_matrix import build_evidence_matrix
+from agents_shipgate.report.json_report import report_json_payload
+from agents_shipgate.schemas.common import (
+    HitlSourceProvenance,
+    sorted_hitl_source_provenance,
+)
+from agents_shipgate.schemas.manifest import (
     AgentConfig,
     AgentsShipgateManifest,
     ChecksConfig,
@@ -26,27 +48,8 @@ from agents_shipgate.config.schema import (
     ProjectConfig,
     RiskOverridesConfig,
 )
-from agents_shipgate.core.models import (
-    AnthropicArtifacts,
-    AuthInfo,
-    Finding,
-    HitlSourceProvenance,
-    OpenAIApiArtifacts,
-    ReadinessReport,
-    ReleaseDecision,
-    ReleaseDecisionItem,
-    Tool,
-    ToolRiskHint,
-    ToolSurfaceDiff,
-    ValidationArtifacts,
-    sorted_hitl_source_provenance,
-)
-from agents_shipgate.core.risk_hints import is_high_risk_tool, risk_tags
-from agents_shipgate.packet.disclaimer import (
-    PACKET_NON_PROOF,
-    PACKET_NON_PROOF_HEADLINE,
-)
-from agents_shipgate.packet.models import (
+from agents_shipgate.schemas.packet import (
+    ActionSurfaceDiffSection,
     ApprovalCoverageRow,
     ApprovalCoverageSection,
     CapabilityIntentDiff,
@@ -69,10 +72,23 @@ from agents_shipgate.packet.models import (
     ToolSurfaceDiffSection,
     VerdictLabel,
 )
+from agents_shipgate.schemas.report import (
+    CapabilityRuntimeEvidence,
+    CapabilityTraceEvidenceSummary,
+    Finding,
+    ReadinessReport,
+    ReleaseDecision,
+    ReleaseDecisionItem,
+)
+from agents_shipgate.schemas.surfaces import (
+    ActionSurfaceDiff,
+    ToolSurfaceDiff,
+)
 
 _VERDICT_BY_DECISION: dict[str, VerdictLabel] = {
     "passed": "PASSED",
     "review_required": "REVIEW REQUIRED",
+    "insufficient_evidence": "INSUFFICIENT EVIDENCE",
     "blocked": "BLOCKED",
 }
 
@@ -118,6 +134,9 @@ def build_packet(
     source_warnings: list[str],
     validation_artifacts: ValidationArtifacts | None = None,
     tool_surface_diff: ToolSurfaceDiff | None = None,
+    action_surface_diff: ActionSurfaceDiff | None = None,
+    report_payload: dict | None = None,
+    capability_runtime_evidence: CapabilityRuntimeEvidence | None = None,
     generated_at: str | None = None,
     config_ref: str = "shipgate.yaml",
     hitl_provenance_mode: str = "fresh_scan",
@@ -145,11 +164,19 @@ def build_packet(
         agent=agent,
         environment=environment,
         release_decision=_build_release_decision(release_decision),
+        evidence_matrix=build_evidence_matrix(report_payload),
         capability_intent=_build_capability_intent(manifest, agent, tools, active),
         high_risk_surface=_build_high_risk_surface(
             tools, approval_declared, idempotency_declared
         ),
-        tool_surface_diff=_build_tool_surface_diff(tool_surface_diff),
+        tool_surface_diff=_build_tool_surface_diff(
+            tool_surface_diff, tools
+        ),
+        action_surface_diff=_build_action_surface_diff(
+            action_surface_diff,
+            active,
+            tools,
+        ),
         approval_coverage=_build_approval_coverage(
             manifest, api_artifacts, anthropic_artifacts, tools, active
         ),
@@ -165,6 +192,7 @@ def build_packet(
             anthropic_artifacts,
             active,
             validation_artifacts=validation_artifacts,
+            capability_runtime_evidence=capability_runtime_evidence,
             config_ref=config_ref,
             provenance_mode=hitl_provenance_mode,
         ),
@@ -224,6 +252,9 @@ def build_packet_from_report(report: ReadinessReport) -> EvidencePacket:
         anthropic_artifacts=None,
         source_warnings=list(report.source_warnings),
         tool_surface_diff=report.tool_surface_diff,
+        action_surface_diff=report.action_surface_diff,
+        report_payload=report_json_payload(report),
+        capability_runtime_evidence=report.capability_runtime_evidence,
         hitl_provenance_mode="rebuilt_from_findings",
     )
     packet.not_proven.additional_residuals.append(_REBUILT_FROM_REPORT_NOTE)
@@ -304,6 +335,13 @@ def _tools_from_inventory(inventory: list[dict]) -> list[Tool]:
                 source_id=None,
                 source_ref=item.get("source_ref"),
                 source_location=None,
+                # v0.19 reviewer-grade provenance: tool_inventory rows
+                # now carry source_path / source_start_line / source_pointer
+                # so reconstructed tools keep the citation surface
+                # working in the rebuilt-from-report packet path.
+                source_path=item.get("source_path"),
+                source_start_line=item.get("source_start_line"),
+                source_pointer=item.get("source_pointer"),
                 input_schema={},
                 output_schema={},
                 parameters=[],
@@ -335,11 +373,50 @@ def _build_release_decision(decision: ReleaseDecision) -> ReleaseDecisionSection
         evidence_coverage=decision.evidence_coverage,
         baseline_delta=decision.baseline_delta,
         fail_policy=decision.fail_policy,
+        static_analysis_only=decision.static_analysis_only,
+        runtime_behavior_verified=decision.runtime_behavior_verified,
+        static_verdict_disclaimer=decision.static_verdict_disclaimer,
     )
+
+
+def _tool_source_index(
+    tools: list[Tool],
+) -> dict[str, tuple[str | None, int | None]]:
+    """Build the tool-name → ``(source_path, source_start_line)`` map
+    used to annotate §3A / §3B diff highlights with source citations.
+    Mirrors the helper in ``cli.scan`` so both surfaces stay
+    consistent — when both sides are populated, the same suffix lands
+    on machine-readable ``reason`` strings AND on packet markdown
+    highlight bullets."""
+    index = {
+        tool.id: (tool.source_path, tool.source_start_line)
+        for tool in tools
+    }
+    counts: dict[str, int] = {}
+    for tool in tools:
+        counts[tool.name] = counts.get(tool.name, 0) + 1
+    for tool in tools:
+        if counts[tool.name] == 1:
+            index[tool.name] = (tool.source_path, tool.source_start_line)
+    return index
+
+
+def _source_suffix(
+    entry: tuple[str | None, int | None] | None,
+) -> str:
+    if entry is None:
+        return ""
+    path, line = entry
+    if path and line is not None:
+        return f" ({path}:{line})"
+    if path:
+        return f" ({path})"
+    return ""
 
 
 def _build_tool_surface_diff(
     diff: ToolSurfaceDiff | None,
+    tools: list[Tool],
 ) -> ToolSurfaceDiffSection:
     if diff is None:
         return ToolSurfaceDiffSection(
@@ -359,27 +436,119 @@ def _build_tool_surface_diff(
         enabled=True,
         base_kind=diff.base.kind,
         summary=diff.summary,
-        highlights=_tool_surface_diff_highlights(diff),
+        highlights=_tool_surface_diff_highlights(
+            diff, _tool_source_index(tools)
+        ),
         notes=list(diff.notes[:3]),
     )
 
 
-def _tool_surface_diff_highlights(diff: ToolSurfaceDiff) -> list[str]:
+def _tool_surface_diff_highlights(
+    diff: ToolSurfaceDiff,
+    tool_source_index: dict[str, tuple[str | None, int | None]],
+) -> list[str]:
     highlights: list[str] = []
     for item in diff.high_risk_effects:
         if item.kind == "added":
-            highlights.append(f"New high-risk tag {item.tag} on {item.tool}")
+            highlights.append(
+                f"New high-risk tag {item.tag} on {item.tool}"
+                f"{_source_suffix(tool_source_index.get(item.tool_id or item.tool))}"
+            )
     for item in diff.controls:
         if item.kind == "removed":
-            highlights.append(f"Removed {item.control} for {item.tool}")
+            highlights.append(
+                f"Removed {item.control} for {item.tool}"
+                f"{_source_suffix(tool_source_index.get(item.tool_id or item.tool))}"
+            )
     for item in diff.tools:
         if item.kind == "added":
-            highlights.append(f"Added tool {item.name}")
+            highlights.append(
+                f"Added tool {item.name}"
+                f"{_source_suffix(tool_source_index.get(item.tool_id or item.name))}"
+            )
         elif item.kind == "removed":
-            highlights.append(f"Removed tool {item.name}")
+            highlights.append(
+                f"Removed tool {item.name}"
+                f"{_source_suffix(tool_source_index.get(item.tool_id or item.name))}"
+            )
     for item in diff.policy_drift:
+        # Policy drift rows reference manifest keys, not tools; no
+        # path:line citation is emitted from the tool index here.
         highlights.append(f"{item.kind.title()} {item.policy_kind} {item.key}")
     return highlights[:5]
+
+
+def _build_action_surface_diff(
+    diff: ActionSurfaceDiff | None,
+    findings: list[Finding],
+    tools: list[Tool],
+) -> ActionSurfaceDiffSection:
+    if diff is None:
+        return ActionSurfaceDiffSection(
+            status="not_declared",
+            notes=["No action-surface diff was recorded."],
+        )
+    if not diff.enabled:
+        return ActionSurfaceDiffSection(
+            status="not_declared",
+            enabled=False,
+            base_kind=diff.base.kind,
+            summary=diff.summary,
+            notes=list(diff.notes),
+        )
+    blocking = [
+        finding
+        for finding in findings
+        if finding.blocks_release
+        and not finding.suppressed
+        and finding.check_id.startswith("SHIP-ACTION-")
+    ]
+    status: SectionStatus = "missing" if blocking else "covered"
+    return ActionSurfaceDiffSection(
+        status=status,
+        enabled=True,
+        base_kind=diff.base.kind,
+        summary=diff.summary,
+        highlights=_action_surface_diff_highlights(
+            diff, _tool_source_index(tools)
+        ),
+        blocking_reasons=_action_surface_blocking_reasons(blocking),
+        notes=list(diff.notes[:3]),
+    )
+
+
+def _action_surface_diff_highlights(
+    diff: ActionSurfaceDiff,
+    tool_source_index: dict[str, tuple[str | None, int | None]],
+) -> list[str]:
+    highlights: list[str] = []
+    for item in diff.added:
+        highlights.append(
+            f"Added action {item.tool_name or item.action_id} ({item.severity})"
+            f"{_source_suffix(tool_source_index.get(item.tool_id or item.tool_name or ''))}"
+        )
+    for item in diff.modified:
+        highlights.append(
+            f"Modified action {item.tool_name or item.action_id}: {item.type} ({item.severity})"
+            f"{_source_suffix(tool_source_index.get(item.tool_id or item.tool_name or ''))}"
+        )
+    for item in diff.removed:
+        highlights.append(
+            f"Removed action {item.tool_name or item.action_id}"
+            f"{_source_suffix(tool_source_index.get(item.tool_id or item.tool_name or ''))}"
+        )
+    return highlights[:8]
+
+
+def _action_surface_blocking_reasons(findings: list[Finding]) -> list[str]:
+    reasons: list[str] = []
+    for finding in sorted(
+        findings,
+        key=lambda item: (item.severity, item.check_id, item.tool_name or ""),
+    ):
+        target = finding.tool_name or finding.evidence.get("action_id") or "action"
+        reasons.append(f"{target}: {finding.title}")
+    return reasons[:8]
 
 
 def _build_capability_intent(
@@ -429,6 +598,7 @@ def _build_capability_intent(
         declared_purpose=declared_purpose,
         prohibited_actions=prohibited,
         observed_tools=observed_tool_names,
+        observed_tool_ids=sorted(tool.id for tool in tools),
         rows=rows,
         divergence_findings=_to_decision_items(divergence),
     )
@@ -440,19 +610,30 @@ def _build_high_risk_surface(
     idempotency_declared: set[str],
 ) -> HighRiskSurfaceSection:
     entries: list[HighRiskToolEntry] = []
+    name_counts: dict[str, int] = {}
+    for tool in tools:
+        name_counts[tool.name] = name_counts.get(tool.name, 0) + 1
     for tool in tools:
         if not is_high_risk_tool(tool):
             continue
         entries.append(
             HighRiskToolEntry(
+                tool_id=tool.id,
                 name=tool.name,
+                provider=tool.provider or tool.source_id or tool.source_type,
                 source_type=tool.source_type,
                 risk_tags=risk_tags(tool, min_confidence="medium"),
-                has_approval_policy=tool.name in approval_declared,
-                has_idempotency_policy=tool.name in idempotency_declared,
+                has_approval_policy=(
+                    "approval" in tool.resolved_controls
+                    or (name_counts[tool.name] == 1 and tool.name in approval_declared)
+                ),
+                has_idempotency_policy=(
+                    "idempotency" in tool.resolved_controls
+                    or (name_counts[tool.name] == 1 and tool.name in idempotency_declared)
+                ),
             )
         )
-    entries.sort(key=lambda entry: entry.name)
+    entries.sort(key=lambda entry: (entry.name, entry.tool_id or ""))
 
     if not entries:
         status: SectionStatus = "informational"
@@ -488,8 +669,11 @@ def _build_approval_coverage(
 
     gap_findings = _findings_with_check(findings, APPROVAL_GAP_CHECKS)
     gap_by_tool: dict[str, list[str]] = {}
+    gap_by_tool_id: dict[str, list[str]] = {}
     for finding in gap_findings:
-        if finding.tool_name and finding.id:
+        if finding.tool_id and finding.id:
+            gap_by_tool_id.setdefault(finding.tool_id, []).append(finding.id)
+        elif finding.tool_name and finding.id:
             gap_by_tool.setdefault(finding.tool_name, []).append(finding.id)
 
     # Per the §4 contract: only include rows for tools where Shipgate has
@@ -498,23 +682,34 @@ def _build_approval_coverage(
     # SHIP-API-TRACE-APPROVAL-MISSING finding fired. High-risk tools that
     # need only confirmation (or no policy at all) are not approval gaps
     # and must not be reported as such.
-    relevant_names = set(declared_by_source) | set(gap_by_tool)
     rows: list[ApprovalCoverageRow] = []
     seen: set[str] = set()
-    for tool in sorted(tools, key=lambda t: t.name):
-        if tool.name not in relevant_names:
+    name_counts = _tool_name_counts(tools)
+    for tool in sorted(tools, key=lambda t: (t.name, t.id)):
+        declared_source = _control_source(
+            tool,
+            control="approval",
+            declared_by_source=declared_by_source,
+            name_counts=name_counts,
+        )
+        gap_ids = gap_by_tool_id.get(tool.id, [])
+        if name_counts[tool.name] == 1:
+            gap_ids = [*gap_ids, *gap_by_tool.get(tool.name, [])]
+        if declared_source is None and not gap_ids:
             continue
-        seen.add(tool.name)
+        seen.add(tool.id)
         rows.append(
             ApprovalCoverageRow(
                 tool=tool.name,
-                declared=tool.name in declared_by_source,
-                source=declared_by_source.get(tool.name),
-                gap_finding_ids=sorted(gap_by_tool.get(tool.name, [])),
+                tool_id=tool.id,
+                provider=tool.provider or tool.source_id or tool.source_type,
+                declared=declared_source is not None,
+                source=declared_source,
+                gap_finding_ids=sorted(gap_ids),
             )
         )
     for tool_name, ids in gap_by_tool.items():
-        if tool_name in seen:
+        if name_counts.get(tool_name) == 1:
             continue
         rows.append(
             ApprovalCoverageRow(
@@ -554,30 +749,44 @@ def _build_idempotency_risk(
 
     gap_findings = _findings_with_check(findings, IDEMPOTENCY_GAP_CHECKS)
     gap_by_tool: dict[str, list[str]] = {}
+    gap_by_tool_id: dict[str, list[str]] = {}
     for finding in gap_findings:
-        if finding.tool_name and finding.id:
+        if finding.tool_id and finding.id:
+            gap_by_tool_id.setdefault(finding.tool_id, []).append(finding.id)
+        elif finding.tool_name and finding.id:
             gap_by_tool.setdefault(finding.tool_name, []).append(finding.id)
 
     # Same rule as §4: only include rows where Shipgate has actual
     # idempotency evidence — declared or flagged. High-risk read-class
     # tools that don't need idempotency must not appear as gaps.
-    relevant_names = set(declared_by_source) | set(gap_by_tool)
     rows: list[IdempotencyRow] = []
     seen: set[str] = set()
-    for tool in sorted(tools, key=lambda t: t.name):
-        if tool.name not in relevant_names:
+    name_counts = _tool_name_counts(tools)
+    for tool in sorted(tools, key=lambda t: (t.name, t.id)):
+        declared_source = _control_source(
+            tool,
+            control="idempotency",
+            declared_by_source=declared_by_source,
+            name_counts=name_counts,
+        )
+        gap_ids = gap_by_tool_id.get(tool.id, [])
+        if name_counts[tool.name] == 1:
+            gap_ids = [*gap_ids, *gap_by_tool.get(tool.name, [])]
+        if declared_source is None and not gap_ids:
             continue
-        seen.add(tool.name)
+        seen.add(tool.id)
         rows.append(
             IdempotencyRow(
                 tool=tool.name,
-                declared=tool.name in declared_by_source,
-                source=declared_by_source.get(tool.name),
-                gap_finding_ids=sorted(gap_by_tool.get(tool.name, [])),
+                tool_id=tool.id,
+                provider=tool.provider or tool.source_id or tool.source_type,
+                declared=declared_source is not None,
+                source=declared_source,
+                gap_finding_ids=sorted(gap_ids),
             )
         )
     for tool_name, ids in gap_by_tool.items():
-        if tool_name in seen:
+        if name_counts.get(tool_name) == 1:
             continue
         rows.append(
             IdempotencyRow(
@@ -604,10 +813,10 @@ def _build_scope_coverage(
 ) -> ScopeCoverageSection:
     declared = list(dict.fromkeys(manifest.permissions.scopes))
 
-    used_by_scope: dict[str, list[str]] = {}
+    used_by_scope: dict[str, list[tuple[str, str]]] = {}
     for tool in tools:
         for scope in tool.auth.scopes:
-            used_by_scope.setdefault(scope, []).append(tool.name)
+            used_by_scope.setdefault(scope, []).append((tool.id, tool.name))
     for scopes in used_by_scope.values():
         scopes.sort()
 
@@ -627,7 +836,8 @@ def _build_scope_coverage(
         ScopeCoverageRow(
             scope=scope,
             declared=scope in declared_set or scope in covered_used,
-            used_by_tools=sorted(used_by_scope.get(scope, [])),
+            used_by_tools=sorted(name for _, name in used_by_scope.get(scope, [])),
+            used_by_tool_ids=sorted(tool_id for tool_id, _ in used_by_scope.get(scope, [])),
         )
         for scope in sorted(declared_set | used_set)
     ]
@@ -731,6 +941,7 @@ def _build_human_in_the_loop(
     findings: list[Finding],
     *,
     validation_artifacts: ValidationArtifacts | None,
+    capability_runtime_evidence: CapabilityRuntimeEvidence | None,
     config_ref: str,
     provenance_mode: str,
 ) -> HumanInTheLoopEvidence:
@@ -749,7 +960,12 @@ def _build_human_in_the_loop(
         )
     )
     trace_findings = _findings_with_check(findings, HITL_GAP_CHECKS)
-    is_configured = bool(approval_tools or confirmation_tools or manifest.validation)
+    is_configured = bool(
+        approval_tools
+        or confirmation_tools
+        or manifest.validation
+        or (capability_runtime_evidence and capability_runtime_evidence.enabled)
+    )
     human_review_recommended = decision.evidence_coverage.human_review_recommended
     source_provenance = _hitl_source_provenance(
         manifest=manifest,
@@ -783,6 +999,15 @@ def _build_human_in_the_loop(
         trace_findings=_to_decision_items(trace_findings),
         source_provenance=source_provenance,
         provenance_mode=resolved_provenance_mode,
+        capability_trace_summary=(
+            capability_runtime_evidence.summary
+            if capability_runtime_evidence is not None
+            else CapabilityTraceEvidenceSummary()
+        ),
+        capability_trace_refs=_hitl_capability_trace_refs(
+            trace_findings,
+            capability_runtime_evidence,
+        ),
     )
 
 
@@ -926,12 +1151,40 @@ def _build_not_proven(
 ) -> NotProvenSection:
     suppressed_ids = sorted(f.id for f in findings if f.suppressed and f.id)
     low_confidence_tools = sorted(
-        tool.name for tool in tools if tool.extraction_confidence == "low"
+        tool.name for tool in tools if tool.extraction_confidence != "high"
     )
     additional = [
         "Memory isolation is not modeled by the v0.1 manifest schema; "
         "no static evidence is available."
     ]
+    provenance_counts = provenance_kind_counts(
+        findings,
+        include_suppressed=False,
+    )
+    heuristic_count = (
+        provenance_counts["keyword_heuristic"]
+        + provenance_counts["regex_heuristic"]
+    )
+    if heuristic_count:
+        additional.append(
+            f"{heuristic_count} active finding(s) came from heuristic "
+            "provenance "
+            f"(keyword_heuristic={provenance_counts['keyword_heuristic']}, "
+            f"regex_heuristic={provenance_counts['regex_heuristic']}); "
+            "review the finding evidence before acting."
+        )
+    if provenance_counts["ast_extraction"]:
+        additional.append(
+            f"{provenance_counts['ast_extraction']} active finding(s) came "
+            "from AST-extracted tool surfaces; confirm against the source "
+            "code when extraction precision matters."
+        )
+    if provenance_counts["policy_pack"]:
+        additional.append(
+            f"{provenance_counts['policy_pack']} active finding(s) came "
+            "from external policy packs; review the pack rule and its "
+            "declared confidence before acting."
+        )
     return NotProvenSection(
         headline=PACKET_NON_PROOF_HEADLINE,
         unconditional=[
@@ -954,6 +1207,11 @@ def _findings_with_check(
 def _to_decision_items(findings: list[Finding]) -> list[ReleaseDecisionItem]:
     items: list[ReleaseDecisionItem] = []
     for finding in findings:
+        # v0.19 reviewer-grade provenance: mirror the dual-source pointers
+        # onto packet ReleaseDecisionItem rows so packet markdown / HTML
+        # rendering and re-rendering from packet.json carry the tool
+        # location and the manifest evidence pointer without a side
+        # lookup into ``report.findings``.
         items.append(
             ReleaseDecisionItem(
                 id=finding.id,
@@ -962,9 +1220,29 @@ def _to_decision_items(findings: list[Finding]) -> list[ReleaseDecisionItem]:
                 severity=finding.severity,
                 title=finding.title,
                 baseline_status=finding.baseline_status,
+                blocks_release=finding.blocks_release,
+                source=finding.source,
+                policy_evidence_source=finding.policy_evidence_source,
+                capability_refs=list(finding.capability_refs),
+                capability_trace_refs=list(finding.capability_trace_refs),
             )
         )
     return items
+
+
+def _hitl_capability_trace_refs(
+    findings: list[Finding],
+    evidence: CapabilityRuntimeEvidence | None,
+) -> list[str]:
+    refs = {
+        ref
+        for finding in findings
+        for ref in finding.capability_trace_refs
+    }
+    if evidence is not None:
+        refs.update(row.id for row in evidence.matched)
+        refs.update(row.id for row in evidence.unmatched)
+    return sorted(refs)
 
 
 def _declared_with_sources(
@@ -983,6 +1261,27 @@ def _declared_with_sources(
     for name in anthropic_set:
         out.setdefault(name, "anthropic")
     return out
+
+
+def _tool_name_counts(tools: list[Tool]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for tool in tools:
+        counts[tool.name] = counts.get(tool.name, 0) + 1
+    return counts
+
+
+def _control_source(
+    tool: Tool,
+    *,
+    control: str,
+    declared_by_source: dict[str, str],
+    name_counts: dict[str, int],
+) -> str | None:
+    if control in tool.resolved_controls:
+        return "policies"
+    if name_counts.get(tool.name) == 1:
+        return declared_by_source.get(tool.name)
+    return None
 
 
 def _approval_declared(

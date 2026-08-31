@@ -3,12 +3,19 @@ import json
 
 import pytest
 
+from agents_shipgate.checks.n8n import run as run_n8n_checks
 from agents_shipgate.cli.discovery.signals import detect_workspace
 from agents_shipgate.cli.discovery.template import render_auto_manifest
 from agents_shipgate.cli.scan import inspect_sources, run_scan
 from agents_shipgate.config.loader import load_manifest
+from agents_shipgate.core.artifact_models import N8nArtifacts
+from agents_shipgate.core.artifacts import ArtifactBag
+from agents_shipgate.core.context import ScanContext
+from agents_shipgate.core.domain import (
+    Agent,
+    Tool,
+)
 from agents_shipgate.core.errors import ConfigError
-from agents_shipgate.core.models import Tool
 from agents_shipgate.core.risk_hints import enrich_tools_with_risk_hints, risk_tags
 from agents_shipgate.inputs.n8n import load_n8n_artifacts
 
@@ -76,8 +83,18 @@ tool_sources:
 """,
         encoding="utf-8",
     )
+    # v0.20 PR #111 review fix P1 #3: ``ToolSourceConfig.type`` is open
+    # ``str`` so third-party adapters can declare custom source types.
+    # ``load_manifest`` no longer rejects ``type: n8N`` (a typo of the
+    # built-in ``n8n``); the dispatcher's ``REGISTRY.require`` raises
+    # ConfigError when the unknown type fails to resolve at scan time
+    # instead. The exit-2 contract is unchanged.
     with pytest.raises(ConfigError):
-        load_manifest(project / "invalid-case.yaml")
+        run_scan(
+            config_path=project / "invalid-case.yaml",
+            output_dir=tmp_path / "invalid-case-out",
+            ci_mode="advisory",
+        )
 
 
 def test_n8n_malformed_optional_placement_is_rejected(tmp_path):
@@ -169,9 +186,53 @@ permissions:
     assert dynamic_finding.source.type == "n8n_workflow"
     assert dynamic_finding.source.path == "workflow.json"
     assert dynamic_finding.source.pointer is not None
-    n8n_findings = [finding for finding in report.findings if finding.check_id.startswith("SHIP-N8N-")]
+    n8n_findings = [
+        finding for finding in report.findings if finding.check_id.startswith("SHIP-N8N-")
+    ]
     assert n8n_findings
     assert {finding.agent_action for finding in n8n_findings} == {"escalate_to_human"}
+
+
+def test_n8n_unknown_mcp_selection_mode_degrades_evidence(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    workflow = _workflow()
+    mcp_client = next(node for node in workflow["nodes"] if node["id"] == "mcp-client")
+    mcp_client["parameters"] = {"toolsToInclude": "Future Typo Mode"}
+    (project / "workflow.json").write_text(json.dumps(workflow), encoding="utf-8")
+    (project / "shipgate.yaml").write_text(
+        """
+version: "0.1"
+project:
+  name: n8n-unknown-mcp-selection
+agent:
+  name: n8n-agent
+environment:
+  target: production_like
+n8n:
+  workflows:
+    - path: workflow.json
+""",
+        encoding="utf-8",
+    )
+
+    report, _ = run_scan(
+        config_path=project / "shipgate.yaml",
+        output_dir=tmp_path / "reports",
+        formats=["json"],
+        ci_mode="advisory",
+    )
+
+    assert any("selection mode is unrecognized" in warning for warning in report.source_warnings)
+    dynamic = [
+        finding
+        for finding in report.findings
+        if finding.check_id == "SHIP-N8N-DYNAMIC-TOOL-SURFACE-NOT-ENUMERABLE"
+        and finding.evidence["surface"]["kind"] == "mcp_client_selection_mode_unknown"
+    ]
+    assert len(dynamic) == 1
+    assert any(tool["name"] == "MCP Client.*" for tool in report.tool_inventory)
+    assert report.release_decision.decision != "passed"
 
 
 def test_n8n_mcp_server_trigger_exposed_tools_are_normalized_as_mcp(tmp_path):
@@ -204,10 +265,9 @@ n8n:
     frameworks = report.frameworks["n8n"]
     assert frameworks["mcp_server_trigger_count"] == 1
     assert frameworks["mcp_server_exposed_tool_count"] == 1
-    tool = next(item for item in report.tool_inventory if item["name"] == "Lookup Case")
+    tool = next(item for item in report.tool_catalog if item["name"] == "Lookup Case")
     assert tool["source_type"] == "mcp"
-    loaded_tool = next(item for item in report.tool_surface_facts.tools if item.name == "Lookup Case")
-    assert loaded_tool.source_type == "mcp"
+    assert report.tool_inventory == []
 
 
 def test_n8n_directory_mode_filters_non_workflows_and_is_deterministic(tmp_path):
@@ -242,7 +302,9 @@ n8n:
     )
 
     assert report.frameworks["n8n"]["workflow_file_count"] == 2
-    assert [tool["name"] for tool in report.tool_inventory if tool["name"] in {"A Tool", "B Tool"}] == [
+    assert [
+        tool["name"] for tool in report.tool_catalog if tool["name"] in {"A Tool", "B Tool"}
+    ] == [
         "A Tool",
         "B Tool",
     ]
@@ -263,7 +325,11 @@ def test_n8n_directory_mode_keeps_source_warnings_local(tmp_path):
                     "id": "clean-tool",
                     "name": "clean_tool",
                     "type": "n8n-nodes-langchain.toolHttpRequest",
-                    "parameters": {"description": "Clean tool.", "method": "GET", "url": "https://example.com"},
+                    "parameters": {
+                        "description": "Clean tool.",
+                        "method": "GET",
+                        "url": "https://example.com",
+                    },
                 }
             )
         ),
@@ -430,8 +496,7 @@ n8n:
 
     assert report.frameworks["n8n"]["human_review_node_count"] == 0
     assert any(
-        finding.check_id == "SHIP-POLICY-APPROVAL-MISSING"
-        and finding.tool_name == "Run Audit Code"
+        finding.check_id == "SHIP-POLICY-APPROVAL-MISSING" and finding.tool_name == "Run Audit Code"
         for finding in report.findings
     )
 
@@ -505,22 +570,12 @@ n8n:
         ci_mode="advisory",
     )
 
-    shared_tools = [
-        tool for tool in report.tool_surface_facts.tools if tool.name == "shared_delete"
-    ]
+    shared_tools = [tool for tool in report.tool_catalog if tool["name"] == "shared_delete"]
     assert len(shared_tools) == 2
     assert report.frameworks["n8n"]["human_review_node_count"] == 1
-    findings = [
-        finding
-        for finding in report.findings
-        if finding.check_id == "SHIP-POLICY-APPROVAL-MISSING"
-        and finding.tool_name == "shared_delete"
-    ]
-    assert len(findings) == 2
-    assert {finding.source.ref for finding in findings if finding.source is not None} == {
-        "workflows/a-reviewed.json#node:reviewed-tool",
-        "workflows/b-unreviewed.json#node:unreviewed-tool",
-    }
+    assert report.binding_surface_facts.status == "unknown"
+    assert report.tool_inventory == []
+    assert not [finding for finding in report.findings if finding.tool_name == "shared_delete"]
 
 
 def test_n8n_regular_code_node_bound_as_ai_tool_gets_code_execution_hint(tmp_path):
@@ -600,8 +655,7 @@ n8n:
     assert report.frameworks["n8n"]["code_tool_count"] == 0
     assert report.frameworks["n8n"]["credential_ref_count"] == 0
     assert not any(
-        finding.check_id == "SHIP-POLICY-APPROVAL-MISSING"
-        and finding.tool_name == "disabled_code"
+        finding.check_id == "SHIP-POLICY-APPROVAL-MISSING" and finding.tool_name == "disabled_code"
         for finding in report.findings
     )
 
@@ -685,8 +739,7 @@ n8n:
     assert report.frameworks["n8n"]["workflow_count"] == 1
     assert report.tool_inventory[0]["name"] == "Community Tool"
     assert any(
-        "no first-party node types" in warning
-        for warning in report.frameworks["n8n"]["warnings"]
+        "no first-party node types" in warning for warning in report.frameworks["n8n"]["warnings"]
     )
     assert any(
         finding.check_id == "SHIP-N8N-DYNAMIC-TOOL-SURFACE-NOT-ENUMERABLE"
@@ -804,7 +857,7 @@ n8n:
     )
 
     inventory_entries = [
-        tool for tool in report.tool_inventory if tool["name"] == "lookup_customer"
+        tool for tool in report.tool_catalog if tool["name"] == "lookup_customer"
     ]
     assert len(inventory_entries) == 2
     assert {tool["source_ref"] for tool in inventory_entries} == {
@@ -847,7 +900,7 @@ n8n:
     )
 
     assert report.frameworks["n8n"]["workflow_count"] == 2
-    inventory = {tool["name"]: tool for tool in report.tool_inventory}
+    inventory = {tool["name"]: tool for tool in report.tool_catalog}
     assert inventory["alpha_tool"]["source_ref"] == "bundle.json#node:a-tool"
     assert inventory["beta_tool"]["source_ref"] == "bundle.json#node:b-tool"
 
@@ -897,6 +950,150 @@ n8n:
         if finding.check_id == "SHIP-N8N-DYNAMIC-TOOL-SURFACE-NOT-ENUMERABLE"
     }
     assert {"runtime_tool_name", "unresolved_workflow"} <= dynamic_kinds
+
+
+def test_n8n_dynamic_surface_preserves_inventory_evidence_and_source(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    workflow = _minimal_agent_workflow(
+        {
+            "id": "runtime-workflow-tool",
+            "name": "Runtime Workflow Tool",
+            "type": "n8n-nodes-langchain.toolWorkflow",
+            "parameters": {
+                "toolName": "={{ $json.tool_name }}",
+                "description": "Call runtime workflow.",
+                "workflowId": "={{ $json.workflow_id }}",
+            },
+        }
+    )
+    (project / "workflow.json").write_text(json.dumps(workflow), encoding="utf-8")
+    (project / "mcp-tools.json").write_text(
+        json.dumps(
+            {
+                "tools": [
+                    {
+                        "name": "inventory_tool",
+                        "description": "Static inventory entry.",
+                        "inputSchema": {"type": "object", "properties": {}},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (project / "shipgate.yaml").write_text(
+        """
+version: "0.1"
+project:
+  name: n8n-runtime-dynamic-with-inventory
+agent:
+  name: n8n-agent
+environment:
+  target: local
+n8n:
+  workflows:
+    - path: workflow.json
+  tool_inventories:
+    - path: mcp-tools.json
+""",
+        encoding="utf-8",
+    )
+
+    report, _ = run_scan(
+        config_path=project / "shipgate.yaml",
+        output_dir=tmp_path / "reports",
+        formats=["json"],
+        ci_mode="advisory",
+    )
+
+    dynamic_findings = [
+        finding
+        for finding in report.findings
+        if finding.check_id == "SHIP-N8N-DYNAMIC-TOOL-SURFACE-NOT-ENUMERABLE"
+    ]
+    assert {finding.evidence["surface"]["kind"] for finding in dynamic_findings} == {
+        "runtime_tool_name",
+        "unresolved_workflow",
+    }
+    for finding in dynamic_findings:
+        assert finding.evidence["explicit_inventory"] is True
+        assert finding.source is not None
+        assert finding.source.type == "n8n_workflow"
+        assert finding.source.path == "workflow.json"
+        assert finding.source.pointer is not None
+
+
+def test_n8n_dynamic_surface_check_suppresses_inventory_wildcards(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "mcp-tools.json").write_text(
+        json.dumps(
+            {
+                "tools": [
+                    {
+                        "name": "inventory_tool",
+                        "description": "Static inventory entry.",
+                        "inputSchema": {"type": "object", "properties": {}},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (project / "shipgate.yaml").write_text(
+        """
+version: "0.1"
+project:
+  name: n8n-wildcard-with-inventory
+agent:
+  name: n8n-agent
+environment:
+  target: local
+n8n:
+  tool_inventories:
+    - path: mcp-tools.json
+""",
+        encoding="utf-8",
+    )
+    manifest = load_manifest(project / "shipgate.yaml")
+    context = ScanContext(
+        manifest=manifest,
+        agent=Agent(id="agent:n8n-agent", name="n8n-agent"),
+        tools=[],
+        config_path=project / "shipgate.yaml",
+        framework_artifacts=ArtifactBag(
+            {
+                "n8n": N8nArtifacts(
+                    tool_inventory_files=["mcp-tools.json"],
+                    dynamic_tool_surfaces=[
+                        {
+                            "kind": "mcp_client_wildcard",
+                            "source_ref": "workflow.json#node:mcp-client",
+                            "source_path": "workflow.json",
+                            "source_pointer": "/nodes/mcp-client",
+                        },
+                        {
+                            "kind": "runtime_tool_name",
+                            "source_ref": "workflow.json#node:runtime-tool",
+                            "source_path": "workflow.json",
+                            "source_pointer": "/nodes/runtime-tool",
+                        },
+                    ],
+                )
+            }
+        ),
+    )
+
+    dynamic_findings = [
+        finding
+        for finding in run_n8n_checks(context)
+        if finding.check_id == "SHIP-N8N-DYNAMIC-TOOL-SURFACE-NOT-ENUMERABLE"
+    ]
+
+    assert len(dynamic_findings) == 1
+    assert dynamic_findings[0].evidence["surface"]["kind"] == "runtime_tool_name"
+    assert dynamic_findings[0].evidence["explicit_inventory"] is True
 
 
 def test_n8n_multi_bound_tool_keeps_agent_and_mcp_surfaces(tmp_path):
@@ -970,7 +1167,7 @@ n8n:
         ci_mode="advisory",
     )
 
-    entries = [tool for tool in report.tool_inventory if tool["name"] == "Dual Tool"]
+    entries = [tool for tool in report.tool_catalog if tool["name"] == "Dual Tool"]
     assert {tool["source_type"] for tool in entries} == {"mcp", "n8n_workflow_tool"}
     assert report.frameworks["n8n"]["ai_agent_count"] == 2
     assert report.frameworks["n8n"]["mcp_server_trigger_count"] == 1
@@ -1136,9 +1333,7 @@ n8n:
     assert artifacts is not None
     artifact_payload = artifacts.model_dump(mode="json")
     tool_payload = [
-        tool.model_dump(mode="json")
-        for source in loaded_sources
-        for tool in source.tools
+        tool.model_dump(mode="json") for source in loaded_sources for tool in source.tools
     ]
     serialized = json.dumps(
         {"artifacts": artifact_payload, "tools": tool_payload},
@@ -1158,15 +1353,12 @@ n8n:
     assert artifacts.ingress[0]["name"] == "Webhook [REDACTED:openai_api_key]"
     assert artifacts.ingress[0]["httpMethod"] == "POST"
     assert "public_path_hash" not in artifacts.ingress[0]
-    assert artifacts.human_review_nodes[0]["name"] == (
-        "Send [REDACTED:openai_api_key]"
-    )
+    assert artifacts.human_review_nodes[0]["name"] == ("Send [REDACTED:openai_api_key]")
     workflow_tool = next(tool for tool in tool_payload if tool["name"] == "Run External Workflow")
     schema_properties = workflow_tool["input_schema"]["properties"]
     assert "[REDACTED:openai_api_key]" in schema_properties
     assert (
-        schema_properties["[REDACTED:openai_api_key]"]["description"]
-        == "[REDACTED:bearer_token]"
+        schema_properties["[REDACTED:openai_api_key]"]["description"] == "[REDACTED:bearer_token]"
     )
     output_schema = workflow_tool["output_schema"]["properties"]
     assert output_schema["result"]["description"] == "[REDACTED:bearer_token]"
@@ -1313,14 +1505,18 @@ n8n:
         "maxTries": 5,
     }
     assert tool.annotations["n8n_error_workflow"] == "billing-cleanup"
-    side_effect_finding = next(
+    control_finding = next(
         finding
         for finding in report.findings
-        if finding.check_id == "SHIP-SIDEFX-IDEMPOTENCY-MISSING"
+        if finding.check_id == "SHIP-ACTION-DESTRUCTIVE-ROLLBACK-MISSING"
         and finding.tool_name == "Delete Billing Record"
     )
-    assert side_effect_finding.severity == "critical"
-    assert side_effect_finding.evidence["retry_policy_known"] is True
+    assert control_finding.severity == "critical"
+    assert control_finding.evidence["missing"] == [
+        "approval.required",
+        "safeguards.rollback",
+        "confirmation.required",
+    ]
 
 
 def test_n8n_ai_tool_classification_uses_parameter_signature(tmp_path):
@@ -1363,12 +1559,8 @@ def test_n8n_ai_tool_classification_uses_parameter_signature(tmp_path):
             },
         ],
         "connections": {
-            "Signature HTTP": {
-                "ai_tool": [[{"node": "AI Agent", "type": "ai_tool", "index": 0}]]
-            },
-            "Signature Code": {
-                "ai_tool": [[{"node": "AI Agent", "type": "ai_tool", "index": 0}]]
-            },
+            "Signature HTTP": {"ai_tool": [[{"node": "AI Agent", "type": "ai_tool", "index": 0}]]},
+            "Signature Code": {"ai_tool": [[{"node": "AI Agent", "type": "ai_tool", "index": 0}]]},
             "Signature Workflow Tool": {
                 "ai_tool": [[{"node": "AI Agent", "type": "ai_tool", "index": 0}]]
             },
@@ -1425,7 +1617,7 @@ def test_n8n_detect_and_auto_init_emit_top_level_block(tmp_path):
     assert result.is_agent_project is True
     assert any(framework.type == "n8n" for framework in result.frameworks)
 
-    manifest_text = render_auto_manifest(project, result)
+    manifest_text = render_auto_manifest(project, result).text
     assert "n8n:" in manifest_text
     assert "type: n8n" not in manifest_text
     assert "  credential_stubs:" in manifest_text
@@ -1466,13 +1658,9 @@ def _workflow(
     header = "Bearer abcdefghijklmnop" if include_secret else "Bearer ${N8N_TOKEN}"
     stripe_key = "sk" + "_live_" + ("a" * 24)
     workflow_name = (
-        "Support Agent sk-workflowaaaaaaaaaaaaaaaa"
-        if include_secret
-        else "Support Agent"
+        "Support Agent sk-workflowaaaaaaaaaaaaaaaa" if include_secret else "Support Agent"
     )
-    webhook_name = (
-        "Webhook sk-webhookaaaaaaaaaaaaaaaaa" if include_secret else "Webhook"
-    )
+    webhook_name = "Webhook sk-webhookaaaaaaaaaaaaaaaaa" if include_secret else "Webhook"
     human_name = "Send sk-humanaaaaaaaaaaaaaaaaaaa" if include_secret else "Send and Wait"
     code = (
         "const key = 'sk-aaaaaaaaaaaaaaaaaaaaaaaa'; "
@@ -1663,9 +1851,7 @@ def _minimal_agent_workflow(tool_node):
             },
         ],
         "connections": {
-            tool_node["name"]: {
-                "ai_tool": [[{"node": "AI Agent", "type": "ai_tool", "index": 0}]]
-            }
+            tool_node["name"]: {"ai_tool": [[{"node": "AI Agent", "type": "ai_tool", "index": 0}]]}
         },
     }
 

@@ -26,7 +26,7 @@ LINK_RE = re.compile(r"\[[^\]]+\]\(([^)#:][^)#]*)(?:#[^)]*)?\)")
 # previous hardcoded literal ("v0.11") let the docs go stale relative
 # to the runtime — see PR #57 review P2.
 def _current_report_schema_version() -> str:
-    from agents_shipgate.core.models import ReadinessReport
+    from agents_shipgate.schemas.report import ReadinessReport
 
     return str(ReadinessReport.model_fields["report_schema_version"].default)
 
@@ -42,14 +42,18 @@ def _previous_report_schema_version() -> str:
 AGENT_FACING_DOCS = (
     "agent-recipes.md",
     "agent-adoption-harness.md",
+    "agent-native-merge-contract.md",
     "autofix-policy.md",
     "minimal-real-configs.md",
     "target-repo-agent-snippets.md",
 )
 
 ADOPTION_DOCS_WITH_LINKS = (
+    REPO_ROOT / "README.md",
+    DOCS_DIR / "agents" / "README.md",
     DOCS_DIR / "target-repo-agent-snippets.md",
     DOCS_DIR / "agent-adoption-harness.md",
+    REPO_ROOT / "samples" / "README.md",
     REPO_ROOT / "examples" / "golden-prs" / "README.md",
     REPO_ROOT / "examples" / "golden-prs" / "openai-agents-sdk-refund-agent" / "README.md",
     REPO_ROOT / "examples" / "golden-prs" / "mcp-only-tool-server" / "README.md",
@@ -125,50 +129,94 @@ def test_index_lists_current_schema():
 
 
 def test_no_doc_falsely_advertises_an_older_schema_as_current():
-    """No file under ``docs/`` may advertise an older report schema as
+    """No agent-facing Markdown may advertise an older report schema as
     "current". The contract-test pattern at
     tests/test_public_surface_contract.py covers PUBLIC_SURFACES; this
-    test extends the guard to **every** Markdown file under ``docs/``.
+    test extends the guard to **every** Markdown file under ``docs/``
+    plus the root-level agent-facing files.
 
     Earlier hand-curated lists missed `docs/overview.md` and
-    `docs/ai-search-summary.md` (#57 review P3), forcing two more
-    drift fixes. Walking the full tree closes that loophole — adding
-    a new doc that mentions the schema cannot bypass the guard."""
+    `docs/ai-search-summary.md` (#57 review P3). The PR #192 review
+    found two more blind spots: the walk skipped root-level AGENTS.md,
+    and a ±200-char marker window let v0.(N-1)'s "frozen" label excuse
+    an adjacent stale "current" claim about v0.N. The marker must now
+    lie *between* the older mention and the nearest "current"."""
     current = _current_report_schema_version()
     older_minor = re.compile(r"report-schema\.v0\.(?P<minor>\d+)\.json")
     current_minor = int(current.split(".")[1])
+    markers = ("frozen", "legacy", "older", "pre-v")
 
-    # Schema files themselves (`docs/report-schema.v0.X.json`) and
-    # private adoption notes are excluded; everything else under
-    # ``docs/`` is scanned.
+    scan_paths = sorted(DOCS_DIR.rglob("*.md")) + [
+        REPO_ROOT / "AGENTS.md",
+        REPO_ROOT / "README.md",
+    ]
     failures: list[str] = []
-    for path in DOCS_DIR.rglob("*.md"):
-        relpath = path.relative_to(DOCS_DIR).as_posix()
-        text = path.read_text(encoding="utf-8")
-        for match in older_minor.finditer(text):
-            mentioned = int(match.group("minor"))
-            if mentioned >= current_minor:
+    for path in scan_paths:
+        relpath = path.relative_to(REPO_ROOT).as_posix()
+        for line in path.read_text(encoding="utf-8").splitlines():
+            lower = line.lower()
+            if "current" not in lower:
                 continue
-            # Find the surrounding context (~one paragraph) and confirm
-            # this older mention is labeled as a frozen/legacy/older
-            # reference, not as "current".
-            start = max(0, match.start() - 200)
-            end = min(len(text), match.end() + 200)
-            context = text[start:end].lower()
-            if "current" in context and not any(
-                marker in context
-                for marker in ("frozen", "legacy", "older", "pre-v")
-            ):
-                failures.append(
-                    f"docs/{relpath}: report-schema.v0.{mentioned}.json "
-                    "near the word 'current' without a "
-                    "frozen/legacy/older marker"
-                )
+            for match in older_minor.finditer(line):
+                mentioned = int(match.group("minor"))
+                if mentioned >= current_minor:
+                    continue
+                # The frozen/legacy marker only excuses the mention when
+                # it sits BETWEEN the mention and a "current" on the same
+                # line — so v0.(N-1)'s own "frozen" label can't whitewash
+                # a stale claim about v0.N, and "current" on a *different*
+                # line (the next bullet, a table header) neither flags nor
+                # excuses anything here. Cross-line trackers are pinned by
+                # the positive presence test below.
+                excused = True
+                index = lower.find("current")
+                while index != -1:
+                    between_start = min(match.end(), index)
+                    between_end = max(match.start(), index)
+                    between = lower[between_start:between_end]
+                    if not any(marker in between for marker in markers):
+                        excused = False
+                        break
+                    index = lower.find("current", index + 1)
+                if not excused:
+                    failures.append(
+                        f"{relpath}: report-schema.v0.{mentioned}.json "
+                        "on a line claiming 'current' without a "
+                        "frozen/legacy/older marker between them"
+                    )
 
     assert not failures, (
         "Doc drift: the following docs mention an older report schema as "
         f"'current' (runtime is v{current}). Bump them or add a "
         "frozen/legacy marker:\n  - " + "\n  - ".join(failures)
+    )
+
+
+def test_current_schema_trackers_name_the_current_schema_file():
+    """Files whose job is to point agents at the *current* report schema
+    must actually name the current file. Positive presence check — this
+    catches stale-version drift regardless of wording (the PR #192
+    review found four files the proximity heuristic above missed)."""
+    current = _current_report_schema_version()
+    trackers = (
+        REPO_ROOT / "AGENTS.md",
+        REPO_ROOT / "README.md",
+        DOCS_DIR / "agent-contract-current.md",
+        DOCS_DIR / "overview.md",
+        DOCS_DIR / "ai-search-summary.md",
+        DOCS_DIR / "report-reading-for-agents.md",
+        DOCS_DIR / "INDEX.md",
+    )
+    needle = f"report-schema.v{current}.json"
+    missing = [
+        path.relative_to(REPO_ROOT).as_posix()
+        for path in trackers
+        if needle not in path.read_text(encoding="utf-8")
+    ]
+    assert not missing, (
+        f"These current-schema trackers do not mention {needle} "
+        f"(runtime is v{current}); update them in the same PR as the "
+        "schema bump:\n  - " + "\n  - ".join(missing)
     )
 
 
@@ -194,12 +242,33 @@ def test_target_repo_snippets_pin_advisory_agent_contract():
     assert 'pr_comment: "true"' in text
     assert "apply-patches" in text
     assert "--confidence high --apply" in text
-    assert "Do not auto-assert approval" in text
+    assert "Do not auto-assert action effect" in text
+    assert "action authority, approval" in text
     assert "confirmation" in text
     assert "idempotency" in text
     assert "broad-scope" in text
     assert "prohibited-action" in text
     assert "pure docs, tests, formatting" in text
+
+
+def test_readme_onboarding_copy_pins_agent_contract():
+    text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "The deterministic merge gate for AI-generated agent capability changes" in text
+    assert "5-minute" in text
+    assert "Copy this into your coding agent" in text
+    assert "https://github.com/marketplace/actions/agents-shipgate" in text
+    assert "Sample reports" in text
+    assert "release_decision.decision" in text
+    assert "agents-shipgate-reports/report.json" in text
+    assert "agents-shipgate contract --json" in text
+    assert "apply-patches" in text
+    assert "--confidence high --apply" in text
+    assert "auto-assert action effect, action authority" in text
+    assert "confirmation" in text
+    assert "idempotency" in text
+    assert "broad-scope" in text
+    assert "prohibited-action" in text
+    assert "agents-shipgate-reports/" in text
 
 
 def test_target_repo_cursor_globs_cover_shipgate_discovery_names():
@@ -213,20 +282,40 @@ def test_target_repo_cursor_globs_cover_shipgate_discovery_names():
     assert '"**/*mcp*.json"' in text
     assert '".agents-shipgate/*.json"' in text
     assert '"prompts/**"' in text
+    assert '"**/prompts/**"' in text
     assert '"policies/**"' in text
+    assert '"**/policies/**"' in text
     assert '".github/workflows/agents-shipgate.yml"' in text
     assert '".github/workflows/agents-shipgate.yaml"' in text
     assert '"**/*.py"' not in text
 
 
-def test_agent_adoption_harness_is_manual_and_keeps_results_private():
+def test_agent_adoption_harness_is_design_rubric_and_keeps_results_private():
+    """The manual harness doc is the design rubric for both manual and
+    automated runs. P0.2 lifted the 'Do not automate' rule and added a
+    pointer to the new operational doc; we keep the rubric anchor, the
+    results-private guidance, and the release-decision contract."""
     text = (DOCS_DIR / "agent-adoption-harness.md").read_text(encoding="utf-8")
-    assert "Do not automate calls" in text
+    assert "Do not automate calls" not in text, (
+        "The 'Do not automate' line was removed by P0.2. If the manual harness "
+        "doc reintroduces it, also restore docs/adoption-harness-automated.md."
+    )
+    assert "adoption-harness-automated.md" in text, (
+        "The manual doc must point at the automated operational doc."
+    )
     assert ".agents-private/adoption-sprint/" in text
     assert "`.agents-private/` to `.gitignore`" in text
     assert "100-Point Rubric" in text
     assert "negative-control non-agent repo" in text
     assert "release_decision.decision" in text
+
+
+def test_adoption_harness_automated_doc_present():
+    """The automated operational doc must exist and link the matrix file."""
+    text = (DOCS_DIR / "adoption-harness-automated.md").read_text(encoding="utf-8")
+    assert "benchmark/matrix.yaml" in text
+    assert "harness/adoption/" in text
+    assert "release_decision" in text
 
 
 def test_golden_pr_examples_exist_and_reference_real_samples():

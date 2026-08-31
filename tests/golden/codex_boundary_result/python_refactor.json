@@ -1,0 +1,120 @@
+{
+  "schema_version": "shipgate.codex_boundary_result/v2",
+  "agent": "codex",
+  "tool": {
+    "name": "agents-shipgate",
+    "version": "0.16.0b7"
+  },
+  "subject": {
+    "agent": "codex"
+  },
+  "decision": "allow",
+  "risk_level": "none",
+  "audit_id": "agent_boundary_4783b50258ee1f9f8a65f729",
+  "policy_version": "1",
+  "summary": "No recognized coding-agent boundary change requires action.",
+  "changed_files": [
+    "src/example.py"
+  ],
+  "control": {
+    "state": "complete",
+    "reason": "No recognized coding-agent boundary change requires action.",
+    "completion_allowed": true,
+    "must_stop": false,
+    "verify_required": false,
+    "next_action": null,
+    "allowed_next_commands": [],
+    "human_review": {
+      "required": false,
+      "why": null,
+      "required_reviewers": []
+    },
+    "stop_reason": null
+  },
+  "repair": {
+    "actor": "coding_agent",
+    "safe_to_attempt": false,
+    "instructions": [],
+    "forbidden_shortcuts": [
+      "Do not suppress the finding (checks.ignore in shipgate.yaml).",
+      "Do not lower severity or add a waiver just to pass the gate.",
+      "Do not invent or assume approval, idempotency, or audit evidence you cannot prove from the code.",
+      "Do not weaken the release policy, CI gate, or agent instructions that evaluate this change."
+    ]
+  },
+  "policy": {
+    "id": "agent-boundary",
+    "version": "1",
+    "source": "packaged_default",
+    "snapshot_sha256": "5ad04b64bfccf46ef42e7fe3602a5ead6b50bce8f31a51b6d3b43910e493260a",
+    "discovery": [
+      "packaged_default:agent-boundary"
+    ]
+  },
+  "violated_rules": [],
+  "affected_files": [
+    {
+      "path": "src/example.py"
+    }
+  ],
+  "required_reviewers": [],
+  "explanation": "No recognized coding-agent boundary change requires action.",
+  "suggested_fixes": [],
+  "agent_repair_instructions": [],
+  "diagnostics": [],
+  "trace": [
+    {
+      "step": "policy_discovery",
+      "summary": "Loaded 2 coding-agent boundary policy families."
+    },
+    {
+      "step": "decision",
+      "summary": "Projected 0 violation(s) to allow."
+    }
+  ],
+  "source_artifacts": {},
+  "trigger": {
+    "schema_version": "0.4",
+    "input_status": "complete",
+    "evaluation_status": "unclassified",
+    "should_run": null,
+    "run_shipgate": null,
+    "skip": null,
+    "force_run": false,
+    "dry_run_recommended": false,
+    "skip_reason": null,
+    "stop_conditions_fired": false,
+    "stop_conditions_terminal": false,
+    "stop_conditions_evaluated": false,
+    "rationale": "1 of 1 changed file(s) were read in full and no rule classified them. That is not evidence the PR is unrelated to agent capabilities \u2014 run the scan to decide.",
+    "matched_rules": [],
+    "changed_files": [
+      "src/example.py"
+    ],
+    "surface_exclusions": {
+      "entries": [
+        {
+          "stage": "trigger",
+          "subject": "src/example.py",
+          "reason": "unclassified_change",
+          "source_ref": "src/example.py",
+          "detail": "No catalog rule classified this changed file, so nothing about it routed a surface into a scan.",
+          "accounting": "route_blocked",
+          "accounted_by": null
+        }
+      ],
+      "total": 1,
+      "gated": 1,
+      "gap_backed": 0,
+      "truncated": false
+    },
+    "diff_tokens": [],
+    "next_action": {
+      "kind": "command",
+      "command": "agents-shipgate verify --preview --json",
+      "why": "The catalog classified none of the changed files, so it cannot say the change is irrelevant; let the scan decide."
+    }
+  },
+  "finding_fingerprints": [],
+  "policy_snapshot_sha256": "5ad04b64bfccf46ef42e7fe3602a5ead6b50bce8f31a51b6d3b43910e493260a"
+}

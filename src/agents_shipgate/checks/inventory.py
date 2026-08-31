@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from agents_shipgate.checks.base import agent_finding, tool_finding
+from agents_shipgate.core.artifact_models import CodexPluginArtifacts
 from agents_shipgate.core.context import ScanContext
 
 
 def run(context: ScanContext):
     findings = []
     if not context.tools:
-        if context.codex_plugin_artifacts is None:
+        if context.artifact("codex_plugin", CodexPluginArtifacts) is None:
             findings.append(
                 agent_finding(
                     check_id="SHIP-INVENTORY-NOT-ENUMERABLE",
@@ -18,6 +19,7 @@ def run(context: ScanContext):
                     confidence="high",
                     recommendation="Declare at least one local MCP tools JSON or OpenAPI source with enumerable tools.",
                     context=context,
+                    provenance_kind="static_declaration",
                 )
             )
     for tool in context.tools:
@@ -33,6 +35,7 @@ def run(context: ScanContext):
                     confidence="high",
                     recommendation="Replace wildcard tool exposure with an explicit tool allowlist before release review.",
                     context=context,
+                    provenance_kind="static_declaration",
                 )
             )
     if len(context.tools) > 50:
@@ -46,6 +49,7 @@ def run(context: ScanContext):
                 confidence="medium",
                 recommendation="Review whether the release needs all declared tools or split high-risk capabilities into a smaller surface.",
                 context=context,
+                provenance_kind="static_declaration",
             )
         )
     if context.manifest.environment.target == "production":
@@ -66,6 +70,7 @@ def run(context: ScanContext):
                         "tool declarations before production promotion."
                     ),
                     context=context,
+                    provenance_kind="static_declaration",
                 )
             )
     return findings

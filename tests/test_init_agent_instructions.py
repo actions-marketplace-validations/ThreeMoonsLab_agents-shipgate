@@ -12,10 +12,11 @@ import json
 import shutil
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
-from agents_shipgate.cli.discovery.agent_instructions import TARGETS
-from agents_shipgate.cli.discovery.agent_instructions.targets import SPECS
+from agents_shipgate.cli.discovery.agent_instructions import DEFAULT_TARGETS
+from agents_shipgate.cli.discovery.agent_instructions.targets import SPECS, TARGETS
 from agents_shipgate.cli.discovery.ci_workflow import WORKFLOW_RELATIVE_PATH
 from agents_shipgate.cli.main import app
 
@@ -38,21 +39,54 @@ def _seed_workspace(tmp_path: Path, sample: str) -> Path:
 # --- dry-run ---------------------------------------------------------------
 
 
-def test_dry_run_all_targets_emits_section_headers(tmp_path: Path) -> None:
+def test_dry_run_default_targets_emits_section_headers(tmp_path: Path) -> None:
     workspace = _seed_workspace(tmp_path, "simple_langchain_agent")
     result = runner.invoke(
         app,
-        ["init", "--workspace", str(workspace), "--agent-instructions=all"],
+        ["init", "--workspace", str(workspace), "--agent-instructions=default"],
     )
     assert result.exit_code == 0, result.output
     # Manifest section header.
     assert "--- shipgate.yaml ---" in result.output
     # Per-target section headers.
-    for name in TARGETS:
+    for name in DEFAULT_TARGETS:
         assert f"--- {SPECS[name].relative_path} ---" in result.output
+    assert "--- .agents/skills/agents-shipgate ---" not in result.output
 
 
-def test_dry_run_all_targets_json_has_rendered_content(tmp_path: Path) -> None:
+def test_dry_run_default_targets_json_has_rendered_content(tmp_path: Path) -> None:
+    workspace = _seed_workspace(tmp_path, "simple_langchain_agent")
+    result = runner.invoke(
+        app,
+        [
+            "init",
+            "--workspace",
+            str(workspace),
+            "--agent-instructions=default",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    ai = payload["agent_instructions"]
+    assert ai["requested"] == list(DEFAULT_TARGETS)
+    assert ai["block_version"] == 1
+    statuses = {t["name"]: t["status"] for t in ai["targets"]}
+    assert statuses == {name: "would_render" for name in DEFAULT_TARGETS}
+    for entry in ai["targets"]:
+        assert entry["rendered"]
+    kit_sources = {
+        entry["name"]: entry.get("kit_source")
+        for entry in ai["targets"]
+        if entry["name"] in {"codex-skill", "claude-code-skill"}
+    }
+    assert kit_sources == {}
+    # No filesystem changes.
+    for name in DEFAULT_TARGETS:
+        assert not (workspace / SPECS[name].relative_path).exists()
+
+
+def test_dry_run_all_targets_json_includes_opt_in_targets(tmp_path: Path) -> None:
     workspace = _seed_workspace(tmp_path, "simple_langchain_agent")
     result = runner.invoke(
         app,
@@ -60,16 +94,8 @@ def test_dry_run_all_targets_json_has_rendered_content(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    ai = payload["agent_instructions"]
-    assert ai["requested"] == list(TARGETS)
-    assert ai["block_version"] == 1
-    statuses = {t["name"]: t["status"] for t in ai["targets"]}
-    assert statuses == {name: "would_render" for name in TARGETS}
-    for entry in ai["targets"]:
-        assert entry["rendered"]
-    # No filesystem changes.
-    for name in TARGETS:
-        assert not (workspace / SPECS[name].relative_path).exists()
+    assert payload["agent_instructions"]["requested"] == list(TARGETS)
+    assert {target["name"] for target in payload["agent_instructions"]["targets"]} == set(TARGETS)
 
 
 def test_dry_run_subset_selector(tmp_path: Path) -> None:
@@ -105,6 +131,144 @@ def test_dry_run_none_selector_emits_empty_targets_list(tmp_path: Path) -> None:
     }
 
 
+def test_explicit_agent_instructions_kit_reports_local_source(
+    tmp_path: Path,
+) -> None:
+    workspace = _seed_workspace(tmp_path, "simple_langchain_agent")
+    override_root = workspace / ".agents-shipgate/adoption-kit/codex-skill"
+    override_root.mkdir(parents=True)
+    override_root.joinpath("SKILL.md").write_text(
+        "# Custom Codex Skill\n",
+        encoding="utf-8",
+    )
+    kit_path = workspace / ".agents-shipgate/custom-kit.yaml"
+    kit_path.write_text(
+        "schema_version: 1\n"
+        "targets:\n"
+        "  codex-skill:\n"
+        "    overrides_dir: .agents-shipgate/adoption-kit/codex-skill\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "init",
+            "--workspace",
+            str(workspace),
+            "--agent-instructions=codex-skill",
+            "--agent-instructions-kit",
+            str(kit_path.relative_to(workspace)),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    [target] = payload["agent_instructions"]["targets"]
+    assert target["kit_source"] == "bundled_plus_local_override"
+    rendered_skill = next(
+        file["content"] for file in target["files"] if file["path"].endswith("/SKILL.md")
+    )
+    assert rendered_skill == "# Custom Codex Skill\n"
+
+
+def test_auto_discovered_agent_instructions_kit_is_used_on_write(
+    tmp_path: Path,
+) -> None:
+    workspace = _seed_workspace(tmp_path, "simple_langchain_agent")
+    override_root = workspace / ".agents-shipgate/adoption-kit/codex-skill"
+    override_root.mkdir(parents=True)
+    override_root.joinpath("references").mkdir()
+    override_root.joinpath("references/report-reading.md").write_text(
+        "# Custom Report Reader\n",
+        encoding="utf-8",
+    )
+    (workspace / ".agents-shipgate/adoption-kit.yaml").write_text(
+        "schema_version: 1\n"
+        "targets:\n"
+        "  codex-skill:\n"
+        "    overrides_dir: .agents-shipgate/adoption-kit/codex-skill\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "init",
+            "--workspace",
+            str(workspace),
+            "--write",
+            "--agent-instructions=codex-skill",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    [target] = payload["agent_instructions"]["targets"]
+    assert target["kit_source"] == "bundled_plus_local_override"
+    assert (workspace / ".agents/skills/agents-shipgate/references/report-reading.md").read_text(
+        encoding="utf-8"
+    ) == "# Custom Report Reader\n"
+
+
+def test_invalid_agent_instructions_kit_fails_before_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _seed_workspace(tmp_path, "simple_langchain_agent")
+    kit_path = workspace / ".agents-shipgate/adoption-kit.yaml"
+    kit_path.parent.mkdir(parents=True)
+    kit_path.write_text("schema_version: 2\n", encoding="utf-8")
+    monkeypatch.setenv("AGENTS_SHIPGATE_AGENT_MODE", "1")
+
+    result = runner.invoke(
+        app,
+        [
+            "init",
+            "--workspace",
+            str(workspace),
+            "--write",
+            "--agent-instructions=codex-skill",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert not (workspace / "shipgate.yaml").exists()
+    assert '"error": "config_error"' in result.output
+    assert str(kit_path) in result.output
+
+
+def test_agent_instructions_kit_absolute_override_outside_workspace_error(
+    tmp_path: Path,
+) -> None:
+    workspace = _seed_workspace(tmp_path, "simple_langchain_agent")
+    outside = tmp_path / "outside-overrides"
+    outside.mkdir()
+    kit_path = workspace / ".agents-shipgate/adoption-kit.yaml"
+    kit_path.parent.mkdir(parents=True)
+    kit_path.write_text(
+        f"schema_version: 1\ntargets:\n  codex-skill:\n    overrides_dir: {outside}\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "init",
+            "--workspace",
+            str(workspace),
+            "--write",
+            "--agent-instructions=codex-skill",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "resolves outside workspace" in result.output
+    assert "is a symlink" not in result.output
+
+
 def test_invalid_selector_exits_two_with_human_error(tmp_path: Path) -> None:
     workspace = _seed_workspace(tmp_path, "simple_langchain_agent")
     result = runner.invoke(
@@ -119,7 +283,7 @@ def test_invalid_selector_exits_two_with_human_error(tmp_path: Path) -> None:
 
 def test_invalid_selector_emits_structured_error_under_agent_mode(
     tmp_path: Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workspace = _seed_workspace(tmp_path, "simple_langchain_agent")
     monkeypatch.setenv("AGENTS_SHIPGATE_AGENT_MODE", "1")
@@ -137,7 +301,7 @@ def test_invalid_selector_emits_structured_error_under_agent_mode(
 # --- --write -------------------------------------------------------------
 
 
-def test_write_all_targets_on_fresh_workspace(tmp_path: Path) -> None:
+def test_write_default_targets_on_fresh_workspace(tmp_path: Path) -> None:
     workspace = _seed_workspace(tmp_path, "simple_langchain_agent")
     result = runner.invoke(
         app,
@@ -146,26 +310,33 @@ def test_write_all_targets_on_fresh_workspace(tmp_path: Path) -> None:
             "--workspace",
             str(workspace),
             "--write",
-            "--agent-instructions=all",
+            "--agent-instructions=default",
             "--json",
         ],
     )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     ai = payload["agent_instructions"]
-    assert {t["status"] for t in ai["targets"]} == {"created_with_block"}
+    assert {t["status"] for t in ai["targets"]} == {
+        "created_with_block",
+    }
+    assert "workflow" not in payload
+    assert payload["local_contract"]["status"] == "created_with_block"
     # Files exist.
-    for name in TARGETS:
+    for name in DEFAULT_TARGETS:
         path = workspace / SPECS[name].relative_path
         assert path.exists()
+    assert not (workspace / WORKFLOW_RELATIVE_PATH).exists()
+    assert not (workspace / ".agents/skills/agents-shipgate").exists()
+    assert not (workspace / ".claude/skills/agents-shipgate").exists()
     # AGENTS.md has the H1 preamble + managed block.
     agents_md = (workspace / "AGENTS.md").read_text(encoding="utf-8")
     assert agents_md.startswith("# Agents")
     assert "<!-- agents-shipgate:start v=1 -->" in agents_md
 
 
-def test_write_idempotent_rerun_is_noop(tmp_path: Path) -> None:
-    """The advertised refresh command — `init --write --agent-instructions=all`
+def test_write_default_idempotent_rerun_is_noop(tmp_path: Path) -> None:
+    """The advertised refresh command — `init --write --agent-instructions=default`
     — must be idempotent at the process level. A re-run reports every target as
     ``unchanged``, exits 0 (even though shipgate.yaml already exists, because
     the user's primary intent under --agent-instructions is the snippet
@@ -178,14 +349,13 @@ def test_write_idempotent_rerun_is_noop(tmp_path: Path) -> None:
             "--workspace",
             str(workspace),
             "--write",
-            "--agent-instructions=all",
+            "--agent-instructions=default",
             "--json",
         ],
     )
     assert first.exit_code == 0, first.output
     snapshot = {
-        rel: (workspace / rel).read_bytes()
-        for rel in (SPECS[name].relative_path for name in TARGETS)
+        p.relative_to(workspace): p.read_bytes() for p in workspace.rglob("*") if p.is_file()
     }
     second = runner.invoke(
         app,
@@ -194,7 +364,7 @@ def test_write_idempotent_rerun_is_noop(tmp_path: Path) -> None:
             "--workspace",
             str(workspace),
             "--write",
-            "--agent-instructions=all",
+            "--agent-instructions=default",
             "--json",
         ],
     )
@@ -204,11 +374,9 @@ def test_write_idempotent_rerun_is_noop(tmp_path: Path) -> None:
     # Manifest action reports the skip informationally; agent-instructions
     # all unchanged.
     assert payload["manifest_status"] == "skipped_existing"
+    assert "workflow" not in payload
     assert {t["status"] for t in payload["agent_instructions"]["targets"]} == {"unchanged"}
-    after = {
-        rel: (workspace / rel).read_bytes()
-        for rel in (SPECS[name].relative_path for name in TARGETS)
-    }
+    after = {p.relative_to(workspace): p.read_bytes() for p in workspace.rglob("*") if p.is_file()}
     # Byte-equal across the run — the canonical "safe to run repeatedly" proof.
     assert snapshot == after
 
@@ -304,7 +472,7 @@ def test_write_cursor_skipped_when_user_modified_exits_two(tmp_path: Path) -> No
 
 
 def test_skipped_target_emits_structured_stderr_under_agent_mode(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Hand-edited cursor + AGENTS_SHIPGATE_AGENT_MODE=1 produces a structured
     next_action JSON line on stderr so coding-agent callers can route to a fix
@@ -345,7 +513,7 @@ def test_triple_combo_init_write_ci_agent_instructions(tmp_path: Path) -> None:
             str(workspace),
             "--write",
             "--ci",
-            "--agent-instructions=all",
+            "--agent-instructions=default",
             "--json",
         ],
     )
@@ -354,12 +522,39 @@ def test_triple_combo_init_write_ci_agent_instructions(tmp_path: Path) -> None:
     # All three orthogonal actions present.
     assert payload["manifest_status"] == "written"
     assert payload["workflow"]["status"] == "written"
+    assert payload["local_contract"]["status"] == "created_with_block"
     assert payload["agent_instructions"]["block_version"] == 1
     # Files on disk.
     assert (workspace / "shipgate.yaml").exists()
     assert (workspace / WORKFLOW_RELATIVE_PATH).exists()
-    for name in TARGETS:
+    for name in DEFAULT_TARGETS:
         assert (workspace / SPECS[name].relative_path).exists()
+
+
+def test_write_all_targets_includes_opt_in_targets_without_ci_side_effect(
+    tmp_path: Path,
+) -> None:
+    workspace = _seed_workspace(tmp_path, "simple_langchain_agent")
+    result = runner.invoke(
+        app,
+        [
+            "init",
+            "--workspace",
+            str(workspace),
+            "--write",
+            "--agent-instructions=all",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert "workflow" not in payload
+    assert payload["agent_instructions"]["requested"] == list(TARGETS)
+    assert (workspace / ".agents/skills/agents-shipgate/SKILL.md").exists()
+    assert (workspace / ".claude/skills/agents-shipgate/SKILL.md").exists()
+    assert (workspace / "CLAUDE.md").exists()
+    assert (workspace / ".github/pull_request_template.md").exists()
+    assert not (workspace / WORKFLOW_RELATIVE_PATH).exists()
 
 
 def test_init_command_documents_agent_instructions() -> None:

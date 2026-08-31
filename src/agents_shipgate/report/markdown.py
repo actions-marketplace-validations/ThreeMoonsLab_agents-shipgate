@@ -2,11 +2,39 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
+from collections.abc import Mapping
 from pathlib import Path
 
+from agents_shipgate.core.action_semantics import (
+    control_phrase,
+    effect_phrase,
+    join_phrases,
+)
+from agents_shipgate.core.control_packs import control_rule_summaries
 from agents_shipgate.core.disclaimers import HITL_RUNTIME_CONTROL_DISCLAIMER
-from agents_shipgate.core.findings import SEVERITY_ORDER
-from agents_shipgate.core.models import (
+from agents_shipgate.core.findings import (
+    PROVENANCE_KIND_ORDER,
+    SEVERITY_ORDER,
+    provenance_kind_counts,
+)
+from agents_shipgate.core.findings.subject_rollup import (
+    missing_items,
+    roll_up_findings,
+    rollup_headline,
+    top_findings_block,
+)
+from agents_shipgate.core.privacy import sanitize_report
+from agents_shipgate.core.source_warnings import group_source_warnings
+from agents_shipgate.core.surface_exclusions import agent_label_index
+from agents_shipgate.report.human_order import (
+    HumanArtifactContext,
+    capability_delta_by_subject,
+    should_render_surface_first,
+    surface_lead,
+)
+from agents_shipgate.report.summary_text import evidence_coverage_text
+from agents_shipgate.schemas.bindings import AgentBindingGraphAssessment
+from agents_shipgate.schemas.report import (
     DeclaredIntention,
     Finding,
     Misalignment,
@@ -14,10 +42,12 @@ from agents_shipgate.core.models import (
 )
 
 DISCLAIMER = (
-    "Agents Shipgate is an advisory release-readiness scanner. It does not certify "
-    "agent safety or compliance. Findings are based on static configuration, declared "
-    "policies, tool schemas, and optional SDK metadata. Runtime behavior, actual tool "
-    "routing, and output interpretation are not verified."
+    "Agents Shipgate is an advisory tool: the deterministic merge gate for "
+    "AI-generated agent capability changes, run as a local-first, static "
+    "Tool-Use Readiness review. It does not certify agent safety "
+    "or compliance. Findings are based on static configuration, declared policies, "
+    "tool schemas, and optional SDK metadata. Runtime behavior, actual tool routing, "
+    "and output interpretation are not verified."
 )
 MARKDOWN_ESCAPE_CHARS = (
     "\\",
@@ -51,12 +81,40 @@ HITL_EVIDENCE_CHECKS = {
 }
 
 
-def write_markdown_report(report: ReadinessReport, path: Path) -> None:
+# Section budget for the grouped summary. Much wider than the flat five
+# findings this replaced, because the section is now a map of the report
+# rather than a sample of it — and every finding still has its own row in
+# Findings By Category below, so the cap costs the reader nothing but scroll.
+_MARKDOWN_SUBJECT_LIMIT = 8
+_MARKDOWN_ROW_LIMIT = 5
+
+
+def write_markdown_report(
+    report: ReadinessReport,
+    path: Path,
+    *,
+    sanitize_output: bool = True,
+    human_context: HumanArtifactContext | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(render_markdown_report(report), encoding="utf-8")
+    path.write_text(
+        render_markdown_report(
+            report,
+            sanitize_output=sanitize_output,
+            human_context=human_context,
+        ),
+        encoding="utf-8",
+    )
 
 
-def render_markdown_report(report: ReadinessReport) -> str:
+def render_markdown_report(
+    report: ReadinessReport,
+    *,
+    sanitize_output: bool = True,
+    human_context: HumanArtifactContext | None = None,
+) -> str:
+    if sanitize_output:
+        report = sanitize_report(report)
     lines: list[str] = []
     summary = report.summary
     lines.extend(
@@ -76,7 +134,13 @@ def render_markdown_report(report: ReadinessReport) -> str:
                 "",
             ]
         )
+    surface_first = should_render_surface_first(report, context=human_context)
+    if surface_first:
+        _append_cold_reader_surface(lines, report)
+        _append_cold_reader_delta(lines, report)
+        _append_top_findings(lines, report)
     _append_release_decision(lines, report)
+    _append_policy_audit(lines, report)
     lines.extend(
         [
             "## Summary",
@@ -93,22 +157,52 @@ def render_markdown_report(report: ReadinessReport) -> str:
             "",
         ]
     )
-    _append_top_findings(lines, report.findings)
-    _append_capability_intent_diff(lines, report)
+    if not surface_first:
+        _append_top_findings(lines, report)
+    _append_finding_provenance(lines, report.findings)
+    _append_capability_intent_diff(
+        lines,
+        report,
+        include_legacy_consequence_decision=not surface_first,
+    )
     _append_baseline(lines, report)
     _append_recommended_actions(lines, report.recommended_actions)
     _append_source_warnings(lines, report)
+    _append_control_pack(lines, report)
     _append_loaded_policy_packs(lines, report)
     _append_loaded_plugins(lines, report)
+    _append_loaded_adapters(lines, report)
     _append_tool_surface(lines, report)
+    _append_action_surface_diff(lines, report)
+    _append_capability_runtime_evidence(lines, report)
     _append_tool_surface_diff(lines, report)
     _append_api_surface(lines, report)
     _append_frameworks(lines, report)
     _append_codex_plugin_surface(lines, report)
     _append_findings_by_category(lines, report.findings)
+    _append_binding_surface(lines, report)
     _append_inventory(lines, report)
     lines.extend(["", "## Disclaimer", "", DISCLAIMER, ""])
     return "\n".join(lines)
+
+
+def _append_cold_reader_surface(lines: list[str], report: ReadinessReport) -> None:
+    lines.extend(["## Capability Surface", ""])
+    for line in surface_lead(report).text_lines():
+        lines.append(_safe_markdown_text(line))
+    lines.append("")
+
+
+def _append_cold_reader_delta(lines: list[str], report: ReadinessReport) -> None:
+    groups = capability_delta_by_subject(report)
+    if not groups:
+        return
+    lines.extend(["## Capability Delta By Subject", ""])
+    for group in groups:
+        lines.append(f"- {_safe_markdown_text(group.subject)}")
+        for change in group.changes:
+            lines.append(f"  - {_safe_markdown_text(change)}")
+    lines.append("")
 
 
 def _append_release_decision(lines: list[str], report: ReadinessReport) -> None:
@@ -122,16 +216,9 @@ def _append_release_decision(lines: list[str], report: ReadinessReport) -> None:
     lines.append("")
     _append_decision_items(lines, "Blockers", decision.blockers)
     _append_decision_items(lines, "Review items", decision.review_items)
-    ev = decision.evidence_coverage
-    ev_extras: list[str] = []
-    if ev.low_confidence_tool_count:
-        ev_extras.append(f"{ev.low_confidence_tool_count} low-confidence tool(s)")
-    if ev.source_warning_count:
-        ev_extras.append(f"{ev.source_warning_count} source warning(s)")
-    if ev.human_review_recommended:
-        ev_extras.append("human review recommended")
-    suffix = f" ({'; '.join(ev_extras)})" if ev_extras else ""
-    lines.append(f"Evidence coverage: {ev.level}{suffix}")
+    lines.append(
+        f"Evidence coverage: {evidence_coverage_text(decision.evidence_coverage)}"
+    )
     lines.append("")
     bd = decision.baseline_delta
     if bd.enabled:
@@ -155,6 +242,56 @@ def _append_release_decision(lines: list[str], report: ReadinessReport) -> None:
     lines.append("")
 
 
+def _append_policy_audit(lines: list[str], report: ReadinessReport) -> None:
+    """v0.17 (M1) policy audit block.
+
+    Surfaces every applied severity override at the top of the markdown
+    report so reviewers don't have to spelunk through per-finding
+    evidence to know what was downgraded. Skipped entirely when no
+    overrides were applied — keeps the existing markdown byte-identical
+    for repos that don't use ``severity_overrides``.
+    """
+    audit = report.policy_audit
+    if audit is None or not audit.severity_overrides_applied:
+        return
+    rows = audit.severity_overrides_applied
+    downgrades = [row for row in rows if row.direction == "downgrade"]
+    upgrades = [row for row in rows if row.direction == "upgrade"]
+    same = [row for row in rows if row.direction == "same"]
+    summary_parts: list[str] = []
+    if downgrades:
+        summary_parts.append(
+            f"{len(downgrades)} downgrade{'s' if len(downgrades) != 1 else ''}"
+        )
+    if upgrades:
+        summary_parts.append(
+            f"{len(upgrades)} upgrade{'s' if len(upgrades) != 1 else ''}"
+        )
+    if same:
+        summary_parts.append(
+            f"{len(same)} no-op{'s' if len(same) != 1 else ''}"
+        )
+    lines.append("## Policy Audit")
+    lines.append("")
+    lines.append(
+        f"{len(rows)} severity override{'s' if len(rows) != 1 else ''} applied "
+        f"({', '.join(summary_parts)})."
+    )
+    lines.append("")
+    for row in rows:
+        tier_note = " · tier-crossed" if row.tier_crossed else ""
+        expiry_note = f" · expires {row.expires}" if row.expires else ""
+        reason_note = (
+            f" — {_safe_markdown_text(row.reason)}" if row.reason else ""
+        )
+        lines.append(
+            f"- {_safe_markdown_text(row.check_id)}: "
+            f"{row.default_severity} → **{row.applied_severity}** "
+            f"({row.direction}{tier_note}{expiry_note}){reason_note}"
+        )
+    lines.append("")
+
+
 def _append_decision_items(
     lines: list[str], label: str, items: list[object]
 ) -> None:
@@ -175,32 +312,108 @@ def _append_decision_items(
     lines.append("")
 
 
-def _append_top_findings(lines: list[str], findings: list[Finding]) -> None:
-    active = sorted(
-        [
-            finding
-            for finding in findings
-            if not finding.suppressed and finding.severity in {"critical", "high"}
-        ],
-        key=lambda finding: (SEVERITY_ORDER[finding.severity], finding.check_id),
-    )
+def _append_top_findings(lines: list[str], report: ReadinessReport) -> None:
+    """The reader-facing section, grouped by subject since #364.
+
+    A flat severity-ordered five could spend all five on one check family
+    repeated over sibling tools, which is a summary that says one thing and
+    hides four.  Grouped, the same budget covers the subjects — and every
+    finding still has its own row in Findings By Category below, and its own
+    record in ``report.json``.
+    """
+
+    groups = roll_up_findings(report)
     lines.extend(["## Top Findings", ""])
-    if not active:
+    if not groups:
         lines.extend(["No critical or high findings.", ""])
         return
-    for index, finding in enumerate(active[:5], start=1):
-        lines.append(f"{index}. {_safe_markdown_text(finding.title)}")
-        lines.append(f"   Evidence: {_compact_evidence(finding.evidence)}")
-        lines.append(f"   Recommendation: {_safe_markdown_text(finding.recommendation)}")
-        lines.append("")
-    if any(finding.check_id in HITL_EVIDENCE_CHECKS for finding in active[:5]):
+    lines.extend([f"{rollup_headline(groups)}, most urgent first.", ""])
+    lines.extend(
+        top_findings_block(
+            groups,
+            group_limit=_MARKDOWN_SUBJECT_LIMIT,
+            row_limit=_MARKDOWN_ROW_LIMIT,
+            escape=_safe_markdown_text,
+            heading=None,
+            bullet="- ",
+            row_prefix="  - ",
+            note_prefix="    - ",
+            annotate=_recommendation_note,
+        )
+    )
+    lines.append("")
+    # Read over every selected finding, not over the block's visible rows. A
+    # second copy of the truncation rule here would put the disclaimer one
+    # limit change away from being absent where it is required, and showing it
+    # for a row that scrolled off costs nothing.
+    selected = [finding for group in groups for finding in group.findings]
+    if any(finding.check_id in HITL_EVIDENCE_CHECKS for finding in selected):
         lines.append(_safe_markdown_text(HITL_RUNTIME_CONTROL_DISCLAIMER))
         lines.append("")
+
+
+def _recommendation_note(finding: Finding) -> tuple[str, ...]:
+    """What to do about one row, for the surface that has room to say it.
+
+    ``report.md`` is the long-form artifact, so a grouped row keeps the
+    sentence that used to sit under the flat one.  The console and the PR
+    comment do not — they stay at one line per finding and point here.
+
+    The sentence is dropped only where it *repeats the row*: the built-in
+    control checks derive it from the same ``evidence.missing`` the row
+    already prints, and saying one fact twice in different words is the one
+    thing a summary cannot afford.  Deciding that by "the row has a missing
+    list" was too broad — an ADK metadata finding's row names ``description``
+    while its sentence says where to write one, which is not the same fact.
+
+    So the test is whether the row's items already appear in the sentence,
+    asked through ``control_phrase`` — the table that renders them, so a
+    control the sentence *renames* still matches.  Its failure mode is one
+    redundant line, never a lost instruction.
+    """
+
+    recommendation = (finding.recommendation or "").strip()
+    if not recommendation:
+        return ()
+    items = missing_items(finding)
+    if items and all(control_phrase(item) in recommendation for item in items):
+        return ()
+    return (recommendation,)
+
+
+def _append_finding_provenance(lines: list[str], findings: list[Finding]) -> None:
+    counts = provenance_kind_counts(findings)
+    suppressed = sum(1 for finding in findings if finding.suppressed)
+    lines.extend(
+        [
+            "## Finding Provenance",
+            "",
+            (
+                "Reviewer triage signal only. Provenance kind does not "
+                "change severity, release decision, fingerprints, baselines, "
+                "or CI exit codes."
+            ),
+            "",
+            "| Provenance kind | Active findings |",
+            "| --- | ---: |",
+        ]
+    )
+    for kind in PROVENANCE_KIND_ORDER:
+        lines.append(f"| `{kind}` | {counts[kind]} |")
+    lines.extend(
+        [
+            "",
+            f"Suppressed findings excluded: {suppressed}",
+            "",
+        ]
+    )
 
 
 def _append_capability_intent_diff(
     lines: list[str],
     report: ReadinessReport,
+    *,
+    include_legacy_consequence_decision: bool = True,
 ) -> None:
     lines.extend(["## Capability <-> Intent Diff", ""])
     if not report.misalignments:
@@ -279,7 +492,11 @@ def _append_capability_intent_diff(
     if consequence is None:
         lines.append("- No release consequence recorded.")
     else:
-        lines.append(f"- Decision: {_safe_markdown_text(consequence.decision)}")
+        # Adopted reports retain this pre-existing consequence projection byte
+        # for byte. Cold reports omit it so the primary release decision is
+        # the only ``Decision:`` line above the newly reordered detail.
+        if include_legacy_consequence_decision:
+            lines.append(f"- Decision: {_safe_markdown_text(consequence.decision)}")
         lines.append(f"- {_safe_markdown_text(consequence.summary)}")
     lines.append("")
 
@@ -297,6 +514,56 @@ def _append_capability_intent_diff(
         )
     else:
         lines.append("- No additional validation scenarios suggested.")
+    lines.append("")
+
+
+def _append_capability_runtime_evidence(
+    lines: list[str],
+    report: ReadinessReport,
+) -> None:
+    evidence = report.capability_runtime_evidence
+    lines.extend(["## Capability Runtime Evidence", ""])
+    if not evidence.enabled:
+        lines.extend(
+            [
+                "No local runtime trace artifacts were declared for capability evidence.",
+                "",
+            ]
+        )
+        return
+    summary = evidence.summary
+    lines.extend(
+        [
+            f"- Sources: {summary.source_count}",
+            f"- Trace rows: {summary.trace_count}",
+            f"- Matched rows: {summary.matched_trace_count}",
+            f"- Unmatched rows: {summary.unmatched_trace_count}",
+            f"- Warnings: {summary.warning_count}",
+            "",
+        ]
+    )
+    if evidence.matched:
+        lines.append("Matched trace rows:")
+        for row in evidence.matched[:5]:
+            target = row.tool_name or row.matched_capability_id or row.id
+            lines.append(
+                f"- `{_safe_markdown_text(row.id)}` "
+                f"{_safe_markdown_text(target)} "
+                f"({row.source_type}, {row.match_reason})"
+            )
+        lines.append("")
+    if evidence.unmatched:
+        lines.append("Unmatched trace rows:")
+        for row in evidence.unmatched[:5]:
+            target = row.tool_name or row.capability_id or row.id
+            lines.append(
+                f"- `{_safe_markdown_text(row.id)}` "
+                f"{_safe_markdown_text(target)} "
+                f"({row.source_type}, {row.match_reason})"
+            )
+        lines.append("")
+    for note in evidence.notes:
+        lines.append(f"- {_safe_markdown_text(note)}")
     lines.append("")
 
 
@@ -371,9 +638,14 @@ def _append_baseline(lines: list[str], report: ReadinessReport) -> None:
 def _append_source_warnings(lines: list[str], report: ReadinessReport) -> None:
     if not report.source_warnings:
         return
+    # Grouped by mechanism: six warnings that differ only in the symbol they
+    # name are one thing to fix, and listing them six times buries it. The
+    # JSON keeps every warning — the count gates (#362).
+    groups = group_source_warnings(report.source_warnings)
     lines.extend(["## Source Warnings", ""])
-    for warning in report.source_warnings:
-        lines.append(f"- {_safe_markdown_text(warning)}")
+    for group in groups:
+        suffix = f" ({group.count} warnings)" if group.count > 1 else ""
+        lines.append(f"- {_safe_markdown_text(group.message)}{suffix}")
     lines.append("")
 
 
@@ -393,6 +665,46 @@ def _append_loaded_plugins(lines: list[str], report: ReadinessReport) -> None:
     lines.append("")
 
 
+def _append_control_pack(lines: list[str], report: ReadinessReport) -> None:
+    """Name the rule that wanted each missing control, once per rule (#410 §F).
+
+    Before this, a scan of four money-moving tools said "lacks a declared
+    approval policy" seven times and never once said *what requires approval*.
+    The rule is the thing an adopter can argue with, adopt, or tighten; the
+    per-tool rows below say who is short of it.
+
+    Rendered from the findings, so it appears only where a control is
+    actually missing — the pack a clean scan ran under is recorded in
+    ``shipgate.yaml`` rather than repeated here.
+
+    One report is one manifest is one pack, so the heading names the pack of
+    any row. Writing a loop over packs would be handling a state the engine
+    cannot produce, which reads as a fix and is never exercised; stating the
+    assumption is the honest version of the same thing.
+    """
+
+    summaries = control_rule_summaries(report.findings)
+    if not summaries:
+        return
+    pack = summaries[0].pack
+    lines.extend(["## Control Pack", ""])
+    lines.append(
+        f"`{_safe_markdown_text(pack.id)}` — {_safe_markdown_text(pack.name)} "
+        f"v{_safe_markdown_text(pack.version)}. "
+        f"{_safe_markdown_text(pack.summary)}"
+    )
+    lines.append("")
+    for row in summaries:
+        subject = join_phrases([effect_phrase(effect) for effect in row.effects])
+        controls = join_phrases([control_phrase(path) for path in row.controls])
+        noun = "action" if row.action_count == 1 else "actions"
+        lines.append(
+            f"- {_safe_markdown_text(subject)} requires "
+            f"{_safe_markdown_text(controls)} — {row.action_count} {noun} short"
+        )
+    lines.append("")
+
+
 def _append_loaded_policy_packs(lines: list[str], report: ReadinessReport) -> None:
     if not report.loaded_policy_packs:
         return
@@ -403,6 +715,44 @@ def _append_loaded_policy_packs(lines: list[str], report: ReadinessReport) -> No
             f"- {_safe_markdown_text(pack.name)}{_safe_markdown_text(version)} "
             f"({_safe_markdown_text(pack.id)}): {pack.rule_count} rules"
         )
+    lines.append("")
+
+
+def _append_loaded_adapters(lines: list[str], report: ReadinessReport) -> None:
+    """v0.20 (PR #111 review follow-up #4): render third-party adapter
+    provenance in the human-readable report.
+
+    Before this section landed, ``load_failed`` and other invalid
+    adapters appeared in ``report.json`` only — the default human
+    report was blind to skipped third-party extensions. Show the
+    validation status prominently so the reviewer sees what was
+    skipped (and why) without opening the JSON.
+    """
+
+    adapters = getattr(report, "loaded_adapters", None) or []
+    if not adapters:
+        return
+    lines.extend(["## Loaded Adapters", ""])
+    for adapter in adapters:
+        distribution = adapter.get("distribution") or "unknown distribution"
+        version = adapter.get("version")
+        source_type = adapter.get("source_type") or "unknown source type"
+        status = adapter.get("validation_status") or "unknown"
+        suffix = f" {version}" if version else ""
+        head = (
+            f"- {_safe_markdown_text(distribution)}"
+            f"{_safe_markdown_text(suffix)}: "
+            f"{_safe_markdown_text(source_type)} — "
+            f"`{_safe_markdown_text(status)}`"
+        )
+        lines.append(head)
+        # Surface every validation_error / runtime_error on its own
+        # indented bullet so a reviewer scanning the report cannot
+        # miss an adapter that failed to load or crashed at runtime.
+        for err in adapter.get("validation_errors") or []:
+            lines.append(f"  - validation_error: {_safe_markdown_text(err)}")
+        for err in adapter.get("runtime_errors") or []:
+            lines.append(f"  - runtime_error: {_safe_markdown_text(err)}")
     lines.append("")
 
 
@@ -514,6 +864,70 @@ def _append_tool_surface_diff(lines: list[str], report: ReadinessReport) -> None
         _append_diff_values(lines, "Notes", diff.notes[:3])
 
 
+def _append_action_surface_diff(lines: list[str], report: ReadinessReport) -> None:
+    diff = report.action_surface_diff
+    lines.extend(["## Action Surface Diff", ""])
+    if not diff.enabled:
+        note = diff.notes[0] if diff.notes else "No comparison source was available."
+        lines.extend(
+            [
+                f"- Status: disabled - {_safe_markdown_text(note)}",
+                f"- Base: {_safe_markdown_text(diff.base.kind)}",
+                "",
+            ]
+        )
+        return
+
+    summary = diff.summary
+    lines.extend(
+        [
+            f"- Base: {_safe_markdown_text(diff.base.kind)}"
+            + (f" ({_safe_markdown_text(diff.base.path)})" if diff.base.path else ""),
+            (
+                "- Actions: "
+                f"+{summary.actions_added}, -{summary.actions_removed}, "
+                f"{summary.actions_modified} modified"
+            ),
+            (
+                "- Escalations: "
+                f"{summary.scope_expansions} scope expansion(s), "
+                f"{summary.effect_escalations} effect escalation(s), "
+                f"{summary.risk_tags_added} risk tag addition(s)"
+            ),
+            (
+                "- Controls: "
+                f"{summary.approvals_removed} approval removal(s), "
+                f"{summary.safeguards_removed} safeguard removal(s)"
+            ),
+            f"- Blocking findings: {summary.blocking_findings}",
+            "",
+        ]
+    )
+    _append_diff_values(
+        lines,
+        "Added actions",
+        [
+            f"{item.tool_name}: {item.operation} ({item.severity})"
+            for item in diff.added
+        ],
+    )
+    _append_diff_values(
+        lines,
+        "Modified actions",
+        [
+            f"{item.tool_name}: {item.type} ({item.severity})"
+            for item in diff.modified
+        ],
+    )
+    _append_diff_values(
+        lines,
+        "Removed actions",
+        [f"{item.tool_name}: {item.operation}" for item in diff.removed],
+    )
+    if diff.notes:
+        _append_diff_values(lines, "Action diff notes", diff.notes[:3])
+
+
 def _append_diff_values(lines: list[str], label: str, values: list[str]) -> None:
     if not values:
         return
@@ -593,6 +1007,27 @@ def _append_frameworks(lines: list[str], report: ReadinessReport) -> None:
                 ("Prebuilt tools", "prebuilt_tool_count"),
                 ("Dynamic or unresolved tool surfaces", "dynamic_tool_surface_count"),
                 ("Tool inventory files", "tool_inventory_file_count"),
+            ],
+        ),
+        (
+            "conductor",
+            "Conductor OSS",
+            "## Conductor OSS Surface Summary",
+            [
+                ("Workflow files", "workflow_file_count"),
+                ("Workflows", "workflow_count"),
+                ("Tasks", "task_count"),
+                ("LLM tasks", "llm_task_count"),
+                ("MCP discovery tasks", "mcp_discovery_task_count"),
+                ("MCP call tasks", "mcp_call_task_count"),
+                ("Human checkpoints", "human_checkpoint_count"),
+                (
+                    "Structurally checkpointed MCP calls",
+                    "structurally_checkpointed_mcp_call_count",
+                ),
+                ("Sub-workflow tasks", "sub_workflow_task_count"),
+                ("Dynamic or unresolved tool surfaces", "dynamic_tool_surface_count"),
+                ("Unsupported capabilities", "unsupported_capability_count"),
             ],
         ),
     ]
@@ -678,9 +1113,9 @@ def _append_findings_by_category(lines: list[str], findings: list[Finding]) -> N
 
 
 def _append_inventory(lines: list[str], report: ReadinessReport) -> None:
-    lines.extend(["## Appendix: Normalized Tool Inventory", ""])
+    lines.extend(["## Appendix: Root-Reachable Tool Inventory", ""])
     if not report.tool_inventory:
-        lines.extend(["No tools were enumerated.", ""])
+        lines.extend(["No tools were proven reachable from the root agent.", ""])
         return
     lines.append("| Tool | Source | Risk Tags | Risk Confidence | Auth Scopes | Owner |")
     lines.append("| --- | --- | --- | --- | --- | --- |")
@@ -697,17 +1132,147 @@ def _append_inventory(lines: list[str], report: ReadinessReport) -> None:
     lines.append("")
 
 
+#: ``root_agent_id`` on the compatibility assessment a report carries when no
+#: agent graph was resolved at all: ``core.findings.report_builder`` builds it
+#: whenever its ``binding_surface_facts`` argument is ``None``, and it is the
+#: ``binding_surface_facts`` default for a ``report.json`` written before the
+#: field existed. It is a state, not an agent id — no node carries it — so it
+#: has to be answered before the label index is consulted, or it renders as a
+#: root the graph could not name.
+#:
+#: Spelled here rather than shared, because the four modules that *produce*
+#: the sentinel each spell the literal too; one constant for all five is a
+#: worthwhile cleanup and a wider change than a rendering fix.
+_LEGACY_DIRECT_ROOT_AGENT_ID = "legacy_direct"
+
+#: What the root line says for a graph rooted by reviewed
+#: ``tool_sources[].binding`` surfaces rather than by an agent object.
+#:
+#: One constant because two branches reach the same fact from opposite sides:
+#: several surfaces leave ``root_agent_id`` unset, and exactly one surface
+#: *becomes* the root (``core.agent_bindings._select_root``). Whether a
+#: repository has an agent object cannot depend on how many sources it
+#: declared, so the sentence must not either.
+_ROOTED_BY_TOOL_SOURCES = "none (graph rooted by declared tool sources)"
+
+
+def _agent_display(agent_id: str, labels: Mapping[str, str]) -> str:
+    """The one label naming an agent on the binding surface. Never its id.
+
+    Both agent lines in this section resolve through
+    :func:`agent_label_index`, for the reason that index exists: an emitter
+    that spells a label from a node's own fields produces a second spelling of
+    the same subject.
+
+    ``unresolved`` where the index cannot name one. Chaining to ``agent_id``
+    puts a derived digest in front of the reader — ``Root agent:
+    agent_v1:7205d836…``, which is in no file they have and which #329 forbids
+    of any adopter-facing sentence. The ids stay in
+    ``binding_surface_facts`` in ``report.json`` for a bug report.
+
+    Callers must answer every id that is not an agent *before* reaching here.
+    A graph the walk built always has a node for its root and for each entry
+    point, so for those the fallback is unreachable — but
+    :data:`_LEGACY_DIRECT_ROOT_AGENT_ID` is a truthy ``root_agent_id`` with no
+    node behind it, and reading it as an unnameable agent reported a rooted,
+    pass-eligible graph as ``unresolved``. ``unresolved`` is the answer for an
+    agent the graph could not name, never for a state that is not an agent.
+    """
+
+    return labels.get(agent_id) or "unresolved"
+
+
+def _root_agent_line(graph: AgentBindingGraphAssessment) -> str:
+    """What to print where a root agent's identity goes.
+
+    ``unresolved`` is the right word for a graph nothing rooted. It is the
+    wrong word for a repository that publishes tool surfaces and has no agent
+    object to name — that graph is rooted, deliberately, by the reviewed
+    ``tool_sources[].binding`` entries listed on the next line, and calling it
+    unresolved reads as the failure it is not (#432 review).
+
+    **Whether an agent object exists is read from the root node's ``kind``,
+    not from whether a root id is set.** ``_select_root`` returns the sole
+    surface node when a repository declares exactly one reviewed
+    ``tool_sources[].binding`` and nothing observed an agent, so that graph
+    has a truthy ``root_agent_id`` pointing at a ``tool_source``. Naming it
+    like an agent printed ``Root agent: github_mcp`` beside
+    ``Pass eligible: true`` for a repository with no agent object at all,
+    while the two-surface form of the same repository printed the correct
+    sentence — one fact, worded two ways by a count (#329 review).
+
+    A root the graph *did* name, and that is an agent, is printed as its
+    label, never as ``root_agent_id`` (see :func:`_agent_display`).
+
+    And ``unresolved`` is the wrong word once more for a report carrying no
+    agent graph at all, whose root is :data:`_LEGACY_DIRECT_ROOT_AGENT_ID` — a
+    truthy id no node carries. Same shape of claim as the tool-source state:
+    ``Status: structural`` and ``Pass eligible: true`` are printed around this
+    line, and ``unresolved`` between them describes a failure that did not
+    happen.
+    """
+
+    if graph.root_agent_id == _LEGACY_DIRECT_ROOT_AGENT_ID:
+        return "none (tools bound directly, no agent graph)"
+    if graph.root_agent_id:
+        root = next(
+            (node for node in graph.agents if node.agent_id == graph.root_agent_id),
+            None,
+        )
+        if root is not None and root.kind == "tool_source":
+            return _ROOTED_BY_TOOL_SOURCES
+        return _agent_display(graph.root_agent_id, agent_label_index(graph.agents))
+    if graph.entry_point_agent_ids:
+        return _ROOTED_BY_TOOL_SOURCES
+    return "unresolved"
+
+
+def _append_binding_surface(lines: list[str], report: ReadinessReport) -> None:
+    graph = report.binding_surface_facts
+    lines.extend(["## Agent Binding Surface", ""])
+    lines.append(f"Status: {_safe_markdown_text(graph.status)}")
+    lines.append(f"Root agent: {_safe_markdown_text(_root_agent_line(graph))}")
+    if graph.entry_point_agent_ids:
+        labels = agent_label_index(graph.agents)
+        lines.append(
+            "Entry points: "
+            + ", ".join(
+                _safe_markdown_text(_agent_display(agent_id, labels))
+                for agent_id in graph.entry_point_agent_ids
+            )
+        )
+    lines.append(f"Pass eligible: {str(graph.pass_eligible).lower()}")
+    lines.append(
+        "Catalog partition: "
+        f"{len(graph.reachable_tool_ids)} reachable, "
+        f"{len(graph.possible_tool_ids)} possible, "
+        f"{len(graph.unbound_tool_ids)} unbound"
+    )
+    if graph.issues:
+        lines.append("")
+        lines.append("Binding gaps:")
+        for issue in graph.issues:
+            lines.append(
+                f"- `{_safe_markdown_text(issue.kind)}` — "
+                f"{_safe_markdown_text(issue.message)}"
+            )
+    lines.append("")
+
+    if report.tool_catalog and len(report.tool_catalog) != len(report.tool_inventory):
+        lines.extend(["### Unbound Catalog Entries", ""])
+        reachable = set(graph.reachable_tool_ids)
+        for tool in report.tool_catalog:
+            if tool.get("tool_id") in reachable:
+                continue
+            lines.append(
+                f"- `{_safe_markdown_text(tool.get('name') or '-')}` "
+                f"({_safe_markdown_text(tool.get('source_type') or '-')})"
+            )
+        lines.append("")
+
+
 def _human_status(status: str) -> str:
     return status.replace("_", " ").capitalize()
-
-
-def _compact_evidence(evidence: dict[str, object]) -> str:
-    parts = []
-    for key, value in evidence.items():
-        if key == "source_provenance" and isinstance(value, list):
-            value = f"{len(value)} provenance item(s)"
-        parts.append(_safe_markdown_text(f"{key}={value}"))
-    return "; ".join(parts) or "static metadata"
 
 
 def _table_cell(value: object) -> str:
@@ -727,6 +1292,25 @@ def _safe_markdown_text(value: object) -> str:
     text = re.sub(r"(?m)^(\s*)-", r"\1\\-", text)
     text = re.sub(r"(?m)^(\s*\d+)\.", r"\1\\.", text)
     return text
+
+
+def _unescape_markdown_text(text: str) -> str:
+    """The inverse of :func:`_safe_markdown_text`, for reading a report back.
+
+    A guard that reads rendered Markdown sees the escaped spelling, and every
+    derived id shape and internal term in
+    :mod:`agents_shipgate.core.adopter_text` contains an underscore — so
+    ``agent_v1:7205d836`` reaches the adopter-vocabulary sweep as
+    ``agent\\_v1:7205d836`` and matches nothing. That is how a digest shipped
+    in the ``Root agent:`` line of all five samples under a sweep written to
+    catch exactly it. Un-escaping first keeps that sweep about the sentence
+    instead of about the escaping.
+
+    A true inverse because the escaper escapes the backslash first: every
+    backslash in its output introduces exactly one escaped character.
+    """
+
+    return re.sub(r"\\(.)", r"\1", text)
 
 
 def _truncate_text(value: str, limit: int = 220) -> str:

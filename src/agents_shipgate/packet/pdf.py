@@ -12,7 +12,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from agents_shipgate.packet.html import render_packet_html
-from agents_shipgate.packet.models import EvidencePacket
+from agents_shipgate.report.human_order import ColdReaderLead, HumanArtifactContext
+from agents_shipgate.schemas.packet import EvidencePacket
 
 
 class PdfRendererUnavailable(RuntimeError):
@@ -23,7 +24,14 @@ class PdfRendererUnavailable(RuntimeError):
     """
 
 
-def render_packet_pdf(packet: EvidencePacket, out_path: Path) -> Path:
+def render_packet_pdf(
+    packet: EvidencePacket,
+    out_path: Path,
+    *,
+    sanitize_output: bool = True,
+    human_context: HumanArtifactContext | None = None,
+    cold_lead: ColdReaderLead | None = None,
+) -> Path:
     """Render the packet as a PDF and write it to ``out_path``.
 
     Returns the resolved output path. Raises
@@ -39,7 +47,12 @@ def render_packet_pdf(packet: EvidencePacket, out_path: Path) -> Path:
         ) from exc
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    html_str = render_packet_html(packet)
+    html_str = render_packet_html(
+        packet,
+        sanitize_output=sanitize_output,
+        human_context=human_context,
+        cold_lead=cold_lead,
+    )
     HTML(string=html_str).write_pdf(str(out_path))
     return out_path
 
@@ -47,7 +60,7 @@ def render_packet_pdf(packet: EvidencePacket, out_path: Path) -> Path:
 def is_pdf_available() -> bool:
     """Probe whether the PDF renderer is importable on this install.
 
-    Used by ``cli/scan.py`` during the path-planning phase so
+    Used by ``cli/scan/output_planning.py`` during the path-planning phase so
     ``report.generated_reports`` only references files that will
     actually be written.
     """

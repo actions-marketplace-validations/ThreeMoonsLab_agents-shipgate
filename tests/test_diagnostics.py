@@ -9,6 +9,18 @@ import pytest
 
 from agents_shipgate.cli import diagnostics as diag_mod
 from agents_shipgate.cli.diagnostics import (
+    diagnose_detect,
+    diagnose_doctor,
+    diagnose_invalid_manifest,
+    diagnose_missing_manifest,
+    top_next_actions,
+)
+from agents_shipgate.cli.main import app as typer_app
+from agents_shipgate.schemas.detect import (
+    DetectResult,
+    WorkspaceSignals,
+)
+from agents_shipgate.schemas.diagnostics import (
     ALL_DIAGNOSTIC_IDS,
     DIAG_CHANGE_ME_PLACEHOLDERS,
     DIAG_DYNAMIC_TOOLSETS_ONLY,
@@ -23,17 +35,7 @@ from agents_shipgate.cli.diagnostics import (
     DIAG_ZERO_TOOLS,
     Diagnostic,
     NextAction,
-    diagnose_detect,
-    diagnose_doctor,
-    diagnose_invalid_manifest,
-    diagnose_missing_manifest,
-    top_next_actions,
 )
-from agents_shipgate.cli.discovery.signals import (
-    DetectResult,
-    WorkspaceSignals,
-)
-from agents_shipgate.cli.main import app as typer_app
 
 # --- NextAction model invariants -------------------------------------------
 
@@ -140,7 +142,7 @@ class TestDiagnoseMissingManifest:
         assert [d.id for d in diags] == [DIAG_MISSING_MANIFEST]
         assert diags[0].severity == "block"
         assert diags[0].next_actions[0].kind == "command"
-        assert "agents-shipgate detect" in diags[0].next_actions[0].command
+        assert "agents-shipgate verify" in diags[0].next_actions[0].command
 
     def test_command_quotes_workspace_with_spaces(
         self, tmp_path: Path
@@ -152,7 +154,7 @@ class TestDiagnoseMissingManifest:
         diags = diagnose_missing_manifest(spaced)
         for action in diags[0].next_actions:
             parts = shlex.split(action.command)
-            assert parts[0] == "agents-shipgate"
+            assert parts[0] in {"agents-shipgate", "shipgate"}
             ws_idx = parts.index("--workspace")
             assert parts[ws_idx + 1] == str(spaced)
 
@@ -582,10 +584,10 @@ class TestRankOneCommandsAreRoutable:
         )
 
         assert commands_to_check, "expected at least one command action"
-        pattern = re.compile(r"^agents-shipgate\s+([\w-]+)")
+        pattern = re.compile(r"^(?:agents-shipgate|shipgate)\s+([\w-]+)")
         for command in commands_to_check:
             match = pattern.match(command)
-            assert match, f"command does not start with agents-shipgate: {command!r}"
+            assert match, f"command does not start with a Shipgate binary: {command!r}"
             subcommand = match.group(1)
             assert subcommand in registered, (
                 f"command {command!r} references unknown subcommand "

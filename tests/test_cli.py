@@ -1,9 +1,10 @@
 import json
+import re
+import shutil
 from pathlib import Path
 from types import UnionType
 from typing import Union, get_args, get_origin
 
-import click
 import pytest
 from pydantic import BaseModel
 from typer.main import get_command
@@ -11,16 +12,86 @@ from typer.testing import CliRunner
 
 from agents_shipgate import __version__
 from agents_shipgate.checks import registry
-from agents_shipgate.cli.main import _safe_output_name, app
-from agents_shipgate.contract import (
-    CONTRACT_VERSION,
-    GATING_SIGNAL,
-    MANUAL_REVIEW_SIGNALS,
+from agents_shipgate.cli._artifact_lifecycle import VERIFIER_ROUTE_ARTIFACT_NAMES
+from agents_shipgate.cli._helpers import _safe_output_name
+from agents_shipgate.cli.main import app
+from agents_shipgate.cli.scan import run_scan
+from agents_shipgate.schemas.capabilities import (
+    CAPABILITY_LOCK_DIFF_SCHEMA_VERSION,
+    CAPABILITY_LOCK_SCHEMA_VERSION,
+    CAPABILITY_STANDARD_VERSION,
 )
-from agents_shipgate.core.models import ReadinessReport, ToolSurfaceDiffSummary
-from agents_shipgate.packet.models import EvidencePacket
+from agents_shipgate.schemas.contract import (
+    AGENT_BOUNDARY_RESULT_SCHEMA_PATH,
+    AGENT_BOUNDARY_RESULT_SCHEMA_VERSION,
+    AGENT_CONTROL_ENVELOPE_BUDGET_BYTES,
+    AGENT_CONTROL_ENVELOPE_SCHEMA_PATH,
+    AGENT_CONTROL_ENVELOPE_SCHEMA_VERSION,
+    AGENT_CONTROL_FIELDS,
+    AGENT_CONTROL_PERMISSIONS,
+    AGENT_CONTROL_STATES,
+    AGENT_HANDOFF_SCHEMA_PATH,
+    AGENT_HANDOFF_SCHEMA_VERSION,
+    AGENT_INTERFACE_OPERATIONS,
+    AGENT_READ_ORDER,
+    AGENT_REFRESH_TRIGGERS,
+    AGENT_RESULT_CONTROL_FIELDS,
+    AGENT_RESULT_SCHEMA_PATH,
+    AGENT_RESULT_SCHEMA_VERSION,
+    ARTIFACTS,
+    ATTESTATION_SCHEMA_VERSION,
+    CODEX_BOUNDARY_RESULT_SCHEMA_VERSION,
+    COMMANDS,
+    CONTRACT_VERSION,
+    CURRENT_CONTROL_FALLBACK_READ_ORDER,
+    CURRENT_CONTROL_SCHEMA_PATH,
+    CURRENT_CONTROL_SCHEMA_VERSION,
+    DEFAULT_PATHS,
+    DO_NOT_AUTO_ASSERT,
+    EXIT_CODE_POLICY,
+    EXTERNAL_INTEGRATION_SURFACES,
+    GATING_SIGNAL,
+    HOST_GRANTS_BASELINE_SCHEMA_VERSION,
+    HOST_GRANTS_DRIFT_SCHEMA_VERSION,
+    HOST_GRANTS_INVENTORY_SCHEMA_VERSION,
+    HUMAN_AUTHORIZATION_EVALUATION_SCHEMA_VERSION,
+    HUMAN_AUTHORIZATION_REQUEST_SCHEMA_VERSION,
+    HUMAN_AUTHORIZATION_SCHEMA_PATH,
+    HUMAN_AUTHORIZATION_SCHEMA_VERSION,
+    HUMAN_AUTHORIZATION_TRUST_POLICY_ACCOUNT_PATH,
+    HUMAN_AUTHORIZATION_TRUST_POLICY_SCHEMA_VERSION,
+    MANUAL_REVIEW_SIGNALS,
+    MCP_TOOLS,
+    MERGE_VERDICTS,
+    MINIMUM_CONTROL_CONTRACT_VERSION,
+    ORG_EVIDENCE_BUNDLE_SCHEMA_VERSION,
+    PRIMARY_COMMANDS,
+    REGISTRY_SCHEMA_VERSION,
+    RELEASE_DECISIONS,
+    TRIGGER_CATALOG_SCHEMA_VERSION,
+    VERIFICATION_ARTIFACT_MANIFEST_SCHEMA_VERSION,
+    VERIFICATION_PLAN_SCHEMA_VERSION,
+    VERIFICATION_RECEIPT_SCHEMA_VERSION,
+    VERIFICATION_UNIT_RESULT_SCHEMA_VERSION,
+    VERIFIER_READ_ORDER,
+    VERIFY_RUN_SCHEMA_VERSION,
+)
+from agents_shipgate.schemas.governance_benchmark import (
+    GOVERNANCE_BENCHMARK_CATALOG_SCHEMA_VERSION,
+    GOVERNANCE_BENCHMARK_RESULT_SCHEMA_VERSION,
+)
+from agents_shipgate.schemas.packet import EvidencePacket
+from agents_shipgate.schemas.preflight import PREFLIGHT_SCHEMA_VERSION
+from agents_shipgate.schemas.report import ReadinessReport
+from agents_shipgate.schemas.surfaces import ToolSurfaceDiffSummary
+from agents_shipgate.schemas.verifier import VerifierArtifact
 
 runner = CliRunner()
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def _plain_cli_output(text: str) -> str:
+    return ANSI_RE.sub("", text)
 
 
 def test_cli_advisory_exits_zero(tmp_path):
@@ -38,12 +109,36 @@ def test_cli_advisory_exits_zero(tmp_path):
     )
 
     assert result.exit_code == 0
-    assert "Agents Shipgate 0.10.0" in result.output
+    assert f"Agents Shipgate {__version__}" in result.output
     # v0.8: CLI summary leads with the release decision; the support_refund
     # sample has new criticals → decision=blocked. (Advisory exit is still 0.)
     assert "Decision: blocked" in result.output
+    assert "Summary:" in result.output
     assert "Reason:" in result.output
+    assert "Next action:" in result.output
     assert "Fail policy:" in result.output
+
+
+def test_cli_pass_summary_names_static_evidence_boundary(tmp_path):
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            "--config",
+            "samples/openai_agents_sdk_agent/shipgate.yaml",
+            "--out",
+            str(tmp_path),
+            "--ci-mode",
+            "advisory",
+            "--no-packet",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Decision: passed" in result.output
+    assert "Release ready" in result.output
+    assert "2/2 actions pass-eligible" in result.output
+    assert "Runtime behavior was not verified" in result.output
 
 
 def test_cli_strict_exits_gate_failure_code(tmp_path):
@@ -101,6 +196,97 @@ tool_sources:
     assert "Input parsing error:" in result.output
 
 
+def test_cli_missing_config_prints_next_action_hint(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENTS_SHIPGATE_AGENT_MODE", raising=False)
+
+    result = runner.invoke(app, ["scan", "--workspace", str(tmp_path)])
+
+    assert result.exit_code == 2
+    assert "Config error:" in result.output
+    # The human reader gets the same rank-1 recovery step that agent
+    # mode emits as JSON — a cold user must not hit a dead end.
+    assert "next: agents-shipgate verify" in result.output
+
+
+def test_cli_change_me_placeholder_error_routes_to_manifest_edit(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENTS_SHIPGATE_AGENT_MODE", raising=False)
+    config = tmp_path / "shipgate.yaml"
+    config.write_text(
+        """
+version: "0.1"
+project:
+  name: placeholder-repo
+agent:
+  name: placeholder-agent
+  declared_purpose:
+    - test
+environment:
+  target: local
+tool_sources:
+  - id: placeholder
+    type: mcp
+    path: CHANGE_ME.yaml
+""",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["scan", "--config", str(config)])
+
+    assert result.exit_code == 3
+    # Named from the parsed manifest, so the route says which field still
+    # holds the placeholder rather than that one exists somewhere.
+    assert "still declares CHANGE_ME at tool_sources[0].path" in result.output
+    # The manifest the run read, not the bare filename: `--workspace` can
+    # select a nested one, and a caller-relative `shipgate.yaml` is a
+    # different file (#329 review).
+    assert f"next: Edit {config}" in result.output
+
+
+def test_a_missing_file_named_change_me_is_not_a_placeholder_manifest(tmp_path):
+    """The placeholder route is a fact about the manifest, not about the text.
+
+    A manifest with every field filled in, pointing at a file that happens to
+    be named `CHANGE_ME-tools.json`, matched a substring search of the failure
+    and was told it still contained template placeholders (#329 review 3).
+    """
+
+    config = tmp_path / "shipgate.yaml"
+    config.write_text(
+        """version: "0.1"
+project:
+  name: real-project
+agent:
+  name: support-agent
+  declared_purpose:
+    - look things up
+environment:
+  target: local
+tool_sources:
+  - id: tools
+    type: mcp
+    path: CHANGE_ME-tools.json
+""",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["scan", "--config", str(config)])
+
+    assert result.exit_code == 3
+    assert "CHANGE_ME" not in result.output.replace("CHANGE_ME-tools.json", "")
+    assert "next: Review:" in result.output
+
+
+def test_cli_agent_mode_suppresses_prose_hint(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTS_SHIPGATE_AGENT_MODE", "1")
+
+    result = runner.invoke(app, ["scan", "--workspace", str(tmp_path)])
+
+    assert result.exit_code == 2
+    # Agent mode keeps the docs/errors.json single-JSON-line contract:
+    # the prose hint lines stay human-mode only.
+    assert not [line for line in result.output.splitlines() if line.startswith("next: ")]
+
+
 def test_cli_list_checks_outputs_catalog():
     result = runner.invoke(app, ["list-checks"])
 
@@ -115,7 +301,7 @@ def test_cli_version_outputs_version():
     result = runner.invoke(app, ["--version"])
 
     assert result.exit_code == 0
-    assert result.output.strip() == "Agents Shipgate 0.10.0"
+    assert result.output.strip() == f"Agents Shipgate {__version__}"
 
 
 def test_cli_contract_json_outputs_runtime_contract():
@@ -126,23 +312,157 @@ def test_cli_contract_json_outputs_runtime_contract():
     # Key order is part of the agent-facing contract payload.
     assert list(payload) == [
         "contract_version",
+        "minimum_control_contract_version",
         "cli_version",
         "report_schema_version",
         "packet_schema_version",
+        "verifier_schema_version",
+        "verify_run_schema_version",
+        "verification_plan_schema_version",
+        "verification_unit_result_schema_version",
+        "verification_artifact_manifest_schema_version",
+        "verification_receipt_schema_version",
+        "current_control_schema_version",
+        "current_control_schema_path",
+        "current_control_artifact",
+        "agent_refresh_triggers",
+        "current_control_fallback_read_order",
+        "agent_control_schema_version",
+        "agent_control_schema_path",
+        "agent_control_budget_bytes",
+        "human_authorization_request_schema_version",
+        "human_authorization_schema_version",
+        "human_authorization_evaluation_schema_version",
+        "human_authorization_trust_policy_schema_version",
+        "human_authorization_trust_policy_default_path",
+        "human_authorization_schema_path",
+        "agent_handoff_schema_version",
+        "agent_handoff_schema_path",
+        "agent_handoff_artifact",
+        "codex_boundary_result_schema_version",
+        "agent_boundary_result_schema_version",
+        "agent_boundary_result_schema_path",
+        "capability_lock_schema_version",
+        "capability_lock_diff_schema_version",
+        "preflight_schema_version",
+        "capability_standard_version",
+        "governance_benchmark_catalog_schema_version",
+        "governance_benchmark_result_schema_version",
+        "attestation_schema_version",
+        "registry_schema_version",
+        "org_evidence_bundle_schema_version",
+        "host_grants_inventory_schema_version",
+        "host_grants_baseline_schema_version",
+        "host_grants_drift_schema_version",
+        "trigger_catalog_schema_version",
+        "deprecated_surfaces",
+        "external_integration_surfaces",
         "gating_signal",
+        "agent_result_schema_version",
+        "agent_result_schema_path",
+        "agent_result_control_fields",
+        "agent_control_fields",
+        "agent_control_permissions",
+        "agent_control_states",
         "manual_review_signals",
+        "agent_interface_operations",
+        "exit_code_policy",
+        "mcp_tools",
+        "primary_commands",
+        "commands",
+        "default_paths",
+        "artifacts",
+        "agent_read_order",
+        "verifier_read_order",
+        "merge_verdicts",
+        "release_decisions",
+        "do_not_auto_assert",
     ]
     assert payload == {
         "contract_version": CONTRACT_VERSION,
+        "minimum_control_contract_version": MINIMUM_CONTROL_CONTRACT_VERSION,
         "cli_version": __version__,
-        "report_schema_version": str(
-            ReadinessReport.model_fields["report_schema_version"].default
+        "report_schema_version": str(ReadinessReport.model_fields["report_schema_version"].default),
+        "packet_schema_version": str(EvidencePacket.model_fields["packet_schema_version"].default),
+        "verifier_schema_version": str(
+            VerifierArtifact.model_fields["verifier_schema_version"].default
         ),
-        "packet_schema_version": str(
-            EvidencePacket.model_fields["packet_schema_version"].default
+        "verify_run_schema_version": VERIFY_RUN_SCHEMA_VERSION,
+        "verification_plan_schema_version": VERIFICATION_PLAN_SCHEMA_VERSION,
+        "verification_unit_result_schema_version": (VERIFICATION_UNIT_RESULT_SCHEMA_VERSION),
+        "verification_artifact_manifest_schema_version": (
+            VERIFICATION_ARTIFACT_MANIFEST_SCHEMA_VERSION
         ),
+        "verification_receipt_schema_version": VERIFICATION_RECEIPT_SCHEMA_VERSION,
+        "current_control_schema_version": CURRENT_CONTROL_SCHEMA_VERSION,
+        "current_control_schema_path": CURRENT_CONTROL_SCHEMA_PATH,
+        "current_control_artifact": ARTIFACTS["current_control"],
+        "agent_refresh_triggers": list(AGENT_REFRESH_TRIGGERS),
+        "current_control_fallback_read_order": list(CURRENT_CONTROL_FALLBACK_READ_ORDER),
+        "agent_control_schema_version": AGENT_CONTROL_ENVELOPE_SCHEMA_VERSION,
+        "agent_control_schema_path": AGENT_CONTROL_ENVELOPE_SCHEMA_PATH,
+        "agent_control_budget_bytes": AGENT_CONTROL_ENVELOPE_BUDGET_BYTES,
+        "human_authorization_request_schema_version": (
+            HUMAN_AUTHORIZATION_REQUEST_SCHEMA_VERSION
+        ),
+        "human_authorization_schema_version": HUMAN_AUTHORIZATION_SCHEMA_VERSION,
+        "human_authorization_evaluation_schema_version": (
+            HUMAN_AUTHORIZATION_EVALUATION_SCHEMA_VERSION
+        ),
+        "human_authorization_trust_policy_schema_version": (
+            HUMAN_AUTHORIZATION_TRUST_POLICY_SCHEMA_VERSION
+        ),
+        "human_authorization_trust_policy_default_path": (
+            HUMAN_AUTHORIZATION_TRUST_POLICY_ACCOUNT_PATH
+        ),
+        "human_authorization_schema_path": HUMAN_AUTHORIZATION_SCHEMA_PATH,
+        "agent_handoff_schema_version": AGENT_HANDOFF_SCHEMA_VERSION,
+        "agent_handoff_schema_path": AGENT_HANDOFF_SCHEMA_PATH,
+        "agent_handoff_artifact": ARTIFACTS["agent_handoff"],
+        "codex_boundary_result_schema_version": CODEX_BOUNDARY_RESULT_SCHEMA_VERSION,
+        "agent_boundary_result_schema_version": AGENT_BOUNDARY_RESULT_SCHEMA_VERSION,
+        "agent_boundary_result_schema_path": AGENT_BOUNDARY_RESULT_SCHEMA_PATH,
+        "capability_lock_schema_version": CAPABILITY_LOCK_SCHEMA_VERSION,
+        "capability_lock_diff_schema_version": CAPABILITY_LOCK_DIFF_SCHEMA_VERSION,
+        "preflight_schema_version": PREFLIGHT_SCHEMA_VERSION,
+        "capability_standard_version": CAPABILITY_STANDARD_VERSION,
+        "governance_benchmark_catalog_schema_version": (
+            GOVERNANCE_BENCHMARK_CATALOG_SCHEMA_VERSION
+        ),
+        "governance_benchmark_result_schema_version": (GOVERNANCE_BENCHMARK_RESULT_SCHEMA_VERSION),
+        "attestation_schema_version": ATTESTATION_SCHEMA_VERSION,
+        "registry_schema_version": REGISTRY_SCHEMA_VERSION,
+        "org_evidence_bundle_schema_version": ORG_EVIDENCE_BUNDLE_SCHEMA_VERSION,
+        "host_grants_inventory_schema_version": HOST_GRANTS_INVENTORY_SCHEMA_VERSION,
+        "host_grants_baseline_schema_version": HOST_GRANTS_BASELINE_SCHEMA_VERSION,
+        "host_grants_drift_schema_version": HOST_GRANTS_DRIFT_SCHEMA_VERSION,
+        "trigger_catalog_schema_version": TRIGGER_CATALOG_SCHEMA_VERSION,
+        "deprecated_surfaces": {
+            "codex-boundary-json": (
+                "Deprecated compatibility projection through 0.16.x; use agent-boundary-json."
+            )
+        },
+        "external_integration_surfaces": list(EXTERNAL_INTEGRATION_SURFACES),
         "gating_signal": GATING_SIGNAL,
+        "agent_result_schema_version": AGENT_RESULT_SCHEMA_VERSION,
+        "agent_result_schema_path": AGENT_RESULT_SCHEMA_PATH,
+        "agent_result_control_fields": list(AGENT_RESULT_CONTROL_FIELDS),
+        "agent_control_fields": list(AGENT_CONTROL_FIELDS),
+        "agent_control_permissions": list(AGENT_CONTROL_PERMISSIONS),
+        "agent_control_states": list(AGENT_CONTROL_STATES),
         "manual_review_signals": list(MANUAL_REVIEW_SIGNALS),
+        "agent_interface_operations": list(AGENT_INTERFACE_OPERATIONS),
+        "exit_code_policy": dict(EXIT_CODE_POLICY),
+        "mcp_tools": list(MCP_TOOLS),
+        "primary_commands": dict(PRIMARY_COMMANDS),
+        "commands": dict(COMMANDS),
+        "default_paths": dict(DEFAULT_PATHS),
+        "artifacts": dict(ARTIFACTS),
+        "agent_read_order": list(AGENT_READ_ORDER),
+        "verifier_read_order": list(VERIFIER_READ_ORDER),
+        "merge_verdicts": list(MERGE_VERDICTS),
+        "release_decisions": list(RELEASE_DECISIONS),
+        "do_not_auto_assert": list(DO_NOT_AUTO_ASSERT),
     }
 
 
@@ -163,14 +483,8 @@ def test_cli_contract_text_outputs_key_values():
     assert result.exit_code == 0, result.output
     assert CONTRACT_VERSION in result.output
     assert __version__ in result.output
-    assert (
-        str(ReadinessReport.model_fields["report_schema_version"].default)
-        in result.output
-    )
-    assert (
-        str(EvidencePacket.model_fields["packet_schema_version"].default)
-        in result.output
-    )
+    assert str(ReadinessReport.model_fields["report_schema_version"].default) in result.output
+    assert str(EvidencePacket.model_fields["packet_schema_version"].default) in result.output
     assert GATING_SIGNAL in result.output
 
 
@@ -184,8 +498,7 @@ def _assert_field_path_resolves(
         is_array = raw_segment.endswith("[]")
         field_name = raw_segment.removesuffix("[]")
         assert field_name in model.model_fields, (
-            f"{signal!r} references missing field {field_name!r} on "
-            f"{model.__name__}"
+            f"{signal!r} references missing field {field_name!r} on {model.__name__}"
         )
         if index == len(segments) - 1:
             return
@@ -204,8 +517,7 @@ def _list_item_model(
 ) -> type[BaseModel]:
     annotation = _unwrap_optional(annotation)
     assert get_origin(annotation) is list, (
-        f"{signal!r} marks {field_name!r} as an array field, but it is "
-        f"{annotation!r}"
+        f"{signal!r} marks {field_name!r} as an array field, but it is {annotation!r}"
     )
     args = get_args(annotation)
     assert args, f"{signal!r} array field {field_name!r} has no item type"
@@ -240,13 +552,13 @@ def test_cli_scan_help_hides_deferred_flags():
     public_options = {
         option
         for parameter in scan_command.params
-        if isinstance(parameter, click.Option) and not parameter.hidden
+        if getattr(parameter, "opts", None) and not getattr(parameter, "hidden", False)
         for option in parameter.opts
     }
     hidden_options = {
         option
         for parameter in scan_command.params
-        if isinstance(parameter, click.Option) and parameter.hidden
+        if getattr(parameter, "opts", None) and getattr(parameter, "hidden", False)
         for option in parameter.opts
     }
 
@@ -257,14 +569,68 @@ def test_cli_scan_help_hides_deferred_flags():
     assert "--policy-pack" in public_options
 
 
+# Visibility policy: root --help shows only the three prominent flows; every
+# supporting command remains directly invokable for compatibility.
+HIDDEN_TOP_LEVEL_COMMANDS = {
+    "agent",
+    "apply-patches",
+    "attest",
+    "baseline",
+    "bootstrap",
+    "capability",
+    "contract",
+    "detect",
+    "doctor",
+    "evidence-packet",
+    "explain",
+    "explain-finding",
+    "feedback",
+    "findings",
+    "fixture",
+    "init",
+    "install-hooks",
+    "list-checks",
+    "mcp",
+    "mcp-serve",
+    "org",
+    "preflight",
+    "registry",
+    "scan",
+    "scenario",
+    "skill",
+    "self-check",
+    "trigger",
+}
+VISIBLE_CORE_COMMANDS = {
+    "check",
+    "verify",
+    "audit",
+}
+
+
+def test_cli_help_hides_niche_commands_but_keeps_them_invokable():
+    root = get_command(app)
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    output = _plain_cli_output(result.output)
+
+    for name in HIDDEN_TOP_LEVEL_COMMANDS:
+        assert root.commands[name].hidden, f"{name} should be hidden from --help"
+        assert f"│ {name}" not in output
+        # Hidden, not removed: the command still resolves and answers --help.
+        invoked = runner.invoke(app, [name, "--help"])
+        assert invoked.exit_code == 0, f"{name} must remain invokable: {invoked.output}"
+
+    for name in VISIBLE_CORE_COMMANDS:
+        assert not root.commands[name].hidden, f"{name} must stay visible"
+        assert re.search(rf"\b{re.escape(name)}\b", output), output
+
+
 def test_cli_tool_surface_summary_detects_no_changes():
-    from agents_shipgate.cli.main import _tool_surface_diff_has_changes
+    from agents_shipgate.cli._helpers import _tool_surface_diff_has_changes
 
     assert _tool_surface_diff_has_changes(ToolSurfaceDiffSummary()) is False
-    assert (
-        _tool_surface_diff_has_changes(ToolSurfaceDiffSummary(tools_added=1))
-        is True
-    )
+    assert _tool_surface_diff_has_changes(ToolSurfaceDiffSummary(tools_added=1)) is True
 
 
 def test_cli_scan_no_plugins_forces_plugins_off(monkeypatch, tmp_path):
@@ -358,15 +724,123 @@ def test_cli_init_write_json_reports_placeholders(tmp_path):
 
 
 def test_cli_explain_json_returns_full_metadata():
-    result = runner.invoke(
-        app, ["explain", "SHIP-POLICY-APPROVAL-MISSING", "--json"]
-    )
+    result = runner.invoke(app, ["explain", "SHIP-POLICY-APPROVAL-MISSING", "--json"])
 
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["id"] == "SHIP-POLICY-APPROVAL-MISSING"
-    for key in ("category", "default_severity", "description"):
+    for key in ("category", "default_severity", "mvp_tier", "description"):
         assert key in payload
+
+
+def test_cli_findings_json_reports_no_heuristic_policy_findings(tmp_path):
+    run_scan(
+        config_path=Path("samples/support_refund_agent/shipgate.yaml"),
+        output_dir=tmp_path,
+        formats=["json"],
+        ci_mode="advisory",
+        packet_enabled=False,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "findings",
+            "--from",
+            str(tmp_path / "report.json"),
+            "--provenance-kind",
+            "keyword_heuristic,regex_heuristic",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["filters"]["provenance_kind"] == [
+        "keyword_heuristic",
+        "regex_heuristic",
+    ]
+    assert payload["filters"]["include_suppressed"] is False
+    assert payload["summary"]["matched_findings"] == 0
+    assert "suppressed_omitted" in payload["summary"]
+    assert "suppressed_excluded" not in payload["summary"]
+    assert payload["summary"]["by_provenance_kind"]["keyword_heuristic"] == 0
+    assert payload["findings"] == []
+
+
+def test_cli_findings_text_excludes_heuristic_policy_gaps(tmp_path):
+    run_scan(
+        config_path=Path("samples/support_refund_agent/shipgate.yaml"),
+        output_dir=tmp_path,
+        formats=["json"],
+        ci_mode="advisory",
+        packet_enabled=False,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "findings",
+            "--from",
+            str(tmp_path / "report.json"),
+            "--provenance-kind",
+            "keyword_heuristic",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Scope: active findings only" in result.output
+    assert "Provenance counts:" in result.output
+    assert "keyword_heuristic:" in result.output
+    assert "No findings matched." in result.output
+
+
+def test_cli_findings_invalid_provenance_kind_exits_three(tmp_path):
+    run_scan(
+        config_path=Path("samples/support_refund_agent/shipgate.yaml"),
+        output_dir=tmp_path,
+        formats=["json"],
+        ci_mode="advisory",
+        packet_enabled=False,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "findings",
+            "--from",
+            str(tmp_path / "report.json"),
+            "--provenance-kind",
+            "made_up",
+        ],
+    )
+
+    assert result.exit_code == 3
+    assert "unsupported --provenance-kind value" in result.output
+
+
+def test_cli_findings_pre_v15_report_agent_mode_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTS_SHIPGATE_AGENT_MODE", "1")
+    old_report = tmp_path / "report.json"
+    old_report.write_text(
+        json.dumps({"report_schema_version": "0.14", "findings": []}),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        ["findings", "--from", str(old_report), "--json"],
+    )
+
+    assert result.exit_code == 3
+    assert ">= 0.15" in result.output
+    json_lines = [line for line in (result.output or "").splitlines() if line.startswith("{")]
+    assert json_lines
+    payload = json.loads(json_lines[-1])
+    assert payload["error"] == "input_parse_error"
+    assert payload["next_actions"][0]["command"] == (
+        "agents-shipgate scan -c shipgate.yaml --format json"
+    )
 
 
 def test_cli_agent_mode_emits_structured_error_on_missing_config(tmp_path, monkeypatch):
@@ -378,9 +852,7 @@ def test_cli_agent_mode_emits_structured_error_on_missing_config(tmp_path, monke
 
     assert result.exit_code == 2
     # Find the JSON line on stderr/stdout (typer.testing combines them).
-    json_lines = [
-        line for line in (result.output or "").splitlines() if line.startswith("{")
-    ]
+    json_lines = [line for line in (result.output or "").splitlines() if line.startswith("{")]
     assert json_lines, f"no structured-error JSON line in output: {result.output!r}"
     payload = json.loads(json_lines[-1])
     assert payload["error"] == "config_error"
@@ -442,14 +914,12 @@ def test_cli_scan_workspace_writes_separate_report_dirs(tmp_path):
     # v0.8: per-manifest workspace summary leads with the baseline-aware
     # release_decision.decision, NOT the legacy baseline-blind summary.status.
     # Regression for PR #38 reviewer feedback.
-    decision_lines = [
-        line for line in result.output.splitlines() if "shipgate.yaml:" in line
-    ]
+    decision_lines = [line for line in result.output.splitlines() if "shipgate.yaml:" in line]
     assert decision_lines, "expected per-manifest summary lines in workspace output"
     for line in decision_lines:
         assert any(
             f": {decision} " in line
-            for decision in ("blocked", "review_required", "passed")
+            for decision in ("blocked", "review_required", "insufficient_evidence", "passed")
         ), f"workspace summary line should lead with decision: {line!r}"
         assert "blockers=" in line
 
@@ -467,7 +937,8 @@ def test_cli_scan_workspace_continues_after_config_error(tmp_path):
     {
       "name": "docs.lookup",
       "description": "Look up internal documentation metadata.",
-      "annotations": {"readOnlyHint": true}
+      "annotations": {"readOnlyHint": true},
+      "auth": {"mode": "none"}
     }
   ]
 }
@@ -489,6 +960,22 @@ tool_sources:
   - id: tools
     type: mcp
     path: tools.json
+agent_bindings:
+  declarations:
+    - agent: root
+      complete: true
+      tools:
+        - tool: docs.lookup
+          source_id: tools
+      handoffs: []
+      reason: reviewed workspace test binding
+action_surface:
+  actions:
+    - tool: docs.lookup
+      source_id: tools
+      effect: read
+      authority:
+        mode: none
 """,
         encoding="utf-8",
     )
@@ -545,7 +1032,7 @@ def test_cli_verbose_json_logs(tmp_path):
 
     assert result.exit_code == 0
     assert '"message": "loaded sources"' in result.output
-    assert '"source_count": 4' in result.output
+    assert '"source_count": 5' in result.output
 
 
 def test_cli_doctor_json_includes_baseline_status():
@@ -566,6 +1053,13 @@ def test_cli_doctor_json_includes_baseline_status():
 
 
 def test_cli_baseline_save_and_scan(tmp_path):
+    sample = tmp_path / "support_refund_agent"
+    shutil.copytree(
+        "samples/support_refund_agent",
+        sample,
+        ignore=shutil.ignore_patterns("agents-shipgate-reports"),
+    )
+    sample_config = sample / "shipgate.yaml"
     baseline_path = tmp_path / "baseline.json"
     save = runner.invoke(
         app,
@@ -573,7 +1067,7 @@ def test_cli_baseline_save_and_scan(tmp_path):
             "baseline",
             "save",
             "--config",
-            "samples/support_refund_agent/shipgate.yaml",
+            str(sample_config),
             "--out",
             str(baseline_path),
         ],
@@ -588,7 +1082,7 @@ def test_cli_baseline_save_and_scan(tmp_path):
         [
             "scan",
             "--config",
-            "samples/support_refund_agent/shipgate.yaml",
+            str(sample_config),
             "--out",
             str(tmp_path / "reports"),
             "--format",
@@ -600,8 +1094,49 @@ def test_cli_baseline_save_and_scan(tmp_path):
         ],
     )
 
-    assert scan.exit_code == 0
+    # Baselines accept finding debt, never semantic evidence gaps. The support
+    # fixture intentionally retains an unresolved wildcard surface, so strict
+    # mode must still fail even when every fingerprint is baseline-matched.
+    assert scan.exit_code == 20
     assert "Baseline delta: matched=" in scan.output
+
+
+def test_cli_baseline_save_preserves_verification_evidence_and_report(tmp_path):
+    sample = tmp_path / "support_refund_agent"
+    shutil.copytree(
+        "samples/support_refund_agent",
+        sample,
+        ignore=shutil.ignore_patterns("agents-shipgate-reports"),
+    )
+    reports = sample / "agents-shipgate-reports"
+    reports.mkdir()
+    preserved = {
+        "report.json": b'{"current": "verification report"}\n',
+        **{
+            name: f"current verification artifact: {name}\n".encode()
+            for name in VERIFIER_ROUTE_ARTIFACT_NAMES
+        },
+    }
+    for name, contents in preserved.items():
+        (reports / name).write_bytes(contents)
+
+    baseline_path = sample / ".agents-shipgate" / "baseline.json"
+    result = runner.invoke(
+        app,
+        [
+            "baseline",
+            "save",
+            "--config",
+            str(sample / "shipgate.yaml"),
+            "--out",
+            str(baseline_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert baseline_path.is_file()
+    for name, contents in preserved.items():
+        assert (reports / name).read_bytes() == contents, name
 
 
 def test_cli_scan_missing_baseline_exits_three(tmp_path):
@@ -631,13 +1166,9 @@ def _stderr_json_lines(output: str) -> list[dict]:
     ]
 
 
-def test_agent_mode_scan_missing_config_emits_next_actions(
-    tmp_path, monkeypatch
-):
+def test_agent_mode_scan_missing_config_emits_next_actions(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENTS_SHIPGATE_AGENT_MODE", "1")
-    result = runner.invoke(
-        app, ["scan", "--config", str(tmp_path / "missing.yaml")]
-    )
+    result = runner.invoke(app, ["scan", "--config", str(tmp_path / "missing.yaml")])
 
     assert result.exit_code == 2
     payloads = _stderr_json_lines(result.output)
@@ -656,19 +1187,14 @@ def test_agent_mode_doctor_missing_config_matches_scan(tmp_path, monkeypatch):
     """Cross-command consistency: scan and doctor surface the same diagnostic
     for missing manifest."""
     monkeypatch.setenv("AGENTS_SHIPGATE_AGENT_MODE", "1")
-    scan_result = runner.invoke(
-        app, ["scan", "--config", str(tmp_path / "missing.yaml")]
-    )
-    doctor_result = runner.invoke(
-        app, ["doctor", "--config", str(tmp_path / "missing.yaml")]
-    )
+    scan_result = runner.invoke(app, ["scan", "--config", str(tmp_path / "missing.yaml")])
+    doctor_result = runner.invoke(app, ["doctor", "--config", str(tmp_path / "missing.yaml")])
 
     scan_payload = _stderr_json_lines(scan_result.output)[-1]
     doctor_payload = _stderr_json_lines(doctor_result.output)[-1]
     # Same rank-1 next_action whether the agent reached for scan or doctor.
     assert (
-        scan_payload["next_actions"][0]["command"]
-        == doctor_payload["next_actions"][0]["command"]
+        scan_payload["next_actions"][0]["command"] == doctor_payload["next_actions"][0]["command"]
     )
 
 
@@ -676,16 +1202,12 @@ def test_detect_emits_negative_control_diagnostic_for_empty_workspace(
     tmp_path,
 ):
     # Empty workspace — no python, no pyproject, no prompts/tools.
-    result = runner.invoke(
-        app, ["detect", "--workspace", str(tmp_path), "--json"]
-    )
+    result = runner.invoke(app, ["detect", "--workspace", str(tmp_path), "--json"])
 
     assert result.exit_code == 0
     payload = json.loads(result.output)
     diagnostics = payload.get("diagnostics", [])
-    assert any(
-        d["id"] == "SHIP-DIAG-NO-AGENT-SURFACE" for d in diagnostics
-    )
+    assert any(d["id"] == "SHIP-DIAG-NO-AGENT-SURFACE" for d in diagnostics)
     assert payload["next_actions"]
     rank_one = payload["next_actions"][0]
     assert rank_one["kind"] == "stop"
@@ -697,9 +1219,7 @@ def test_detect_emits_negative_control_diagnostic_for_empty_workspace(
 def test_detect_plain_json_carries_diagnostics_without_agent_mode(tmp_path):
     """Diagnostics surface in --json output even when AGENTS_SHIPGATE_AGENT_MODE
     is unset. The env var only gates structured-error stderr emission."""
-    result = runner.invoke(
-        app, ["detect", "--workspace", str(tmp_path), "--json"]
-    )
+    result = runner.invoke(app, ["detect", "--workspace", str(tmp_path), "--json"])
 
     assert result.exit_code == 0
     payload = json.loads(result.output)
@@ -825,7 +1345,7 @@ def test_missing_manifest_recovery_uses_config_workspace(tmp_path, monkeypatch):
     payloads = _stderr_json_lines(result.output)
     assert payloads, result.output
     rank_one = payloads[-1]["next_actions"][0]
-    assert "agents-shipgate detect --workspace" in rank_one["command"]
+    assert "agents-shipgate verify --workspace" in rank_one["command"]
     # Routes recovery to the config's parent directory, not the foreign cwd.
     assert str(tmp_path / "repo") in rank_one["command"]
     assert str(foreign_cwd) not in rank_one["command"]
@@ -870,17 +1390,11 @@ tool_sources:
     assert len(unresolved) == 1
     assert unresolved[0]["id"] == "escaped"
     assert unresolved[0]["reason"] == "outside_manifest_dir"
-    diag = next(
-        d
-        for d in payload["diagnostics"]
-        if d["id"] == "SHIP-DIAG-MISSING-SOURCE-FILE"
-    )
+    diag = next(d for d in payload["diagnostics"] if d["id"] == "SHIP-DIAG-MISSING-SOURCE-FILE")
     assert "outside" in diag["next_actions"][0]["why"].lower()
 
 
-def test_invalid_manifest_dispatches_to_invalid_diagnostic(
-    tmp_path, monkeypatch
-):
+def test_invalid_manifest_dispatches_to_invalid_diagnostic(tmp_path, monkeypatch):
     """P1 regression: ConfigError where the file exists but is invalid must
     surface SHIP-DIAG-INVALID-MANIFEST with an `edit` rank-1 action — NOT
     SHIP-DIAG-MISSING-MANIFEST with a detect/init command. Otherwise the
@@ -890,8 +1404,7 @@ def test_invalid_manifest_dispatches_to_invalid_diagnostic(
     # Valid YAML structure but schema-invalid (missing required project, etc.)
     config.write_text("not: a valid manifest\n", encoding="utf-8")
 
-    for command in (["scan", "--config", str(config)],
-                     ["doctor", "--config", str(config)]):
+    for command in (["scan", "--config", str(config)], ["doctor", "--config", str(config)]):
         result = runner.invoke(app, command)
         assert result.exit_code == 2, result.output
         payloads = _stderr_json_lines(result.output)
@@ -903,14 +1416,10 @@ def test_invalid_manifest_dispatches_to_invalid_diagnostic(
         assert str(config) in rank_one["path"]
         # And the next_action string must NOT advertise a detect command —
         # that would route the agent away from the actual fix.
-        assert not payloads[-1]["next_action"].startswith(
-            "agents-shipgate detect"
-        )
+        assert not payloads[-1]["next_action"].startswith("agents-shipgate detect")
 
 
-def test_invalid_yaml_manifest_dispatches_to_invalid_diagnostic(
-    tmp_path, monkeypatch
-):
+def test_invalid_yaml_manifest_dispatches_to_invalid_diagnostic(tmp_path, monkeypatch):
     """Companion to the schema-invalid case: an unparseable YAML file is
     also "exists but invalid" — same dispatch."""
     monkeypatch.setenv("AGENTS_SHIPGATE_AGENT_MODE", "1")
@@ -926,9 +1435,7 @@ def test_invalid_yaml_manifest_dispatches_to_invalid_diagnostic(
     assert str(config) in rank_one["path"]
 
 
-def test_missing_manifest_command_quotes_workspace_with_spaces(
-    tmp_path, monkeypatch
-):
+def test_missing_manifest_command_quotes_workspace_with_spaces(tmp_path, monkeypatch):
     """P2 regression: dynamic `command` strings must POSIX-shell-quote
     paths so a coding-agent shell runner doesn't word-split a workspace
     containing spaces."""
@@ -948,8 +1455,7 @@ def test_missing_manifest_command_quotes_workspace_with_spaces(
     import shlex
 
     parts = shlex.split(command)
-    assert parts[0] == "agents-shipgate"
-    assert parts[1] == "detect"
+    assert parts[:2] == ["agents-shipgate", "verify"]
     assert "--workspace" in parts
     workspace_arg = parts[parts.index("--workspace") + 1]
     assert workspace_arg == str(spaced)
@@ -977,9 +1483,7 @@ def test_doctor_workspace_dispatches_invalid_manifest(tmp_path, monkeypatch):
         "expected SHIP-DIAG-INVALID-MANIFEST edit action"
     )
     assert str(config) in rank_one["path"]
-    assert not payloads[-1]["next_action"].startswith(
-        "agents-shipgate detect"
-    )
+    assert not payloads[-1]["next_action"].startswith("agents-shipgate detect")
 
 
 def test_scan_glob_dispatches_invalid_manifest(tmp_path, monkeypatch):
@@ -1000,18 +1504,14 @@ def test_scan_glob_dispatches_invalid_manifest(tmp_path, monkeypatch):
     assert str(config) in rank_one["path"]
 
 
-def test_glob_with_no_matches_yields_workspace_cwd_not_glob_chars(
-    tmp_path, monkeypatch
-):
+def test_glob_with_no_matches_yields_workspace_cwd_not_glob_chars(tmp_path, monkeypatch):
     """P1 regression (round 3): a glob with no matches must produce a
     missing-manifest hint targeting cwd, not a workspace argument
     containing literal `*` characters."""
     monkeypatch.setenv("AGENTS_SHIPGATE_AGENT_MODE", "1")
     monkeypatch.chdir(tmp_path)
 
-    result = runner.invoke(
-        app, ["scan", "--config", "no_such_dir/*/shipgate.yaml"]
-    )
+    result = runner.invoke(app, ["scan", "--config", "no_such_dir/*/shipgate.yaml"])
 
     assert result.exit_code == 2
     payloads = _stderr_json_lines(result.output)
@@ -1026,31 +1526,23 @@ def test_glob_with_no_matches_yields_workspace_cwd_not_glob_chars(
     assert "?" not in workspace_arg
 
 
-def test_artifact_only_command_quotes_workspace_with_spaces(
-    tmp_path, monkeypatch
-):
+def test_artifact_only_command_quotes_workspace_with_spaces(tmp_path, monkeypatch):
     """P2 regression (round 3): SHIP-DIAG-MCP-OPENAPI-ARTIFACT-ONLY's rank-1
     command must shell-quote the workspace path."""
     spaced = tmp_path / "space dir" / "artifact only"
     spaced.mkdir(parents=True)
     # Plant an MCP file matching MCP_PATTERNS so the artifact-only
     # diagnostic fires.
-    (spaced / "mcp-tools.json").write_text(
-        '{"tools": [{"name": "x"}]}', encoding="utf-8"
-    )
+    (spaced / "mcp-tools.json").write_text('{"tools": [{"name": "x"}]}', encoding="utf-8")
 
-    result = runner.invoke(
-        app, ["detect", "--workspace", str(spaced), "--json"]
-    )
+    result = runner.invoke(app, ["detect", "--workspace", str(spaced), "--json"])
 
     assert result.exit_code == 0
     payload = json.loads(result.output)
     diag_ids = [d["id"] for d in payload["diagnostics"]]
     assert "SHIP-DIAG-MCP-OPENAPI-ARTIFACT-ONLY" in diag_ids
     artifact_only = next(
-        d
-        for d in payload["diagnostics"]
-        if d["id"] == "SHIP-DIAG-MCP-OPENAPI-ARTIFACT-ONLY"
+        d for d in payload["diagnostics"] if d["id"] == "SHIP-DIAG-MCP-OPENAPI-ARTIFACT-ONLY"
     )
     command = artifact_only["next_actions"][0]["command"]
     import shlex as _shlex
@@ -1061,9 +1553,7 @@ def test_artifact_only_command_quotes_workspace_with_spaces(
     assert workspace_arg == str(spaced)
 
 
-def test_scan_bad_flag_value_does_not_dispatch_to_invalid_manifest(
-    tmp_path, monkeypatch
-):
+def test_scan_bad_flag_value_does_not_dispatch_to_invalid_manifest(tmp_path, monkeypatch):
     """P1 regression (round 4): a bad CLI flag value (e.g. --fail-on banana)
     raises ConfigError before the manifest is touched. The error must NOT
     surface SHIP-DIAG-INVALID-MANIFEST claiming the loader rejected the
@@ -1091,9 +1581,7 @@ def test_scan_bad_flag_value_does_not_dispatch_to_invalid_manifest(
     assert rank_one["kind"] != "edit", (
         f"flag-value error dispatched to {rank_one!r}; the manifest is fine"
     )
-    assert "samples/clean_read_only_agent" not in str(
-        rank_one.get("path") or ""
-    )
+    assert "samples/clean_read_only_agent" not in str(rank_one.get("path") or "")
 
 
 @pytest.mark.parametrize(
@@ -1185,14 +1673,8 @@ def test_doctor_edit_action_paths_include_manifest_directory(tmp_path):
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)[0]
-    diag = next(
-        d
-        for d in payload["diagnostics"]
-        if d["id"] == "SHIP-DIAG-MISSING-SOURCE-FILE"
-    )
+    diag = next(d for d in payload["diagnostics"] if d["id"] == "SHIP-DIAG-MISSING-SOURCE-FILE")
     edit_path = diag["next_actions"][0]["path"]
     # Edit target carries the directory the user pointed doctor at.
     assert str(config) in edit_path
-    assert edit_path != "shipgate.yaml" and not edit_path.startswith(
-        "shipgate.yaml:"
-    )
+    assert edit_path != "shipgate.yaml" and not edit_path.startswith("shipgate.yaml:")

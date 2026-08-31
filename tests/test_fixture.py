@@ -74,10 +74,60 @@ def test_cli_fixture_run(tmp_path: Path):
             str(out),
         ],
     )
-    # exit code may be 0 or 20 depending on findings; either is "the
-    # fixture ran"
-    assert result.exit_code in (0, 20), result.output
+    assert result.exit_code == 0, result.output
     assert (out / "report.json").is_file()
+    payload = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    assert payload["release_decision"]["decision"] == "passed"
+    semantic = payload["release_decision"]["evidence_coverage"]["semantic_coverage"]
+    assert semantic == {
+        "total_actions": 1,
+        "pass_eligible_actions": 1,
+        "gap_count": 0,
+        "review_concern_count": 0,
+        "reason_counts": {},
+        "acknowledged_overrides": [],
+        # Nothing was ever asked: ``readOnlyHint`` establishes the effect and
+        # the MCP auth block establishes the authority, so the manifest's
+        # declarations restate what the scan already proved.
+        "declaration_questions": {
+            "total": 0,
+            "answered": 0,
+            "open": 0,
+            "open_by_dimension": {},
+            "open_questions": [],
+        },
+    }
+
+
+def test_cli_fixture_run_ai_generated_refund_pr_writes_verifier_artifacts(tmp_path: Path):
+    out = tmp_path / "verify-out"
+    result = runner.invoke(
+        app,
+        [
+            "fixture",
+            "run",
+            "ai_generated_refund_pr",
+            "--out",
+            str(out),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Mode: verify" in result.output
+    assert "Merge verdict: blocked" in result.output
+    assert (out / "verifier.json").is_file()
+    assert (out / "report.json").is_file()
+    assert (out / "pr-comment.md").is_file()
+    payload = json.loads((out / "verifier.json").read_text(encoding="utf-8"))
+    assert payload["merge_verdict"] == "blocked"
+    assert payload["can_merge_without_human"] is False
+    report = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    blocker_checks = {
+        item["check_id"] for item in report["release_decision"]["blockers"]
+    }
+    assert "SHIP-ACTION-DESTRUCTIVE-ROLLBACK-MISSING" in blocker_checks
+    semantic = report["release_decision"]["evidence_coverage"]["semantic_coverage"]
+    assert semantic["gap_count"] == 0
+    assert semantic["pass_eligible_actions"] == semantic["total_actions"]
 
 
 def test_cli_fixture_copy(tmp_path: Path):
@@ -99,3 +149,30 @@ def test_cli_fixture_copy(tmp_path: Path):
 def test_cli_fixture_unknown_returns_2():
     result = runner.invoke(app, ["fixture", "run", "this-fixture-does-not-exist"])
     assert result.exit_code == 2
+
+
+def test_cli_fixture_run_agent_weakens_gate_blocks_on_gate_removal(tmp_path: Path):
+    """The trust-root demo: head deletes the Shipgate CI workflow and the
+    verifier blocks via the suppression-immune gate-removal checks."""
+    out = tmp_path / "verify-out"
+    result = runner.invoke(
+        app,
+        [
+            "fixture",
+            "run",
+            "agent_weakens_gate",
+            "--out",
+            str(out),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Mode: verify" in result.output
+    assert "Merge verdict: blocked" in result.output
+    payload = json.loads((out / "verifier.json").read_text(encoding="utf-8"))
+    assert payload["merge_verdict"] == "blocked"
+    assert payload["can_merge_without_human"] is False
+    report = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    blocker_checks = {
+        item["check_id"] for item in report["release_decision"]["blockers"]
+    }
+    assert "SHIP-VERIFY-CI-GATE-REMOVED" in blocker_checks

@@ -9,16 +9,19 @@ from jsonschema import validate
 
 from agents_shipgate.cli.scan import run_scan
 from agents_shipgate.config.loader import load_manifest
-from agents_shipgate.config.schema import (
+from agents_shipgate.core.errors import ConfigError, InputParseError
+from agents_shipgate.core.findings import finding_fingerprint
+from agents_shipgate.inputs.validation import load_validation_artifacts
+from agents_shipgate.report.json_report import report_json_payload
+from agents_shipgate.schemas.manifest import (
     ArtifactPathConfig,
     ValidationConfig,
     ValidationEvidenceConfig,
 )
-from agents_shipgate.core.errors import ConfigError, InputParseError
-from agents_shipgate.core.findings import finding_fingerprint
-from agents_shipgate.core.models import Finding, ReadinessReport
-from agents_shipgate.inputs.validation import load_validation_artifacts
-from agents_shipgate.report.json_report import report_json_payload
+from agents_shipgate.schemas.report import (
+    Finding,
+    ReadinessReport,
+)
 
 SAMPLE = Path("samples/hitl_evidence_agent/shipgate.yaml")
 COVERED_SAMPLE = Path("samples/hitl_evidence_covered_agent/shipgate.yaml")
@@ -146,7 +149,19 @@ required_evidence:
 
     assert artifacts is not None
     assert artifacts.approval_traces == [
-        {"tool_name": "issue_refund", "approved": True, "success": True}
+        {
+            "tool_name": "issue_refund",
+            "approved": True,
+            "success": True,
+            "_shipgate_source": {
+                "source_type": "validation_approval_trace",
+                "source_ref": "validation/approval-traces.jsonl",
+                "source_path": "validation/approval-traces.jsonl",
+                "source_line": 1,
+                "source_pointer": None,
+                "source_index": 0,
+            },
+        }
     ]
     assert artifacts.override_events == [
         {
@@ -256,7 +271,12 @@ validation:
     )
     assert exit_code == 0
     assert finding.evidence["reason"] == "file_missing"
-    assert any("optional approval trace" in warning for warning in report.source_warnings)
+    approval_trace_warnings = [
+        warning
+        for warning in report.source_warnings
+        if "optional approval trace" in warning
+    ]
+    assert len(approval_trace_warnings) == 1
     provenance = finding.evidence["source_provenance"]
     assert any(
         item["type"] == "approval_trace"
@@ -269,6 +289,7 @@ validation:
     ("field", "path"),
     [
         ("approval_traces", "../outside.jsonl"),
+        ("agent_traces", "../outside.jsonl"),
         ("override_logs", "../outside.jsonl"),
         ("high_risk_exclusions", "../outside.yaml"),
         ("promotion_criteria", "../outside.yaml"),
@@ -442,6 +463,9 @@ def test_hitl_evidence_sample_reports_expected_findings_and_packet(tmp_path):
     assert exit_code == 0
     assert payload["summary"]["critical_count"] == 0
     assert payload["release_decision"]["decision"] == "review_required"
+    semantic = payload["release_decision"]["evidence_coverage"]["semantic_coverage"]
+    assert semantic["gap_count"] == 0
+    assert semantic["pass_eligible_actions"] == semantic["total_actions"]
     assert {
         "SHIP-EVIDENCE-APPROVAL-TRACE-MISSING",
         "SHIP-EVIDENCE-OVERRIDE-REASON-MISSING",
@@ -489,6 +513,11 @@ def test_hitl_evidence_covered_sample_reports_provenance(tmp_path):
 
     assert exit_code == 0
     assert not any(finding.check_id.startswith("SHIP-EVIDENCE-") for finding in report.findings)
+    assert report.release_decision is not None
+    assert report.release_decision.decision == "passed"
+    semantic = report.release_decision.evidence_coverage.semantic_coverage
+    assert semantic.gap_count == 0
+    assert semantic.pass_eligible_actions == semantic.total_actions
     packet = json.loads((tmp_path / "packet.json").read_text(encoding="utf-8"))
     hitl = packet["human_in_the_loop"]
     assert hitl["status"] == "covered"
@@ -620,6 +649,14 @@ tool_sources:
   - id: tools
     type: mcp
     path: tools.json
+agent_bindings:
+  declarations:
+    - agent: root
+      complete: true
+      tools:
+        - {{tool: issue_refund, source_id: tools}}
+      handoffs: []
+      reason: reviewed validation fixture binding
 {validation_block}
 permissions:
   scopes:

@@ -1,0 +1,3 @@
+*.json
+!.gitignore
+!baseline.v0.2.json

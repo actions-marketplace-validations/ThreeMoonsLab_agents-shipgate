@@ -18,11 +18,16 @@ Status enum:
   CLI; refused to downgrade.
 - ``skipped_ambiguous`` — multiple/mismatched markers; refused to guess.
 - ``skipped_user_modified`` — cursor MDC file content does not match any
-  shipped render; refused to overwrite.
+  shipped render, or a skill-bundle file was edited by the user; refused to
+  overwrite.
 - ``skipped_symlink`` — the host path is a symlink; refused to follow it
   outside the workspace.
 - ``skipped_directory_template`` — the directory form
   ``.github/PULL_REQUEST_TEMPLATE/`` exists; v1 only handles the file form.
+- ``created_file_tree`` — created a repo-scoped skill bundle (Codex or
+  Claude Code).
+- ``migrated_and_repaired`` — rewrote prior-version skill files and
+  recreated at least one missing file in the same pass.
 
 Every ``skipped_*`` status contributes 2 to the exit code (matching the
 ``skipped_existing_target`` precedent in :mod:`ci_workflow`); other statuses
@@ -32,25 +37,50 @@ contribute 0.
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+from agents_shipgate.cli.discovery.agent_instructions.adoption_kit import (
+    SIDECAR_FILENAME,
+    AdoptionKitConfig,
+    KitSource,
+    bootstrap_legacy_hashes,
+    build_sidecar,
+    parse_sidecar,
+    render_adoption_kit,
+    root_relative_path,
+    sidecar_text,
+)
 from agents_shipgate.cli.discovery.agent_instructions.managed_block import (
     UpsertStatus,
     upsert,
 )
 from agents_shipgate.cli.discovery.agent_instructions.renderers import (
-    CURSOR_PRIOR_RENDER_SHA256,
+    CLAUDE_COMMAND_PRIOR_RENDER_SHA256,
+    LOCAL_CONTRACT_PRIOR_RENDER_SHA256,
     render_agents_md,
+    render_claude_code_skill_bundle_text,
+    render_claude_command_file,
     render_claude_md,
+    render_codex_skill_bundle_text,
     render_cursor_file,
+    render_local_contract_file,
     render_pr_template,
+)
+from agents_shipgate.cli.discovery.agent_instructions.renderers import (
+    cursor as cursor_renderer,
 )
 from agents_shipgate.cli.discovery.agent_instructions.targets import (
     BLOCK_VERSION,
     SPECS,
 )
+from agents_shipgate.cli.discovery.local_contract import (
+    LOCAL_CONTRACT_RELATIVE_PATH,
+    LOCAL_CONTRACT_SCHEMA_VERSION,
+)
+from agents_shipgate.schemas.contract import GATING_SIGNAL
 
 PR_TEMPLATE_LOWER = ".github/pull_request_template.md"
 PR_TEMPLATE_UPPER = ".github/PULL_REQUEST_TEMPLATE.md"
@@ -110,6 +140,8 @@ class TargetOutcome:
     block_version: int = BLOCK_VERSION
     message: str = ""
     rendered: str | None = None  # populated only on dry-run
+    files: list[dict[str, str]] | None = None  # populated for file-tree targets
+    kit_source: KitSource | None = None  # populated for adoption-kit file-tree targets
 
     def to_json(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -122,6 +154,10 @@ class TargetOutcome:
             payload["message"] = self.message
         if self.rendered is not None:
             payload["rendered"] = self.rendered
+        if self.files is not None:
+            payload["files"] = list(self.files)
+        if self.kit_source is not None:
+            payload["kit_source"] = self.kit_source
         return payload
 
     @property
@@ -152,19 +188,32 @@ class ApplyResult:
 # --- rendering -------------------------------------------------------------
 
 
-def _rendered_inner(name: str) -> str:
+def _rendered_inner(name: str, kit_config: AdoptionKitConfig | None = None) -> str:
     if name == "agents-md":
         return render_agents_md()
     if name == "claude-md":
         return render_claude_md()
+    if name == "codex-skill":
+        return render_codex_skill_bundle_text(kit_config)
+    if name == "claude-code-skill":
+        return render_claude_code_skill_bundle_text(kit_config)
     if name == "pr-template":
         return render_pr_template()
     if name == "cursor":
         return render_cursor_file()
+    if name == "claude-command":
+        return render_claude_command_file()
+    if name == "local-contract":
+        return render_local_contract_file()
     raise ValueError(f"unknown target {name!r}")  # pragma: no cover - guarded by selector
 
 
-def render_targets(workspace: Path, requested: Iterable[str]) -> list[TargetOutcome]:
+def render_targets(
+    workspace: Path,
+    requested: Iterable[str],
+    *,
+    kit_config: AdoptionKitConfig | None = None,
+) -> list[TargetOutcome]:
     """Pure rendering pass for dry-run output. Does not read existing files."""
     workspace = workspace.resolve()
     outcomes: list[TargetOutcome] = []
@@ -174,12 +223,15 @@ def render_targets(workspace: Path, requested: Iterable[str]) -> list[TargetOutc
         # symlink at the host path and report a path outside the workspace,
         # which would mislead callers in the dry-run JSON.
         path = workspace / spec.relative_path
+        rendered_kit = render_adoption_kit(name, kit_config) if spec.is_file_tree else None
         outcomes.append(
             TargetOutcome(
                 name=name,
                 path=str(path),
                 status="would_render",
-                rendered=_rendered_inner(name),
+                rendered=_rendered_inner(name, kit_config),
+                files=(_file_payload(workspace, rendered_kit.files) if spec.is_file_tree else None),
+                kit_source=rendered_kit.kit_source if rendered_kit else None,
             )
         )
     return outcomes
@@ -229,9 +281,7 @@ def _resolve_pr_template_path(workspace: Path) -> tuple[Path, str | None]:
     return lower, None
 
 
-def _apply_managed_block_target(
-    name: str, path: Path, workspace: Path
-) -> TargetOutcome:
+def _apply_managed_block_target(name: str, path: Path, workspace: Path) -> TargetOutcome:
     inner = _rendered_inner(name)
     preamble = H1_PREAMBLES.get(name, "")
     # Refuse to follow symlinks anywhere in the parent chain. A symlinked
@@ -325,14 +375,20 @@ def _apply_managed_block_target(
     )
 
 
-def _apply_cursor(path: Path, workspace: Path) -> TargetOutcome:
-    rendered = render_cursor_file()
+def _apply_full_file(
+    *,
+    name: str,
+    path: Path,
+    workspace: Path,
+    rendered: str,
+    prior_hashes: Iterable[str],
+) -> TargetOutcome:
     rendered_bytes = rendered.encode("utf-8")
     rendered_sha = hashlib.sha256(rendered_bytes).hexdigest()
     symlink = _first_symlink_in_chain(path, workspace)
     if symlink is not None:
         return TargetOutcome(
-            name="cursor",
+            name=name,
             path=str(path),
             status="skipped_symlink",
             message=(
@@ -345,30 +401,37 @@ def _apply_cursor(path: Path, workspace: Path) -> TargetOutcome:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(rendered_bytes)
         return TargetOutcome(
-            name="cursor",
+            name=name,
             path=str(path),
             status="created_with_block",
             message=f"Created {path}.",
+        )
+    if not path.is_file():
+        return TargetOutcome(
+            name=name,
+            path=str(path),
+            status="skipped_user_modified",
+            message=f"{path} exists but is not a regular file; refusing to overwrite.",
         )
     existing = path.read_bytes()
     existing_sha = hashlib.sha256(existing).hexdigest()
     if existing_sha == rendered_sha:
         return TargetOutcome(
-            name="cursor",
+            name=name,
             path=str(path),
             status="unchanged",
             message=f"{path} already up to date.",
         )
-    if existing_sha in CURSOR_PRIOR_RENDER_SHA256:
+    if existing_sha in prior_hashes:
         path.write_bytes(rendered_bytes)
         return TargetOutcome(
-            name="cursor",
+            name=name,
             path=str(path),
             status="migrated",
             message=f"Migrated {path} to current renderer (v{BLOCK_VERSION}).",
         )
     return TargetOutcome(
-        name="cursor",
+        name=name,
         path=str(path),
         status="skipped_user_modified",
         message=(
@@ -378,8 +441,245 @@ def _apply_cursor(path: Path, workspace: Path) -> TargetOutcome:
     )
 
 
+def _apply_cursor(path: Path, workspace: Path) -> TargetOutcome:
+    return _apply_full_file(
+        name="cursor",
+        path=path,
+        workspace=workspace,
+        rendered=render_cursor_file(),
+        prior_hashes=cursor_renderer.PRIOR_RENDER_SHA256,
+    )
+
+
+def _apply_claude_command(path: Path, workspace: Path) -> TargetOutcome:
+    return _apply_full_file(
+        name="claude-command",
+        path=path,
+        workspace=workspace,
+        rendered=render_claude_command_file(),
+        prior_hashes=CLAUDE_COMMAND_PRIOR_RENDER_SHA256,
+    )
+
+
+def _apply_local_contract(path: Path, workspace: Path) -> TargetOutcome:
+    rendered = render_local_contract_file()
+    rendered_bytes = rendered.encode("utf-8")
+    rendered_sha = hashlib.sha256(rendered_bytes).hexdigest()
+    symlink = _first_symlink_in_chain(path, workspace)
+    if symlink is not None:
+        return TargetOutcome(
+            name="local-contract",
+            path=str(path),
+            status="skipped_symlink",
+            message=(
+                f"{symlink} is a symlink; refusing to follow it. "
+                "Replace the symlink with a regular file or directory before "
+                "re-running."
+            ),
+        )
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(rendered_bytes)
+        return TargetOutcome(
+            name="local-contract",
+            path=str(path),
+            status="created_with_block",
+            message=f"Created {path}.",
+        )
+    if not path.is_file():
+        return TargetOutcome(
+            name="local-contract",
+            path=str(path),
+            status="skipped_user_modified",
+            message=f"{path} exists but is not a regular file; refusing to overwrite.",
+        )
+
+    existing = path.read_bytes()
+    existing_sha = hashlib.sha256(existing).hexdigest()
+    if existing_sha == rendered_sha:
+        return TargetOutcome(
+            name="local-contract",
+            path=str(path),
+            status="unchanged",
+            message=f"{path} already up to date.",
+        )
+    if existing_sha in LOCAL_CONTRACT_PRIOR_RENDER_SHA256 or _is_managed_local_contract(existing):
+        path.write_bytes(rendered_bytes)
+        return TargetOutcome(
+            name="local-contract",
+            path=str(path),
+            status="updated",
+            message=f"Updated managed local contract at {path}.",
+        )
+    return TargetOutcome(
+        name="local-contract",
+        path=str(path),
+        status="skipped_user_modified",
+        message=(
+            f"{path} differs from the managed Agents Shipgate local contract; "
+            "not overwriting. Delete the file or restore the managed contract "
+            "before re-running."
+        ),
+    )
+
+
+def _is_managed_local_contract(existing: bytes) -> bool:
+    """Whether this file is an untouched managed contract at the current version.
+
+    Deliberately narrow. An earlier revision of this change widened it to accept
+    *any* superseded version carrying the managed gating signal and path, on the
+    reasoning that the exact-hash allowlist beside it had twice been left
+    un-appended and stranded repositories on schema 8 and 9. That traded one
+    failure for a worse one: a v9 file a user had customized still matched the
+    shape, so the upgrade silently erased their edit.
+
+    The allowlist is the right mechanism — it distinguishes *pristine* earlier
+    renders from modified ones, which shape alone cannot — and it now carries
+    the v8 and v9 hashes that were missing. A modified older contract stays
+    ``skipped_user_modified``, which is the answer a user's own edit deserves.
+    """
+
+    try:
+        payload = json.loads(existing.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    default_paths = payload.get("default_paths")
+    if not isinstance(default_paths, dict):
+        return False
+    return (
+        payload.get("schema_version") == LOCAL_CONTRACT_SCHEMA_VERSION
+        and payload.get("gating_signal") == GATING_SIGNAL
+        and default_paths.get("local_contract") == LOCAL_CONTRACT_RELATIVE_PATH
+    )
+
+
+def _apply_file_tree(
+    name: str,
+    path: Path,
+    workspace: Path,
+    kit_config: AdoptionKitConfig | None,
+) -> TargetOutcome:
+    rendered = render_adoption_kit(name, kit_config)
+    rendered_files = rendered.files
+    target_paths = {rel: workspace / rel for rel in rendered_files}
+    files = _file_payload(workspace, rendered_files)
+    sidecar_path = path / SIDECAR_FILENAME
+
+    for target in [*target_paths.values(), sidecar_path]:
+        symlink = _first_symlink_in_chain(target, workspace)
+        if symlink is not None:
+            return TargetOutcome(
+                name=name,
+                path=str(path),
+                status="skipped_symlink",
+                files=files,
+                kit_source=rendered.kit_source,
+                message=(
+                    f"{symlink} is a symlink; refusing to follow it. "
+                    "Replace the symlink with a regular file or directory before "
+                    "re-running."
+                ),
+            )
+
+    existing: list[str] = []
+    missing: list[str] = []
+    prior_version: list[str] = []
+    sidecar = parse_sidecar(sidecar_path)
+    if sidecar is not None and sidecar.target != name:
+        sidecar = None
+    expected_sidecar = build_sidecar(rendered)
+    expected_hashes = expected_sidecar["file_hashes"]
+    sidecar_current = (
+        sidecar is not None
+        and sidecar.file_hashes == expected_hashes
+        and sidecar.kit_source_id == rendered.kit_source_id
+    )
+    legacy_sha = bootstrap_legacy_hashes(name)
+    for rel, content in rendered_files.items():
+        target = target_paths[rel]
+        if not target.exists():
+            missing.append(rel)
+            continue
+        existing.append(rel)
+        if not target.is_file():
+            return TargetOutcome(
+                name=name,
+                path=str(path),
+                status="skipped_user_modified",
+                files=files,
+                kit_source=rendered.kit_source,
+                message=f"{target} exists but is not a regular file; refusing to overwrite.",
+            )
+        current = target.read_text(encoding="utf-8")
+        if current == content:
+            continue
+        current_sha = hashlib.sha256(current.encode("utf-8")).hexdigest()
+        root_rel = root_relative_path(name, rel)
+        sidecar_hash = sidecar.file_hashes.get(root_rel) if sidecar else None
+        if current_sha == sidecar_hash or current_sha in legacy_sha.get(rel, ()):
+            prior_version.append(rel)
+            continue
+        return TargetOutcome(
+            name=name,
+            path=str(path),
+            status="skipped_user_modified",
+            files=files,
+            kit_source=rendered.kit_source,
+            message=(
+                f"{target} does not match a shipped Agents Shipgate {name} file; "
+                "refusing to overwrite user edits. Edit the file manually or remove "
+                "the skill directory before re-running."
+            ),
+        )
+
+    for rel, content in rendered_files.items():
+        target = target_paths[rel]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+    if not sidecar_current:
+        sidecar_path.write_text(sidecar_text(rendered), encoding="utf-8")
+
+    if not existing:
+        status = "created_file_tree"
+        message = f"Wrote {name} skill bundle to {path}"
+    elif prior_version and missing:
+        status = "migrated_and_repaired"
+        message = f"Updated {name} skill bundle and repaired missing file(s) at {path}"
+    elif prior_version:
+        status = "migrated"
+        message = f"Updated {name} skill bundle at {path}"
+    elif missing:
+        status = "updated"
+        message = f"Repaired missing {name} skill file(s) under {path}"
+    elif not sidecar_current:
+        status = "migrated"
+        message = f"Recorded managed {name} skill bundle metadata at {path}"
+    else:
+        status = "unchanged"
+        message = f"{name} skill bundle already current at {path}"
+    return TargetOutcome(
+        name=name,
+        path=str(path),
+        status=status,
+        files=files,
+        kit_source=rendered.kit_source,
+        message=message,
+    )
+
+
+def _file_payload(workspace: Path, files: dict[str, str]) -> list[dict[str, str]]:
+    return [{"path": str(workspace / rel), "content": content} for rel, content in files.items()]
+
+
 def apply_agent_instructions(
-    workspace: Path, requested: Iterable[str], *, write: bool
+    workspace: Path,
+    requested: Iterable[str],
+    *,
+    write: bool,
+    kit_config: AdoptionKitConfig | None = None,
 ) -> ApplyResult:
     """Apply the per-target decision tree against ``workspace``.
 
@@ -392,7 +692,7 @@ def apply_agent_instructions(
     if not write:
         return ApplyResult(
             requested=requested_list,
-            targets=render_targets(workspace, requested_list),
+            targets=render_targets(workspace, requested_list, kit_config=kit_config),
         )
 
     outcomes: list[TargetOutcome] = []
@@ -434,8 +734,14 @@ def apply_agent_instructions(
             # check ``is_symlink`` and refuse before touching the file.
             path = workspace / spec.relative_path
 
-        if name == "cursor":
+        if spec.is_file_tree:
+            outcomes.append(_apply_file_tree(name, path, workspace, kit_config))
+        elif name == "cursor":
             outcomes.append(_apply_cursor(path, workspace))
+        elif name == "claude-command":
+            outcomes.append(_apply_claude_command(path, workspace))
+        elif name == "local-contract":
+            outcomes.append(_apply_local_contract(path, workspace))
         else:
             outcomes.append(_apply_managed_block_target(name, path, workspace))
 

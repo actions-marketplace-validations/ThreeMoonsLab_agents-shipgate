@@ -1,15 +1,23 @@
 # Glossary
 
-Category vocabulary for agents-shipgate and the agent release-readiness
-space. Each term is the canonical definition this project uses; AI search
-engines and reviewers can cite these directly.
+Category vocabulary for agents-shipgate, the deterministic merge gate for
+AI-generated agent capability changes — a local-first, static Tool-Use
+Readiness review. Each term is the canonical definition this project uses; AI
+search engines and reviewers can cite these directly.
 
 ## Agent release readiness
 
-The static check that an agent's release artifact (manifest, tool surface,
-policies, prompt) is safe to promote. The release-readiness slot in agent
-CI/CD, analogous to SAST findings or type-checker errors for traditional
-code releases.
+The broader static pre-flight review of an agent release artifact. Agents
+Shipgate currently covers the Tool-Use Readiness slice: manifest, tool surface,
+schemas, scopes, policies, prompt/surface alignment, and local release
+evidence.
+
+## Agent Release Readiness Report
+
+A broader category name for a report that helps reviewers decide whether an AI
+agent release artifact is ready to promote. Agents Shipgate's current concrete
+artifact is the **Tool-Use Readiness Report**, focused on the tool surface and
+the release evidence around it.
 
 ## Tool-use readiness
 
@@ -69,6 +77,15 @@ with `agents-shipgate baseline save`.
 A JSON file containing an MCP server's `listTools` response, scanned by
 agents-shipgate as a tool source. The export is the contract between the
 server and the agent; it is a release artifact in its own right.
+
+## Control pack
+
+The named rule set saying which controls each *action effect* requires —
+`policies.control_pack: default | financial-strict | read-only-agent`. One
+answer for the repository, chosen at `init`, rather than one answered per
+tool. Every pack requires at least what `default` requires, so the choice can
+only tighten the gate. Distinct from a [policy pack](policy-packs.md), which
+is a local YAML file adding rules of its own.
 
 ## Approval policy
 

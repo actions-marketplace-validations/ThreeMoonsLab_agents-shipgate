@@ -7,16 +7,23 @@ parser, and PR template path resolution edge cases.
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 from pathlib import Path
 
 import pytest
 
 from agents_shipgate.cli.discovery.agent_instructions import (
     BLOCK_VERSION,
+    DEFAULT_TARGETS,
     TARGETS,
     InvalidSelector,
     apply_agent_instructions,
     parse_selector,
+)
+from agents_shipgate.cli.discovery.agent_instructions.adoption_kit import (
+    SIDECAR_FILENAME,
+    load_adoption_kit_config,
 )
 from agents_shipgate.cli.discovery.agent_instructions.apply import (
     PR_TEMPLATE_DIR,
@@ -28,17 +35,23 @@ from agents_shipgate.cli.discovery.agent_instructions.renderers import (
 )
 from agents_shipgate.cli.discovery.agent_instructions.renderers import (
     render_agents_md,
+    render_claude_code_skill_files,
+    render_claude_command_file,
+    render_codex_skill_files,
     render_cursor_file,
+    render_local_contract_file,
 )
+from agents_shipgate.cli.discovery.local_contract import LOCAL_CONTRACT_SCHEMA_VERSION
 
 
 def _filesystem_is_case_sensitive(path: Path) -> bool:
-    probe = path / ".__case_probe__"
+    probe_name = f".__case_probe_{os.getpid()}__"
+    probe = path / probe_name
     probe.write_bytes(b"x")
     try:
-        return not (path / ".__CASE_PROBE__").exists()
+        return not (path / probe_name.upper()).exists()
     finally:
-        probe.unlink()
+        probe.unlink(missing_ok=True)
 
 
 case_sensitive_fs = pytest.mark.skipif(
@@ -51,7 +64,37 @@ case_insensitive_fs = pytest.mark.skipif(
     reason="Test asserts case-insensitive samefile collapsing.",
 )
 
+
+def _write_sidecar(
+    root: Path,
+    *,
+    target: str,
+    file_hashes: dict[str, str],
+) -> None:
+    (root / SIDECAR_FILENAME).write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "target": target,
+                "kit_source": "bundled",
+                "kit_source_id": f"test:{target}",
+                "writer_version": "0.0.0-test",
+                "file_hashes": file_hashes,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 # --- selector parsing ------------------------------------------------------
+
+
+def test_parse_selector_default_returns_default_target_kit() -> None:
+    assert parse_selector("default") == list(DEFAULT_TARGETS)
+    assert parse_selector("recommended") == list(DEFAULT_TARGETS)
+    assert "codex-skill" not in DEFAULT_TARGETS
+    assert "claude-code-skill" not in DEFAULT_TARGETS
 
 
 def test_parse_selector_all_returns_every_target() -> None:
@@ -103,11 +146,16 @@ def test_apply_dry_run_does_not_touch_filesystem(tmp_path: Path) -> None:
 def test_apply_write_fresh_workspace_creates_all_targets(tmp_path: Path) -> None:
     result = apply_agent_instructions(tmp_path, list(TARGETS), write=True)
     assert result.exit_code == 0
-    assert {t.status for t in result.targets} == {"created_with_block"}
+    assert {t.status for t in result.targets} == {"created_with_block", "created_file_tree"}
     # Files exist where expected.
     assert (tmp_path / "AGENTS.md").exists()
     assert (tmp_path / "CLAUDE.md").exists()
+    assert (tmp_path / ".agents/skills/agents-shipgate/SKILL.md").exists()
+    assert (tmp_path / ".agents/skills/agents-shipgate" / SIDECAR_FILENAME).exists()
+    assert (tmp_path / ".claude/skills/agents-shipgate" / SIDECAR_FILENAME).exists()
     assert (tmp_path / ".cursor/rules/agents-shipgate.mdc").exists()
+    assert (tmp_path / ".claude/commands/shipgate.md").exists()
+    assert (tmp_path / ".shipgate/agent-contract.json").exists()
     assert (tmp_path / PR_TEMPLATE_LOWER).exists()
     # AGENTS.md preamble + block.
     agents_md = (tmp_path / "AGENTS.md").read_text(encoding="utf-8")
@@ -127,6 +175,319 @@ def test_apply_write_idempotent_repeat(tmp_path: Path) -> None:
     assert snapshot == after
 
 
+def test_codex_skill_current_files_match_renderer() -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    for rel, content in render_codex_skill_files().items():
+        assert (repo_root / rel).read_text(encoding="utf-8") == content
+
+
+def test_claude_command_current_file_matches_renderer() -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    assert (repo_root / ".claude/commands/shipgate.md").read_text(
+        encoding="utf-8"
+    ) == render_claude_command_file()
+
+
+def test_local_contract_renderer_has_required_fields() -> None:
+    payload = json.loads(render_local_contract_file())
+    assert payload["schema_version"] == "10"
+    assert payload["contract_version"] == "27"
+    assert "verify_local" not in payload["primary_commands"]
+    assert payload["primary_commands"]["verify_pr"].startswith("agents-shipgate verify")
+    assert payload["commands"]["verify_local"].startswith("agents-shipgate verify")
+    assert payload["primary_commands"]["host_audit"].startswith("shipgate audit --host")
+    assert payload["agent_handoff_schema_version"] == "shipgate.agent_handoff/v8"
+    assert payload["agent_handoff_artifact"] == "agents-shipgate-reports/agent-handoff.json"
+    assert payload["current_control_artifact"] == (
+        "agents-shipgate-reports/current-control.json"
+    )
+    assert payload["attestation_schema_version"] == "0.5"
+    assert payload["registry_schema_version"] == "0.4"
+    assert payload["org_evidence_bundle_schema_version"] == ("shipgate.org_evidence_bundle/v2")
+    assert payload["agent_boundary_result_schema_version"] == ("shipgate.agent_boundary_result/v2")
+    assert payload["host_grants_inventory_schema_version"] == "0.2"
+    assert payload["host_grants_baseline_schema_version"] == "0.2"
+    assert payload["host_grants_drift_schema_version"] == "0.2"
+    assert payload["trigger_catalog_schema_version"] == "0.4"
+    assert payload["gating_signal"] == "release_decision.decision"
+    assert payload["default_paths"]["local_contract"] == ".shipgate/agent-contract.json"
+    assert payload["verifier_read_order"] == [
+        "control.state",
+        "authorization",
+        "execution",
+        "merge_verdict",
+        "applicability",
+        "can_merge_without_human",
+        "control.next_action",
+        "fix_task",
+        "capability_review.top_changes",
+        "release_decision.decision",
+        "request_id",
+        "decision_id",
+    ]
+
+
+def test_local_contract_updates_prior_managed_contract(tmp_path: Path) -> None:
+    apply_agent_instructions(tmp_path, ["local-contract"], write=True)
+    target = tmp_path / ".shipgate/agent-contract.json"
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    payload["agents_shipgate_version"] = "0.0.0-prior"
+    target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    result = apply_agent_instructions(tmp_path, ["local-contract"], write=True)
+
+    [outcome] = result.targets
+    assert outcome.status == "updated"
+    assert json.loads(target.read_text(encoding="utf-8")) == json.loads(
+        render_local_contract_file()
+    )
+
+
+def test_local_contract_upgrades_a_real_shipped_v9_render(tmp_path: Path) -> None:
+    """The upgrade path is exercised from a byte-exact earlier release.
+
+    The fixture is the `.shipgate/agent-contract.json` this revision's base
+    actually generated, not a synthesized one. Every previous bump was
+    verified by round-tripping the *current* render, which cannot detect the
+    failure this covers: the outgoing hash was never appended, so a repository
+    holding an untouched managed v9 file was told `skipped_user_modified` and
+    left on the old schema.
+    """
+
+    target = tmp_path / ".shipgate/agent-contract.json"
+    target.parent.mkdir(parents=True)
+    shipped = (Path(__file__).parent / "fixtures/local-agent-contract.v9.json").read_bytes()
+    target.write_bytes(shipped)
+    assert json.loads(shipped)["schema_version"] == "9"
+
+    result = apply_agent_instructions(tmp_path, ["local-contract"], write=True)
+
+    [outcome] = result.targets
+    assert outcome.status == "updated", outcome.message
+    assert result.exit_code == 0
+    upgraded = json.loads(target.read_text(encoding="utf-8"))
+    assert upgraded["schema_version"] == LOCAL_CONTRACT_SCHEMA_VERSION
+    assert upgraded == json.loads(render_local_contract_file())
+
+
+def test_local_contract_refuses_a_modified_older_contract(tmp_path: Path) -> None:
+    """A user's edit to an older managed file is theirs, not ours to erase.
+
+    Recognizing any superseded version by shape alone would have upgraded this
+    and silently discarded the customization. Only a *pristine* earlier render —
+    matched by exact hash — is safe to replace, which is why the allowlist and
+    not the shape check is the mechanism that carries older versions forward.
+    """
+
+    target = tmp_path / ".shipgate/agent-contract.json"
+    target.parent.mkdir(parents=True)
+    shipped = json.loads(
+        (Path(__file__).parent / "fixtures/local-agent-contract.v9.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    shipped["commands"]["verify_pr"] = "agents-shipgate verify --config custom.yaml --json"
+    body = json.dumps(shipped, indent=2, sort_keys=True) + "\n"
+    target.write_text(body, encoding="utf-8")
+
+    result = apply_agent_instructions(tmp_path, ["local-contract"], write=True)
+
+    [outcome] = result.targets
+    assert outcome.status == "skipped_user_modified"
+    assert result.exit_code == 2
+    assert target.read_text(encoding="utf-8") == body
+
+
+def test_local_contract_refuses_user_authored_json(tmp_path: Path) -> None:
+    target = tmp_path / ".shipgate/agent-contract.json"
+    target.parent.mkdir(parents=True)
+    target.write_text('{"schema_version": "custom"}\n', encoding="utf-8")
+
+    result = apply_agent_instructions(tmp_path, ["local-contract"], write=True)
+
+    [outcome] = result.targets
+    assert outcome.status == "skipped_user_modified"
+    assert result.exit_code == 2
+    assert target.read_text(encoding="utf-8") == '{"schema_version": "custom"}\n'
+
+
+def test_codex_skill_skipped_when_user_modified(tmp_path: Path) -> None:
+    apply_agent_instructions(tmp_path, ["codex-skill"], write=True)
+    skill = tmp_path / ".agents/skills/agents-shipgate/SKILL.md"
+    skill.write_text("# user custom skill\n", encoding="utf-8")
+    result = apply_agent_instructions(tmp_path, ["codex-skill"], write=True)
+    [outcome] = result.targets
+    assert outcome.status == "skipped_user_modified"
+    assert result.exit_code == 2
+    assert skill.read_text(encoding="utf-8") == "# user custom skill\n"
+
+
+def test_codex_skill_repairs_missing_file(tmp_path: Path) -> None:
+    apply_agent_instructions(tmp_path, ["codex-skill"], write=True)
+    missing = tmp_path / ".agents/skills/agents-shipgate/references/recipes.md"
+    missing.unlink()
+    result = apply_agent_instructions(tmp_path, ["codex-skill"], write=True)
+    [outcome] = result.targets
+    assert outcome.status == "updated"
+    assert missing.exists()
+
+
+def test_codex_skill_records_sidecar_for_pre_sidecar_current_tree(
+    tmp_path: Path,
+) -> None:
+    for rel, content in render_codex_skill_files().items():
+        target = tmp_path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    sidecar = tmp_path / ".agents/skills/agents-shipgate" / SIDECAR_FILENAME
+    assert not sidecar.exists()
+
+    result = apply_agent_instructions(tmp_path, ["codex-skill"], write=True)
+
+    [outcome] = result.targets
+    assert outcome.status == "migrated"
+    assert sidecar.exists()
+
+
+def test_codex_skill_local_override_migrates_sidecar_managed_tree(
+    tmp_path: Path,
+) -> None:
+    apply_agent_instructions(tmp_path, ["codex-skill"], write=True)
+    override_root = tmp_path / ".agents-shipgate/adoption-kit/codex-skill"
+    override_root.mkdir(parents=True)
+    override_root.joinpath("SKILL.md").write_text(
+        "# Custom Agents Shipgate Skill\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / ".agents-shipgate/adoption-kit.yaml"
+    config_path.write_text(
+        "schema_version: 1\n"
+        "targets:\n"
+        "  codex-skill:\n"
+        "    overrides_dir: .agents-shipgate/adoption-kit/codex-skill\n",
+        encoding="utf-8",
+    )
+    kit_config = load_adoption_kit_config(tmp_path)
+
+    result = apply_agent_instructions(
+        tmp_path,
+        ["codex-skill"],
+        write=True,
+        kit_config=kit_config,
+    )
+
+    [outcome] = result.targets
+    assert outcome.status == "migrated"
+    assert outcome.kit_source == "bundled_plus_local_override"
+    assert (tmp_path / ".agents/skills/agents-shipgate/SKILL.md").read_text(
+        encoding="utf-8"
+    ) == "# Custom Agents Shipgate Skill\n"
+
+
+def test_codex_skill_reports_migrate_and_repair_from_sidecar(
+    tmp_path: Path,
+) -> None:
+    apply_agent_instructions(tmp_path, ["codex-skill"], write=True)
+    root = tmp_path / ".agents/skills/agents-shipgate"
+    skill = root / "SKILL.md"
+    missing = root / "references/recipes.md"
+    prior_text = "# prior shipped skill\n"
+    prior_sha = hashlib.sha256(prior_text.encode("utf-8")).hexdigest()
+    _write_sidecar(root, target="codex-skill", file_hashes={"SKILL.md": prior_sha})
+
+    skill.write_text(prior_text, encoding="utf-8")
+    missing.unlink()
+    result = apply_agent_instructions(tmp_path, ["codex-skill"], write=True)
+
+    [outcome] = result.targets
+    assert outcome.status == "migrated_and_repaired"
+    assert (
+        skill.read_text(encoding="utf-8")
+        == render_codex_skill_files()[".agents/skills/agents-shipgate/SKILL.md"]
+    )
+    assert missing.exists()
+
+
+def test_apply_refuses_symlinked_parent_directory_for_codex_skill(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / ".agents").symlink_to(outside)
+    result = apply_agent_instructions(workspace, ["codex-skill"], write=True)
+    [outcome] = result.targets
+    assert outcome.status == "skipped_symlink"
+    assert result.exit_code == 2
+    assert list(outside.iterdir()) == []
+
+
+# --- Claude Code skill edge cases ------------------------------------------
+
+
+def test_claude_code_skill_skipped_when_user_modified(tmp_path: Path) -> None:
+    apply_agent_instructions(tmp_path, ["claude-code-skill"], write=True)
+    skill = tmp_path / ".claude/skills/agents-shipgate/SKILL.md"
+    skill.write_text("# user custom skill\n", encoding="utf-8")
+    result = apply_agent_instructions(tmp_path, ["claude-code-skill"], write=True)
+    [outcome] = result.targets
+    assert outcome.status == "skipped_user_modified"
+    assert result.exit_code == 2
+    assert skill.read_text(encoding="utf-8") == "# user custom skill\n"
+
+
+def test_claude_code_skill_repairs_missing_file(tmp_path: Path) -> None:
+    apply_agent_instructions(tmp_path, ["claude-code-skill"], write=True)
+    missing = tmp_path / ".claude/skills/agents-shipgate/prompts/fix-top-finding.md"
+    missing.unlink()
+    result = apply_agent_instructions(tmp_path, ["claude-code-skill"], write=True)
+    [outcome] = result.targets
+    assert outcome.status == "updated"
+    assert missing.exists()
+
+
+def test_claude_code_skill_reports_migrate_and_repair_from_sidecar(
+    tmp_path: Path,
+) -> None:
+    apply_agent_instructions(tmp_path, ["claude-code-skill"], write=True)
+    root = tmp_path / ".claude/skills/agents-shipgate"
+    skill = root / "SKILL.md"
+    missing = root / "prompts/fix-top-finding.md"
+    prior_text = "# prior shipped skill\n"
+    prior_sha = hashlib.sha256(prior_text.encode("utf-8")).hexdigest()
+    _write_sidecar(
+        root,
+        target="claude-code-skill",
+        file_hashes={"SKILL.md": prior_sha},
+    )
+
+    skill.write_text(prior_text, encoding="utf-8")
+    missing.unlink()
+    result = apply_agent_instructions(tmp_path, ["claude-code-skill"], write=True)
+
+    [outcome] = result.targets
+    assert outcome.status == "migrated_and_repaired"
+    assert (
+        skill.read_text(encoding="utf-8")
+        == render_claude_code_skill_files()[".claude/skills/agents-shipgate/SKILL.md"]
+    )
+    assert missing.exists()
+
+
+def test_apply_refuses_symlinked_parent_directory_for_claude_code_skill(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / ".claude").symlink_to(outside)
+    result = apply_agent_instructions(workspace, ["claude-code-skill"], write=True)
+    [outcome] = result.targets
+    assert outcome.status == "skipped_symlink"
+    assert result.exit_code == 2
+    assert list(outside.iterdir()) == []
+
+
 # --- AGENTS.md edge cases --------------------------------------------------
 
 
@@ -144,9 +505,7 @@ def test_apply_appends_to_existing_agents_md_without_markers(tmp_path: Path) -> 
 
 def test_apply_updates_existing_block_when_content_differs(tmp_path: Path) -> None:
     (tmp_path / "AGENTS.md").write_text(
-        "<!-- agents-shipgate:start v=1 -->\n"
-        "outdated body\n"
-        "<!-- agents-shipgate:end -->\n",
+        "<!-- agents-shipgate:start v=1 -->\noutdated body\n<!-- agents-shipgate:end -->\n",
         encoding="utf-8",
     )
     result = apply_agent_instructions(tmp_path, ["agents-md"], write=True)
@@ -159,9 +518,7 @@ def test_apply_updates_existing_block_when_content_differs(tmp_path: Path) -> No
 
 def test_apply_skips_when_block_version_is_newer(tmp_path: Path) -> None:
     (tmp_path / "AGENTS.md").write_text(
-        "<!-- agents-shipgate:start v=99 -->\n"
-        "future content\n"
-        "<!-- agents-shipgate:end -->\n",
+        "<!-- agents-shipgate:start v=99 -->\nfuture content\n<!-- agents-shipgate:end -->\n",
         encoding="utf-8",
     )
     result = apply_agent_instructions(tmp_path, ["agents-md"], write=True)
@@ -219,11 +576,6 @@ def test_cursor_migrated_when_file_matches_prior_render(
     prior_text = "stub-prior-render\n"
     prior_sha = hashlib.sha256(prior_text.encode("utf-8")).hexdigest()
     monkeypatch.setattr(cursor_module, "PRIOR_RENDER_SHA256", (prior_sha,))
-    # Reload the symbol that apply imported at module load.
-    from agents_shipgate.cli.discovery.agent_instructions import renderers as _r
-    monkeypatch.setattr(_r, "CURSOR_PRIOR_RENDER_SHA256", (prior_sha,))
-    from agents_shipgate.cli.discovery.agent_instructions import apply as apply_module
-    monkeypatch.setattr(apply_module, "CURSOR_PRIOR_RENDER_SHA256", (prior_sha,))
 
     target = tmp_path / ".cursor/rules/agents-shipgate.mdc"
     target.parent.mkdir(parents=True)
@@ -267,10 +619,7 @@ def test_pr_template_picks_marked_one_when_both_exist(tmp_path: Path) -> None:
     upper.write_text("# Untouched\n", encoding="utf-8")
     lower = tmp_path / PR_TEMPLATE_LOWER
     lower.write_text(
-        "# With marker\n"
-        "<!-- agents-shipgate:start v=1 -->\n"
-        "stale\n"
-        "<!-- agents-shipgate:end -->\n",
+        "# With marker\n<!-- agents-shipgate:start v=1 -->\nstale\n<!-- agents-shipgate:end -->\n",
         encoding="utf-8",
     )
     result = apply_agent_instructions(tmp_path, ["pr-template"], write=True)
@@ -342,9 +691,7 @@ def test_apply_refuses_to_follow_symlink_for_managed_block_target(
     assert outcome.status == "skipped_symlink"
     assert result.exit_code == 2
     # The link target was not mutated.
-    assert decoy_target.read_text(encoding="utf-8") == (
-        "USER PROSE outside the snippet system\n"
-    )
+    assert decoy_target.read_text(encoding="utf-8") == ("USER PROSE outside the snippet system\n")
     # The symlink still points at the original target.
     assert link.is_symlink()
     assert link.readlink() == decoy_target

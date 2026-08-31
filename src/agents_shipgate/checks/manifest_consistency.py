@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from agents_shipgate.checks.base import agent_finding, tool_finding
-from agents_shipgate.config.schema import PolicyToolEntry
 from agents_shipgate.core.context import ScanContext
 from agents_shipgate.core.heuristics import is_broad_scope
-from agents_shipgate.core.risk_hints import is_high_risk_tool, risk_tags
+from agents_shipgate.core.manifest_protection import (
+    CODEOWNERS_LOCATIONS,
+    manifest_protection,
+)
+from agents_shipgate.core.risk_hints import is_policy_eligible_high_risk_tool, risk_tags
+from agents_shipgate.schemas.manifest import PolicyToolEntry
 
 
 def run(context: ScanContext, *, known_check_ids: set[str]) -> list:
@@ -15,7 +19,85 @@ def run(context: ScanContext, *, known_check_ids: set[str]) -> list:
     findings.extend(_stale_overrides(context, tool_names))
     findings.extend(_missing_high_risk_owners(context))
     findings.extend(_unused_manifest_scopes(context))
+    findings.extend(_unprotected_manifest(context))
     return findings
+
+
+def _unprotected_manifest(context: ScanContext) -> list:
+    """Nothing in this checkout requires a human to approve a manifest change.
+
+    Every verdict rests on the manifest, so who may change it is part of what
+    the verdict is worth. Attestation is the PR review of a protected file —
+    not a separate ceremony — and CODEOWNERS is the half of that a checkout
+    can prove (#410 §G).
+
+    Two things keep it proportionate, and both follow from what it can
+    actually establish.
+
+    **It asks only where the manifest is load-bearing.** Who may change the
+    gate matters once the gate is enforcing something; a repository still on
+    ``ci.mode: advisory`` has not asked CI to fail on this verdict yet, and
+    ``doctor`` already names manifest protection as one of the two steps from
+    rung 2 to rung 3. Repeating it on every advisory scan would be noise at
+    the one moment there is nothing to act on. The *declared* block is what
+    is read, never the invocation's ``--ci-mode``: the question is what this
+    repository enforces, not how one run was launched (#298).
+
+    **It never moves a verdict.** Branch protection is the other half and it
+    lives in repository settings no file here can read, so a repository with
+    CODEOWNERS may still merge without review and one without it may protect
+    the manifest another way — an organization-wide approval rule covers the
+    manifest without naming it anywhere in the checkout. Deciding a verdict on
+    the half that is visible would be exactly the pretending this finding
+    exists to avoid, so it carries ``requires_human_review: False`` and stays
+    guidance a reviewer reads.
+    """
+
+    declared_ci = context.declared_ci or context.manifest.ci
+    if declared_ci.mode != "strict":
+        return []
+    protection = manifest_protection(context.config_path)
+    if protection.covered:
+        return []
+    if protection.codeowners_path is None:
+        where = "this repository has no CODEOWNERS file GitHub would read"
+    elif protection.owners and not protection.self_owned:
+        # Both halves matter and they want different fixes. A rule set that
+        # owns the manifest but not itself describes a protection one edit
+        # deep: the same pull request can delete the rule.
+        where = (
+            f"{protection.codeowners_path} covers it but assigns no owner to "
+            "itself, so the rule can be removed in the same change"
+        )
+    else:
+        where = f"{protection.codeowners_path} has no rule covering it"
+    return [
+        agent_finding(
+            check_id="SHIP-TRUST-MANIFEST-UNPROTECTED",
+            title="No CODEOWNERS rule covers the Agents Shipgate manifest",
+            severity="low",
+            category="manifest",
+            evidence={
+                "ci_mode": declared_ci.mode,
+                "manifest_path": protection.manifest_path,
+                "codeowners_path": protection.codeowners_path,
+                "codeowners_self_owned": protection.self_owned,
+                "searched": list(CODEOWNERS_LOCATIONS),
+                # Named so the finding says what it did *not* establish. A
+                # repository can require review without CODEOWNERS, and can
+                # have CODEOWNERS without requiring review.
+                "branch_protection": "not statically verifiable",
+            },
+            confidence="high",
+            recommendation=(
+                f"Add a CODEOWNERS rule for {protection.manifest_path} and require "
+                "review on the branch it merges to, so changing what this gate "
+                f"enforces takes a named human's approval — {where}."
+            ),
+            context=context,
+            provenance_kind="static_declaration",
+        )
+    ]
 
 
 def _stale_suppressions(
@@ -44,6 +126,7 @@ def _stale_suppressions(
                 confidence="high",
                 recommendation="Remove stale suppressions or update them to match current check IDs and tool names.",
                 context=context,
+                provenance_kind="static_declaration",
             )
         )
     return findings
@@ -70,6 +153,7 @@ def _stale_policies(context: ScanContext, tool_names: set[str]) -> list:
                     confidence="high",
                     recommendation="Remove stale policy entries or update them to current tool names.",
                     context=context,
+                    provenance_kind="static_declaration",
                 )
             )
     return findings
@@ -90,6 +174,7 @@ def _stale_overrides(context: ScanContext, tool_names: set[str]) -> list:
                 confidence="high",
                 recommendation="Remove stale risk overrides or update them to current tool names.",
                 context=context,
+                provenance_kind="static_declaration",
             )
         )
     return findings
@@ -100,7 +185,7 @@ def _missing_high_risk_owners(context: ScanContext) -> list:
         return []
     findings = []
     for tool in context.tools:
-        if not is_high_risk_tool(tool) or tool.owner:
+        if not is_policy_eligible_high_risk_tool(tool) or tool.owner:
             continue
         findings.append(
             tool_finding(
@@ -116,6 +201,7 @@ def _missing_high_risk_owners(context: ScanContext) -> list:
                 confidence="high",
                 recommendation="Declare an owner for each high-risk production tool in risk_overrides.tools.",
                 context=context,
+                provenance_kind="static_declaration",
             )
         )
     return findings
@@ -144,6 +230,7 @@ def _unused_manifest_scopes(context: ScanContext) -> list:
                 confidence="medium",
                 recommendation="Remove unused manifest scopes or add tool metadata showing why they are required.",
                 context=context,
+                provenance_kind="static_declaration",
             )
         )
     return findings

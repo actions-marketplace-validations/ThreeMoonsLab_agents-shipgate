@@ -2,11 +2,17 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar, Literal
 
-from agents_shipgate.config.schema import ToolSourceConfig
+from agents_shipgate.core.domain import (
+    AuthAlternative,
+    AuthInfo,
+    AuthorityMode,
+    AuthSchemeRequirement,
+    LoadedToolSource,
+    Tool,
+)
 from agents_shipgate.core.errors import InputParseError
-from agents_shipgate.core.models import AuthInfo, LoadedToolSource, Tool
 from agents_shipgate.inputs.common import (
     HTTP_METHODS,
     PositionIndex,
@@ -16,7 +22,13 @@ from agents_shipgate.inputs.common import (
     resolve_input_path,
     schema_to_parameters,
     stable_tool_id,
+    strip_untrusted_binding_annotations,
     tool_name_warning,
+)
+from agents_shipgate.inputs.protocol import LoadedAdapterResult
+from agents_shipgate.schemas.manifest import (
+    AgentsShipgateManifest,
+    ToolSourceConfig,
 )
 
 MAX_SCHEMA_RESOLVE_DEPTH = 32
@@ -62,6 +74,7 @@ def load_openapi_tools(source: ToolSourceConfig, base_dir: Path) -> LoadedToolSo
                     operation=operation,
                     path_parameters=path_parameters,
                     positions=positions,
+                    warnings=warnings,
                 )
             except (RecursionError, MemoryError):
                 raise
@@ -71,7 +84,9 @@ def load_openapi_tools(source: ToolSourceConfig, base_dir: Path) -> LoadedToolSo
                     f"{method_lower.upper()} {api_path}: {type(exc).__name__}: {exc}"
                 ) from exc
             if tool.name in seen_names:
-                warnings.append(f"Duplicate OpenAPI tool name {tool.name!r} in source {source.id!r}")
+                warnings.append(
+                    f"Duplicate OpenAPI tool name {tool.name!r} in source {source.id!r}"
+                )
             seen_names.add(tool.name)
             if warning := tool_name_warning(tool.name):
                 warnings.append(warning)
@@ -101,18 +116,25 @@ def _operation_to_tool(
     operation: dict[str, Any],
     path_parameters: list[Any],
     positions: PositionIndex,
+    warnings: list[str],
 ) -> Tool:
     operation_id = operation.get("operationId") or _operation_name(method, api_path)
     request_schema = _extract_request_schema(document, operation)
-    parameter_schema = _parameters_to_schema(document, path_parameters, operation.get("parameters") or [])
+    parameter_schema = _parameters_to_schema(
+        document, path_parameters, operation.get("parameters") or []
+    )
     input_schema = _merge_object_schemas(parameter_schema, request_schema)
     description = "\n".join(
         part for part in [operation.get("summary"), operation.get("description")] if part
     )
-    annotations = _extract_annotations(operation)
+    annotations = _extract_annotations(
+        operation,
+        operation_label=str(operation_id),
+        warnings=warnings,
+    )
     annotations["httpMethod"] = method.upper()
     annotations["path"] = api_path
-    auth_type, scopes = _extract_security(document, operation)
+    auth = _extract_security(document, operation)
 
     pointer = f"/paths/{json_pointer_escape(api_path)}/{method}"
     pos = positions.lookup(pointer)
@@ -123,7 +145,7 @@ def _operation_to_tool(
 
     # Note: `source_location` intentionally stays None for OpenAPI tools.
     # The legacy `path:line` string participates in `run_id` (see
-    # `cli/scan.py:_run_id`), and v0.10 OpenAPI tools never set it.
+    # `cli/scan/run_identity.py:_run_id`), and v0.10 OpenAPI tools never set it.
     # Reviewers get the line via the structured `source_start_line` /
     # `source_pointer` fields; SARIF prefers those over the legacy string.
     return Tool(
@@ -141,19 +163,13 @@ def _operation_to_tool(
         output_schema=_extract_response_schema(document, operation),
         parameters=schema_to_parameters(input_schema),
         annotations=annotations,
-        auth=AuthInfo(
-            type=auth_type,
-            scopes=scopes,
-            source="openapi",
-        ),
+        auth=auth,
         extraction_confidence="high",
         extraction={"method": "openapi", "confidence": "high"},
     )
 
 
-def _extract_request_schema(
-    document: dict[str, Any], operation: dict[str, Any]
-) -> dict[str, Any]:
+def _extract_request_schema(document: dict[str, Any], operation: dict[str, Any]) -> dict[str, Any]:
     request_body = operation.get("requestBody")
     if not isinstance(request_body, dict):
         return {}
@@ -170,9 +186,7 @@ def _extract_request_schema(
     return _resolve_schema(document, schema)
 
 
-def _extract_response_schema(
-    document: dict[str, Any], operation: dict[str, Any]
-) -> dict[str, Any]:
+def _extract_response_schema(document: dict[str, Any], operation: dict[str, Any]) -> dict[str, Any]:
     responses = operation.get("responses") or {}
     if not isinstance(responses, dict):
         return {}
@@ -233,25 +247,102 @@ def _merge_object_schemas(left: dict[str, Any], right: dict[str, Any]) -> dict[s
     return merged
 
 
-def _extract_security(document: dict[str, Any], operation: dict[str, Any]) -> tuple[str | None, list[str]]:
-    security = operation.get("security", document.get("security") or [])
-    schemes = ((document.get("components") or {}).get("securitySchemes") or {})
+def _extract_security(document: dict[str, Any], operation: dict[str, Any]) -> AuthInfo:
+    if "security" in operation:
+        security = operation["security"]
+        explicit = True
+        inherited = False
+    elif "security" in document:
+        security = document["security"]
+        explicit = True
+        inherited = True
+    else:
+        security = []
+        explicit = False
+        inherited = False
+    schemes = (document.get("components") or {}).get("securitySchemes") or {}
     scopes: list[str] = []
     auth_type: str | None = None
+    alternatives: list[AuthAlternative] = []
+    invalid_annotations: list[str] = []
     if isinstance(security, list):
-        for entry in security:
+        for entry_index, entry in enumerate(security):
             if not isinstance(entry, dict):
+                invalid_annotations.append(f"security[{entry_index}] must be an object")
                 continue
+            requirements: list[AuthSchemeRequirement] = []
             for scheme_name, scheme_scopes in entry.items():
                 scheme = schemes.get(scheme_name) if isinstance(schemes, dict) else None
+                scheme_type: str | None = None
                 if isinstance(scheme, dict):
-                    auth_type = auth_type or scheme.get("type")
-                if isinstance(scheme_scopes, list):
-                    scopes.extend(str(scope) for scope in scheme_scopes)
-    return auth_type, sorted(set(scopes))
+                    raw_type = scheme.get("type")
+                    if isinstance(raw_type, str) and raw_type.strip():
+                        scheme_type = raw_type.strip()
+                    elif raw_type is not None:
+                        invalid_annotations.append(
+                            f"security scheme {scheme_name!r} has invalid type"
+                        )
+                    auth_type = auth_type or scheme_type
+                normalized_scopes: list[str] = []
+                if not isinstance(scheme_scopes, list):
+                    invalid_annotations.append(
+                        f"security scopes for {scheme_name!r} must be a list"
+                    )
+                else:
+                    for raw_scope in scheme_scopes:
+                        if not isinstance(raw_scope, str) or not raw_scope.strip():
+                            invalid_annotations.append(
+                                f"security scopes for {scheme_name!r} must be non-blank strings"
+                            )
+                            continue
+                        normalized_scopes.append(raw_scope.strip())
+                    normalized_scopes = sorted(set(normalized_scopes))
+                scopes.extend(normalized_scopes)
+                requirements.append(
+                    AuthSchemeRequirement(
+                        name=str(scheme_name),
+                        type=scheme_type,
+                        scopes=normalized_scopes,
+                    )
+                )
+            alternatives.append(
+                AuthAlternative(
+                    schemes=sorted(requirements, key=lambda item: item.name),
+                    anonymous=not entry,
+                )
+            )
+    else:
+        invalid_annotations.append("effective OpenAPI security must be a list")
+
+    mode: AuthorityMode = "unknown"
+    if isinstance(security, list) and not security:
+        mode = "none"
+    elif len(alternatives) == 1:
+        alternative = alternatives[0]
+        if alternative.anonymous:
+            mode = "none"
+        elif all(item.type is not None and item.scopes for item in alternative.schemes):
+            mode = "scoped"
+        elif all(item.type is not None for item in alternative.schemes):
+            mode = "unscoped"
+    return AuthInfo(
+        type=auth_type,
+        scopes=sorted(set(scopes)),
+        source="openapi",
+        mode=mode,
+        explicit=explicit,
+        inherited=inherited,
+        alternatives=alternatives,
+        invalid_annotations=invalid_annotations,
+    )
 
 
-def _extract_annotations(operation: dict[str, Any]) -> dict[str, Any]:
+def _extract_annotations(
+    operation: dict[str, Any],
+    *,
+    operation_label: str,
+    warnings: list[str],
+) -> dict[str, Any]:
     annotations: dict[str, Any] = {}
     for source_key, output_key in {
         "x-readOnlyHint": "readOnlyHint",
@@ -264,7 +355,16 @@ def _extract_annotations(operation: dict[str, Any]) -> dict[str, Any]:
             annotations[output_key] = operation[source_key]
     agents_shipgate = operation.get("x-agents-shipgate")
     if isinstance(agents_shipgate, dict):
-        annotations.update(agents_shipgate)
+        safe_annotations, rejected_binding_keys = strip_untrusted_binding_annotations(
+            agents_shipgate
+        )
+        annotations.update(safe_annotations)
+        if rejected_binding_keys:
+            warnings.append(
+                f"OpenAPI operation {operation_label!r} contains reserved binding "
+                "annotations that were ignored: "
+                f"{', '.join(rejected_binding_keys)}"
+            )
     return annotations
 
 
@@ -294,15 +394,21 @@ def _resolve_schema(
     resolved = deepcopy(resolved)
     if "properties" in resolved and isinstance(resolved["properties"], dict):
         resolved["properties"] = {
-            name: _resolve_schema(document, prop, seen_refs.copy(), depth + 1, budget) if isinstance(prop, dict) else prop
+            name: _resolve_schema(document, prop, seen_refs.copy(), depth + 1, budget)
+            if isinstance(prop, dict)
+            else prop
             for name, prop in resolved["properties"].items()
         }
     if "items" in resolved and isinstance(resolved["items"], dict):
-        resolved["items"] = _resolve_schema(document, resolved["items"], seen_refs.copy(), depth + 1, budget)
+        resolved["items"] = _resolve_schema(
+            document, resolved["items"], seen_refs.copy(), depth + 1, budget
+        )
     for combinator in ("oneOf", "anyOf", "allOf"):
         if combinator in resolved and isinstance(resolved[combinator], list):
             resolved[combinator] = [
-                _resolve_schema(document, item, seen_refs.copy(), depth + 1, budget) if isinstance(item, dict) else item
+                _resolve_schema(document, item, seen_refs.copy(), depth + 1, budget)
+                if isinstance(item, dict)
+                else item
                 for item in resolved[combinator]
             ]
     return resolved
@@ -341,3 +447,20 @@ def _operation_name(method: str, path: str) -> str:
     safe_path = path.strip("/").replace("/", "_").replace("{", "").replace("}", "")
     safe_path = safe_path.replace("-", "_") or "root"
     return f"{method}_{safe_path}"
+
+
+class OpenAPIAdapter:
+    """``ToolSourceAdapter`` wrapping :func:`load_openapi_tools`."""
+
+    source_type: ClassVar[str] = "openapi"
+    scope: ClassVar[Literal["per_source", "per_scan"]] = "per_source"
+    artifact_class: ClassVar[type | None] = None
+
+    def load(
+        self,
+        source: ToolSourceConfig | None,
+        base_dir: Path,
+        manifest: AgentsShipgateManifest,
+    ) -> LoadedAdapterResult:
+        assert source is not None, "per_source adapter requires a source"
+        return LoadedAdapterResult(tool_sources=[load_openapi_tools(source, base_dir)])

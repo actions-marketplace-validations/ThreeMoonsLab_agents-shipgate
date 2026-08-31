@@ -2,12 +2,31 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
-from typing import Any
+from typing import ClassVar, Literal
 
-from agents_shipgate.config.schema import AgentsShipgateManifest, ToolSourceConfig
+from agents_shipgate.core.domain import (
+    AgentBindingObservation,
+    AuthInfo,
+    LoadedToolSource,
+    Tool,
+    ToolkitScopeBound,
+)
 from agents_shipgate.core.errors import InputParseError
-from agents_shipgate.core.models import AuthInfo, LoadedToolSource, Tool, ToolParameter
 from agents_shipgate.inputs.common import resolve_input_path, stable_tool_id
+from agents_shipgate.inputs.config_trace import trace_config_binding
+from agents_shipgate.inputs.protocol import LoadedAdapterResult
+from agents_shipgate.inputs.python_static import (
+    display_path,
+    dotted_name,
+    function_input_schema,
+    function_output_schema,
+    function_signature,
+    parse_python_file,
+)
+from agents_shipgate.schemas.manifest import (
+    AgentsShipgateManifest,
+    ToolSourceConfig,
+)
 
 DEFAULT_FUNCTION_TOOL_DECORATORS = frozenset(
     {"function_tool", "agents.function_tool", "openai_agents.function_tool"}
@@ -31,23 +50,224 @@ def load_openai_sdk_static_tools(
             source_type="openai_agents_sdk",
             warnings=[f"OpenAI Agents SDK entrypoint not found: {path}"],
         )
-    try:
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    except SyntaxError as exc:
+    if path.is_dir():
+        python_files = sorted(path.glob("*.py"))
+        if not python_files:
+            raise InputParseError(f"OpenAI Agents SDK source directory has no Python files: {path}")
+        tools: list[Tool] = []
+        toolkit_bounds: list[ToolkitScopeBound] = []
+        for python_file in python_files:
+            file_tools, file_bounds = _load_python_file(python_file, source, base_dir)
+            tools.extend(file_tools)
+            toolkit_bounds.extend(file_bounds)
+    elif path.suffix.lower() == ".py":
+        tools, toolkit_bounds = _load_python_file(path, source, base_dir)
+        python_files = [path]
+    else:
         raise InputParseError(
-            f"Unable to parse OpenAI Agents SDK entrypoint {path}: {exc.msg}"
-        ) from exc
-    decorator_names = _function_tool_decorator_names(tree)
-    tools = [
-        _function_to_tool(node, source, entrypoint, decorator_names)
-        for node in ast.walk(tree)
-        if _is_function_tool(node, decorator_names)
-    ]
+            f"OpenAI Agents SDK source must be a Python file or directory: {path}"
+        )
+    binding_warnings, binding_observations = _extract_agent_bindings(
+        tools, python_files, source, base_dir
+    )
     return LoadedToolSource(
         source_id=source.id,
         source_type="openai_agents_sdk",
         tools=tools,
+        toolkit_bounds=toolkit_bounds,
+        binding_observations=binding_observations,
+        warnings=[*_toolkit_binding_warnings(toolkit_bounds), *binding_warnings],
     )
+
+
+def _toolkit_binding_warnings(bounds: list[ToolkitScopeBound]) -> list[str]:
+    """Source warnings for toolkit factories whose binding is unreadable.
+
+    An ``unknown`` binding means the constructor's authority-bearing
+    argument exists but is not statically traceable — previously that case
+    was silently skipped (a fail-open: the factory disappeared from every
+    surface). Mirror the ADK dynamic-toolset fix: record a warning so the
+    scan routes to review instead of silence. ``config``-bound factories
+    stay warning-free — they carry a comparable marker the verify-tier
+    config-binding checks own.
+    """
+    return [
+        (
+            f"{bound.provider} toolkit constructor {bound.constructor} at "
+            f"{bound.source_ref}:{bound.source_line} passes a configuration "
+            "that is not statically readable; its effective tool surface "
+            "cannot be enumerated or compared. Use a literal configuration "
+            "allowlist, bind it from a config file, or declare an explicit "
+            "local tool inventory."
+        )
+        for bound in bounds
+        if bound.config_binding == "unknown"
+    ]
+
+
+def _load_python_file(
+    path: Path,
+    source: ToolSourceConfig,
+    base_dir: Path,
+) -> tuple[list[Tool], list[ToolkitScopeBound]]:
+    try:
+        tree = parse_python_file(path, label="OpenAI Agents SDK")
+    except InputParseError as exc:
+        message = str(exc).replace(
+            "OpenAI Agents SDK Python entrypoint",
+            "OpenAI Agents SDK entrypoint",
+        )
+        raise InputParseError(message) from exc
+    ref = display_path(path, base_dir)
+    decorator_names = _function_tool_decorator_names(tree)
+    tools = [
+        _function_to_tool(node, source, ref, decorator_names)
+        for node in ast.walk(tree)
+        if _is_function_tool(node, decorator_names)
+    ]
+    return tools, _detect_toolkit_bounds(tree, ref)
+
+
+def _extract_agent_bindings(
+    tools: list[Tool],
+    paths: list[Path],
+    source: ToolSourceConfig,
+    base_dir: Path,
+) -> tuple[list[str], list[AgentBindingObservation]]:
+    """Extract exact, local-only ``Agent(..., tools=[...])`` wiring.
+
+    This intentionally resolves only literal lists, names bound to literal
+    lists, and local/imported function-tool identifiers. Dynamic expressions
+    are preserved as partial evidence instead of being guessed.
+    """
+
+    warnings: list[str] = []
+    observations: list[AgentBindingObservation] = []
+    tool_by_name = {tool.name: tool for tool in tools}
+    tool_by_name.update(
+        {
+            symbol: tool
+            for tool in tools
+            if isinstance((symbol := tool.annotations.get("python_symbol")), str)
+        }
+    )
+    for path in paths:
+        tree = parse_python_file(path, label="OpenAI Agents SDK")
+        source_ref = display_path(path, base_dir)
+        list_vars: dict[str, list[str] | None] = {}
+        import_aliases: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    import_aliases[alias.asname or alias.name] = alias.name
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                target = _assignment_target(node)
+                value = node.value
+                if target and isinstance(value, (ast.List, ast.Tuple)):
+                    list_vars[target] = _literal_names(value, import_aliases)
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            target = _assignment_target(node)
+            call = node.value if isinstance(node.value, ast.Call) else None
+            if not target or call is None or _last_name(call.func) != "Agent":
+                continue
+            tools_expr = _keyword(call, "tools")
+            names = _resolve_name_list(tools_expr, list_vars, import_aliases)
+            pointer = f"{source_ref}:{call.lineno}"
+            issues: list[str] = []
+            tools_complete = True
+            if names is None:
+                reason = (
+                    f"OpenAI Agents SDK agent {target!r} at {pointer} uses a "
+                    "dynamic tools expression; its binding graph is incomplete."
+                )
+                warnings.append(reason)
+                issues.append(reason)
+                tools_complete = False
+                names = []
+            else:
+                for name in names:
+                    if tool_by_name.get(name) is None:
+                        reason = (
+                            f"OpenAI Agents SDK agent {target!r} at {pointer} binds "
+                            f"unresolved tool {name!r}."
+                        )
+                        warnings.append(reason)
+                        issues.append(reason)
+                        tools_complete = False
+                names = [
+                    tool_by_name[name].name if name in tool_by_name else name
+                    for name in names
+                ]
+            handoff_names = _resolve_name_list(
+                _keyword(call, "handoffs"), list_vars, import_aliases
+            )
+            handoffs_complete = True
+            if handoff_names is None:
+                reason = f"OpenAI Agents SDK agent {target!r} has dynamic handoffs at {pointer}."
+                warnings.append(reason)
+                issues.append(reason)
+                handoffs_complete = False
+                handoff_names = []
+            observations.append(
+                AgentBindingObservation(
+                    agent=target,
+                    source_id=source.id,
+                    source=source_ref,
+                    source_pointer=pointer,
+                    tool_names=names,
+                    handoff_names=handoff_names,
+                    tools_complete=tools_complete,
+                    handoffs_complete=handoffs_complete,
+                    issues=issues,
+                )
+            )
+    return list(dict.fromkeys(warnings)), observations
+
+
+def _assignment_target(node: ast.Assign | ast.AnnAssign) -> str | None:
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+    return targets[0].id if len(targets) == 1 and isinstance(targets[0], ast.Name) else None
+
+
+def _last_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _keyword(call: ast.Call, name: str) -> ast.AST | None:
+    return next((item.value for item in call.keywords if item.arg == name), None)
+
+
+def _literal_names(
+    value: ast.List | ast.Tuple, aliases: dict[str, str]
+) -> list[str] | None:
+    names: list[str] = []
+    for item in value.elts:
+        if not isinstance(item, ast.Name):
+            return None
+        names.append(aliases.get(item.id, item.id))
+    return names
+
+
+def _resolve_name_list(
+    value: ast.AST | None,
+    list_vars: dict[str, list[str] | None],
+    aliases: dict[str, str],
+) -> list[str] | None:
+    if value is None:
+        return []
+    if isinstance(value, (ast.List, ast.Tuple)):
+        return _literal_names(value, aliases)
+    if isinstance(value, ast.Name):
+        if value.id in list_vars:
+            return list_vars[value.id]
+        return [aliases.get(value.id, value.id)]
+    return None
 
 
 def _function_tool_decorator_names(tree: ast.Module) -> set[str]:
@@ -75,14 +295,9 @@ def _is_function_tool(node: ast.AST, decorator_names: set[str]) -> bool:
 
 
 def _decorator_name(decorator: ast.AST) -> str | None:
-    if isinstance(decorator, ast.Name):
-        return decorator.id
-    if isinstance(decorator, ast.Attribute):
-        prefix = _decorator_name(decorator.value)
-        return f"{prefix}.{decorator.attr}" if prefix else decorator.attr
     if isinstance(decorator, ast.Call):
         return _decorator_name(decorator.func)
-    return None
+    return dotted_name(decorator)
 
 
 def _function_to_tool(
@@ -92,20 +307,7 @@ def _function_to_tool(
     decorator_names: set[str],
 ) -> Tool:
     tool_name = _tool_name(node, decorator_names)
-    parameters = _parameters(node)
-    return_type = _annotation_to_string(node.returns)
-    signature = f"{tool_name}({', '.join(param.name for param in parameters)})"
-    if return_type:
-        signature = f"{signature} -> {return_type}"
-    properties: dict[str, Any] = {
-        param.name: {"type": _json_schema_type(param.type)}
-        for param in parameters
-    }
-    input_schema = {
-        "type": "object",
-        "properties": properties,
-        "required": [param.name for param in parameters if param.required],
-    }
+    input_schema, parameters = function_input_schema(node)
     description = _description(node, decorator_names) or ast.get_docstring(node)
     return Tool(
         id=stable_tool_id(tool_name),
@@ -116,44 +318,17 @@ def _function_to_tool(
         source_ref=source_ref,
         source_location=f"{source_ref}:{node.lineno}",
         input_schema=input_schema,
-        output_schema={"type": _json_schema_type(return_type)} if return_type else {},
+        output_schema=function_output_schema(node),
         parameters=parameters,
-        function_signature=signature,
+        function_signature=function_signature(tool_name, parameters, node),
+        annotations={"python_symbol": node.name},
         auth=AuthInfo(source="sdk_static"),
         extraction_confidence="medium",
         extraction={"method": "openai_agents_sdk_ast", "confidence": "medium"},
     )
 
 
-def _parameters(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ToolParameter]:
-    parameters: list[ToolParameter] = []
-    positional_args = [*node.args.posonlyargs, *node.args.args]
-    positional_defaults: list[ast.expr | None] = [
-        None for _ in range(len(positional_args) - len(node.args.defaults))
-    ]
-    positional_defaults.extend(node.args.defaults)
-    for arg, default in zip(positional_args, positional_defaults, strict=True):
-        if arg.arg in {"self", "ctx", "context"}:
-            continue
-        parameters.append(_parameter(arg, required=default is None))
-    for arg, default in zip(node.args.kwonlyargs, node.args.kw_defaults, strict=True):
-        if arg.arg in {"self", "ctx", "context"}:
-            continue
-        parameters.append(_parameter(arg, required=default is None))
-    return parameters
-
-
-def _parameter(arg: ast.arg, *, required: bool) -> ToolParameter:
-    return ToolParameter(
-        name=arg.arg,
-        type=_annotation_to_string(arg.annotation),
-        required=required,
-    )
-
-
-def _tool_name(
-    node: ast.FunctionDef | ast.AsyncFunctionDef, decorator_names: set[str]
-) -> str:
+def _tool_name(node: ast.FunctionDef | ast.AsyncFunctionDef, decorator_names: set[str]) -> str:
     return _decorator_kwarg_string(node, decorator_names, "name_override") or node.name
 
 
@@ -181,19 +356,289 @@ def _decorator_kwarg_string(
     return None
 
 
-def _annotation_to_string(annotation: ast.AST | None) -> str | None:
-    if annotation is None:
+# ---------------------------------------------------------------------------
+# Agent-toolkit scope bounds
+# ---------------------------------------------------------------------------
+#
+# Some agent toolkits expose their tools through a runtime factory
+# (``*toolkit.get_tools()``) the static extractor cannot enumerate, but the
+# *constructor* takes a statically-parseable permission allowlist. We capture
+# that allowlist so the verifier can diff it base-vs-head and catch a silent
+# broadening (the allowlist removed or widened) even when the individual tools
+# stay opaque. See ``core.domain.ToolkitScopeBound`` and the
+# ``SHIP-VERIFY-CAPABILITY-SCOPE-BROADENED`` check.
+#
+# Known agent-toolkit constructors, grouped by the top-level module they are
+# imported from. A symbol only counts when it is actually imported from the
+# provider's package (resolved through this file's import aliases below), so an
+# unrelated local symbol that happens to share the name is NOT matched, and an
+# aliased import (``import StripeAgentToolkit as SAT``) IS. Both the class
+# constructor and the async factory map to the same provider so a base→head
+# switch between them still matches.
+_TOOLKIT_MODULES: dict[str, dict[str, str]] = {
+    "stripe_agent_toolkit": {
+        "StripeAgentToolkit": "stripe",
+        "create_stripe_agent_toolkit": "stripe",
+    },
+}
+
+
+def _detect_toolkit_bounds(tree: ast.Module, ref: str) -> list[ToolkitScopeBound]:
+    name_map, module_aliases = _toolkit_alias_maps(tree)
+    if not name_map and not module_aliases:
+        return []
+    bounds: list[ToolkitScopeBound] = []
+    captured: set[int] = set()
+    # Assignments first so we can attach the Python binding name, which keys
+    # the bound per-instance (see core.toolkit_scope.policy_key_for).
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        call = _unwrap_toolkit_call(value)
+        if call is None:
+            continue
+        bound = _bound_from_toolkit_call(
+            call, tree, ref, _first_assign_name(targets), name_map, module_aliases
+        )
+        if bound is not None:
+            bounds.append(bound)
+            captured.add(id(call))
+    # Bare/inline toolkit constructions not bound to a name.
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or id(node) in captured:
+            continue
+        bound = _bound_from_toolkit_call(node, tree, ref, None, name_map, module_aliases)
+        if bound is not None:
+            bounds.append(bound)
+    return bounds
+
+
+def _toolkit_alias_maps(
+    tree: ast.Module,
+) -> tuple[dict[str, tuple[str, str]], dict[str, str]]:
+    """Resolve local names to known toolkit constructors via the file's imports.
+
+    Returns ``(name_map, module_aliases)``:
+
+    - ``name_map``: local call name → ``(provider, symbol)`` for
+      ``from <toolkit_module> import <Symbol> [as <local>]`` (handles aliases).
+    - ``module_aliases``: local module alias → top-level toolkit package for
+      ``import <toolkit_module>[.sub] [as <alias>]``, so a later
+      ``alias.Symbol(...)`` attribute call resolves.
+
+    Only imports whose top-level package is a known toolkit module contribute,
+    so an unrelated symbol that merely shares a constructor name is ignored.
+    """
+    name_map: dict[str, tuple[str, str]] = {}
+    module_aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            symbols = _toolkit_symbols_for_module(node.module)
+            if symbols is None:
+                continue
+            for alias in node.names:
+                provider = symbols.get(alias.name)
+                if provider is not None:
+                    name_map[alias.asname or alias.name] = (provider, alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".", 1)[0] in _TOOLKIT_MODULES:
+                    module_aliases[alias.asname or alias.name] = alias.name.split(".", 1)[0]
+    return name_map, module_aliases
+
+
+def _toolkit_symbols_for_module(module: str | None) -> dict[str, str] | None:
+    if not module:
         return None
-    return ast.unparse(annotation)
+    return _TOOLKIT_MODULES.get(module.split(".", 1)[0])
 
 
-def _json_schema_type(annotation: str | None) -> str:
-    if annotation in {"int", "float"}:
-        return "number"
-    if annotation == "bool":
-        return "boolean"
-    if annotation in {"list", "List"} or (annotation or "").startswith("list["):
-        return "array"
-    if annotation in {"dict", "Dict"} or (annotation or "").startswith("dict["):
-        return "object"
-    return "string"
+def _resolve_toolkit_call(
+    call: ast.Call,
+    name_map: dict[str, tuple[str, str]],
+    module_aliases: dict[str, str],
+) -> tuple[str, str] | None:
+    """Resolve a call node to ``(provider, constructor)`` via the import maps.
+
+    Matches a bare ``Name`` against ``name_map`` (covers plain and aliased
+    ``from`` imports) and an ``Attribute`` against ``module_aliases`` or a
+    fully-qualified ``stripe_agent_toolkit…`` path. Returns ``None`` for calls
+    that do not resolve to a known toolkit constructor.
+    """
+    func = call.func
+    if isinstance(func, ast.Name):
+        return name_map.get(func.id)
+    if isinstance(func, ast.Attribute):
+        base = dotted_name(func.value)
+        if not base:
+            return None
+        base_top = base.split(".", 1)[0]
+        top = module_aliases.get(base_top) or (base_top if base_top in _TOOLKIT_MODULES else None)
+        if top is not None:
+            provider = _TOOLKIT_MODULES.get(top, {}).get(func.attr)
+            if provider is not None:
+                return (provider, func.attr)
+    return None
+
+
+def _unwrap_toolkit_call(value: ast.expr) -> ast.Call | None:
+    if isinstance(value, ast.Await):
+        value = value.value
+    return value if isinstance(value, ast.Call) else None
+
+
+def _first_assign_name(targets: list[ast.expr]) -> str | None:
+    for target in targets:
+        if isinstance(target, ast.Name):
+            return target.id
+        if isinstance(target, ast.Attribute):
+            return target.attr
+    return None
+
+
+def _bound_from_toolkit_call(
+    call: ast.Call,
+    tree: ast.Module,
+    ref: str,
+    binding: str | None,
+    name_map: dict[str, tuple[str, str]],
+    module_aliases: dict[str, str],
+) -> ToolkitScopeBound | None:
+    resolved = _resolve_toolkit_call(call, name_map, module_aliases)
+    if resolved is None:
+        return None
+    provider, constructor = resolved
+    parser = _CONFIG_PARSERS.get(provider)
+    parsed = parser(call) if parser is not None else (False, [])
+    if isinstance(parsed, tuple):
+        bounded, scopes = parsed
+        return ToolkitScopeBound(
+            provider=provider,
+            constructor=constructor,
+            bounded=bounded,
+            scopes=sorted(scopes),
+            binding=binding,
+            source_ref=ref,
+            source_line=getattr(call, "lineno", None),
+            config_binding="literal" if bounded else "absent",
+        )
+    # The authority-bearing argument is present but not a literal. Trace it
+    # conservatively (docs/engineering/config-bound-capability-detection.md):
+    # a name bound from a config read becomes a ``config``-bound marker the
+    # verify diff can compare base-vs-head; anything else is ``unknown`` — a
+    # marker + source warning (never silence, mirroring the ADK dynamic-
+    # toolset fail-open fix) that no removal check ever fires on.
+    trace = trace_config_binding(
+        parsed, tree=tree, line=getattr(call, "lineno", 0)
+    )
+    return ToolkitScopeBound(
+        provider=provider,
+        constructor=constructor,
+        bounded=False,
+        scopes=[],
+        binding=binding,
+        source_ref=ref,
+        source_line=getattr(call, "lineno", None),
+        config_binding=trace.binding,
+        config_path=trace.config_path,
+    )
+
+
+def _parse_stripe_configuration(
+    call: ast.Call,
+) -> tuple[bool, list[str]] | ast.expr:
+    """Read the Stripe ``configuration={"actions": {...}}`` allowlist.
+
+    Returns ``(bounded, scopes)``:
+
+    - No ``configuration`` keyword, OR a ``configuration`` dict with no
+      ``actions`` key → ``(False, [])``. The Stripe toolkit mounts its FULL
+      surface when ``actions`` is absent, so this is *unbounded*, not "bounded
+      to no tools" — otherwise a base ``actions={…}`` → head
+      ``configuration={"context": …}`` migration would read as a narrowing and
+      escape the gate.
+    - ``configuration`` (or its ``actions``) present but not a dict literal →
+      the offending *expression* (the authority-bearing argument), which the
+      caller traces for a config binding instead of silently skipping.
+    - ``actions`` is a dict literal → ``(True, scopes)`` with each truthy
+      ``resource:verb`` flattened. An explicit empty ``actions={}`` is
+      ``(True, [])`` — explicitly bounded to no tools.
+    """
+    config = _keyword_value(call, "configuration")
+    if config is None:
+        return (False, [])
+    if not isinstance(config, ast.Dict):
+        return config
+    actions = _dict_get(config, "actions")
+    if actions is None:
+        return (False, [])
+    if not isinstance(actions, ast.Dict):
+        return actions
+    scopes: list[str] = []
+    for resource_key, resource_value in zip(actions.keys, actions.values, strict=False):
+        resource = _const_str(resource_key)
+        if resource is None:
+            continue
+        if isinstance(resource_value, ast.Dict):
+            for verb_key, verb_value in zip(
+                resource_value.keys, resource_value.values, strict=False
+            ):
+                verb = _const_str(verb_key)
+                if verb is not None and _is_truthy_const(verb_value):
+                    scopes.append(f"{resource}:{verb}")
+        elif _is_truthy_const(resource_value):
+            scopes.append(f"{resource}:*")
+    return (True, scopes)
+
+
+# Per-provider configuration parsers. Provider detection (imports) is kept
+# separate from config-shape parsing so a future provider with a different
+# allowlist shape only adds a parser here.
+_CONFIG_PARSERS = {"stripe": _parse_stripe_configuration}
+
+
+def _keyword_value(call: ast.Call, name: str) -> ast.expr | None:
+    for keyword in call.keywords:
+        if keyword.arg == name:
+            return keyword.value
+    return None
+
+
+def _dict_get(node: ast.Dict, name: str) -> ast.expr | None:
+    for key, value in zip(node.keys, node.values, strict=False):
+        if _const_str(key) == name:
+            return value
+    return None
+
+
+def _const_str(node: ast.expr | None) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _is_truthy_const(node: ast.expr) -> bool:
+    return isinstance(node, ast.Constant) and bool(node.value) is True
+
+
+class OpenAISDKAdapter:
+    """``ToolSourceAdapter`` wrapping :func:`load_openai_sdk_static_tools`."""
+
+    source_type: ClassVar[str] = "openai_agents_sdk"
+    scope: ClassVar[Literal["per_source", "per_scan"]] = "per_source"
+    artifact_class: ClassVar[type | None] = None
+
+    def load(
+        self,
+        source: ToolSourceConfig | None,
+        base_dir: Path,
+        manifest: AgentsShipgateManifest,
+    ) -> LoadedAdapterResult:
+        assert source is not None, "per_source adapter requires a source"
+        return LoadedAdapterResult(
+            tool_sources=[load_openai_sdk_static_tools(source, manifest, base_dir)]
+        )

@@ -130,6 +130,9 @@ def test_report_includes_loaded_plugin_provenance(monkeypatch, tmp_path):
         ci_mode="advisory",
     )
 
+    # v0.17 (M5): every loaded_plugins entry now carries validation
+    # provenance fields. A clean plugin shows ``valid`` status with
+    # empty ``validation_errors`` and ``runtime_errors`` arrays.
     assert report.loaded_plugins == [
         {
             "name": "acme",
@@ -137,8 +140,47 @@ def test_report_includes_loaded_plugin_provenance(monkeypatch, tmp_path):
             "distribution": "acme-shipgate-checks",
             "version": "1.2.3",
             "check_id": "ACME-CHECK",
+            "validation_status": "valid",
+            "validation_errors": [],
+            "runtime_errors": [],
         }
     ]
+
+
+def test_plugin_checks_can_read_action_surface_facts(monkeypatch, tmp_path):
+    seen: dict[str, int] = {}
+
+    def plugin(context):
+        seen["action_count"] = len(context.action_surface_facts.actions)
+        return []
+
+    plugin.AGENTS_SHIPGATE_METADATA = {
+        "id": "ACME-ACTION-CHECK",
+        "category": "custom",
+        "default_severity": "medium",
+        "description": "Custom action-surface plugin check.",
+    }
+
+    class FakeEntryPoint:
+        name = "acme"
+        value = "acme_shipgate_checks:run"
+        dist = FakeDist()
+
+        def load(self):
+            return plugin
+
+    monkeypatch.setenv("AGENTS_SHIPGATE_ENABLE_PLUGINS", "1")
+    monkeypatch.setattr(registry, "entry_points", lambda group: [FakeEntryPoint()])
+
+    report, _ = run_scan(
+        config_path=Path("samples/clean_read_only_agent/shipgate.yaml"),
+        output_dir=tmp_path,
+        formats=["json"],
+        ci_mode="advisory",
+    )
+
+    assert seen["action_count"] == len(report.action_surface_facts.actions)
+    assert seen["action_count"] > 0
 
 
 def test_no_plugins_with_suggest_patches_does_not_load_plugins(monkeypatch, tmp_path):

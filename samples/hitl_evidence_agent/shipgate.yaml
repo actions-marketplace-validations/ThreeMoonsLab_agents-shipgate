@@ -19,6 +19,15 @@ tool_sources:
     type: mcp
     path: tools.json
 
+agent_bindings:
+  declarations:
+    - agent: root
+      complete: true
+      tools:
+        - {tool: issue_refund, source_id: refund_tools}
+      handoffs: []
+      reason: reviewed HITL fixture binding
+
 validation:
   mode: human_in_the_loop
   target_review_posture: limited_auto_approval
@@ -45,6 +54,21 @@ risk_overrides:
       tags: [financial_action, write]
       owner: support-ops
       reason: refund issuance is a financial write action
+
+action_surface:
+  actions:
+    - tool: issue_refund
+      effect: financial_write
+      scopes: [refunds:write]
+      authority:
+        mode: scoped
+        auth_type: oauth2
+        credential_mode: service_account
+      approval:
+        required: true
+      safeguards:
+        idempotency: true
+        audit_log: true
 
 ci:
   mode: advisory
