@@ -9,6 +9,7 @@ import typer
 
 from agents_shipgate import __version__
 from agents_shipgate.checks.plugin_validation import strict_failure_messages
+from agents_shipgate.cli.current_workspace import caller_path_spelling
 from agents_shipgate.cli.diagnostics import (
     diagnose_invalid_manifest,
     diagnose_missing_manifest,
@@ -18,7 +19,10 @@ from agents_shipgate.cli.scan.orchestrator import run_scan
 from agents_shipgate.core.action_semantics import effect_phrase, join_phrases
 from agents_shipgate.core.control_packs import control_rule_summaries
 from agents_shipgate.core.declaration_questions import progress_sentence
-from agents_shipgate.core.disclaimers import STATIC_VERDICT_DISCLAIMER
+from agents_shipgate.core.disclaimers import (
+    DETERMINISM_BOUNDARY_REFERENCE,
+    STATIC_VERDICT_DISCLAIMER,
+)
 from agents_shipgate.core.errors import AgentsShipgateError, ConfigError, InputParseError
 from agents_shipgate.core.findings.subject_rollup import (
     roll_up_findings,
@@ -482,7 +486,15 @@ def _print_cli_summary(
     *,
     verbose: bool = False,
     human_context: HumanArtifactContext | None = None,
+    reports_base: Path | None = None,
 ) -> None:
+    """Print the single-manifest scan summary.
+
+    ``reports_base`` is the manifest's directory, which the report's
+    ``generated_reports`` paths are recorded relative to. When given, the
+    printed report paths are spelled so they open from the current directory
+    (#818); ``report.json`` keeps its manifest-relative values.
+    """
     summary = report.summary
     typer.echo(f"Agents Shipgate {__version__}")
     typer.echo("")
@@ -551,7 +563,9 @@ def _print_cli_summary(
     # Grouped by mechanism: six warnings that differ only in the symbol they
     # name are one thing to fix. The raw count is what gates, so both numbers
     # are printed and report.json keeps every warning (#362).
-    warning_groups = group_source_warnings(report.source_warnings)
+    evidence_gaps = report.release_decision.evidence_coverage.evidence_gaps if report.release_decision else ()
+    recoveries = {gap.subject for gap in evidence_gaps if gap.recovery is not None}
+    warning_groups = group_source_warnings(report.source_warnings, evidence_gaps=evidence_gaps)
     if verbose:
         typer.echo(f"Tool count: {report.tool_surface.total_tools}")
         distinct = ""
@@ -574,11 +588,15 @@ def _print_cli_summary(
         typer.echo("")
     typer.echo("Reports:")
     for path in report.generated_reports.values():
+        if reports_base is not None and isinstance(path, str) and not Path(path).is_absolute():
+            path = caller_path_spelling(reports_base / path)
         typer.echo(f"- {path}")
-    if verbose and report.source_warnings:
+    if report.source_warnings and (verbose or recoveries):
         typer.echo("")
         typer.echo("Source warnings:")
         for group in warning_groups:
+            if not verbose and not recoveries.intersection(group.warnings):
+                continue
             suffix = f" ({group.count} warnings)" if group.count > 1 else ""
             typer.echo(f"- {group.message}{suffix}")
     typer.echo("")
@@ -607,6 +625,11 @@ def _print_decision_summary(report) -> None:
             typer.echo(declarations)
         if decision.decision == "insufficient_evidence":
             typer.echo(f"Improve evidence: {primary_evidence_remediation_text(ev)}")
+            # The gap says what to do here; this says what the tool can
+            # establish at all. A reader who cannot tell "unreadable
+            # repository" from "unreadable declaration shape" reads an
+            # honest abstention as a broken tool (#473).
+            typer.echo(DETERMINISM_BOUNDARY_REFERENCE)
         if report.agent_summary and report.agent_summary.first_recommended_action:
             action = report.agent_summary.first_recommended_action
             if action.command:

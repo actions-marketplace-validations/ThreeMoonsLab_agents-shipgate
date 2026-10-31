@@ -18,7 +18,7 @@ Writes / verifies:
                                 (from agents_shipgate.schemas.packet.EvidencePacket)
 - docs/verifier-schema.v0.<minor>.json
                                 (from agents_shipgate.schemas.verifier.VerifierArtifact)
-- docs/verify-run-schema.v3.json
+- docs/verify-run-schema.v5.json
                                 (from agents_shipgate.schemas.verify_run.
                                  VerifyRunArtifact)
 - docs/verification-plan-schema.v1.json
@@ -31,7 +31,7 @@ Writes / verifies:
 - docs/human-authorization-schema.v1.json
                                 (authorization request, signed grant,
                                  evaluation, and trust policy union)
-- docs/agent-handoff-schema.v6.json
+- docs/agent-handoff-schema.v9.json
                                 (from agents_shipgate.schemas.agent_handoff.
                                  AgentHandoffArtifact)
 - docs/agent-result-schema.v2.json
@@ -39,9 +39,9 @@ Writes / verifies:
 - docs/agent-boundary-result-schema.v1.json
                                 (from agents_shipgate.schemas.agent_boundary.
                                  AgentBoundaryResultV1)
-- docs/preflight-schema.v0.3.json
+- docs/preflight-schema.v0.6.json
                                 (from agents_shipgate.schemas.preflight.
-                                 PreflightResultV3)
+                                 PreflightResultV6)
 - docs/org-governance-schema.v0.1.json
                                 (from agents_shipgate.schemas.org_governance.
                                  OrgGovernanceStatusV1)
@@ -51,19 +51,34 @@ Writes / verifies:
 - docs/registry-schema.v0.4.json
                                 (from agents_shipgate.schemas.registry.
                                  RegistryQueryResultV1)
-- docs/host-grants-inventory-schema.v0.2.json
+- docs/host-grants-inventory-schema.v0.9.json
                                 (from agents_shipgate.schemas.host_grants.
-                                 HostGrantsInventoryArtifactV2)
-- docs/host-grants-baseline-schema.v0.2.json
-                                (from HostGrantsBaselineArtifactV2)
-- docs/host-grants-drift-schema.v0.2.json
-                                (from HostGrantsDriftArtifactV2)
+                                 HostGrantsInventoryArtifactV9)
+- docs/host-grants-baseline-schema.v0.9.json
+                                (from HostGrantsBaselineArtifactV9)
+- docs/host-grants-drift-schema.v0.9.json
+                                (from HostGrantsDriftArtifactV9)
 - docs/capability-lock-schema.v0.8.json
                                 (from agents_shipgate.schemas.capabilities.
                                  CapabilityLockFileArtifactV1)
 - docs/capability-lock-diff-schema.v0.9.json
                                 (from agents_shipgate.schemas.capabilities.
                                  CapabilityLockDiffArtifactV1)
+- docs/capability-payload-schema.v1.json
+                                (from agents_shipgate.schemas.capability_payload.
+                                 CapabilityPayloadV1)
+- docs/examples/capability-payload.v1.state.example.json
+- docs/examples/capability-payload.v1.delta.example.json
+                                (projected from the shipped
+                                 samples/ai_generated_refund_pr fixture, so the
+                                 worked examples cannot drift from the schema)
+- docs/capability-delta-attestation-schema.v1.json
+                                (from agents_shipgate.schemas.capability_attestation.
+                                 CapabilityDeltaAttestationV1)
+- docs/examples/capability-delta-attestation.v1.example.json
+                                (the same fixture, wrapped as an in-toto
+                                 statement; needs a `git` binary for the
+                                 subject's tree ids)
 - docs/governance-benchmark-catalog-schema.v0.2.json
                                 (from agents_shipgate.schemas.governance_benchmark.
                                  GovernanceBenchmarkCatalogArtifactV1)
@@ -95,7 +110,7 @@ DOCS = REPO_ROOT / "docs"
 # Filenames follow the schema identifiers, so a version bump cannot leave a
 # generated file sitting under the previous version's name.
 _AGENT_RESULT_SUFFIX = "v3"
-_BOUNDARY_SUFFIX = "v2"
+_BOUNDARY_SUFFIX = "v3"
 _VERIFY_RUN_SUFFIX = "v5"
 SRC = REPO_ROOT / "src"
 
@@ -235,6 +250,7 @@ def build_report_schema() -> tuple[Path, str]:
     from agents_shipgate.schemas.report import ReadinessReport
 
     schema = ReadinessReport.model_json_schema()
+    _postprocess_declaration_review(schema)
     minor = ReadinessReport.model_fields["report_schema_version"].default
     title = f"Agents Shipgate Readiness Report v{minor}"
     schema_id = (
@@ -341,6 +357,11 @@ def build_report_schema() -> tuple[Path, str]:
             # run decline to look at?" must never read the answer as "the
             # field is missing, so probably nothing".
             "surface_exclusions",
+            # v0.43: the privacy-safe manifest declaration projection is a
+            # first-class input to base-vs-head declaration review. Omitting
+            # it is not equivalent to an empty manifest, so current report
+            # bytes must always carry the explicit snapshot envelope.
+            "action_declaration_facts",
         ]
     )
     # Preserve version constants. Pydantic emits these as plain strings
@@ -1238,6 +1259,7 @@ def build_packet_schema() -> tuple[Path, str]:
     from agents_shipgate.schemas.packet import EvidencePacket
 
     schema = EvidencePacket.model_json_schema()
+    _postprocess_declaration_review(schema)
     minor = str(EvidencePacket.model_fields["packet_schema_version"].default)
     schema["$id"] = (
         "https://raw.githubusercontent.com/ThreeMoonsLab/agents-shipgate/"
@@ -1324,6 +1346,81 @@ def _postprocess_authorization_evaluation(schema: dict[str, Any]) -> None:
     properties = evaluation.get("properties", {})
     if isinstance(properties, dict) and isinstance(properties.get("reason_codes"), dict):
         properties["reason_codes"]["uniqueItems"] = True
+
+
+def _postprocess_declaration_review(schema: dict[str, Any]) -> None:
+    """Pin the current declaration-review wire shape in every embedding schema.
+
+    These models deliberately carry defaults so legacy report/packet/verifier
+    normalizers can construct the honest disabled-empty projection. Current
+    emitted artifacts, however, always serialize every key. Requiring those
+    keys prevents a current-version payload from using Python defaults to erase
+    review rows or their counts.
+    """
+
+    defs = schema.get("$defs", {})
+    required_by_definition = {
+        "ActionDeclarationSelectorFact": [
+            "tool",
+            "tool_id",
+            "source_type",
+            "source_id",
+            "provider",
+            "operation",
+        ],
+        "ActionDeclarationFact": [
+            "row_id",
+            "selector",
+            "subject",
+            "subject_id",
+            "resolution",
+            "declared_effect",
+            "declared_risk_tags",
+            "has_override",
+            "override_identity",
+            "basis",
+            "declaration_hash",
+            "manifest_path",
+        ],
+        "ActionDeclarationFacts": ["snapshot_version", "rows"],
+        "DeclarationReviewSummary": [
+            "evidence_consistent",
+            "unverified",
+            "acknowledged_override",
+        ],
+        "DeclarationReviewRow": [
+            "row_id",
+            "change_type",
+            "bucket",
+            "subject",
+            "subject_id",
+            "declared_effect",
+            "declared_risk_tags",
+            "observed_readings",
+            "reason",
+            "manifest_path",
+            "acknowledged_overrides",
+        ],
+        "DeclarationReviewDecision": [
+            "enabled",
+            "base_comparison_requested",
+            "base_kind",
+            "changed_count",
+            "summary",
+            "rows",
+            "notes",
+        ],
+    }
+    for name, required in required_by_definition.items():
+        definition = defs.get(name)
+        if isinstance(definition, dict):
+            definition["required"] = sorted(required)
+
+    semantic = defs.get("SemanticCoverageDecision")
+    if isinstance(semantic, dict):
+        semantic["required"] = sorted(
+            set(semantic.get("required", [])) | {"declaration_review"}
+        )
 
 
 def build_verifier_schema() -> tuple[Path, str]:
@@ -1427,7 +1524,7 @@ def build_verify_run_schema() -> tuple[Path, str]:
         f"main/docs/verify-run-schema.{_VERIFY_RUN_SUFFIX}.json"
     )
     schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
-    schema["title"] = "Agents Shipgate Verify Run v3"
+    schema["title"] = "Agents Shipgate Verify Run v5"
     schema["description"] = (
         "JSON Schema for agents-shipgate-reports/verify-run.json. Generated "
         "from agents_shipgate.schemas.verify_run.VerifyRunArtifact. Do not "
@@ -1579,6 +1676,48 @@ def build_human_authorization_schema() -> tuple[Path, str]:
     return DOCS / "human-authorization-schema.v1.json", _canonical_json(schema)
 
 
+def build_human_review_request_schema() -> tuple[Path, str]:
+    """A new request grammar; no shared control union is widened (#536)."""
+    from agents_shipgate.schemas.human_review_request import HumanReviewRequestV1
+
+    schema = HumanReviewRequestV1.model_json_schema()
+    schema["$id"] = (
+        "https://raw.githubusercontent.com/ThreeMoonsLab/agents-shipgate/"
+        "main/docs/human-review-request-schema.v1.json"
+    )
+    schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
+    schema["description"] = (
+        "Unsigned complete-evidence review question; never an authorization. "
+        "Content identities and full-scope relations also require model validation."
+    )
+    return DOCS / "human-review-request-schema.v1.json", _canonical_json(schema)
+
+
+
+def build_human_review_decision_schema() -> tuple[Path, str]:
+    """A detached decision and its non-authorizing applicability result (#537)."""
+    from pydantic import TypeAdapter
+
+    from agents_shipgate.schemas.human_review_decision import (
+        HumanReviewDecisionV1,
+        HumanReviewEvaluationV1,
+    )
+
+    schema = TypeAdapter(HumanReviewDecisionV1 | HumanReviewEvaluationV1).json_schema()
+    schema["$id"] = (
+        "https://raw.githubusercontent.com/ThreeMoonsLab/agents-shipgate/"
+        "main/docs/human-review-decision-schema.v1.json"
+    )
+    schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
+    schema["title"] = "Agents Shipgate Human Review Decision Protocol v1"
+    schema["description"] = (
+        "Externally signed review decision and separate applicability result; "
+        "neither grants operation or release authority. Content identity, time "
+        "ordering, signature, current verification and trusted eligibility "
+        "require the evaluator, not JSON Schema alone."
+    )
+    return DOCS / "human-review-decision-schema.v1.json", _canonical_json(schema)
+
 def build_agent_handoff_schema() -> tuple[Path, str]:
     """Generate the current agent-handoff schema."""
 
@@ -1612,10 +1751,10 @@ def build_preflight_schema() -> tuple[Path, str]:
 
     from agents_shipgate.schemas.preflight import (
         PREFLIGHT_SCHEMA_VERSION,
-        PreflightResultV3,
+        PreflightResultV6,
     )
 
-    schema = PreflightResultV3.model_json_schema()
+    schema = PreflightResultV6.model_json_schema()
     minor = PREFLIGHT_SCHEMA_VERSION
     schema["$id"] = (
         "https://raw.githubusercontent.com/ThreeMoonsLab/agents-shipgate/"
@@ -1625,7 +1764,7 @@ def build_preflight_schema() -> tuple[Path, str]:
     schema["title"] = f"Agents Shipgate Preflight Result v{minor}"
     schema["description"] = (
         "JSON Schema for shipgate preflight --json. Generated from "
-        "agents_shipgate.schemas.preflight.PreflightResultV3. It is a "
+        "agents_shipgate.schemas.preflight.PreflightResultV6. It is a "
         "proactive routing/projection surface, not a release gate; "
         "release_decision.decision remains the only gate."
     )
@@ -1707,6 +1846,496 @@ def write_capability_lock_diff_schema(
         check_only=check_only,
         drift=drift if drift is not None else [],
     )
+
+
+#: The one place a published capability object may leave a property out of
+#: ``required``, and why. ``DigestSet`` is in-toto's type, not ours: it is
+#: ``map<string, string>``, so an algorithm the producer did not compute is
+#: absent rather than ``null``. Everywhere else in these schemas absence is
+#: spelled as a value, and the assertion below keeps it that way.
+_CAPABILITY_OPTIONAL_PROPERTIES: dict[str, frozenset[str]] = {
+    "CapabilityDeltaSubjectDigest": frozenset({"gitCommit"}),
+}
+
+
+def _postprocess_capability_payload(schema: dict[str, Any]) -> None:
+    """Push every constraint JSON Schema *can* express into the published file.
+
+    Pydantic's ``model_json_schema`` does not emit ``model_validator`` rules, so
+    a consumer handed only this file would validate far less than the spec
+    promises. Several of those rules are ordinary conditional schemas, and an
+    external tool should get them for free rather than be told to reimplement
+    them. What genuinely cannot be expressed here — anything requiring a
+    recomputation — is named as stage two in the schema description and
+    enumerated in the spec page.
+    """
+
+    defs = schema["$defs"]
+
+    def not_null(field: str) -> dict[str, Any]:
+        return {"properties": {field: {"not": {"type": "null"}}}}
+
+    def is_null(field: str) -> dict[str, Any]:
+        return {"properties": {field: {"type": "null"}}}
+
+    def when(field: str, value: Any) -> dict[str, Any]:
+        return {"properties": {field: {"const": value}}, "required": [field]}
+
+    if "CapabilityRecordTransitionEntry" not in defs:  # pragma: no cover
+        raise AssertionError(
+            "the capability payload post-processor was handed a schema that "
+            "carries no capability records; it would silently publish none of "
+            "the stage-one rules"
+        )
+    entry = defs["CapabilityRecordTransitionEntry"]
+    entry["allOf"] = [
+        # A membership change has exactly one side, no changed dimensions, and
+        # one honest direction.
+        {
+            "if": when("transition", "added"),
+            "then": {
+                "allOf": [
+                    is_null("before"),
+                    not_null("after"),
+                    {"properties": {"changed_dimensions": {"maxItems": 0}}},
+                    when("semantic_direction", "added"),
+                ]
+            },
+        },
+        {
+            "if": when("transition", "removed"),
+            "then": {
+                "allOf": [
+                    not_null("before"),
+                    is_null("after"),
+                    {"properties": {"changed_dimensions": {"maxItems": 0}}},
+                    when("semantic_direction", "removed"),
+                ]
+            },
+        },
+        # A paired change carries both sides, at least one moved dimension, and
+        # cannot claim a membership direction.
+        *(
+            {
+                "if": when("transition", transition),
+                "then": {
+                    "allOf": [
+                        not_null("before"),
+                        not_null("after"),
+                        {"properties": {"changed_dimensions": {"minItems": 1}}},
+                        {
+                            "properties": {
+                                "semantic_direction": {
+                                    "not": {"enum": ["added", "removed"]}
+                                }
+                            }
+                        },
+                    ]
+                },
+            }
+            for transition in ("changed", "reidentified")
+        ),
+    ]
+
+    subject = defs["CapabilityDeltaSubject"]
+    subject["allOf"] = [
+        # `transition` follows from the presence pair, and a subject present on
+        # neither side is not a row at all.
+        {
+            "if": {
+                "allOf": [when("present_in_base", base), when("present_in_head", head)]
+            },
+            "then": when("transition", expected),
+        }
+        for base, head, expected in (
+            (False, True, "added"),
+            (True, False, "removed"),
+            (True, True, "modified"),
+        )
+    ] + [
+        {
+            "not": {
+                "allOf": [
+                    when("present_in_base", False),
+                    when("present_in_head", False),
+                ]
+            }
+        },
+        # Presence bounds the changes, not only the transition label: a subject
+        # base never had cannot carry a capability that changed or went away.
+        *(
+            {
+                "if": when(field, False),
+                "then": {
+                    "properties": {
+                        "changes": {
+                            "items": {
+                                "properties": {"transition": {"const": allowed}},
+                                "required": ["transition"],
+                            }
+                        }
+                    }
+                },
+            }
+            for field, allowed in (
+                ("present_in_base", "added"),
+                ("present_in_head", "removed"),
+            )
+        ),
+    ]
+
+    # The permission shapes the classifier can actually produce. A consumer
+    # reasons about this block — "is this read-only?" — so a combination the
+    # lattice never emits is a claim with no meaning, and stage one can say so.
+    permission = defs["CapabilityPermissionFacts"]
+    permission["allOf"] = [
+        {
+            "if": when("status", "unavailable"),
+            "then": {
+                "allOf": [
+                    {"properties": {"classes": {"maxItems": 0}}},
+                    when("side_effect_unknown", True),
+                ]
+            },
+        },
+        {
+            "if": when("status", "measured"),
+            "then": {"properties": {"classes": {"minItems": 1}}},
+        },
+        # `read` is the whole profile or not in it at all.
+        {
+            "if": {
+                "properties": {"classes": {"contains": {"const": "read"}}},
+                "required": ["classes"],
+            },
+            "then": {"properties": {"classes": {"maxItems": 1}}},
+        },
+        # `destructive` always carries `write`.
+        {
+            "if": {
+                "properties": {"classes": {"contains": {"const": "destructive"}}},
+                "required": ["classes"],
+            },
+            "then": {"properties": {"classes": {"contains": {"const": "write"}}}},
+        },
+        # Unknown side effects and the `unknown` class are the same statement,
+        # in both directions.
+        {
+            "if": when("side_effect_unknown", True),
+            "then": {
+                "anyOf": [
+                    when("status", "unavailable"),
+                    {"properties": {"classes": {"contains": {"const": "unknown"}}}},
+                ]
+            },
+        },
+        {
+            "if": {
+                "properties": {"classes": {"contains": {"const": "unknown"}}},
+                "required": ["classes"],
+            },
+            "then": when("side_effect_unknown", True),
+        },
+    ]
+
+    # A membership change has no second record to compare against.
+    for transition in ("added", "removed"):
+        entry["allOf"].append(
+            {
+                "if": when("transition", transition),
+                "then": {"properties": {"semantic_changes": {"maxItems": 0}}},
+            }
+        )
+
+    # Naming a subject outside analysis requires having looked.
+    defs["CapabilityAnalysisCoverage"]["allOf"] = [
+        {
+            "if": {
+                "properties": {"status": {"not": {"const": "complete"}}},
+                "required": ["status"],
+            },
+            "then": {"properties": {"subjects_outside_analysis": {"maxItems": 0}}},
+        }
+    ]
+
+    # Identical rows are the cheap half of "one subject, one row"; the rest is
+    # stage two, because uniqueness is on a sub-key.
+    for name, field in (
+        ("CapabilityStatePayloadV1", "subjects"),
+        ("CapabilityDeltaPayloadV1", "subjects"),
+        ("CapabilityStateSubject", "capabilities"),
+        ("CapabilityDeltaSubject", "changes"),
+        ("CapabilityAnalysisCoverage", "subjects_outside_analysis"),
+        ("CapabilityCoverageDelta", "newly_outside_analysis"),
+        ("CapabilityCoverageDelta", "no_longer_outside_analysis"),
+        ("CapabilityRecordTransitionEntry", "semantic_changes"),
+        ("CapabilityRecordTransitionEntry", "changed_dimensions"),
+        ("CapabilityPermissionFacts", "classes"),
+        ("CapabilityRecord", "resource"),
+        ("CapabilityRecord", "scope"),
+        ("CapabilityRecord", "risk_tags"),
+        ("CapabilityAuthorityFacts", "scopes"),
+        ("CapabilityAuthorityFacts", "broad_scopes"),
+    ):
+        # Skip what this document does not carry: the attestation embeds the
+        # delta view alone, and reusing this one post-processor is how the two
+        # published schemas cannot express different rules for the same object.
+        if name in defs:
+            defs[name]["properties"][field]["uniqueItems"] = True
+
+    # Every object in the published schema requires every property it declares.
+    # A field with a schema default drops out of `required`, and a wire format
+    # whose spec says "always present" must not have any.
+    for name, definition in defs.items():
+        if definition.get("type") != "object" or "properties" not in definition:
+            continue
+        allowed = _CAPABILITY_OPTIONAL_PROPERTIES.get(name, frozenset())
+        missing = sorted(
+            set(definition["properties"]) - set(definition.get("required", [])) - allowed
+        )
+        if missing:  # pragma: no cover - the generator would be shipping a hole
+            raise AssertionError(
+                f"{name} publishes optional properties {missing}; every field of "
+                "the capability payload must be required on the wire"
+            )
+
+
+def build_capability_payload_schema() -> tuple[Path, str]:
+    """Generate the frozen shared capability payload schema (#469)."""
+
+    from agents_shipgate.schemas.capability_payload import (
+        CAPABILITY_PAYLOAD_SCHEMA_VERSION,
+        CapabilityPayloadV1,
+    )
+
+    schema = CapabilityPayloadV1.model_json_schema()
+    _postprocess_capability_payload(schema)
+    schema["$id"] = (
+        "https://raw.githubusercontent.com/ThreeMoonsLab/agents-shipgate/"
+        "main/docs/capability-payload-schema.v1.json"
+    )
+    schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
+    schema["title"] = "Agents Shipgate Capability Payload v1"
+    schema["description"] = (
+        "Frozen JSON Schema for "
+        f"{CAPABILITY_PAYLOAD_SCHEMA_VERSION} — the one capability payload "
+        "shared by the exported capability delta and the committed capability "
+        "state. Generated from "
+        "agents_shipgate.schemas.capability_payload.CapabilityPayloadV1. Two "
+        "views discriminated on `view`; one subject is one row. "
+        "VALIDATION IS TWO STAGES: this file is stage one and is not "
+        "sufficient on its own. The rules that require recomputation — "
+        "subject-key derivation, summary and transition rollups, changed-"
+        "dimension derivation, state-digest verification, cross-row "
+        "uniqueness, and the coverage transition — cannot be expressed in "
+        "JSON Schema and are listed as stage two in "
+        "docs/capability-payload.md; a consumer that runs only stage one does "
+        "not have the guarantees the spec states. It is non-gating and is not "
+        "part of report.json; release_decision.decision remains the only gate."
+    )
+    target = DOCS / "capability-payload-schema.v1.json"
+    return target, _canonical_json(schema)
+
+
+# The worked examples are projected from a shipped sample rather than written
+# by hand, for the reason #425 recorded: a hand-written example is a claim
+# about the format that nothing checks, and it drifts silently. Generating
+# them here puts them under the same `--check` drift gate as the schemas.
+_PAYLOAD_EXAMPLE_SAMPLE = REPO_ROOT / "samples" / "ai_generated_refund_pr"
+
+
+def _capability_payload_example_facts() -> tuple[list[Any], list[Any]]:
+    """Build the base and head capability facts of the refund-PR sample.
+
+    The sample keeps its head tool surface under ``_head/`` because the fixture
+    runner materializes a two-commit history from it. Reproduce that here with a
+    temporary copy: static inputs only, no git, no network.
+    """
+
+    import shutil
+    import tempfile
+
+    from agents_shipgate.cli.capability import build_capability_lock_from_config
+
+    base = build_capability_lock_from_config(
+        config=_PAYLOAD_EXAMPLE_SAMPLE / "shipgate.yaml",
+        no_plugins=True,
+        verbose=False,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        head_root = Path(tmp) / "head"
+        shutil.copytree(_PAYLOAD_EXAMPLE_SAMPLE, head_root)
+        shutil.copyfile(head_root / "_head" / "tools.json", head_root / "tools.json")
+        head = build_capability_lock_from_config(
+            config=head_root / "shipgate.yaml",
+            no_plugins=True,
+            verbose=False,
+        )
+    return base.capabilities, head.capabilities
+
+
+def build_capability_payload_state_example() -> tuple[Path, str]:
+    """Generate the worked state-view example from the shipped sample."""
+
+    from agents_shipgate.core.capability_payload import project_capability_state
+
+    base_facts, _ = _capability_payload_example_facts()
+    payload = project_capability_state(base_facts, ref="samples/ai_generated_refund_pr")
+    target = DOCS / "examples" / "capability-payload.v1.state.example.json"
+    return target, _canonical_json(payload.model_dump(mode="json"))
+
+
+def build_capability_payload_delta_example() -> tuple[Path, str]:
+    """Generate the worked delta-view example from the shipped sample."""
+
+    from agents_shipgate.core.capability_payload import project_capability_delta
+
+    base_facts, head_facts = _capability_payload_example_facts()
+    payload = project_capability_delta(
+        base_facts,
+        head_facts,
+        base_ref="samples/ai_generated_refund_pr",
+        head_ref="samples/ai_generated_refund_pr/_head",
+    )
+    target = DOCS / "examples" / "capability-payload.v1.delta.example.json"
+    return target, _canonical_json(payload.model_dump(mode="json"))
+
+
+def build_capability_delta_attestation_schema() -> tuple[Path, str]:
+    """Generate the frozen in-toto delta-attestation schema (#470)."""
+
+    from agents_shipgate.schemas.capability_attestation import (
+        CAPABILITY_DELTA_ATTESTATION_SCHEMA_VERSION,
+        CAPABILITY_DELTA_PREDICATE_TYPE,
+        GIT_OBJECT_PATTERN,
+        CapabilityDeltaAttestationV1,
+    )
+
+    schema = CapabilityDeltaAttestationV1.model_json_schema()
+    # The same post-processor the payload schema runs. The attestation embeds
+    # the delta view, so running a second, parallel set of stage-one rules over
+    # the same objects is exactly the divergence the shared payload exists to
+    # prevent.
+    _postprocess_capability_payload(schema)
+    # Pydantic's validation schema for an optional nullable field admits
+    # ``null``, and the producer never emits it: a ``DigestSet`` is
+    # ``map<string, string>``, so an uncomputed algorithm is absent. Publishing
+    # the nullable form would tell an external validator to accept a document
+    # this format does not produce and an in-toto consumer cannot type.
+    digest = schema["$defs"]["CapabilityDeltaSubjectDigest"]["properties"]["gitCommit"]
+    digest.pop("anyOf", None)
+    digest.pop("default", None)
+    digest["type"] = "string"
+    digest["pattern"] = GIT_OBJECT_PATTERN
+    schema["$id"] = (
+        "https://raw.githubusercontent.com/ThreeMoonsLab/agents-shipgate/"
+        "main/docs/capability-delta-attestation-schema.v1.json"
+    )
+    schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
+    schema["title"] = "Agents Shipgate Capability Delta Attestation v1"
+    schema["description"] = (
+        "Frozen JSON Schema for an in-toto Statement carrying "
+        f"{CAPABILITY_DELTA_ATTESTATION_SCHEMA_VERSION} — the exported "
+        "capability delta, published so a consumer can read what an agent can "
+        "do after a change without running Agents Shipgate. predicateType is "
+        f"{CAPABILITY_DELTA_PREDICATE_TYPE}, and `predicate.delta` is the "
+        "frozen shipgate.capability_payload/v1 delta view unchanged. "
+        "VALIDATION IS TWO STAGES: this file is stage one and is not "
+        "sufficient on its own. Beyond the payload's own stage-two rules "
+        "(docs/capability-payload.md), a consumer must check that the attested "
+        "subject's gitTree equals predicate.delta.head.ref, and that both refs "
+        "are git object ids. The statement is emitted unsigned; authenticity "
+        "is the transport's job. It is non-gating: "
+        "release_decision.decision remains the only release gate."
+    )
+    target = DOCS / "capability-delta-attestation-schema.v1.json"
+    return target, _canonical_json(schema)
+
+
+def _capability_payload_example_trees() -> tuple[str, str]:
+    """The git tree object ids of the shipped sample's base and head states.
+
+    Real object ids, not placeholders: the attestation binds its subject to a
+    tree, and a worked example whose subject is fabricated is a claim about the
+    format that nothing can check. ``git write-tree`` is deterministic — a tree
+    id is a function of file names, contents and modes alone, with no author,
+    no date and no history — so the committed example is stable across machines
+    and re-runs, which is what puts it under the ``--check`` drift gate.
+    """
+
+    import shutil
+    import subprocess
+    import tempfile
+
+    def tree_id(root: Path) -> str:
+        git = (
+            "git",
+            # Neutralize whatever the developer's global config says: a
+            # line-ending rewrite or a stray excludes file would change the
+            # blob contents, and with them the published example.
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "core.eol=lf",
+            "-c",
+            "core.excludesfile=",
+            "-c",
+            "core.attributesfile=",
+            "-C",
+            str(root),
+        )
+        subprocess.run([*git, "init", "-q", "-b", "main"], check=True)
+        subprocess.run([*git, "add", "-A"], check=True)
+        written = subprocess.run(
+            [*git, "write-tree"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        shutil.rmtree(root / ".git")
+        return written.stdout.strip()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base_root = Path(tmp) / "base"
+        head_root = Path(tmp) / "head"
+        shutil.copytree(_PAYLOAD_EXAMPLE_SAMPLE, base_root)
+        shutil.copytree(_PAYLOAD_EXAMPLE_SAMPLE, head_root)
+        # ``_head/`` is the fixture runner's staging area for the second
+        # commit, not part of either reviewed state.
+        shutil.copyfile(head_root / "_head" / "tools.json", head_root / "tools.json")
+        shutil.rmtree(base_root / "_head")
+        shutil.rmtree(head_root / "_head")
+        return tree_id(base_root), tree_id(head_root)
+
+
+def build_capability_delta_attestation_example() -> tuple[Path, str]:
+    """Generate the worked attestation from the shipped sample (#470).
+
+    ``verification.status`` is ``unbound`` and that is the honest value: this
+    example is projected from the sample's capability facts, not emitted by a
+    ``verify`` run, so there is no receipt to chain to. A ``verify`` emission
+    always carries ``bound`` — the run identities it would name mix in the
+    engine build and the platform, which is precisely why a committed golden
+    cannot be one.
+    """
+
+    from agents_shipgate.core.capability_attestation import (
+        project_capability_delta_attestation,
+    )
+    from agents_shipgate.schemas.capability_attestation import attestation_json
+
+    base_facts, head_facts = _capability_payload_example_facts()
+    base_tree, head_tree = _capability_payload_example_trees()
+    attestation = project_capability_delta_attestation(
+        base_facts,
+        head_facts,
+        subject_name="samples/ai_generated_refund_pr",
+        base_tree_sha=base_tree,
+        head_tree_sha=head_tree,
+        head_commit_sha=None,
+    )
+    target = DOCS / "examples" / "capability-delta-attestation.v1.example.json"
+    return target, _canonical_json(attestation_json(attestation))
 
 
 def build_governance_benchmark_catalog_schema() -> tuple[Path, str]:
@@ -1865,10 +2494,10 @@ def build_host_grants_inventory_schema() -> tuple[Path, str]:
 
     from agents_shipgate.schemas.host_grants import (
         HOST_GRANTS_INVENTORY_SCHEMA_VERSION,
-        HostGrantsInventoryArtifactV2,
+        HostGrantsInventoryArtifactV9,
     )
 
-    schema = HostGrantsInventoryArtifactV2.model_json_schema()
+    schema = HostGrantsInventoryArtifactV9.model_json_schema()
     minor = HOST_GRANTS_INVENTORY_SCHEMA_VERSION
     schema["$id"] = (
         "https://raw.githubusercontent.com/ThreeMoonsLab/agents-shipgate/"
@@ -1889,10 +2518,10 @@ def build_host_grants_baseline_schema() -> tuple[Path, str]:
 
     from agents_shipgate.schemas.host_grants import (
         HOST_GRANTS_BASELINE_SCHEMA_VERSION,
-        HostGrantsBaselineArtifactV2,
+        HostGrantsBaselineArtifactV9,
     )
 
-    schema = HostGrantsBaselineArtifactV2.model_json_schema()
+    schema = HostGrantsBaselineArtifactV9.model_json_schema()
     minor = HOST_GRANTS_BASELINE_SCHEMA_VERSION
     schema["$id"] = (
         "https://raw.githubusercontent.com/ThreeMoonsLab/agents-shipgate/"
@@ -1912,10 +2541,10 @@ def build_host_grants_drift_schema() -> tuple[Path, str]:
 
     from agents_shipgate.schemas.host_grants import (
         HOST_GRANTS_DRIFT_SCHEMA_VERSION,
-        HostGrantsDriftArtifactV2,
+        HostGrantsDriftArtifactV9,
     )
 
-    schema = HostGrantsDriftArtifactV2.model_json_schema()
+    schema = HostGrantsDriftArtifactV9.model_json_schema()
     minor = HOST_GRANTS_DRIFT_SCHEMA_VERSION
     schema["$id"] = (
         "https://raw.githubusercontent.com/ThreeMoonsLab/agents-shipgate/"
@@ -1928,8 +2557,431 @@ def build_host_grants_drift_schema() -> tuple[Path, str]:
     return target, _canonical_json(schema)
 
 
+def build_openshell_native_trust_schema() -> tuple[Path, str]:
+    from agents_shipgate.schemas.openshell_native import NativeTrustConfig
+
+    schema = NativeTrustConfig.model_json_schema()
+    schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
+    schema["$id"] = "https://raw.githubusercontent.com/ThreeMoonsLab/agents-shipgate/main/docs/openshell-native-trust-schema.v1.json"
+    schema["title"] = "Agents Shipgate optional OpenShell native trust configuration v1"
+    return DOCS / "openshell-native-trust-schema.v1.json", _canonical_json(schema)
+
+
+def build_openshell_native_evidence_schema() -> tuple[Path, str]:
+    from agents_shipgate.schemas.openshell_native import NativeEvidence
+
+    schema = NativeEvidence.model_json_schema()
+    schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
+    schema["$id"] = "https://raw.githubusercontent.com/ThreeMoonsLab/agents-shipgate/main/docs/openshell-native-evidence-schema.v1.json"
+    schema["title"] = "Agents Shipgate modeled OpenShell native containment evidence v1"
+    return DOCS / "openshell-native-evidence-schema.v1.json", _canonical_json(schema)
+
+
 # Public ordered list of (name, builder) pairs. Tests and the CLI iterate this
 # instead of hardcoding individual calls, so adding a new schema is one edit.
+# --- Determinism boundary ---------------------------------------------------
+
+
+_BOUNDARY_INTRO = """\
+Agents Shipgate abstains where it cannot prove something. That is only useful
+if the line is published: an `insufficient_evidence` verdict outside the
+boundary reads as *"this tool cannot analyse my repository"*, and inside it as
+*"this repository declares its tools in a shape nothing static can read"*.
+Those are different answers, and only one of them tells you what to do next.
+
+Read this page as a scoping answer. Find the input you use, find the shape your
+repository declares tools in, and the row says what the scan can establish about
+it and what a verdict may rest on. Every "cannot" here is a property of static
+reading, not of your code.
+
+Nothing on this page is written by hand. Each built-in adapter declares what it
+reads for each declaration shape and the extraction-confidence ceiling that
+shape reaches, beside the code that mints it; the outcome column is computed by
+asking the engine's own completeness predicates about those declared facts. CI
+regenerates the page and fails on any difference, so a boundary that moves in
+the code moves here in the same commit or the build stops.
+"""
+
+_BOUNDARY_CEILING_NOTE = """\
+`ceiling` is the best `extraction_confidence` the route reaches, and `high` is
+the only value that leaves an action able to be pass-eligible. Below it there is
+no tolerance to spend: an action that cannot be proven raises an
+`incomplete_surface` semantic gap, semantic gaps are zero-tolerance, and one of
+them is enough to withhold a verdict. A single action from a `low_confidence`
+route is therefore already a scan that cannot reach `passed` — the point is not
+how many you have.
+
+A ceiling is a ceiling, not a promise — an individual action can land lower, and
+effect, authority, identity, and binding evidence are judged separately and can
+withhold a pass from a route marked `proven` here.
+"""
+
+_BOUNDARY_REMEDY = """\
+There is no universal remedy, and the per-input line below each table says which
+one applies. Where an input accepts a **reviewed tool inventory** — an
+MCP-export-shaped file listing the tools the source really exposes, declared in
+the manifest and merged through review — that file is read as a published
+contract and reaches `high`. Four inputs have such a key; the rest do not, and
+telling their adopters to write one sends them after a manifest key that does
+not exist.
+
+Two rows an inventory never moves. A wildcard inventory (`wildcard: true`) is a
+reviewed file that names nothing, so it loads at `high` and still proves no
+surface — review is not the ingredient that was missing. And where the table
+says `not_extracted`, the scan is telling you it read a declaration and refused
+to guess what it produces; that is a statement about the declaration, not a gap
+an inventory fills. `not_applicable` means the input has no such declaration
+form at all.
+
+Nothing an agent can write for itself moves a row. That is the point of the
+boundary rather than an accident of it.
+"""
+
+
+def _boundary_cell_label(cell: object) -> str:
+    shape = cell.shape
+    variant = cell.variant
+    return f"{shape} — {variant}" if variant else str(shape)
+
+
+def _boundary_anchor(source: Any) -> str:
+    """The GitHub heading anchor for one input's section.
+
+    GitHub lowercases, drops every character that is not alphanumeric, a space,
+    or a hyphen, then maps spaces to hyphens. Approximating that with a couple
+    of `replace` calls produced `#openai-agents-sdk-(python)`, which resolves to
+    nothing — the parentheses survive in the link and not in the heading.
+    """
+
+    text = "".join(
+        char
+        for char in source.label.lower()
+        if char.isalnum() or char in " -"
+    )
+    return text.replace(" ", "-")
+
+
+def _boundary_table_text(value: str) -> str:
+    return value.replace("|", "\\|")
+
+
+def _boundary_remedy_line(source: Any) -> str:
+    """The remedy that actually applies to this input.
+
+    Derived from `inventory_manifest_key()` and from whether any route here
+    reaches `proven` at all, because the universal-inventory promise was false
+    for most rows: there is no inventory key for `sdk_function`,
+    `conductor_mcp_call`, or `codex_config_mcp`.
+    """
+
+    inventory_key = source.inventory_key
+    proven = [
+        cell for cell in source.cells if cell.outcome == "proven"
+    ]
+    if inventory_key:
+        return (
+            f"**Getting to `proven` here:** declare a reviewed tool inventory at "
+            f"`{inventory_key}[]`. It is read as a published contract, so it "
+            "reaches `high` — unless it declares `wildcard: true`, which names "
+            "nothing."
+        )
+    if proven:
+        labels = " or ".join(f"`{_boundary_cell_label(cell)}`" for cell in proven)
+        return (
+            f"**Getting to `proven` here:** only via {labels}. The engine "
+            "prescribes no `tool_inventories[]` remediation for this input, so "
+            "that route is the whole answer."
+        )
+    return (
+        "**Getting to `proven` here:** no route on this input reaches `proven`. "
+        "Publish the actions through an input that does, or accept that a "
+        "verdict cannot rest on this surface alone."
+    )
+
+
+def build_determinism_boundary_matrix() -> tuple[Path, str]:
+    """Generate docs/determinism-boundary.json from the adapter registry."""
+
+    from agents_shipgate.inputs.coverage import build_boundary_matrix
+
+    matrix = build_boundary_matrix()
+    payload = {
+        "$id": (
+            "https://raw.githubusercontent.com/ThreeMoonsLab/agents-shipgate/"
+            "main/docs/determinism-boundary.json"
+        ),
+        "title": "Agents Shipgate Determinism Boundary",
+        "description": (
+            "What each built-in input can establish, per declaration shape: the "
+            "extraction-confidence ceiling and what that ceiling means for a "
+            "release verdict. Generated from "
+            "agents_shipgate.inputs.coverage.build_boundary_matrix(). Do not "
+            "edit by hand."
+        ),
+        **matrix.model_dump(mode="json"),
+    }
+    return DOCS / "determinism-boundary.json", _canonical_json(payload)
+
+
+#: Plain words for each outcome, for the table an adopter actually reads. The
+#: tokens stay in the JSON and in the per-input detail; a reader scanning for
+#: their framework should not have to learn `set_unproven` first (#478 review).
+_BOUNDARY_OUTCOME_WORDS: dict[str, str] = {
+    "proven": "✅ proven",
+    "set_unproven": "⚠️ set unproven",
+    "low_confidence": "⚠️ not proven",
+    "not_extracted": "✖ not read",
+    "not_applicable": "· n/a",
+}
+
+#: The reader's own words for each declaration shape. They recognise
+#: `tools=[a, b]` faster than "literal registration", so the column headers ask
+#: the question and the token is defined once, in the reference at the bottom.
+_BOUNDARY_SHAPE_HEADINGS: dict[str, str] = {
+    "export_artifact": "…in a contract file",
+    "literal_registration": "…written out in code",
+    "factory": "…built by a call",
+    "dynamic_construction": "…not named at all",
+}
+
+
+def _boundary_answer(source: Any, matrix: Any) -> list[str]:
+    """The plain-language answer for one input.
+
+    Composed from the outcomes the engine already derived, never written per
+    adapter — a hand-written paragraph per input is the drift this whole page
+    exists to avoid. Three shapes of answer, because there are three shapes of
+    repository: the contract file *is* the surface, the code is read but never
+    proven, or nothing here reaches a verdict at all.
+    """
+
+    proven = [cell for cell in source.cells if cell.outcome == "proven"]
+    code_route = matrix.best_outcome(source, "literal_registration")
+
+    # Ordered by what the reader has in their hands. Leading with the contract
+    # file told a LangChain adopter "yes, from a contract file" when the thing
+    # they actually wrote is Python, and buried the fact that their code *is*
+    # read — just never proven.
+    if not proven:
+        answer = (
+            "**Not on its own.** shipgate may still read and check actions here "
+            "— the routes below say which — but none of them proves one well "
+            "enough for a verdict to rest on it."
+        )
+    elif code_route == "proven":
+        answer = (
+            "**Yes, from your source** — when the file resolves completely. A "
+            "single unresolved expression anywhere in the module drops "
+            "everything that module declares, including tools a resolved "
+            "toolset contributed."
+        )
+    elif code_route in {"low_confidence", "set_unproven"}:
+        answer = (
+            "**Read, but not proven from your source alone.** shipgate reads "
+            "the tools you write out and can say what each one does. What it "
+            "cannot do is prove that list is *all* of them — so it will not "
+            "pass them on their own, however ordinary they look."
+        )
+    elif code_route == "not_extracted":
+        answer = (
+            "**Not from your source.** shipgate read the declaration and "
+            "refused to guess what it produces, which is a statement about the "
+            "declaration rather than a gap in the scan."
+        )
+    else:
+        answer = (
+            "**Yes, from the file you point it at.** That file is the contract "
+            "and it is read as written; what it does not name, shipgate does "
+            "not invent."
+        )
+
+    return [answer, "", _boundary_remedy_line(source)]
+
+
+def build_determinism_boundary_page() -> tuple[Path, str]:
+    """Generate docs/determinism-boundary.md from the adapter registry.
+
+    Ordered for someone who arrived from an `insufficient_evidence` verdict and
+    wants to know whether shipgate can read *their* repository. The precise
+    matrix is still here in full — it moved below the answer, not out of it.
+    """
+
+    from agents_shipgate.inputs.coverage import (
+        CELL_OUTCOME_VERDICTS,
+        DECLARATION_SHAPE_DEFINITIONS,
+        DECLARATION_SHAPE_ORDER,
+        build_boundary_matrix,
+    )
+
+    matrix = build_boundary_matrix()
+    lines: list[str] = [
+        "# What Agents Shipgate can prove about your repository",
+        "",
+        "> Generated by `scripts/generate_schemas.py` from the adapter registry.",
+        "> Do not edit by hand — re-run the script to update.",
+        "",
+        _BOUNDARY_INTRO,
+        "## Start here",
+        "",
+        "1. Find your framework in the table below.",
+        (
+            "2. Read across to the way **your** repository declares its tools. "
+            "Most repositories use more than one."
+        ),
+        (
+            "3. Anything that is not ✅ has a fix, and it is written under that "
+            "framework's heading."
+        ),
+        "",
+        (
+            "If you landed here from an `insufficient_evidence` verdict, this "
+            "page is the reason for it. A ⚠️ or ✖ on the row you use is not a "
+            "bug report — it is shipgate telling you which of your declarations "
+            "it could not read, and that is a scoping answer you can act on."
+        ),
+        "",
+        "| Your framework | " + " | ".join(
+            _BOUNDARY_SHAPE_HEADINGS[shape] for shape in DECLARATION_SHAPE_ORDER
+        ) + " |",
+        "| --- | " + " | ".join("---" for _ in DECLARATION_SHAPE_ORDER) + " |",
+    ]
+    for source in matrix.sources:
+        cells = [
+            _BOUNDARY_OUTCOME_WORDS[matrix.best_outcome(source, shape)]
+            for shape in DECLARATION_SHAPE_ORDER
+        ]
+        lines.append(f"| [{source.label}](#{_boundary_anchor(source)}) | " + " | ".join(cells) + " |")
+    lines.extend(
+        [
+            "",
+            "**✅ proven** — a clean verdict can rest on this. "
+            "**⚠️ not proven / set unproven** — shipgate read the action but "
+            "cannot prove it saw the whole set, so it will not pass it. "
+            "**✖ not read** — nothing enters the catalog; shipgate says so "
+            "rather than reporting an empty surface. **· n/a** — your framework "
+            "has no such declaration.",
+            "",
+            (
+                "Where an input shows more than one answer for a shape, the "
+                "table shows the best of them and the framework's own section "
+                "lists every route."
+            ),
+            "",
+            "## Your framework",
+            "",
+        ]
+    )
+    for source in matrix.sources:
+        routes = []
+        if "tool_sources" in source.configured_as:
+            routes.append(f"a `tool_sources[]` entry of type `{source.adapter}`")
+        if "manifest_section" in source.configured_as:
+            routes.append(f"the top-level `{source.manifest_section}:` manifest section")
+        configured = " or ".join(routes)
+        if source.manifest_section_role == "supplements":
+            configured += (
+                f" The top-level `{source.manifest_section}:` section supplements "
+                "what that entry finds and cannot activate this input on its own."
+            )
+        lines.extend(
+            [
+                f"### {source.label}",
+                "",
+                f"*Configured as {configured}.* {source.reads}",
+                "",
+                "**Can a verdict rest on it?**",
+                "",
+            ]
+        )
+        lines.extend(_boundary_answer(source, matrix))
+        lines.extend(
+            [
+                "",
+                "<details>",
+                f"<summary>Every route this input has, in full ({len(source.cells)})</summary>",
+                "",
+                (
+                    "| Declaration shape | What is read | Emits | Ceiling | "
+                    "Outcome | Evidence gaps | Raises |"
+                ),
+                "| --- | --- | --- | --- | --- | --- | --- |",
+            ]
+        )
+        for cell in source.cells:
+            emits = ", ".join(f"`{value}`" for value in cell.emits) or "—"
+            ceiling = f"`{cell.ceiling}`" if cell.ceiling else "—"
+            gaps = ", ".join(f"`{gap}`" for gap in cell.evidence_gaps) or "—"
+            raises = ", ".join(f"`{check}`" for check in cell.raises) or "—"
+            lines.append(
+                f"| `{_boundary_cell_label(cell)}` "
+                f"| {_boundary_table_text(cell.reads)} "
+                f"| {emits} | {ceiling} | `{cell.outcome}` | {gaps} | {raises} |"
+            )
+        lines.extend(["", "</details>", ""])
+
+    lines.extend(["## Reference", "", "### The four declaration shapes", "", ])
+    for shape in DECLARATION_SHAPE_ORDER:
+        lines.append(
+            f"- **{_BOUNDARY_SHAPE_HEADINGS[shape]}** (`{shape}`) — "
+            f"{DECLARATION_SHAPE_DEFINITIONS[shape]}"
+        )
+    lines.extend(["", "### What each outcome means for a verdict", "", _BOUNDARY_CEILING_NOTE])
+    for outcome, sentence in CELL_OUTCOME_VERDICTS.items():
+        lines.append(
+            f"- **{_BOUNDARY_OUTCOME_WORDS[outcome]}** (`{outcome}`) — {sentence}"
+        )
+    lines.extend(
+        [
+            "",
+            "### Getting a route to ✅",
+            "",
+            _BOUNDARY_REMEDY,
+            "### Which release this describes",
+            "",
+            (
+                f"This page describes **agents-shipgate {matrix.generated_for_version}**, "
+                "and its rows move as the adapters do — `schema_version` "
+                f"(`{matrix.schema_version}`) versions the shape of the "
+                "machine-readable companion, not the routes."
+            ),
+            "",
+            (
+                "If you arrived from a link in a stored report, check that "
+                "version against the scanner that produced the report before "
+                "trusting a row: a boundary is only a specification of the "
+                "release it was generated from. Every released version is "
+                "tagged, so the matrix your scanner implemented is at "
+                "`https://github.com/ThreeMoonsLab/agents-shipgate/blob/v<your-version>/docs/determinism-boundary.md`."
+            ),
+            "",
+            "### Scope",
+            "",
+            (
+                "This page covers the built-in inputs of this distribution. A "
+                "third-party adapter registered through the "
+                "`agents_shipgate.adapters` entry point may coin any source type "
+                "and any confidence, and nothing here speaks for what it proves."
+            ),
+            "",
+            (
+                "Repository coverage is not risk coverage. This page says what "
+                "the scan can *read*; [`docs/checks.md`](checks.md) says what it "
+                "checks once it has read it. The machine-readable companion is "
+                "[`determinism-boundary.json`](determinism-boundary.json)."
+            ),
+            "",
+        ]
+    )
+    return DOCS / "determinism-boundary.md", "\n".join(lines)
+
+
+def write_determinism_boundary_page(
+    *, check_only: bool = False, drift: list[str] | None = None
+) -> bool:
+    target, content = build_determinism_boundary_page()
+    return _emit(target, content, check_only=check_only, drift=drift if drift is not None else [])
+
+
 BUILDERS: tuple[tuple[str, Callable[[], tuple[Path, str]]], ...] = (
     ("manifest", build_manifest_schema),
     ("checks_catalog", build_checks_catalog),
@@ -1945,6 +2997,8 @@ BUILDERS: tuple[tuple[str, Callable[[], tuple[Path, str]]], ...] = (
     ("current_control", build_current_control_schema),
     ("agent_control_envelope", build_agent_control_envelope_schema),
     ("human_authorization", build_human_authorization_schema),
+    ("human_review_request", build_human_review_request_schema),
+    ("human_review_decision", build_human_review_decision_schema),
     ("agent_handoff", build_agent_handoff_schema),
     ("agent_result", build_agent_result_schema),
     # codex_boundary_result v2 is a frozen compatibility schema and is not
@@ -1953,6 +3007,14 @@ BUILDERS: tuple[tuple[str, Callable[[], tuple[Path, str]]], ...] = (
     ("preflight", build_preflight_schema),
     ("capability_lock", build_capability_lock_schema),
     ("capability_lock_diff", build_capability_lock_diff_schema),
+    ("capability_payload", build_capability_payload_schema),
+    ("capability_payload_state_example", build_capability_payload_state_example),
+    ("capability_payload_delta_example", build_capability_payload_delta_example),
+    ("capability_delta_attestation", build_capability_delta_attestation_schema),
+    (
+        "capability_delta_attestation_example",
+        build_capability_delta_attestation_example,
+    ),
     ("attestation", build_attestation_schema),
     ("org_governance", build_org_governance_schema),
     ("org_evidence_bundle", build_org_evidence_bundle_schema),
@@ -1960,8 +3022,12 @@ BUILDERS: tuple[tuple[str, Callable[[], tuple[Path, str]]], ...] = (
     ("host_grants_inventory", build_host_grants_inventory_schema),
     ("host_grants_baseline", build_host_grants_baseline_schema),
     ("host_grants_drift", build_host_grants_drift_schema),
+    ("openshell_native_trust", build_openshell_native_trust_schema),
+    ("openshell_native_evidence", build_openshell_native_evidence_schema),
     ("governance_benchmark_catalog", build_governance_benchmark_catalog_schema),
     ("governance_benchmark_result", build_governance_benchmark_result_schema),
+    ("determinism_boundary_matrix", build_determinism_boundary_matrix),
+    ("determinism_boundary_page", build_determinism_boundary_page),
 )
 
 
@@ -1981,6 +3047,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     DOCS.mkdir(parents=True, exist_ok=True)
+    (DOCS / "examples").mkdir(parents=True, exist_ok=True)
     drift: list[str] = []
     for _name, builder in BUILDERS:
         target, content = builder()

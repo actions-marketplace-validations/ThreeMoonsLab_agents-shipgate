@@ -1,7 +1,7 @@
 {
   "schema_version": "0.1",
-  "report_schema_version": "0.42",
-  "run_id": "agents_shipgate_7a7430f9672871d1",
+  "report_schema_version": "1.0",
+  "run_id": "agents_shipgate_e7535b101fdbdc1b",
   "request_id": null,
   "subject_id": null,
   "input_set_id": null,
@@ -64,7 +64,7 @@
   },
   "release_decision": {
     "decision": "insufficient_evidence",
-    "reason": "Insufficient evidence: the agent's tool binding graph is incomplete (durable_order_agent [conductor_workflows]). Fix at shipgate.yaml#agent_bindings. Context: 1 binding evidence gap(s), 1 semantic evidence gap(s), 1 low-confidence tool(s) and 4 source warning(s); scan results are not trustworthy enough to gate release.",
+    "reason": "Insufficient evidence: some tools cannot be traced to an agent that can call them (durable_order_agent [conductor_workflows]). Fix at shipgate.yaml#agent_bindings. Context: 1 binding evidence gap(s), 1 semantic evidence gap(s), 1 low-confidence tool(s) and 4 source warning(s); scan results are not trustworthy enough to gate release.",
     "blockers": [],
     "review_items": [
       {
@@ -132,8 +132,8 @@
             "kind": "provide_complete_binding_graph",
             "command": "agents-shipgate verify --workspace . --config shipgate.yaml --ci-mode advisory --format json",
             "path": "shipgate.yaml#agent_bindings",
-            "why": "A complete root-reachable static binding graph is required for passed.",
-            "expects": "Provide static wiring or an exact reviewed declaration for every reachable edge.",
+            "why": "Every tool has to be traceable to an agent that can call it before this can pass.",
+            "expects": "Wire each tool to the agent that calls it in code, or declare that link exactly.",
             "accepted_values": [
               "literal_tools",
               "literal_handoffs",
@@ -149,19 +149,19 @@
           }
         },
         {
-          "kind": "incomplete_surface",
+          "kind": "unattested_surface",
           "subject": "lookup_order [conductor_workflows]",
           "subject_id": "tool_v2_d3382b0bdebb027000b5bbda4209994458144a0542a64bcec07f6eeb5a30322e",
           "subject_kind": "action",
           "source_type": "conductor_mcp_call",
           "source_ref": "/tasks/3",
-          "why": "tool surface enumeration is incomplete or not high confidence",
+          "why": "no reviewed tool inventory attests this surface (extraction_confidence=medium)",
           "next_action": {
             "kind": "provide_complete_inventory",
             "command": "agents-shipgate verify --workspace . --config shipgate.yaml --ci-mode advisory --format json",
             "path": "shipgate.yaml#tool_sources",
-            "why": "The complete statically-bound tool surface must be enumerable.",
-            "expects": "Provide a complete MCP export, OpenAPI spec, or reviewed explicit tool inventory, then rerun verification.",
+            "why": "The statically-bound tool surface needs reviewed attestation.",
+            "expects": "Bind a complete MCP export, OpenAPI spec, or reviewed explicit tool inventory to this source, then rerun verification.",
             "accepted_values": [
               "complete_mcp_export",
               "openapi_spec",
@@ -303,9 +303,24 @@
         "gap_count": 1,
         "review_concern_count": 0,
         "reason_counts": {
-          "incomplete_surface": 1
+          "unattested_surface": 1
         },
         "acknowledged_overrides": [],
+        "declaration_review": {
+          "enabled": false,
+          "base_comparison_requested": false,
+          "base_kind": "none",
+          "changed_count": 0,
+          "summary": {
+            "evidence_consistent": 0,
+            "unverified": 0,
+            "acknowledged_override": 0
+          },
+          "rows": [],
+          "notes": [
+            "No trustworthy base declaration snapshot was available; declaration review disabled."
+          ]
+        },
         "declaration_questions": {
           "total": 2,
           "answered": 2,
@@ -620,9 +635,9 @@
             ],
             "issues": [
               {
-                "kind": "incomplete_surface",
+                "kind": "unattested_surface",
                 "dimension": "effect",
-                "message": "tool surface enumeration is incomplete or not high confidence",
+                "message": "no reviewed tool inventory attests this surface (extraction_confidence=medium)",
                 "source": "tool_extraction",
                 "source_pointer": "/tasks/3"
               }
@@ -712,6 +727,32 @@
     "modified": [],
     "notes": [
       "No action-surface comparison source was provided."
+    ]
+  },
+  "action_declaration_facts": {
+    "snapshot_version": "0.1",
+    "rows": [
+      {
+        "row_id": "action_declaration_ac11f59bcb25f9465a56",
+        "selector": {
+          "tool": "lookup_order",
+          "tool_id": null,
+          "source_type": null,
+          "source_id": null,
+          "provider": null,
+          "operation": null
+        },
+        "subject": "lookup_order [conductor_workflows]",
+        "subject_id": "tool_v2_d3382b0bdebb027000b5bbda4209994458144a0542a64bcec07f6eeb5a30322e",
+        "resolution": "resolved",
+        "declared_effect": "read",
+        "declared_risk_tags": [],
+        "has_override": false,
+        "override_identity": null,
+        "basis": null,
+        "declaration_hash": "action_declaration_value_83fa75b49c74e60dfa15",
+        "manifest_path": "shipgate.yaml#action_surface.actions[0]"
+      }
     ]
   },
   "binding_surface_facts": {
@@ -1045,9 +1086,9 @@
           ],
           "issues": [
             {
-              "kind": "incomplete_surface",
+              "kind": "unattested_surface",
               "dimension": "effect",
-              "message": "tool surface enumeration is incomplete or not high confidence",
+              "message": "no reviewed tool inventory attests this surface (extraction_confidence=medium)",
               "source": "tool_extraction",
               "source_pointer": "/tasks/3"
             }
@@ -1227,9 +1268,9 @@
           ],
           "issues": [
             {
-              "kind": "incomplete_surface",
+              "kind": "unattested_surface",
               "dimension": "effect",
-              "message": "tool surface enumeration is incomplete or not high confidence",
+              "message": "no reviewed tool inventory attests this surface (extraction_confidence=medium)",
               "source": "tool_extraction",
               "source_pointer": "/tasks/3"
             }
@@ -1302,7 +1343,7 @@
   "policy_evidence_gaps": [],
   "agent_summary": {
     "verdict": "insufficient_evidence",
-    "headline": "Insufficient evidence: the agent's tool binding graph is incomplete (durable_order_agent [conductor_workflows]). Fix at shipgate.yaml#agent_bindings. Context: 1 binding evidence gap(s), 1 semantic evidence gap(s), 1 low-confidence tool(s) and 4 source warning(s); scan results are not trustworthy enough to gate release.",
+    "headline": "Insufficient evidence: some tools cannot be traced to an agent that can call them (durable_order_agent [conductor_workflows]). Fix at shipgate.yaml#agent_bindings. Context: 1 binding evidence gap(s), 1 semantic evidence gap(s), 1 low-confidence tool(s) and 4 source warning(s); scan results are not trustworthy enough to gate release.",
     "blocker_count": 0,
     "review_item_count": 2,
     "auto_appliable_patches": 0,
@@ -1310,7 +1351,7 @@
     "first_recommended_action": {
       "kind": "info",
       "command": null,
-      "why": "Provide static wiring or an exact reviewed declaration for every reachable edge. Target: shipgate.yaml#agent_bindings. That is the gap this verdict names: the agent's tool binding graph is incomplete (durable_order_agent [conductor_workflows]). Applying patches does not clear an evidence verdict, so close this gap and re-run verification."
+      "why": "Wire each tool to the agent that calls it in code, or declare that link exactly. Target: shipgate.yaml#agent_bindings. That is the gap this verdict names: some tools cannot be traced to an agent that can call them (durable_order_agent [conductor_workflows]). Applying patches does not clear an evidence verdict, so close this gap and re-run verification."
     }
   },
   "policy_audit": {
@@ -1318,7 +1359,7 @@
   },
   "privacy_audit": {
     "enabled": true,
-    "rules_version": "0.1",
+    "rules_version": "0.2",
     "sensitive_field_inventory_version": "0.1",
     "redacted_occurrence_count": 0,
     "redacted_paths": [],
@@ -1409,20 +1450,10 @@
     ]
   },
   "surface_exclusions": {
-    "entries": [
-      {
-        "stage": "surface_completeness",
-        "subject": "lookup_order [conductor_workflows]",
-        "reason": "surface_not_enumerated",
-        "source_ref": "/tasks/3",
-        "detail": "The tool's own surface could not be established as complete, so an unknown remainder of it was never analysed.",
-        "accounting": "evidence_gap",
-        "accounted_by": "lookup_order [conductor_workflows]"
-      }
-    ],
-    "total": 1,
-    "gated": 1,
-    "gap_backed": 1,
+    "entries": [],
+    "total": 0,
+    "gated": 0,
+    "gap_backed": 0,
     "truncated": false
   }
 }

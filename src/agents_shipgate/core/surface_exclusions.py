@@ -97,6 +97,15 @@ EXCLUSION_REASON_PHRASES: dict[str, str] = {
         "a disagreeing second declaration of a server this workspace declares "
         "more than once"
     ),
+    # adapter_parse (agents_shipgate.inputs.openapi)
+    "unresolved_path_item_ref": (
+        "a path item whose $ref this document does not resolve, so its "
+        "operations were not read"
+    ),
+    "shadowed_path_item_operation": (
+        "a referenced operation replaced by one of the same method written "
+        "beside the $ref"
+    ),
 }
 
 #: What an unrecognised token renders as. Deliberately says only what every
@@ -271,6 +280,21 @@ def agent_label_index(agents: Iterable[AgentBindingNode]) -> dict[str, str]:
     """
 
     return {node.agent_id: agent_subject(node) for node in agents}
+
+
+def provider_token(value: str) -> str:
+    """Normalize a raw provider spelling to the one a capability subject uses.
+
+    ``ActionFact.provider`` is ``provider or source_id or source_type`` with
+    whitespace collapsed; ``ToolSurfaceToolFact.provider`` is the same
+    expression *without* the collapse. So a source id of ``my api`` reaches the
+    capability layer as ``my_api`` and the catalog as ``my api`` — the second
+    spelling of one subject this module exists to prevent. Anything that has to
+    key a catalog row the way a capability fact is keyed calls this rather than
+    restating the regex.
+    """
+
+    return re.sub(r"\s+", "_", value.strip())
 
 
 def catalog_label_index(rows: Iterable[Any]) -> dict[str, str]:
@@ -488,7 +512,7 @@ def _binding_exclusions(
                     if introduced
                     else (
                         "The tool is in the catalog and no edge binds it to "
-                        "the root agent, and the base comparison that would "
+                        "the root agent, and the requested binding comparison that would "
                         "say whether this change introduced it could not be "
                         "performed."
                     )
@@ -602,6 +626,23 @@ def build_detect_exclusions(result: DetectResult) -> SurfaceExclusionLedger:
 
     entries: list[SurfaceExclusion] = []
     signals = result.workspace_signals
+    for path in result.host_discovery_incomplete_paths:
+        entries.append(SurfaceExclusion(
+            stage="discovery", subject=path, reason="census_not_seen_through",
+            # Both ways the census stops short — a link it does not follow and
+            # a path it could not read — leave the same hole, and the detail
+            # must not name only one of them: it read as a claim about a
+            # `docs/README.md -> ../README.md` that conceals nothing.
+            detail="Host discovery could not see through this path, so a complete negative is withheld.",
+            # `route_blocked`, not `not_claimed`: the run did act on these —
+            # withholding the product-wide negative is the act, and
+            # `total - gated` is documented as "recorded and deliberately not
+            # acted on", which these are not. Unconditional for the same
+            # reason `walk_capped` is: the withheld verdict is a whole-run
+            # fact, and that row already sits beside a runnable published
+            # route (the higher-cap retry) without meaning routing stopped.
+            accounting="route_blocked",
+        ))
     if result.python_parse_truncated:
         entries.append(
             SurfaceExclusion(
@@ -678,6 +719,7 @@ __all__ = [
     "agent_label_index",
     "agent_subject",
     "catalog_label_index",
+    "provider_token",
     "derived_id_kind",
     "tool_label",
     "unavailable_base_subject",

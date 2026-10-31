@@ -1,6 +1,6 @@
 # Evidence-backed `passed` verdict
 
-In the Agents Shipgate `0.16.0b7` runtime (contract v27, report schema v0.42),
+In the Agents Shipgate runtime since `1.0.0` (report schema v1.0; runtime contract v42 in this tree),
 `release_decision.decision: passed` means the configured root
 agent and its complete reachable tool/handoff graph were statically proven,
 and every reachable capability has complete, conflict-free static identity,
@@ -39,7 +39,7 @@ to known evidence by `--no-heuristics` or `human_ack`.
 Machine consumers should inspect
 `release_decision.evidence_coverage.semantic_coverage`, `binding_coverage`,
 `identity_coverage`, and `policy_gap_count`, then work `evidence_gaps[]` in
-order. Current packet schema v0.17 mirrors this contract and binds the
+order. Current packet schema v0.18 mirrors this contract and binds the
 verification request and decision, while capability standard
 v0.5 carries the same normalized assessment and binding hash in capability
 lock v0.6 and lock-diff v0.7 artifacts.
@@ -48,7 +48,12 @@ Policy severity, `block: true`, risk overrides, and rule-declared confidence
 cannot upgrade underlying evidence. Heuristic-only, mixed, unknown, or
 conflicting policy applicability creates a non-waivable evidence gap. The
 conservative effect may still increase, but no hard finding is emitted until
-the predicate is supported by authoritative static evidence.
+the predicate is supported by authoritative static evidence. A check whose
+value is the observation itself — a secret or instruction-like text in a tool
+description, a contradicted MCP annotation — still publishes that observation
+as a finding with `support.policy_eligible: false` beside its gap, and the gap's
+`why` names what was detected; such a finding is never a blocker or a named
+review item.
 
 Catalog membership never implies binding. `tool_catalog[]` contains every
 canonical extracted declaration; `tool_inventory[]`, actions, checks, and

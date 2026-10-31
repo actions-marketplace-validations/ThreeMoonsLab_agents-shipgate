@@ -4,6 +4,7 @@ import json
 import pytest
 
 from agents_shipgate.checks.n8n import run as run_n8n_checks
+from agents_shipgate.cli.discovery import artifacts as discovery_artifacts
 from agents_shipgate.cli.discovery.signals import detect_workspace
 from agents_shipgate.cli.discovery.template import render_auto_manifest
 from agents_shipgate.cli.scan import inspect_sources, run_scan
@@ -17,7 +18,9 @@ from agents_shipgate.core.domain import (
 )
 from agents_shipgate.core.errors import ConfigError
 from agents_shipgate.core.risk_hints import enrich_tools_with_risk_hints, risk_tags
+from agents_shipgate.inputs import common as inputs_common
 from agents_shipgate.inputs.n8n import load_n8n_artifacts
+from agents_shipgate.inputs.n8n._tools import _is_unfiltered_mode, _selection_mode
 
 
 def test_n8n_top_level_config_is_accepted_and_tool_source_type_is_rejected(tmp_path):
@@ -404,15 +407,42 @@ n8n:
     assert finding.evidence.get("source_ref") is None
 
 
-def test_n8n_mcp_operation_field_does_not_create_wildcard_selection(tmp_path):
+#: `parameters` of n8n's MCP Client Tool node (`@n8n/n8n-nodes-langchain.mcpClientTool`)
+#: as n8n exports them. `include` selects the tools — `all`, `selected` or
+#: `except` — and is left out at its default, `all`, so the default export
+#: names no selection at all (#1025).
+_MCP_CLIENT_ENDPOINT = {"endpointUrl": "https://mcp.example.com/github", "options": {}}
+_MCP_CLIENT_EXPORTS = {
+    "default": dict(_MCP_CLIENT_ENDPOINT),
+    "include_all": {**_MCP_CLIENT_ENDPOINT, "include": "all"},
+    "include_except": {
+        **_MCP_CLIENT_ENDPOINT,
+        "include": "except",
+        "excludeTools": ["list_issues", "delete_repository"],
+    },
+    "include_selected": {
+        **_MCP_CLIENT_ENDPOINT,
+        "include": "selected",
+        "includeTools": ["get_issue", "list_issues"],
+        # The node's `options` collection is not a tool selection, whatever a
+        # key in it says.
+        "options": {"operation": "all"},
+    },
+    # n8n filters by `includeTools` only when it names a tool.
+    "include_selected_empty": {**_MCP_CLIENT_ENDPOINT, "include": "selected"},
+}
+
+
+def _scan_mcp_client_export(tmp_path, parameters):
     project = tmp_path / "project"
     project.mkdir()
     workflow = _minimal_agent_workflow(
         {
             "id": "mcp-client",
-            "name": "MCP Client",
-            "type": "n8n-nodes-langchain.toolMcp",
-            "parameters": {"include": "All", "options": {"operation": "all"}},
+            "name": "GitHub MCP",
+            "type": "@n8n/n8n-nodes-langchain.mcpClientTool",
+            "typeVersion": 1.1,
+            "parameters": parameters,
         }
     )
     (project / "workflow.json").write_text(json.dumps(workflow), encoding="utf-8")
@@ -420,7 +450,7 @@ def test_n8n_mcp_operation_field_does_not_create_wildcard_selection(tmp_path):
         """
 version: "0.1"
 project:
-  name: n8n-mcp-operation
+  name: n8n-mcp-client-export
 agent:
   name: n8n-agent
 environment:
@@ -431,18 +461,121 @@ n8n:
 """,
         encoding="utf-8",
     )
-
     report, _ = run_scan(
         config_path=project / "shipgate.yaml",
         output_dir=tmp_path / "reports",
         formats=["json"],
         ci_mode="advisory",
     )
+    return report
 
+
+@pytest.mark.parametrize(
+    ("export", "selection_mode"),
+    [
+        ("default", "all"),
+        ("include_all", "all"),
+        ("include_except", "all_except"),
+        ("include_selected_empty", "all"),
+    ],
+)
+def test_n8n_mcp_client_export_exposing_every_tool_is_unfiltered(
+    tmp_path, export, selection_mode
+):
+    """Each export n8n runs with every tool, or every tool but some, of the server.
+
+    The reader read only spellings n8n never wrote, so the default export —
+    which carries no `include` — entered the catalog as one concretely named
+    tool: no wildcard, no dynamic surface and no UNFILTERED finding.
+    """
+
+    report = _scan_mcp_client_export(tmp_path, _MCP_CLIENT_EXPORTS[export])
+
+    assert [tool["name"] for tool in report.tool_inventory] == ["GitHub MCP.*"]
+    assert report.frameworks["n8n"]["dynamic_tool_surface_count"] == 1
+    dynamic = [
+        finding
+        for finding in report.findings
+        if finding.check_id == "SHIP-N8N-DYNAMIC-TOOL-SURFACE-NOT-ENUMERABLE"
+    ]
+    assert [finding.evidence["surface"]["kind"] for finding in dynamic] == [
+        "mcp_client_wildcard"
+    ]
+    unfiltered = [
+        finding
+        for finding in report.findings
+        if finding.check_id == "SHIP-N8N-MCP-CLIENT-TOOLSET-UNFILTERED"
+    ]
+    assert len(unfiltered) == 1
+    assert unfiltered[0].severity == "high"
+    assert unfiltered[0].evidence["selection_mode"] == selection_mode
+    if selection_mode == "all_except":
+        assert unfiltered[0].evidence["excluded_tools"] == [
+            "delete_repository",
+            "list_issues",
+        ]
+    else:
+        assert "excluded_tools" not in unfiltered[0].evidence
+    assert report.release_decision.decision != "passed"
+
+
+def test_n8n_mcp_client_export_selecting_tools_names_them(tmp_path):
+    report = _scan_mcp_client_export(tmp_path, _MCP_CLIENT_EXPORTS["include_selected"])
+
+    assert sorted(tool["name"] for tool in report.tool_inventory) == [
+        "get_issue",
+        "list_issues",
+    ]
     assert report.frameworks["n8n"]["dynamic_tool_surface_count"] == 0
     assert "SHIP-N8N-MCP-CLIENT-TOOLSET-UNFILTERED" not in {
         finding.check_id for finding in report.findings
     }
+
+
+def test_n8n_mcp_client_include_outranks_a_legacy_spelling(tmp_path):
+    """`include` decides when an earlier spelling is also present, under any hash seed."""
+
+    report = _scan_mcp_client_export(
+        tmp_path,
+        {
+            **_MCP_CLIENT_EXPORTS["include_selected"],
+            "toolSelection": "all",
+            "toolsToInclude": "All",
+        },
+    )
+
+    assert sorted(tool["name"] for tool in report.tool_inventory) == [
+        "get_issue",
+        "list_issues",
+    ]
+    assert report.frameworks["n8n"]["dynamic_tool_surface_count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("parameters", "trigger_unfiltered", "client_mode"),
+    [
+        # Shapes n8n gives only the MCP Client Tool: the trigger reads none.
+        ({"include": "all"}, False, "all"),
+        ({"include": "except"}, False, "all_except"),
+        ({"toolSelection": "selected"}, False, "all"),
+        ({}, False, "all"),
+        # The earlier spellings both have always read.
+        ({"toolsToInclude": "All"}, True, "all"),
+        ({"toolSelection": "All Except"}, True, "all_except"),
+    ],
+)
+def test_n8n_mcp_server_trigger_keeps_the_selection_it_read(
+    parameters, trigger_unfiltered, client_mode
+):
+    """n8n's `include` and its defaults belong to the client node (#1025 review).
+
+    The MCP Server Trigger has no selection of its own; it is read by the
+    earlier spellings only, as before, so a shape n8n gives only the client
+    adds no `mcp_server_wildcard` surface to a trigger.
+    """
+
+    assert _is_unfiltered_mode(parameters) is trigger_unfiltered
+    assert _selection_mode(parameters, client=True) == client_mode
 
 
 def test_n8n_nested_send_and_wait_text_does_not_count_as_human_review(tmp_path):
@@ -1628,6 +1761,64 @@ def test_n8n_detect_and_auto_init_emit_top_level_block(tmp_path):
     assert "    - path: data-tables/customers.json" in manifest_text
     assert "  eval_sets:" in manifest_text
     assert "    - path: evaluations/support.json" in manifest_text
+
+
+def test_n8n_oversized_workflow_is_not_written_into_the_manifest(tmp_path, monkeypatch):
+    """`init` must not list a workflow `scan` will refuse to read.
+
+    ``discover_n8n_artifacts`` feeds the manifest's ``n8n.workflows`` list, and
+    the n8n adapter loads each entry through ``load_structured_file``, which
+    refuses anything over ``MAX_INPUT_FILE_BYTES`` before parsing. Writing an
+    oversized workflow would therefore break the documented ``init --write`` ->
+    ``scan`` step out of the box — the same cold-start failure the tool-source
+    parse probe exists to prevent.
+
+    This is the second consumer of ``_looks_like_n8n_workflow``'s size guard;
+    the first (framework scoring) is pinned in ``test_zero_install_detector``.
+    Pinned separately because a refactor that moved the check into the scoring
+    loop alone would leave those tests green while `init` regressed here.
+
+    The bound is monkeypatched down rather than writing a 10 MB fixture: the
+    rule under test is "compare the file's size against the configured bound".
+    """
+
+    # Above the ~1.8 KB a plain `_write_workflow` produces, so the small
+    # sibling clears the bound on content alone.
+    bound = 4096
+    # ``discovery_artifacts`` is aliased at import: five tests in this file bind
+    # ``artifacts`` as a local, which would shadow an unaliased module import.
+    monkeypatch.setattr(discovery_artifacts, "MAX_STRUCTURED_FILE_BYTES", bound)
+    # Keep the two constants coherent: production pins them equal (see
+    # test_structured_input_bound_matches_the_adapter_bound), and lowering only
+    # the discovery-side copy would put the run in a state that cannot occur.
+    monkeypatch.setattr(inputs_common, "MAX_INPUT_FILE_BYTES", bound)
+    project = tmp_path / "project"
+    workflows = project / "workflows"
+    workflows.mkdir(parents=True)
+    _write_workflow(workflows / "small.json")
+    _write_workflow(workflows / "bulk.json")
+    # Push one workflow over the bound without changing its shape, so size is
+    # the only thing that can drop it.
+    bulk = workflows / "bulk.json"
+    padded = json.loads(bulk.read_text(encoding="utf-8"))
+    padded["notes"] = "x" * (4 * bound)
+    bulk.write_text(json.dumps(padded), encoding="utf-8")
+    assert bulk.stat().st_size > bound
+    assert (workflows / "small.json").stat().st_size <= bound
+
+    assert discovery_artifacts.discover_n8n_artifacts(project)["workflows"] == [
+        "workflows/small.json"
+    ]
+
+    result = detect_workspace(project)
+    manifest_text = render_auto_manifest(project, result).text
+    # Assert on the ``n8n.workflows`` entry form, not a bare substring: both
+    # files also match the Conductor glob, so both are named in the rendered
+    # excluded-sources hint comment. That comment is the manifest reporting
+    # what it declined — it is exactly what must not be confused with a
+    # declared workflow.
+    assert "    - path: workflows/small.json" in manifest_text
+    assert "    - path: workflows/bulk.json" not in manifest_text
 
 
 def _write_workflow(

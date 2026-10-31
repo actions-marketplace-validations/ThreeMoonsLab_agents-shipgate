@@ -52,6 +52,26 @@ files never re-saved) fail every active gate: unknown history is ungoverned
 debt, not exempt debt. `--as-of YYYY-MM-DD` pins the reference date for
 reproducible CI output.
 
+The host-grant drift gate (`shipgate audit --host --drift --fail-on-drift`)
+can exit 20 once after upgrading past `1.0.0`. Claude Code hook files nothing
+selects now read as `access: unknown`, with no expansion signal, and plugin
+manifests, marketplaces and the hook files they select are newly read (#714).
+A newly read hook file carries a `hook_added` signal only when the
+repository's project settings enable the plugin that selects it, because that
+hook was loaded all along. A repository whose plugin manifest or marketplace
+declares `hooks` drifts once even when no grant changes: the manifest is a new
+artifact and a new observed source, so the gate exits 20 reporting
+**0 typed grant change(s)** with no rows. Separately, a `0.4` or `0.5`
+baseline holding a workflow grant is incomparable after #771; move it aside
+and re-save it as the workflow step action references migration note in
+`STABILITY.md` describes. Read `changes`, `artifact_changes` and
+`coverage_changes` in `shipgate audit --host --drift --json` — the Markdown
+summary counts typed grant changes only — then move the old file aside
+(`git mv .agents-shipgate/host-grants.json .agents-shipgate/host-grants.v0.5.json`)
+and re-save the host-grants baseline from a checkout of the reviewed default
+branch. `--save-baseline` refuses to overwrite any baseline older than `0.6`,
+including every baseline `1.0.0` wrote.
+
 ## Apply The Baseline
 
 ```bash
@@ -70,7 +90,7 @@ fail CI.
 
 Reports keep the v0.1 payload contract and add baseline fields:
 
-- `report_schema_version: "0.42"` in current reports
+- `report_schema_version: "1.0"` in current reports
 - `baseline.path`
 - `baseline.matched_count`
 - `baseline.new_count`
@@ -142,6 +162,127 @@ load in older package versions.
 `findings[].baseline_status`, strict-mode filtering, and
 `release_decision.baseline_delta`; `--diff-from` drives `tool_surface_diff` and
 `action_surface_diff`.
+
+In `verify`, `--diff-from` also stands in for the base scan, so it is the
+"before" half of every base-relative comparison, including the base policy
+snapshot `SHIP-VERIFY-POLICY-WEAKENED` reads. It is therefore never taken from
+the change under review (#1024). With a base (`--base`, or one detected), a
+path inside the repository is read as the base commit holds it; if the base has
+no regular file at that path, verify scans the base instead and says so in
+`base_notes`. A path outside the repository is the operator's and is read where
+it is, as is any path with `--no-base`. The `--baseline` file is read from the
+evaluated head. An in-repository `--diff-from`, `--baseline` or `--policy-pack`
+file that the change edits is reported by `SHIP-VERIFY-TRUST-ROOT-TOUCHED`
+(class `shipgate_state`, or `policy` for a pack), so a human reviews the edit.
+
+Finding delta buckets compare **identity**, not whether the PR caused a risk.
+`new_findings` means an identity was absent from the reference;
+`resolved_findings` means it is absent from the head; `unchanged_findings` means
+the identity matched. None proves introduction, remediation or unchanged
+authority. `accepted_debt` keeps its existing reviewed-baseline meaning.
+
+The current implementation retains full base report findings and compares
+their predicate support, source references, capability subjects and release
+contribution with matching head findings. `tool_surface_diff.notes` names
+changed evidence and base/head locations, unavailable support and ambiguous
+identities. The legacy buckets and gate are unchanged. A baseline or older
+reference without full finding evidence cannot establish that comparison;
+regenerate a base report to inspect it. Equal predicate support still does not
+establish complete shared-helper, binding or configuration dependency coverage.
+
+The Markdown summary calls these **finding identities** and discloses omitted
+comparison notes; all notes remain in `report.json`. Inspect both full reports
+before attributing a finding to the change. #515's default diff scope remains
+open on dependency-proof prerequisite #557; this comparison does not exclude
+standing findings from the release decision.
+
+For the OpenAI Agents SDK, the current reader also carries
+`tool_surface_facts.guard_dependencies` and compares them in
+`tool_surface_diff.guard_comparisons`. An unchanged tool declaration can now
+point to an imported Boolean guard whose allowed inputs changed. The report
+preserves the tool observation and canonical capability identity, the call
+and guard definition locations, the input file digests, and the base/head
+predicate tables. Bit `i` in each `allowed_inputs` integer represents the
+Boolean value of `parameters[i]`; the parameter list is sorted and bounded
+to eight names. A widened set permits more Boolean inputs, a narrowed set
+permits fewer, and equal sets describe equivalent predicates in that domain.
+
+This first reader profile (`sdk_boolean_guard/v1`) handles a direct sibling
+relative import through empty package initializers, followed by a first
+`if not guard(...): return False` (or `return None`) in a module-level tool.
+The imported function has one return expression composed of Boolean
+parameters, constants, `and`, `or`, and `not`. Calls in predicates, configuration
+indirection, module/package ambiguity, executable initializers, rebinding,
+unsupported signatures, missing inputs and reader limits remain unresolved.
+An older report with no record does not establish absence of a guard.
+
+These are **source-predicate comparisons**. They do not establish deployed
+Python import resolution, downstream effects, or complete capability
+dependency coverage. Every row reports `dependency_coverage: incomplete` and
+`finding_exclusion_eligible: false`; all findings and the current release
+decision remain unchanged. A user-supplied `--diff-from` report is comparison
+input, not authenticated proof of its claimed source evidence. Redacted or
+ambiguous records cannot yield a predicate direction. The Markdown report
+shows up to eight relevant comparisons; JSON retains the full list.
+
+An observed guard can also carry `source_behavior`, from the narrower
+`sdk_boolean_function/v1` profile. This inspects the **entire** selected tool
+function, including statements after a return and both arms of every branch,
+and a single source-level `Agent(name="…", tools=[tool])` (or `tools=[]`).
+Its module contains only the exact SDK imports, the one sibling guard import,
+the decorated function and that literal Agent assignment, in definition order.
+The guard module contains only the selected pure Boolean function. Every
+function parameter is Boolean; expressions are Boolean literals, parameters,
+`not`, `and`, `or`, and the already-resolved guard call. Statements are `if`
+and `return`; an implicit return is recorded as `none`. There are no opaque
+operation leaves. External calls, free/configuration variables, mutation,
+additional functions or Agent configuration, handoffs and unresolved imports
+leave the source model unresolved, even in apparently unreachable code.
+
+`source_behavior.returns[i]` is `true`, `false` or `none` for input mask `i`
+over **all** sorted tool parameters, not just the parameters used by the first
+guard. `configuration_reads: none` means the closed model admitted no such
+read; it is absent as a claim when the model is unresolved. The literal
+`binding` records the source Agent symbol/name and whether its tools list
+contains the selected function. This is source membership, not a claim that
+the Agent is a deployed entry point or that the installed SDK executes it.
+
+The comparison keeps four axes separate: all return values (`returns`), the
+set of inputs returning true (`true_domain`), literal tool membership
+(`binding`), and the true-return inputs reachable through that membership
+(`bound_true_domain`). A narrowed first guard can still have a widened whole
+function true domain; unchanged returns can accompany added membership.
+Changing `False` to `None` changes returns even when the true domain is equal.
+A changed Agent identity leaves the bound relation unresolved. Missing old
+models, ambiguous capability identities and redacted evidence never establish
+equality. The model and its inputs are carried in each side's existing guard
+record and verifier-bound artifacts; it introduces no separate authority.
+
+**A true return is not approval.** The model does not prove a caller-controlled
+Boolean came from an approver, establish an action's effect/authority or
+attribute an existing policy predicate to a change. The outer capability
+dependency coverage remains `incomplete` and finding exclusion remains false.
+Neither a narrowed true domain nor equal source models is a safe verdict.
+Joining complete source evidence to actual capability/policy dependencies and
+the fixed-history evaluation remains work in #557/#515/#563. This SDK profile
+does not cover #515's TypeScript MongoDB acceptance case.
+
+Verification binds the reader's captured dependency bytes and named absent
+import candidates in `verification-plan.json` under
+`inputs.options.dependency_inputs`. A current-control read checks
+them again, including ignored files and newly appearing packages that ordinary
+Git status would miss. Committed comparisons read each side's archived Git
+tree. This input binding does not turn a bounded predicate into a complete
+dependency closure; #557 and #515 retain that remaining obligation.
+
+An attempted guard read that fails before bytes can be captured (such as a
+symlink, oversized input or non-regular file) is explicitly unconfirmable.
+`agent control` then uses its existing `workspace_unverifiable` refusal;
+repair the unreadable path and re-run verification before using current
+authority. This does not replace the report's release decision. A missing
+candidate whose absence was captured, or an unsupported predicate whose bytes
+were read, remains confirmable. Durable typed refusal identities are deferred
+separately; an exception string is not sufficient evidence of stable inputs.
 
 Scope deltas distinguish tool-required scopes from manifest-declared scopes.
 If the same literal scope moves between those kinds, the diff reports one

@@ -44,14 +44,14 @@ ALL_RENDERERS = {
 }
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXPECTED_CLAUDE_CODE_SKILL_RENDER_SHA256 = {
-    ".claude/skills/agents-shipgate/SKILL.md": "6aedbd716d37d42a60efd385ff6b516bcf20239a8524b7c594d96ae7ef41c49b",
-    ".claude/skills/agents-shipgate/ci-recipes/advisory-pr-comment.yml": "1f6ef3e51a09e824a98d6e5b33f2bf61282c62e2ae859e234da9f56161fa4a87",
-    ".claude/skills/agents-shipgate/prompts/add-shipgate-to-repo.md": "5c5eba31886aeabc902a97b53d00bfdd6ab15e1423574633060bbdfd8bbd8b25",
-    ".claude/skills/agents-shipgate/prompts/decide-shipgate-relevance.md": "4f92d6d0b254e602c993516e1dc5b77c64c87b3e7b5cb4967ddd5a140dd2d510",
+    ".claude/skills/agents-shipgate/SKILL.md": "c474cec05fdba44430a0c42857fc7b761e5aa84791b1c64042aebdcb3bac86e3",
+    ".claude/skills/agents-shipgate/ci-recipes/advisory-pr-comment.yml": "d9c1184c8c8f5c69550bee640653a30583fea5d6c5f1b6c09fd95213a656d211",
+    ".claude/skills/agents-shipgate/prompts/add-shipgate-to-repo.md": "ff8794b6b6dfe34b43fed4f6cc7e5e0046f6581c4ec39e1dfa6f1c35d952e190",
+    ".claude/skills/agents-shipgate/prompts/decide-shipgate-relevance.md": "f51855fd93728585fe3a74adf0e7e19029b9cafbdb6377c390ee6d878df22de4",
     ".claude/skills/agents-shipgate/prompts/explain-finding-to-user.md": "18031ed870b3c937a2996173820639ef441afe0a45e8171f16468826cd389829",
     ".claude/skills/agents-shipgate/prompts/fix-top-finding.md": "1956133a2d1003326e471f8ecab7b781e655dc9c33fbd2d1d681711f9ac0f08c",
     ".claude/skills/agents-shipgate/prompts/recommend-fixes.md": "162aa2fb96066535425d9cf86a247a6782b8ec7cc661a18b42dbedf394779475",
-    ".claude/skills/agents-shipgate/prompts/stabilize-strict-mode.md": "00da293e63792ccaf980f82d525ac12073807f41fd2d78c5a95498054053e364",
+    ".claude/skills/agents-shipgate/prompts/stabilize-strict-mode.md": "658098dc571594a37ff721d4873998d02d51fbe9ec94f3e37382617c077e717e",
     ".claude/skills/agents-shipgate/prompts/triage-false-positive.md": "8cfbb0d4b6e2c36569d24260384d3a54165f966276112f4b143b4ac234b51ada",
     ".claude/skills/agents-shipgate/prompts/upgrade-shipgate-version.md": "992122338eba26ae5d8056b9658117d718a6b477b9928c2a438dd449b5effb68",
     ".claude/skills/agents-shipgate/prompts/verify-agent-diff.md": "1e0279c7b6beae88f468f478b4e3b7401d7cc53bead5c53b6edcc256f59e159c",
@@ -59,8 +59,8 @@ EXPECTED_CLAUDE_CODE_SKILL_RENDER_SHA256 = {
 EXPECTED_CODEX_SKILL_RENDER_SHA256 = {
     ".agents/skills/agents-shipgate/SKILL.md": "34ef4bdac90ff7b409eb2254f6b73c52888e92bd9ba44824d6f056c44c2a50ff",
     ".agents/skills/agents-shipgate/agents/openai.yaml": "aa511e933ff663dcd1e0d2af3da2a7101206ce2bb1bb98c4dae801bb3f4e42ef",
-    ".agents/skills/agents-shipgate/assets/advisory-pr-comment.yml": "89580914407edd5516db10c8d7725f22c1a919e827e9b820115007a7a6caab31",
-    ".agents/skills/agents-shipgate/references/recipes.md": "49f71ac4f5b6c83f34caa1e5a7126cf4550d95188725ce37d93b558c6bfae17a",
+    ".agents/skills/agents-shipgate/assets/advisory-pr-comment.yml": "a33856e24e39a3eb9363eec448b72ac7530e8f169c2deb42075cf163f7233664",
+    ".agents/skills/agents-shipgate/references/recipes.md": "dcf9f982036d6189e4663923a97bf56ecd3ae68f34b4ce46081d135a88c4b564",
     ".agents/skills/agents-shipgate/references/report-reading.md": "d9709d600fa6ed6c697202f731977e66c102a4757e29ab825fa89935abe8f72a",
 }
 
@@ -147,7 +147,7 @@ def test_agent_instruction_surfaces_name_phase1_control_fields() -> None:
     }.items():
         for token in (
             "shipgate check",
-            "shipgate.agent_boundary_result/v2",
+            "shipgate.agent_boundary_result/v3",
             "control.state",
             "decision",
             "control.next_action",
@@ -155,6 +155,32 @@ def test_agent_instruction_surfaces_name_phase1_control_fields() -> None:
             "control.human_review",
         ):
             assert token in text, f"{name} missing {token!r}"
+
+
+def test_every_generated_copy_names_the_change_before_routing_on_control() -> None:
+    """#662: an agent following any maintained copy says what changed.
+
+    The Cursor rule led with `shipgate diff` while the AGENTS.md and CLAUDE.md
+    blocks routed only on `control.state`, so two of three copies could end a
+    turn with "a human must review" and no named change.
+    """
+
+    for name, text in {
+        "agents-md": render_agents_md(),
+        "claude-md": render_claude_md(),
+        "cursor": render_cursor_file(),
+    }.items():
+        flat = " ".join(text.split())
+        for phrase in (
+            "shipgate diff --workspace .",
+            "Quote those rows to the user, and put them in the pull request body.",
+            "A covered comparison with no rows is a real answer",
+            "A row is a description, never a permission",
+        ):
+            assert phrase in flat, f"{name} missing {phrase!r}"
+        assert flat.index("shipgate diff --workspace .") < flat.index(
+            "shipgate.agent_boundary_result/v3"
+        ), f"{name} routes on control before naming the change"
 
 
 def test_committed_cursor_rule_matches_renderer() -> None:
@@ -173,30 +199,30 @@ def test_local_contract_renderer_exposes_agent_operational_fields() -> None:
     payload = json.loads(render_local_contract_file())
     assert payload["schema_version"] == "10"
     assert payload["agents_shipgate_version"]
-    assert payload["contract_version"] == "27"
+    assert payload["contract_version"] == "42"
     assert payload["minimum_control_contract_version"] == "21"
     assert payload["primary_commands"]["verify_pr"].startswith("agents-shipgate verify")
     assert payload["primary_commands"]["host_audit"].startswith("shipgate audit --host")
     assert "verify_local" not in payload["primary_commands"]
     assert payload["commands"]["verify_local"].startswith("agents-shipgate verify")
-    assert payload["verifier_schema_version"] == "0.15"
+    assert payload["verifier_schema_version"] == "0.21"
     assert payload["verify_run_schema_version"] == "shipgate.verify_run/v5"
-    assert payload["agent_handoff_schema_version"] == "shipgate.agent_handoff/v8"
-    assert payload["agent_handoff_schema_path"] == "docs/agent-handoff-schema.v8.json"
+    assert payload["agent_handoff_schema_version"] == "shipgate.agent_handoff/v9"
+    assert payload["agent_handoff_schema_path"] == "docs/agent-handoff-schema.v9.json"
     assert payload["agent_handoff_artifact"] == "agents-shipgate-reports/agent-handoff.json"
     assert payload["codex_boundary_result_schema_version"] == "shipgate.codex_boundary_result/v2"
-    assert payload["agent_boundary_result_schema_version"] == ("shipgate.agent_boundary_result/v2")
+    assert payload["agent_boundary_result_schema_version"] == ("shipgate.agent_boundary_result/v3")
     assert payload["agent_boundary_result_schema_path"] == (
-        "docs/agent-boundary-result-schema.v2.json"
+        "docs/agent-boundary-result-schema.v3.json"
     )
     assert payload["agent_result_schema_version"] == "agent_result_v3"
     assert payload["agent_result_schema_path"] == "docs/agent-result-schema.v3.json"
     assert payload["attestation_schema_version"] == "0.5"
     assert payload["registry_schema_version"] == "0.4"
     assert payload["org_evidence_bundle_schema_version"] == ("shipgate.org_evidence_bundle/v2")
-    assert payload["host_grants_inventory_schema_version"] == "0.2"
-    assert payload["host_grants_baseline_schema_version"] == "0.2"
-    assert payload["host_grants_drift_schema_version"] == "0.2"
+    assert payload["host_grants_inventory_schema_version"] == "0.9"
+    assert payload["host_grants_baseline_schema_version"] == "0.9"
+    assert payload["host_grants_drift_schema_version"] == "0.9"
     assert payload["trigger_catalog_schema_version"] == "0.4"
     assert payload["agent_result_control_fields"] == [
         "decision",
@@ -326,13 +352,19 @@ def test_codex_skill_render_hashes_change_intentionally() -> None:
 
 
 def test_claude_code_skill_source_matches_renderer() -> None:
-    """The checked-in repo-scoped Claude Code skill and init renderer must not drift."""
+    """The checked-in repo-scoped Claude Code skill and init renderer must not drift.
+
+    ``advisory-pr-comment.yml`` used to be exempt here, and the exemption hid
+    exactly the defect #506 is about: the checked-in copy had been hand-corrected
+    to the latest published tag while the renderer still emitted
+    ``@v<__version__>``, so the file a reader opened and the file an adopter
+    received named different — and only one resolvable — releases. Both come
+    from ``LATEST_PUBLISHED_VERSION`` now, so nothing is skipped.
+    """
     for rel, content in render_claude_code_skill_files().items():
         source_rel = rel.removeprefix(".claude/")
         source_path = REPO_ROOT / source_rel
-        if source_rel.endswith("advisory-pr-comment.yml"):
-            continue
-        assert source_path.read_text(encoding="utf-8") == content
+        assert source_path.read_text(encoding="utf-8") == content, source_rel
 
 
 def test_claude_code_skill_render_hashes_change_intentionally() -> None:
@@ -448,6 +480,7 @@ def test_codex_skill_has_required_surfaces() -> None:
     assert "install or upgrade `agents-shipgate`" in skill
     recipes = files[".agents/skills/agents-shipgate/references/recipes.md"]
     assert "minimum_control_contract_version: 21" in recipes
+    # The installed skill bundle remains deferred under #690.
     assert "shipgate.agent_boundary_result/v2" in recipes
 
 

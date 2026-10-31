@@ -152,7 +152,11 @@ def _host_grants_line(workspace: Path) -> tuple[str | None, bool]:
             True,
         )
 
-    if inventory.get("host_grants_inventory_schema_version") == "0.2":
+    # Every typed inventory since 0.2 shares this layout; only 0.1 is laid out
+    # differently. Naming the one legacy version keeps a new minor from
+    # silently reading as "no host grants", which a list of known versions did
+    # when 0.5 shipped (#700).
+    if inventory.get("host_grants_inventory_schema_version") != "0.1":
         grants = inventory.get("grants") or []
         kind_labels = {
             "mcp_server": "MCP server",
@@ -161,6 +165,11 @@ def _host_grants_line(workspace: Path) -> tuple[str | None, bool]:
             "hook": "hook",
             "sandbox": "sandbox setting",
             "additional_path": "additional path",
+            # A setting Claude Code runs as a command, and an env entry that
+            # redirects it or loads code (#1027): without a label a repo
+            # holding only these read as having no host configuration.
+            "command_setting": "command setting",
+            "env": "env setting",
             "plugin_or_app": "plugin/app",
             "workflow": "workflow",
             "instruction_trust_root": "instruction trust root",

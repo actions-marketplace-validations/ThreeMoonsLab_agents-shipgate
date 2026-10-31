@@ -8,7 +8,7 @@ the normative agent protocol, use [claude-code.md](claude-code.md) and
 shipgate check --agent claude-code --workspace . --format agent-boundary-json
 ```
 
-Parse stdout as `shipgate.agent_boundary_result/v2`, switch on
+Parse stdout as `shipgate.agent_boundary_result/v3`, switch on
 `control.state`, and follow `control.next_action`,
 `control.allowed_next_commands`, and `control.human_review`. Treat `decision`
 as diagnostic context only; do not infer local control from prose.
@@ -155,7 +155,9 @@ agents-shipgate verify --base origin/main --head HEAD --json
 
 If preflight returns `control.state="human_review_required"`, Claude Code must
 stop for a human before editing the protected surface or asserting missing
-high-risk evidence.
+high-risk evidence. `control.state="planning_only"` means the plan named nothing for
+preflight to route; it authorizes nothing, so Claude Code still runs `verify`
+before reporting a change complete.
 
 Then read `agents-shipgate-reports/agent-handoff.json` and **switch on
 `control.state`**, then read `gate.merge_verdict` (`mergeable` / `human_review_required` /

@@ -16,7 +16,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from agents_shipgate.core.host_input_failure import HostInputFailure
 from agents_shipgate.schemas.agent_result_v1 import AgentResultDiagnostic
+
+#: The path a record carries when its headers do not name a file the parser
+#: can read. It is never a repository path, so it never matches an adapter.
+INVALID_DIFF_PATH = "\0invalid-diff-path"
 
 
 @dataclass(frozen=True)
@@ -38,6 +43,13 @@ class DiffFile:
     is_deleted: bool = False
     is_new: bool = False
     is_rename: bool = False
+    metadata_changed: bool = False
+    #: Git printed ``Binary files ... differ`` or a ``GIT binary patch``: the
+    #: record names a content change and carries no text hunk for it.
+    is_binary: bool = False
+    #: Git's ``similarity index`` for a rename or copy, in percent. Only 100
+    #: says the two sides are byte-identical; ``None`` when not stated.
+    similarity: int | None = None
 
     @property
     def path(self) -> str:
@@ -58,6 +70,7 @@ class BoundaryInputIssue:
     code: str
     path: str
     message: str
+    recovery: HostInputFailure | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +82,12 @@ class BoundaryChangeSet:
     changed_paths: tuple[str, ...]
     issues: tuple[BoundaryInputIssue, ...] = ()
     manifest_text_snapshot: str | None = None
+    #: The refs this change set actually compared, after defaults were
+    #: resolved. A caller that passed nothing still needs to publish what
+    #: was answered — a diff against an unnamed base is not a reviewable
+    #: claim (#649).
+    resolved_base: str | None = None
+    resolved_head: str | None = None
 
 
 def git_diff_path_token(prefix: str, path: str) -> str:
@@ -102,17 +121,47 @@ def git_diff_path_token(prefix: str, path: str) -> str:
 
 
 def parse_unified_diff(diff_text: str) -> list[DiffFile]:
+    """Parse unified diff text into per-file added/removed lines and hunks.
+
+    Hunk state, not line spelling, decides what is content.  A removed
+    ``---`` renders as ``----`` and a removed ``-- note`` renders as
+    ``--- note``; matching those against the file-header prefixes drops a
+    counted row, and in the second case rewrites the file's own identity
+    from its content.  While a hunk still owes rows, any line opening with
+    a unified-diff marker (space, ``+``, ``-``, ``\\``) is that hunk's data
+    and is dispatched on its first character alone.
+
+    The row budget comes from the hunk header, so a truncated or
+    over-declared hunk ends as soon as a line cannot be hunk data.  The
+    short hunk is kept, and the declared-count comparison in
+    ``core.instruction_structure`` still refuses it — repairing the parser
+    must not turn an incomplete comparison into a successful one.
+    """
+
     files_out: list[DiffFile] = []
     current: dict[str, Any] | None = None
     current_hunk: DiffHunk | None = None
+    old_remaining = 0
+    new_remaining = 0
 
     def finish() -> None:
-        nonlocal current, current_hunk
+        nonlocal current, current_hunk, old_remaining, new_remaining
         if current is None:
             return
         if current_hunk is not None:
             current.setdefault("hunks", []).append(current_hunk)
             current_hunk = None
+        old_remaining = 0
+        new_remaining = 0
+        if not current.get("header_resolved", True) and (
+            current.get("header_old_path") is None
+            or current.get("header_new_path") is None
+        ):
+            # A header whose halves name different files, with no rename or
+            # copy line to say where one name ends (#581). Refuse the record
+            # rather than guess a split.
+            current["old_path"] = INVALID_DIFF_PATH
+            current["new_path"] = INVALID_DIFF_PATH
         files_out.append(
             DiffFile(
                 old_path=current.get("old_path"),
@@ -123,6 +172,9 @@ def parse_unified_diff(diff_text: str) -> list[DiffFile]:
                 is_deleted=bool(current.get("is_deleted")),
                 is_new=bool(current.get("is_new")),
                 is_rename=bool(current.get("is_rename")),
+                metadata_changed=bool(current.get("metadata_changed")),
+                is_binary=bool(current.get("is_binary")),
+                similarity=current.get("similarity"),
             )
         )
         current = None
@@ -130,23 +182,29 @@ def parse_unified_diff(diff_text: str) -> list[DiffFile]:
     for raw_line in diff_text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         if raw_line.startswith("diff --git "):
             finish()
+            header_resolved = True
             try:
-                old_token, remainder = _parse_git_path_token(
-                    raw_line[len("diff --git ") :]
-                )
-                new_token, trailing = _parse_git_path_token(remainder)
-                if trailing.strip():
-                    raise ValueError("unexpected diff-header suffix")
-                old_path = _strip_diff_prefix(old_token)
-                new_path = _strip_diff_prefix(new_token)
+                pair = _parse_diff_git_header(raw_line[len("diff --git ") :])
             except (UnicodeDecodeError, ValueError):
-                old_path = "\0invalid-diff-path"
-                new_path = "\0invalid-diff-path"
+                old_path = INVALID_DIFF_PATH
+                new_path = INVALID_DIFF_PATH
+            else:
+                if pair is None:
+                    # The halves name different files: a rename or a copy
+                    # between names with spaces. Its rename/copy lines name
+                    # the pair, and finish() refuses a record that never does.
+                    header_resolved = False
+                    old_path = None
+                    new_path = None
+                else:
+                    old_path = _strip_diff_prefix(pair[0])
+                    new_path = _strip_diff_prefix(pair[1])
             current = {
                 "old_path": old_path,
                 "new_path": new_path,
                 "header_old_path": old_path,
                 "header_new_path": new_path,
+                "header_resolved": header_resolved,
                 "added_lines": [],
                 "removed_lines": [],
                 "hunks": [],
@@ -158,26 +216,70 @@ def parse_unified_diff(diff_text: str) -> list[DiffFile]:
             continue
         if current is None:
             continue
-        if raw_line.startswith("deleted file mode"):
+        if (old_remaining > 0 or new_remaining > 0) and raw_line[:1] in {
+            " ",
+            "+",
+            "-",
+            "\\",
+        }:
+            # Inside a hunk that still owes rows: this is content, whatever
+            # it is spelled like. "\ No newline at end of file" is a marker
+            # rather than a row, so it consumes no budget.
+            if raw_line.startswith("\\"):
+                continue
+            marker, text = raw_line[0], raw_line[1:]
+            if marker == "+":
+                current["added_lines"].append(text)
+                new_remaining -= 1
+            elif marker == "-":
+                current["removed_lines"].append(text)
+                old_remaining -= 1
+            else:
+                old_remaining -= 1
+                new_remaining -= 1
+            if current_hunk is not None:
+                current_hunk.lines.append((marker, text))
+            continue
+        # Any other line ends the hunk, however many rows it still owed.
+        # The short hunk is retained so the declared-count comparison can
+        # refuse it.
+        old_remaining = 0
+        new_remaining = 0
+        if raw_line.startswith(("old mode ", "new mode ")):
+            current["metadata_changed"] = True
+        elif raw_line.startswith("deleted file mode"):
             current["is_deleted"] = True
+            current["metadata_changed"] = raw_line != "deleted file mode 100644"
         elif raw_line.startswith("new file mode"):
             current["is_new"] = True
-        elif raw_line.startswith("rename from "):
-            value = _parse_git_path_value(raw_line[len("rename from ") :])
-            current["old_path"] = (
-                value
-                if value == current.get("header_old_path")
-                else "\0invalid-diff-path"
+            current["metadata_changed"] = raw_line != "new file mode 100644"
+        elif raw_line.startswith(("rename from ", "copy from ")):
+            is_rename = raw_line.startswith("rename from ")
+            value = _parse_git_path_value(
+                raw_line[len("rename from " if is_rename else "copy from ") :]
             )
-            current["is_rename"] = True
-        elif raw_line.startswith("rename to "):
-            value = _parse_git_path_value(raw_line[len("rename to ") :])
-            current["new_path"] = (
-                value
-                if value == current.get("header_new_path")
-                else "\0invalid-diff-path"
+            _bind_metadata_path(current, "old", value)
+            if is_rename:
+                current["is_rename"] = True
+            else:
+                current["metadata_changed"] = True
+        elif raw_line.startswith(("rename to ", "copy to ")):
+            is_rename = raw_line.startswith("rename to ")
+            value = _parse_git_path_value(
+                raw_line[len("rename to " if is_rename else "copy to ") :]
             )
-            current["is_rename"] = True
+            _bind_metadata_path(current, "new", value)
+            if is_rename:
+                current["is_rename"] = True
+            else:
+                current["metadata_changed"] = True
+        elif raw_line.startswith("similarity index "):
+            match = re.fullmatch(r"(\d{1,3})%", raw_line[len("similarity index ") :], re.ASCII)
+            current["similarity"] = int(match.group(1)) if match else None
+        elif raw_line == "GIT binary patch" or (
+            raw_line.startswith("Binary files ") and raw_line.endswith(" differ")
+        ):
+            current["is_binary"] = True
         elif raw_line.startswith("--- "):
             value = _parse_git_path_value(raw_line[4:])
             parsed = None if value == "/dev/null" else _strip_diff_prefix(value)
@@ -188,7 +290,7 @@ def parse_unified_diff(diff_text: str) -> list[DiffFile]:
                     and parsed != current.get("header_old_path")
                 )
             ):
-                current["old_path"] = "\0invalid-diff-path"
+                current["old_path"] = INVALID_DIFF_PATH
             else:
                 current["old_path"] = parsed
         elif raw_line.startswith("+++ "):
@@ -201,7 +303,7 @@ def parse_unified_diff(diff_text: str) -> list[DiffFile]:
                     and parsed != current.get("header_new_path")
                 )
             ):
-                current["new_path"] = "\0invalid-diff-path"
+                current["new_path"] = INVALID_DIFF_PATH
             else:
                 current["new_path"] = parsed
             if value == "/dev/null":
@@ -210,6 +312,8 @@ def parse_unified_diff(diff_text: str) -> list[DiffFile]:
             if current_hunk is not None:
                 current.setdefault("hunks", []).append(current_hunk)
             current_hunk = _parse_hunk_header(raw_line)
+            old_remaining = current_hunk.old_count
+            new_remaining = current_hunk.new_count
         elif raw_line.startswith("+") and not raw_line.startswith("+++"):
             current["added_lines"].append(raw_line[1:])
             if current_hunk is not None:
@@ -244,21 +348,102 @@ def _strip_diff_prefix(value: str) -> str:
 
 
 def _parse_git_path_value(value: str) -> str:
-    """Decode one Git pathname, failing into a structural-review sentinel."""
+    """Decode the pathname a ``---``/``+++``/``rename``/``copy`` line carries.
+
+    An unquoted name is the whole value, spaces included (#581). Git never
+    quotes a space and never leaves a TAB unquoted, so the first TAB ends the
+    name: Git appends one to a ``---``/``+++`` name that contains a space, and
+    generic unified diffs put a timestamp after one. Keeping the TAB would make
+    it part of the repository pathname and could hide a protected file. A
+    malformed value fails into a structural-review sentinel.
+    """
 
     try:
-        candidate = value
-        if not value.lstrip(" ").startswith('"'):
-            # Generic unified diffs conventionally append a timestamp after a
-            # TAB. Split it before token parsing; otherwise the TAB becomes
-            # part of the repository pathname and can hide a protected file.
-            candidate = value.partition("\t")[0]
-        token, trailing = _parse_git_path_token(candidate)
-        if trailing:
+        if not value.startswith('"'):
+            name = value.partition("\t")[0]
+            if not name:
+                raise ValueError("missing Git path")
+            return name
+        token, trailing = _parse_git_path_token(value)
+        if trailing.partition("\t")[0]:
             raise ValueError("unexpected path suffix")
         return token
     except (UnicodeDecodeError, ValueError):
-        return "\0invalid-diff-path"
+        return INVALID_DIFF_PATH
+
+
+def _bind_metadata_path(record: dict[str, Any], side: str, value: str) -> None:
+    """Take one side of a record's pair from its ``rename``/``copy`` line.
+
+    A resolved header already names the pair, and the line must agree with it.
+    An unresolved header (#581) is named by the first such line, and every
+    later line for that side, ``---``/``+++`` included, must agree with it.
+    """
+
+    header_key = f"header_{side}_path"
+    if not record.get("header_resolved", True) and record.get(header_key) is None:
+        record[header_key] = value
+    record[f"{side}_path"] = (
+        value if value == record.get(header_key) else INVALID_DIFF_PATH
+    )
+
+
+def _parse_diff_git_header(text: str) -> tuple[str, str] | None:
+    """The two pathnames of a ``diff --git`` header, as Git spells them.
+
+    Git C-quotes a pathname only when it holds a control character, a double
+    quote, a backslash, or a byte ``core.quotePath`` keeps out of raw output.
+    It never quotes a space, so ``a/new scope/x b/new scope/x`` cannot be split
+    at its first space (#581). ``check`` and ``verify`` also diff with
+    ``core.quotePath=false``, so non-ASCII names arrive unquoted as well.
+
+    An unquoted pair is resolved the way ``git apply`` resolves it: by the one
+    split whose halves name the same file once an ``a/`` or ``b/`` prefix is
+    set aside. A header with a single space has only one split. Anything else,
+    a rename or copy between names with spaces, returns ``None``, and the
+    record's ``rename``/``copy`` lines name the pair.
+
+    Raises ``ValueError`` for a malformed quoted name.
+    """
+
+    if text.startswith('"'):
+        old, remainder = _parse_git_path_token(text)
+        return old, _header_second_name(remainder)
+    quote = text.find(' "')
+    if quote != -1:
+        # An unquoted name cannot contain a double quote, so the first
+        # space-quote pair is where the quoted second name starts.
+        return text[:quote], _header_second_name(text[quote + 1 :])
+    if text.count(" ") == 1:
+        old, _, new = text.partition(" ")
+        if not old or not new:
+            raise ValueError("missing Git path")
+        return old, new
+    length = len(text)
+    # Two names that are equal once a 0- or 2-character prefix is removed put
+    # the separating space at one of three positions. Checking only those keeps
+    # a long header linear.
+    splits = sorted(
+        index
+        for index in {(length - 3) // 2, (length - 1) // 2, (length + 1) // 2}
+        if 0 < index < length - 1
+        and text[index] == " "
+        and _strip_diff_prefix(text[:index]) == _strip_diff_prefix(text[index + 1 :])
+    )
+    if len(splits) != 1:
+        return None
+    return text[: splits[0]], text[splits[0] + 1 :]
+
+
+def _header_second_name(value: str) -> str:
+    if not value:
+        raise ValueError("missing Git path")
+    if not value.startswith('"'):
+        return value
+    token, trailing = _parse_git_path_token(value)
+    if trailing:
+        raise ValueError("unexpected diff-header suffix")
+    return token
 
 
 def _parse_git_path_token(value: str) -> tuple[str, str]:

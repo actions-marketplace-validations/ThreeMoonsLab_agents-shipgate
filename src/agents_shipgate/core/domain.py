@@ -8,6 +8,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agents_shipgate.core.heuristics import is_broad_scope
 from agents_shipgate.schemas.common import Confidence, ProvenanceKind, parse_confidence
+from agents_shipgate.schemas.coverage_recovery import SourceRecoveryEvidence
+from agents_shipgate.schemas.guard_dependencies import GuardDependencyEvidence
+from agents_shipgate.schemas.operation_attribution import DeclaredOperation
 from agents_shipgate.schemas.surfaces import ActionEffect
 
 SemanticDimension = Literal["identity", "binding", "effect", "authority"]
@@ -145,6 +148,7 @@ SemanticIssueKind = Literal[
     "ambiguous_legacy_tool_identity",
     "invalid_tool_binding",
     "incomplete_surface",
+    "unattested_surface",
     "missing_effect_evidence",
     "inferred_effect_only",
     "conflicting_effect_evidence",
@@ -385,6 +389,28 @@ class AuthInfo(BaseModel):
 SURFACE_ENUMERATED = "enumerated"
 SURFACE_PARTIAL = "partial"
 
+#: Source types whose MCP hints were read out of the tool server's own source
+#: code rather than out of the contract it publishes to clients (#658).
+SOURCE_READ_ANNOTATION_SOURCE_TYPES = frozenset({"mcp_server_source"})
+#: The MCP hints that route reads, and the only annotation keys the gate governs.
+ANNOTATION_HINT_KEYS = frozenset({"readOnlyHint", "destructiveHint"})
+
+
+def annotation_hints_are_effect_evidence(tool: Tool) -> bool:
+    """Whether this tool's ``readOnlyHint``/``destructiveHint`` may count as evidence.
+
+    ``False`` for a hint read from source. The route reads it so the one check
+    built to doubt it has something to doubt; every effect reading ignores it.
+    Measured before this gate existed, a FastMCP ``readOnlyHint: true`` read
+    from source moved ``transfer_funds`` from ``write`` to ``read`` with no
+    finding and closed three of eight open effect questions — the server
+    answering, about itself, what a reviewer had been asked. That is the #268
+    shape, and the medium extraction ceiling does not prevent it: it only keeps
+    the action from passing, not its effect from being lowered.
+    """
+
+    return tool.source_type not in SOURCE_READ_ANNOTATION_SOURCE_TYPES
+
 
 class ToolParameter(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -567,6 +593,97 @@ class ToolkitScopeBound(BaseModel):
     config_path: str | None = None
 
 
+#: How much a static reader established about one argument of a remote
+#: binding. Every axis of :class:`AgentRemoteBinding` carries one of these
+#: beside its value, so "nothing was read" and "nothing is there" can never
+#: collapse into the same claim.
+#:
+#: - ``"literal"``                — a literal value was read from source.
+#: - ``"environment_reference"``  — one or more ``os.environ`` / ``os.getenv``
+#:   *names* were read. The name, never a value: nothing reads the process
+#:   environment and a name establishes no privilege level.
+#: - ``"redacted"``               — a value was read and is deliberately
+#:   withheld (credential material written literally into source or into a
+#:   URL). See the module note on why the withheld bytes are also excluded
+#:   from the comparison hash.
+#: - ``"unresolved"``             — the argument is present and is not
+#:   statically readable (a dynamic expression, a shadowed or rebound name).
+#: - ``"absent"``                 — the argument is not present at all.
+#: - ``"not_read"``               — this adapter path does not read the
+#:   argument. Distinct from ``"absent"``: it is a statement about the
+#:   reader, so a coverage gap stays visible instead of reading as a
+#:   connection that carries nothing.
+RemoteBindingStatus = Literal[
+    "literal",
+    "environment_reference",
+    "redacted",
+    "unresolved",
+    "absent",
+    "not_read",
+]
+
+
+class AgentRemoteBinding(BaseModel):
+    """One agent -> remote tool-surface binding, read statically.
+
+    A remote binding is a capability in its own right, independent of whether
+    the leaves behind it were enumerated: *this agent will call whatever
+    ``<endpoint>`` advertises, under ``<credential reference>``, restricted to
+    ``<filter>``*. The three are separate axes on purpose — supplying a leaf
+    inventory completes a different claim and must never clear a change to any
+    of them (#538).
+
+    Identity is ``agent`` + ``source_id`` + ``slot`` and nothing else — see
+    ``core.remote_bindings.policy_key_for`` for why each component is there.
+    ``source_ref`` carries the file and line for reviewer evidence and is
+    deliberately excluded from every key and hash, so line movement,
+    reformatting and comments produce no delta.
+
+    Nothing here is executed, imported, connected to, or looked up in the
+    process environment.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    agent: str
+    source_id: str
+    #: Stable discriminator between several bindings of one agent: the
+    #: module-level variable the toolset was assigned to, else ``"#<n>"`` for
+    #: the n-th inline construction in that agent's tool list. Never a line
+    #: number.
+    slot: str
+    provider: str
+    transport: str | None = None
+    transport_status: RemoteBindingStatus = "not_read"
+    #: The literal endpoint, already redacted. Never carries userinfo or a
+    #: sensitive query value.
+    endpoint: str | None = None
+    endpoint_status: RemoteBindingStatus = "not_read"
+    #: The environment variable *name* the endpoint is read from, when the
+    #: endpoint is an environment reference.
+    endpoint_env_ref: str | None = None
+    #: ``"<where>=<ENV_NAME>"`` entries, sorted. ``where`` names the argument
+    #: the reference was found in (``headers.Authorization``, ``env.API_KEY``,
+    #: ``url``), so a reviewer can open the line.
+    credential_refs: list[str] = Field(default_factory=list)
+    credential_status: RemoteBindingStatus = "not_read"
+    tool_filter: list[str] = Field(default_factory=list)
+    filter_status: RemoteBindingStatus = "not_read"
+    #: Leaf coverage for this binding, kept out of every connection axis: a
+    #: supplied inventory supplements the binding and cannot conceal a change
+    #: to it.
+    inventory_path: str | None = None
+    #: Machine reason codes for what this reader could not establish.
+    limitations: list[str] = Field(default_factory=list)
+    #: ``file:line`` — reviewer evidence only, never identity.
+    source_ref: str | None = None
+
+
+#: A ``tool_issues`` key for a guess whose real binding could be any of the
+#: agent's tools, not one this reader can name (#879 review).
+ANY_TOOL = "*"
+
+
 class AgentBindingObservation(BaseModel):
     """One framework parser's normalized, agent-level binding observation."""
 
@@ -577,10 +694,49 @@ class AgentBindingObservation(BaseModel):
     source: str
     source_pointer: str | None = None
     tool_names: list[str] = Field(default_factory=list)
+    #: ``tool_name -> native locator`` of the definition the reader resolved
+    #: the name to (#864). Two definitions may share a tool name in one source
+    #: — ``lookup`` in two modules, bound to two agents — and a name alone
+    #: cannot say which one this agent binds.
+    tool_locators: dict[str, str] = Field(default_factory=dict)
+    #: ``tool_name -> why`` for a tool bound on a guess: the reader named a
+    #: definition for it but could not establish that it is the one bound
+    #: (#879 review). The binding is reported, never as established.
+    tool_issues: dict[str, str] = Field(default_factory=dict)
+    #: ``tool_name -> ["file:line", ...]``: the constructions of this agent
+    #: that list the tool, when one name is constructed more than once in the
+    #: source (#872). Where each binding is, not which one runs.
+    tool_sites: dict[str, list[str]] = Field(default_factory=dict)
+    #: ``tool_name -> [condition, ...]`` for a tool the agent's list holds only
+    #: under a condition -- a branch of ``a if c else b`` or ``a or b``, or a
+    #: comprehension's filter (#909). Each entry is one alternative, its
+    #: conditions joined with "and"; a tool the list also holds unconditionally
+    #: has no entry. Source text, never evaluated.
+    tool_conditions: dict[str, list[str]] = Field(default_factory=dict)
     handoff_names: list[str] = Field(default_factory=list)
+    #: Caller and construction locations for a resolved handoff/sub-agent.
+    handoff_sites: dict[str, list[str]] = Field(default_factory=dict)
+    #: ``handoff_name -> [condition, ...]``: the same, for a handoff target.
+    handoff_conditions: dict[str, list[str]] = Field(default_factory=dict)
+    #: ``binding name -> {identity, location, unread}`` for each tool the agent
+    #: binds as an object (#910): an MCP server or toolset, an agent exposed as
+    #: a tool, a hosted or built-in tool. Read only for ``diff --application``
+    #: (``inputs/object_tools.py``); never a catalog tool, so ``scan`` and the
+    #: binding graph see nothing new.
+    object_bindings: dict[str, dict[str, Any]] = Field(default_factory=dict)
     tools_complete: bool = True
     handoffs_complete: bool = True
     issues: list[str] = Field(default_factory=list)
+    #: Reader-owned constructor causes by construction pointer. Internal
+    #: routing provenance, never inferred from warning prose or annotations.
+    constructor_issues: dict[str, str] = Field(default_factory=dict, exclude=True)
+    #: Internal source-label provenance; never a deployed agent-name assertion.
+    source_identity_fallback: bool = Field(default=False, exclude=True)
+    #: Qualified construction labels, independent of a clone's display identity.
+    source_construction_labels: list[str] = Field(default_factory=list, exclude=True)
+    #: Source-read clone settings; not bindings or runtime behavior assertions.
+    agent_settings: dict[str, str] = Field(default_factory=dict, exclude=True)
+    agent_settings_issues: list[str] = Field(default_factory=list, exclude=True)
 
 
 class SourceSurfaceOmission(BaseModel):
@@ -632,6 +788,10 @@ class LoadedToolSource(BaseModel):
     configured_source_id: str | None = None
     tools: list[Tool] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    # Explanatory loader evidence, separate from actual surface omissions.
+    recovery_evidence: list[SourceRecoveryEvidence] = Field(
+        default_factory=list, exclude_if=lambda value: not value
+    )
     # Entries this source dropped. Empty for every adapter that has not been
     # taught to record them, which is why the exclusion ledger reports what it
     # can prove rather than guessing from `warnings`.
@@ -640,10 +800,19 @@ class LoadedToolSource(BaseModel):
     # toolkits found in this source (e.g. ``stripe_agent_toolkit``). Empty
     # for sources that declare no recognized agent-toolkit constructor.
     toolkit_bounds: list[ToolkitScopeBound] = Field(default_factory=list)
+    # Agent -> remote tool-surface bindings read from this source (#538).
+    # Carried beside ``toolkit_bounds`` because it answers the same shape of
+    # question — what did the constructor bound, when the leaves behind it are
+    # not enumerable — for a remote endpoint rather than a local factory.
+    # Empty for every source that declares no recognized remote binding.
+    remote_bindings: list[AgentRemoteBinding] = Field(default_factory=list)
     # Framework-owned observations about Agent(...) wiring. These are kept
     # separate from Tool.annotations so catalog-controlled metadata can never
     # become authority-bearing binding evidence.
     binding_observations: list[AgentBindingObservation] = Field(default_factory=list)
+    # Reader-owned observations, never derived from catalog annotations.
+    guard_dependencies: list[GuardDependencyEvidence] = Field(default_factory=list)
+    operation_evidence: list[DeclaredOperation] = Field(default_factory=list)
     # For a reviewed tool inventory declared with
     # ``<framework>.tool_inventories[].source_id``: the id of the source whose
     # surface this file enumerates. ``build_tool_identity_catalog`` turns it

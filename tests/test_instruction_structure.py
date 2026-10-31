@@ -1,0 +1,419 @@
+from __future__ import annotations
+
+import difflib
+
+import pytest
+
+from agents_shipgate.core.boundary_diff import (
+    DiffFile,
+    DiffHunk,
+    ResolvedFileText,
+    parse_unified_diff,
+)
+from agents_shipgate.core.instruction_structure import (
+    classify_instruction,
+    unchanged_instruction_structure,
+)
+
+
+def _skill(body="Explain the result.", fields=""):
+    return f"---\nname: demo\ndescription: Test fixture\n{fields}---\n{body}\n"
+
+
+def _same_structure(before, after, path=".claude/skills/demo/SKILL.md"):
+    text = "".join(difflib.unified_diff(
+        (before or "").splitlines(keepends=True), (after or "").splitlines(keepends=True),
+        fromfile="a/" + path, tofile="b/" + path,
+    ))
+    records = parse_unified_diff("diff --git a/" + path + " b/" + path + "\n" + text)
+    diff = records[0]
+    return unchanged_instruction_structure(diff, ResolvedFileText(before, after, "fixture", None, None))
+
+
+@pytest.mark.parametrize("path", ["AGENTS.md", "nested/AGENTS.override.md", "CLAUDE.md"])
+def test_prose_requirement_and_command_example_do_not_declare_execution(path):
+    before = "You must run Shipgate.\n```sh\npython audit.py\n```\n"
+    after = "Explain the test result before committing.\n"
+    assert _same_structure(before, after, path)
+    assert classify_instruction(path, after).status == "guidance"
+
+
+def test_skill_body_prose_compares_without_command_mention_heuristic():
+    assert _same_structure(_skill("Explain."), _skill("Explain the shell and subprocess examples."))
+    assert _same_structure(_skill(), _skill("```sh\necho example\n```"))
+
+
+@pytest.mark.parametrize("value", ["true", "42", "{catalog: {internal: true}, versions: [1, 2]}"])
+def test_free_form_skill_metadata_retains_values_and_prose_boundary(value):
+    before = _skill(fields=f"metadata:\n  data: {value}\n")
+    result = classify_instruction(".claude/skills/demo/SKILL.md", before)
+    assert result.status == "structured"
+    assert _same_structure(before, before + "More guidance.\n")
+    # A metadata edit remains a structural edit; it is neither dropped nor
+    # stringified into an equivalent declaration.
+    quoted = _skill(fields=f"metadata:\n  data: '{value}'\n")
+    assert not _same_structure(before, quoted)
+    assert not _same_structure(before, _skill())
+
+
+@pytest.mark.parametrize(("value", "changed"), [
+    ("[a, b]", "[a]"), ("internal", "external"), ("true", "'true'"), ("[]", "{}"),
+])
+def test_non_map_metadata_is_digested_as_written(value, changed):
+    """Claude Code drops a non-map `metadata` and grants nothing from it (#848).
+
+    Read like an undocumented key (#730): the skill is structured, prose still
+    proves unchanged structure, and any change to the value is a change.
+    """
+
+    before = _skill(fields=f"metadata: {value}\n")
+    result = classify_instruction(".claude/skills/demo/SKILL.md", before)
+    assert result.status == "structured"
+    assert _same_structure(before, before + "More guidance.\n")
+    assert not _same_structure(before, _skill(fields=f"metadata: {changed}\n"))
+    assert not _same_structure(before, _skill())
+
+
+@pytest.mark.parametrize(("value", "reason"), [
+    # A key that is not a string, which the digest would write as one: `true`
+    # and 'True', in one map or across a change, would read as the same key.
+    # At the top of the map, nested, inside a list, and in a non-map value.
+    ("{true: a, 'True': b}", "frontmatter_invalid_structure"),
+    ("{nested: {true: a, 'True': b}}", "frontmatter_invalid_structure"),
+    ("{items: [{false: value}]}", "frontmatter_invalid_structure"),
+    ("[{1: integer}]", "frontmatter_invalid_structure"),
+    # A control, refused before the key check: `1` and '1' have the same
+    # scalar text, which the duplicate-key check already refuses.
+    ("{nested: {1: integer, '1': text}}", "frontmatter_ambiguous_keys"),
+])
+def test_metadata_keys_the_digest_would_collapse_remain_unresolved(value, reason):
+    result = classify_instruction(
+        ".claude/skills/demo/SKILL.md", _skill(fields=f"metadata: {value}\n"),
+    )
+    assert (result.status, result.reason) == ("unresolved", reason)
+
+
+@pytest.mark.parametrize("field", [
+    "allowed-tools: Bash(*)\n",
+    "hooks:\n  PreToolUse:\n    - hooks:\n        - type: command\n          command: ./audit.sh\n",
+    "context: fork\nagent: Explore\n",
+])
+def test_added_execution_or_permission_declaration_changes_structure(field):
+    assert not _same_structure(_skill(), _skill(fields=field))
+
+
+def test_bang_backtick_execution_changes_even_inside_a_fenced_example():
+    assert not _same_structure(_skill(), _skill("!`echo actual`"))
+    assert not _same_structure(_skill(), _skill("```\n!`echo actual`\n```"))
+    assert not _same_structure(_skill("!`echo a`"), _skill("!`echo b`"))
+
+
+def test_multiline_execution_remains_unresolved_and_nonwhitespace_inline_is_literal():
+    executable = _skill("```!\necho actual\n```")
+    assert classify_instruction("SKILL.md", executable).status == "unresolved"
+    assert not _same_structure(executable, executable + "Prose.\n")
+    assert _same_structure(_skill("KEY=!`literal a`"), _skill("KEY=!`literal b`"))
+
+
+@pytest.mark.parametrize("old,new", [
+    (".claude/skills/a/SKILL.md", ".claude/skills/b/SKILL.md"),
+    (".cursor/rules/a.mdc", "nested/.cursor/rules/a.mdc"),
+])
+def test_structure_registration_move_remains_reviewable(old, new):
+    diff = DiffFile(old_path=old, new_path=new, is_rename=True)
+    text = _skill() if old.endswith("SKILL.md") else "---\nalwaysApply: true\n---\nText.\n"
+    assert not unchanged_instruction_structure(diff, ResolvedFileText(text, text, "fixture", None, None))
+
+
+@pytest.mark.parametrize("text", [
+    "---\nhooks: [\n", "---\nhooks: [\n---\n",
+    _skill(fields="allowed-tools: Read\nallowed-tools: Bash\n"),
+    _skill(fields="metadata: &meta {x: y}\n"),
+    _skill(fields="hooks: invalid\n"),
+    _skill(fields="allowed-tools: {shell: true}\n"),
+    _skill(fields="disable-model-invocation: maybe\n"),
+    _skill(fields="hooks:\n  PreToolUse:\n    - hooks:\n        - command: ./run.sh\n"),
+    _skill(body="!`unterminated"),
+])
+def test_malformed_or_unsupported_structure_cannot_clear_prose_edit(text):
+    result = classify_instruction(".claude/skills/demo/SKILL.md", text)
+    assert result.status == "unresolved"
+    assert not _same_structure(text, text + "Prose addition.\n")
+
+
+def test_missing_comparison_and_cross_format_rename_are_not_prose_exemptions():
+    assert not _same_structure(None, "Text", "AGENTS.md")
+    diff = DiffFile(old_path=".mcp.json", new_path="AGENTS.md", is_rename=True)
+    assert not unchanged_instruction_structure(diff, ResolvedFileText("{}", "{}", "fixture", None, None))
+
+
+def test_truncated_new_file_hunk_cannot_establish_a_complete_instruction():
+    diff = DiffFile(
+        old_path=None, new_path="AGENTS.md", is_new=True,
+        hunks=[DiffHunk(0, 0, 1, 10, [("+", "One line of ten")])],
+    )
+    assert not unchanged_instruction_structure(diff, ResolvedFileText("", "One line of ten\n", "diff_new_file", None, None))
+
+
+def test_directories_and_structured_config_files_are_never_exempted():
+    for path in [".claude/settings.json", ".codex/config.toml", ".agents/skills/demo/hook.py", ".mcp.json"]:
+        assert classify_instruction(path, "{}") is None
+
+
+@pytest.mark.parametrize("path", [".claude/commands/AGENTS.md", ".claude/commands/CLAUDE.md"])
+def test_command_directory_wins_over_plain_instruction_basename(path):
+    old = "---\nallowed-tools: Read\n---\nText.\n"
+    new = "---\nallowed-tools: Bash\n---\nText.\n"
+    assert not _same_structure(old, new, path)
+
+
+@pytest.mark.parametrize("path", [".claude/agents/AGENTS.md", ".claude/rules/AGENTS.md"])
+def test_unsupported_structured_directory_cannot_become_plain_guidance(path):
+    text = "---\ntools: Read\n---\nText.\n"
+    assert classify_instruction(path, text).status == "unresolved"
+    assert not _same_structure(text, text + "More prose.\n", path)
+
+
+def test_mode_change_cannot_hide_behind_a_prose_change():
+    before, after = "Old prose.\n", "New prose.\n"
+    diff = "diff --git a/AGENTS.md b/AGENTS.md\nold mode 100644\nnew mode 100755\n"
+    diff += "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), fromfile="a/AGENTS.md", tofile="b/AGENTS.md"))
+    parsed = parse_unified_diff(diff)[0]
+    assert parsed.metadata_changed
+    assert not unchanged_instruction_structure(parsed, ResolvedFileText(before, after, "fixture", None, None))
+
+
+# --- empty frontmatter values ------------------------------------------------
+#
+# `globs:` with nothing after it is how Cursor writes a rule that is not
+# glob-scoped, and YAML reads that as None. Rejecting it made the canonical
+# Cursor rule an unresolved structure — a *blocking* inventory issue — so a
+# repository carrying one produced no rows at all. `Doist/todoist-mcp` had
+# eleven readable host files and two such rules, and `shipgate diff` answered
+# `incomparable` for that whole repository on every step of its history.
+
+_CURSOR_RULE = ".cursor/rules/demo.mdc"
+
+
+def _cursor(fields: str) -> str:
+    return f"---\n{fields}---\nBe concise.\n"
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        # Exactly what Cursor generates for an always-apply rule.
+        "description: \nglobs: \nalwaysApply: true\n",
+        # ...and for a described rule that is not glob-scoped.
+        "description: Use context7 for library docs\nglobs: \nalwaysApply: false\n",
+        "description: \nglobs: \nalwaysApply: \n",
+        "globs: \n",
+    ],
+)
+def test_an_empty_cursor_field_is_absent_not_invalid(fields: str) -> None:
+    resolved = classify_instruction(_CURSOR_RULE, _cursor(fields))
+
+    assert resolved.status == "structured", resolved.reason
+
+
+def test_a_populated_cursor_rule_still_resolves() -> None:
+    """The fix must not be the only reason anything passes."""
+
+    resolved = classify_instruction(
+        _CURSOR_RULE, _cursor('description: TS rules\nglobs: "**/*.ts"\nalwaysApply: false\n')
+    )
+
+    assert resolved.status == "structured", resolved.reason
+
+
+@pytest.mark.parametrize(
+    ("fields", "reason"),
+    [
+        # A wrong *type* is still a wrong type. Only "not set" is forgiven.
+        ("description: TS\nglobs: 7\nalwaysApply: false\n", "frontmatter_invalid_structure"),
+        ("description: TS\nglobs: \nalwaysApply: yes-please\n", "frontmatter_invalid_structure"),
+        # An unknown key is still unknown, empty or not.
+        ("description: TS\nunexpected: \n", "frontmatter_unknown_fields"),
+    ],
+)
+def test_an_empty_value_does_not_excuse_a_real_structure_problem(
+    fields: str, reason: str
+) -> None:
+    resolved = classify_instruction(_CURSOR_RULE, _cursor(fields))
+
+    assert resolved.status == "unresolved"
+    assert resolved.reason == reason
+
+
+def test_a_skill_still_needs_a_real_description() -> None:
+    """The required-field check is separate and must keep firing.
+
+    Treating an explicit null as absent in the shared type check would be a
+    hole if identity were only enforced there. A `name` is not required: the
+    docs default it to the directory name (#722), which
+    `tests/test_documented_claude_frontmatter.py` covers. An omitted
+    `description` takes the body's first non-empty line (#730), so identity is
+    missing only when the body has none.
+    """
+
+    for fields in ("name: demo\ndescription: \n", "name: demo\n"):
+        resolved = classify_instruction(
+            ".agents/skills/demo/SKILL.md", f"---\n{fields}---\n\n"
+        )
+        assert resolved.status == "unresolved", fields
+        assert resolved.reason == "skill_identity_missing", fields
+
+
+@pytest.mark.parametrize(
+    ("path", "required", "optional"),
+    [
+        (".cursor/rules/demo.mdc", "", "globs"),
+        (".cursor/rules/demo.mdc", "", "alwaysApply"),
+        (".claude/commands/demo.md", "", "allowed-tools"),
+        (".claude/commands/demo.md", "", "hooks"),
+        (".agents/skills/demo/SKILL.md", "name: demo\ndescription: Test\n", "allowed-tools"),
+    ],
+)
+def test_optional_null_and_omitted_fields_have_the_same_structure(path, required, optional):
+    absent = classify_instruction(path, f"---\n{required}---\nBody.\n")
+    explicit_null = classify_instruction(path, f"---\n{required}{optional}:\n---\nBody.\n")
+    assert absent.status == explicit_null.status == "structured"
+    assert absent.sha256 == explicit_null.sha256
+
+
+def test_normalizing_null_does_not_hide_an_actual_permission_change():
+    path = ".claude/commands/demo.md"
+    empty = classify_instruction(path, "---\nallowed-tools:\n---\nBody.\n")
+    granted = classify_instruction(path, "---\nallowed-tools: Bash(*)\n---\nBody.\n")
+    assert empty.status == granted.status == "structured"
+    assert empty.sha256 != granted.sha256
+
+
+def test_a_skill_without_frontmatter_uses_the_documented_defaults() -> None:
+    """Frontmatter is optional (#730): `name` from the directory, `description` from the first line."""
+
+    path = ".agents/skills/demo/SKILL.md"
+    plain = classify_instruction(path, "\nFirst line.\nMore prose.\n")
+    assert plain.status == "structured", plain.reason
+
+    later_prose = classify_instruction(path, "\nFirst line.\nOther prose.\n")
+    first_line = classify_instruction(path, "\nAnother first line.\nMore prose.\n")
+    assert plain.sha256 == later_prose.sha256
+    assert plain.sha256 != first_line.sha256
+
+
+def test_an_undocumented_skill_key_is_digested_not_refused() -> None:
+    """Undocumented keys are digested, so changing one is still a change (#730)."""
+
+    path = ".agents/skills/demo/SKILL.md"
+
+    def document(value: str) -> str:
+        return f"---\nname: demo\ndescription: Test fixture\nfuture-hook: {value}\n---\nBody.\n"
+
+    first = classify_instruction(path, document("./run.sh"))
+    second = classify_instruction(path, document("./other.sh"))
+    assert first.status == second.status == "structured"
+    assert first.sha256 != second.sha256
+
+
+def test_only_a_header_yaml_itself_refused_is_reported_as_a_parse_failure() -> None:
+    """`frontmatter_invalid` was also the catch-all, so its message lied (review cycle 1).
+
+    ``INVALID_SYNTAX_REASONS`` promises that a reason in it names text this
+    entry could not parse, and callers print `the file's own text could not be
+    parsed. Repair or review this declared surface.` for it. Two exits reached
+    `frontmatter_invalid` without any parse having failed: a header that
+    composes into something other than a mapping, and a value the digest's
+    `json.dumps(..., allow_nan=False)` refuses. Both headers are read by
+    `yaml.safe_load` without error, asserted here so the fixtures cannot drift
+    into genuinely broken YAML.
+    """
+
+    import yaml
+
+    from agents_shipgate.core.instruction_structure import (
+        INVALID_SYNTAX_REASONS,
+        unresolved_reason_is_invalid_syntax,
+    )
+
+    path = ".claude/skills/demo/SKILL.md"
+    non_mapping = "- a\n- b"
+    unencodable = "name: demo\ndescription: Test fixture\nbudget: .nan"
+    assert yaml.safe_load(non_mapping) == ["a", "b"]
+    assert yaml.safe_load(unencodable)["name"] == "demo"
+
+    sequence = classify_instruction(path, f"---\n{non_mapping}\n---\nBody.\n")
+    assert sequence.status == "unresolved"
+    assert sequence.reason == "frontmatter_not_mapping"
+
+    # `budget` is undocumented, so `_valid_metadata` skips it (#730) and the
+    # float reaches the digest. The refusal is this entry's, not the file's.
+    nan = classify_instruction(path, f"---\n{unencodable}\n---\nBody.\n")
+    assert nan.status == "unresolved"
+    assert nan.reason == "structure_value_unencodable"
+
+    for reason in (sequence.reason, nan.reason):
+        assert reason not in INVALID_SYNTAX_REASONS
+        assert not unresolved_reason_is_invalid_syntax(reason)
+
+    # YAML's own refusal keeps the reason, and keeps the repair advice.
+    broken = classify_instruction(path, "---\nname: [unclosed\ndescription: d\n---\nBody.\n")
+    assert broken.reason == "frontmatter_invalid"
+    assert unresolved_reason_is_invalid_syntax(broken.reason)
+    with pytest.raises(yaml.YAMLError):
+        yaml.safe_load("name: [unclosed\ndescription: d")
+
+
+def test_a_null_header_is_the_empty_header_it_has_always_been() -> None:
+    """The non-mapping exit must not swallow `~` (review cycle 2).
+
+    ``yaml.compose("~")`` returns a scalar node, so deciding the exit on the
+    node type alone fired here — while ``_split_frontmatter``, called on the
+    very next line and by the skill scanner, resolves the same header through
+    ``yaml.safe_load``, takes its ``raw is None`` branch and answers ``{}``
+    with no error. That is the empty header ``---\\n---`` already digests, and
+    the digest proves it: a file that was `structured` would have become
+    `unresolved`, which publishes a *blocking* `unsupported` inventory issue,
+    which makes the inventory incomplete and refuses the whole comparison — so
+    one skill with a `~` header anywhere in a repository would have hidden a
+    widening elsewhere in the same change.
+    """
+
+    import yaml
+
+    for header in ("~", "null", "NULL"):
+        assert yaml.safe_load(header) is None
+        for path in (
+            ".claude/skills/demo/SKILL.md",
+            ".claude/commands/demo.md",
+            ".cursor/rules/demo.mdc",
+        ):
+            structure = classify_instruction(path, f"---\n{header}\n---\n\nA skill body.\n")
+            empty = classify_instruction(path, "---\n---\n\nA skill body.\n")
+            assert empty.status == "structured"
+            assert structure.status == "structured", (path, header)
+            assert structure.reason == "declared_structure"
+            # Nothing is declared either way, so nothing distinguishes them.
+            assert structure.sha256 == empty.sha256
+
+    # A scalar that is not null is still refused, so the carve-out is the null
+    # tag and not "any scalar": `yaml.safe_load` reads this one too, and the
+    # skill parser then answers `frontmatter must be a mapping`.
+    scalar = classify_instruction(
+        ".claude/skills/demo/SKILL.md", "---\nhello\n---\n\nA skill body.\n"
+    )
+    assert scalar.status == "unresolved"
+    assert scalar.reason == "frontmatter_not_mapping"
+
+
+def test_a_duplicate_key_inside_a_non_mapping_header_keeps_its_own_reason() -> None:
+    """The non-mapping exit is checked after the ambiguity walk, not before it.
+
+    Both are reasons that prescribe no repair, so nothing a reader is told
+    changes; the published reason is the more specific one, as before.
+    """
+
+    structure = classify_instruction(
+        ".claude/skills/demo/SKILL.md", "---\n- a: 1\n  a: 2\n---\nBody.\n"
+    )
+    assert structure.reason == "frontmatter_ambiguous_keys"

@@ -11,8 +11,10 @@ import typer
 from agents_shipgate.cli.agent_mode import (
     detect_actor,
     emit_agent_mode_error_action,
+    is_agent_mode,
 )
 from agents_shipgate.cli.agent_result import (
+    UnresolvedComparisonError,
     agent_result_json,
     build_agent_boundary_result,
     build_codex_agent_result,
@@ -51,7 +53,7 @@ from agents_shipgate.schemas.diagnostics import NextAction
 # differ only in how that one result is rendered on stdout, so every place that
 # chooses a builder, an audit-id schema, or an error projection must treat them
 # alike; only `_emit_check_result` may tell them apart.
-_CURRENT_BOUNDARY_FORMATS = frozenset({"agent-boundary-json", "agent-control-json"})
+_CURRENT_BOUNDARY_FORMATS = frozenset({"agent-boundary-json", "agent-control-json", "text"})
 CHECK_FORMATS = frozenset({*_CURRENT_BOUNDARY_FORMATS, "codex-boundary-json"})
 
 
@@ -73,6 +75,25 @@ def _emit_check_result(
     same condition.
     """
 
+    if format_ == "text":
+        from agents_shipgate.core.agent_control_envelope import control_headline_lines
+        from agents_shipgate.report.host_comparison import host_comparison_lines
+        from agents_shipgate.schemas.host_comparison import HostComparison
+
+        if result.comparison_status != "not_attempted":
+            comparison = HostComparison(
+                comparison_status=result.comparison_status,
+                incomparable_reasons=result.incomparable_reasons,
+                head_kind="provided_diff" if result.input_mode == "provided_diff" else "worktree",
+                rows=result.rows,
+            )
+            for line in host_comparison_lines(comparison):
+                typer.echo(line)
+        for line in control_headline_lines(
+            envelope_from_agent_result(result, execution="succeeded" if evaluated else "failed")
+        ):
+            typer.echo(line)
+        return
     if format_ == "agent-control-json":
         envelope = envelope_from_agent_result(
             result, execution="succeeded" if evaluated else "failed"
@@ -188,11 +209,11 @@ def check(
             "mismatched content fails closed."
         ),
     ),
-    format_: str = typer.Option(
-        "agent-boundary-json",
+    format_: str | None = typer.Option(
+        None,
         "--format",
         help=(
-            "Output format. Supports agent-boundary-json, agent-control-json "
+            "Output format. Supports text, agent-boundary-json, agent-control-json "
             "(the compact shipgate.agent_control/v1 envelope), and deprecated "
             "codex-boundary-json."
         ),
@@ -216,16 +237,20 @@ def check(
     base: str | None = typer.Option(
         None,
         "--base",
-        help="Base git ref for diff resolution when --diff is omitted.",
+        help=(
+            "Base git ref. Defaults to the detected default branch's merge "
+            "base with HEAD; use --base HEAD for uncommitted changes only."
+        ),
     ),
     head: str | None = typer.Option(
         None,
         "--head",
-        help="Head git ref for diff resolution when --diff is omitted.",
+        help="Head git ref. Defaults to the working tree.",
     ),
 ) -> None:
     """Run the agent-native local boundary check."""
     require_workspace(workspace)
+    format_ = format_ or ("agent-boundary-json" if is_agent_mode() else "text")
 
     # The actor lands in the result and in the audit id, so an undetected
     # harness mislabels every row it writes. An explicit flag always wins.
@@ -256,20 +281,17 @@ def check(
             command=None,
             expects="A non-empty diff path, stdin, a complete ref range, or the worktree.",
         )
-    if (base is None) != (head is None) or (
-        base is not None and (not base or not head)
-    ):
+    if (base is not None and not base) or (head is not None and not head):
         raise _flag_error(
-            "--base and --head must be provided together and cannot be empty.",
+            "--base and --head cannot be empty.",
             command=None,
-            expects="Both non-empty refs, or neither for local worktree changes.",
+            expects=(
+                "A non-empty ref, both refs for a committed range, or neither "
+                "to compare this branch against its detected base."
+            ),
         )
     if any(
-        value is not None
-        and (
-            value.startswith("-")
-            or any(char in value for char in "\0\r\n")
-        )
+        value is not None and (value.startswith("-") or any(char in value for char in "\0\r\n"))
         for value in (base, head)
     ):
         raise _flag_error(
@@ -295,7 +317,7 @@ def check(
         )
     if format_ not in CHECK_FORMATS:
         raise _flag_error(
-            "--format must be 'agent-boundary-json', 'agent-control-json', or "
+            "--format must be 'text', 'agent-boundary-json', 'agent-control-json', or "
             "'codex-boundary-json'.",
             command=corrected(valid_agent=agent),
             expects="The current agent-boundary result contract.",
@@ -328,6 +350,10 @@ def check(
             changed_files_override = list(change_set.changed_paths)
             manifest_text_snapshot = change_set.manifest_text_snapshot
             manifest_snapshot_captured = True
+            # Publish what was actually compared, not what was typed. A
+            # verdict whose base is unnamed cannot be reviewed (#649).
+            base = change_set.resolved_base
+            head = change_set.resolved_head
     except InputParseError as exc:
         if isinstance(exc.__cause__, FileNotFoundError):
             result = _diff_input_error_result(
@@ -367,6 +393,15 @@ def check(
                 "failure reported by this check before rerunning it."
             ),
         ) from exc
+    except UnresolvedComparisonError as exc:
+        # Ahead of the RuntimeError handler below on purpose: that one
+        # renders a diff-input result and exits 0, and "I could not work out
+        # what to compare" must never leave as a passing check (#649).
+        raise _flag_error(
+            str(exc),
+            command=None,
+            expects="A named base ref this working tree can be compared against.",
+        ) from exc
     except (OSError, RuntimeError) as exc:
         result = _diff_input_error_result(
             agent=agent,
@@ -401,14 +436,12 @@ def check(
         "diff_text": diff_text,
         "config": config,
         "policy": (
-            policy
-            if policy is None or policy.is_absolute()
-            else workspace.resolve() / policy
+            policy if policy is None or policy.is_absolute() else workspace.resolve() / policy
         ),
         "input_issues": input_issues,
         "base": base,
         "head": head,
-        "input_mode": "provided_diff" if diff else "git_range" if base else "worktree",
+        "input_mode": ("provided_diff" if diff else "git_range" if (base and head) else "worktree"),
         # A standalone diff can describe either side of a change, but verify
         # accepts a checkout or a ref range. Do not authorize a worktree verify
         # for a subject the check cannot bind to repository state.
@@ -428,6 +461,54 @@ def check(
                 "filesystem spelling and contains no symlink components."
             ),
         ) from exc
+    if format_ in _CURRENT_BOUNDARY_FORMATS and diff is None:
+        from agents_shipgate.schemas.host_comparison import HostComparison
+
+        try:
+            from agents_shipgate.cli.verify.host_comparison import compare_host_refs
+
+            comparison = compare_host_refs(
+                workspace=git_root_for(workspace) or workspace.resolve(),
+                base=base,
+                head=head,
+                auto_base=False,
+                config_relative=Path("shipgate.yaml"),
+                require_unconfigured=False,
+                redact_permission_arguments=True,
+                # The boundary result cannot name a limit, and check routes a
+                # plugin file only when the change touches an enabled plugin's
+                # hook declaration (#809), so a plugin-reference limit both
+                # sides share on an untouched source must not refuse it. One
+                # only one side carries still does, so no row is built from it
+                # (#714).
+                exclude_plugin_reference_limits=True,
+                # The boundary result carries no coverage (#812).
+                coverage=False,
+            )
+        except (OSError, ValueError, RuntimeError, ConfigError) as exc:
+            comparison = HostComparison(
+                comparison_status="incomparable",
+                incomparable_reasons=[f"host_comparison_unavailable:{type(exc).__name__}"],
+                head_kind="provided_diff" if diff is not None else "worktree",
+            )
+        if comparison is not None and comparison.unchanged_limits:
+            # The boundary result cannot name unchanged limits yet, so `check`
+            # keeps refusing rather than show rows without them. `diff` and
+            # `verify` name them (#721).
+            comparison = HostComparison(
+                comparison_status="incomparable",
+                incomparable_reasons=["unchanged_limits_not_representable"],
+                head_kind=comparison.head_kind,
+            )
+        if comparison is not None:
+            result = result.model_copy(
+                update={
+                    "rows": comparison.rows,
+                    "comparison_status": comparison.comparison_status,
+                    "incomparable_reasons": comparison.incomparable_reasons,
+                    "comparison_scope": "changed_host_files" if diff is not None else "repository",
+                }
+            )
     _emit_check_result(result, format_=format_)
 
 
@@ -592,17 +673,11 @@ def _diff_input_error_audit_id(
         else "worktree"
     )
     requested_workspace = Path(_cwd_anchored(workspace))
-    config_identity = (
-        config if config.is_absolute() else requested_workspace / config
-    )
+    config_identity = config if config.is_absolute() else requested_workspace / config
     policy_identity = (
-        None
-        if policy is None
-        else policy if policy.is_absolute() else requested_workspace / policy
+        None if policy is None else policy if policy.is_absolute() else requested_workspace / policy
     )
-    diff_identity = (
-        None if diff is None else _cwd_anchored(Path(diff))
-    )
+    diff_identity = None if diff is None else _cwd_anchored(Path(diff))
     payload = {
         "schema": output_schema,
         "kind": "diff_input_error",

@@ -22,6 +22,13 @@
   },
   "boundary_adapters": [
     {
+      "id": "openshell",
+      "hosts": ["openshell"],
+      "exact_paths": [".shipgate/openshell.json"],
+      "globs": ["**/.shipgate/openshell.json"],
+      "experimental": false
+    },
+    {
       "id": "codex",
       "hosts": ["codex"],
       "exact_paths": [".codex/config.toml", ".codex/hooks.json", ".codex/requirements.toml"],
@@ -31,8 +38,8 @@
     {
       "id": "claude_code",
       "hosts": ["claude-code"],
-      "exact_paths": [".claude/settings.json", ".claude/settings.local.json", ".mcp.json", "CLAUDE.md"],
-      "globs": ["**/.mcp.json", "**/CLAUDE.md", ".claude/commands/*", ".claude/commands/**", ".claude/skills/*/SKILL.md", ".claude/skills/**/SKILL.md"],
+      "exact_paths": [".claude/settings.json", ".claude/settings.local.json", ".claude/hooks/hooks.json", ".mcp.json", "CLAUDE.md"],
+      "globs": ["**/.claude/hooks/hooks.json", "**/.mcp.json", "**/CLAUDE.md", ".claude/commands/*", ".claude/commands/**", ".claude/skills/*/SKILL.md", ".claude/skills/**/SKILL.md"],
       "experimental": false
     },
     {
@@ -47,7 +54,7 @@
       "hosts": ["vscode"],
       "exact_paths": [".vscode/mcp.json"],
       "globs": [],
-      "experimental": true
+      "experimental": false
     },
     {
       "id": "shared",
@@ -58,6 +65,17 @@
     }
   ],
   "rules": [
+    {
+      "id": "TRIGGER-OPENSHELL-BOUNDARY-CHANGED",
+      "surface_class": "host_boundary",
+      "agents_md_row": "Adds/changes coding-agent host config, hooks, permissions, MCP servers, or workflows",
+      "when": {
+        "boundary_adapter": "openshell"
+      },
+      "action": "run_shipgate",
+      "rationale": "Explicit OpenShell policy selections define a reviewed sandbox authority surface.",
+      "command": "agents-shipgate verify --preview --json"
+    },
     {
       "id": "TRIGGER-MCP-EXPORT-CHANGED",
       "surface_class": "capability",
@@ -92,6 +110,24 @@
       },
       "action": "run_shipgate",
       "rationale": "A tool definition carrying an MCP input schema and MCP annotation hints is a tool surface whatever the file is named. TRIGGER-MCP-EXPORT-CHANGED recognises MCP exports by filename, which misses `pkg/github/__toolsnaps__/delete_repository.snap` and `mcp-server/tools.json` alike; content recognition does not depend on a naming convention the repository never agreed to.",
+      "command": "agents-shipgate verify --preview --json"
+    },
+    {
+      "id": "TRIGGER-MCP-TOOL-REGISTRATION-SOURCE",
+      "surface_class": "capability",
+      "agents_md_row": "Adds/changes an MCP tool registration written in TypeScript, Go or Python source (`static toolName`, `.registerTool(`, `MustTool(`, `NewTool(`, `mcp.Tool{`, `@mcp.tool`)",
+      "when": {
+        "any_of": [
+          {"diff_contains": ".registerTool("},
+          {"diff_contains": "@mcp.tool"},
+          {"diff_contains": "MustTool("},
+          {"diff_contains": "NewTool("},
+          {"diff_contains": "mcp.Tool{"},
+          {"diff_contains": "static toolName"}
+        ]
+      },
+      "action": "run_shipgate",
+      "rationale": "Most MCP servers never emit their tool list: the official MongoDB and Grafana servers declare every tool as a string literal at a registration site in TypeScript or Go, and the largest measured shape is a Python `@mcp.tool` decorator whose name is usually not written down at all. No filename or schema-content rule matches such a diff. These six tokens are the high-precision subset of the built-in idiom registry (`agents_shipgate.inputs.mcp_idioms.DIFF_TOKENS`), narrower than what that reader matches because a matched capability rule overrides the workspace stop condition. Routing this diff stops the silent miss; the `mcp_server_source` input reads the whole surface once the repository is adopted.",
       "command": "agents-shipgate verify --preview --json"
     },
     {
@@ -408,6 +444,8 @@
       {"detect_returns": "is_agent_project: false"},
       {"detect_returns": "suggested_sources: []"},
       {"detect_returns": "codex_plugin_candidates: []"},
+      {"detect_returns": "host_boundary_candidates: []"},
+      {"detect_returns": "host_discovery_incomplete_paths: []"},
       {"detect_returns": "python_parse_truncated: false"},
       {"file_absent": "shipgate.yaml"},
       {"user_did_not_request": true}

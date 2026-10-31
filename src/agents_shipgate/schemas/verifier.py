@@ -7,7 +7,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from agents_shipgate.schemas.agent_control import AgentControl, normalize_legacy_agent_control
 from agents_shipgate.schemas.common import ReleaseDecisionStatus
 from agents_shipgate.schemas.disclaimers import STATIC_VERDICT_DISCLAIMER
+from agents_shipgate.schemas.host_comparison import HostComparison
 from agents_shipgate.schemas.human_authorization import AuthorizationEvaluationV1
+from agents_shipgate.schemas.instruction_structure import ConditionalInstructionEditRule
 from agents_shipgate.schemas.report import ReleaseDecision
 from agents_shipgate.schemas.verification_identity import CONTENT_ID_PATTERN
 
@@ -718,7 +720,7 @@ class VerifierArtifact(BaseModel):
         },
     )
 
-    verifier_schema_version: Literal["0.15"] = "0.15"
+    verifier_schema_version: Literal["0.21"] = "0.21"
     static_analysis_only: Literal[True] = True
     runtime_behavior_verified: Literal[False] = False
     static_verdict_disclaimer: str = STATIC_VERDICT_DISCLAIMER
@@ -764,6 +766,7 @@ class VerifierArtifact(BaseModel):
     agent_summary: dict[str, Any] | None = None
     reviewer_summary: dict[str, Any] | None = None
     capability_review: VerifierCapabilityReview = Field(default_factory=VerifierCapabilityReview)
+    host_comparison: HostComparison | None = None
     mode: str = "advisory"
     decision: str | None = None
     merge_verdict: MergeVerdict = "unknown"
@@ -775,6 +778,7 @@ class VerifierArtifact(BaseModel):
     fix_task: VerifierFixTask | None = None
     forbidden_file_edits: list[str] = Field(default_factory=list)
     forbidden_actions: list[str] = Field(default_factory=list)
+    conditional_file_edits: list[ConditionalInstructionEditRule] = Field(default_factory=list)
     artifacts: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="before")
@@ -786,6 +790,102 @@ class VerifierArtifact(BaseModel):
             return data
         normalized = dict(data)
         legacy_version = normalized.get("verifier_schema_version")
+        if legacy_version == "0.20":
+            comparison = normalized.get("host_comparison")
+            review = comparison.get("review") if isinstance(comparison, dict) else None
+            if isinstance(review, dict) and any(
+                isinstance(change, dict) and "guidance" in change
+                for change in review.get("changes") or []
+            ):
+                raise ValueError("Legacy verifier cannot claim permission review guidance")
+            coverage = comparison.get("coverage") if isinstance(comparison, dict) else None
+            if isinstance(coverage, dict) and (
+                coverage.get("read_sources_only") is False
+                or "unread_candidates" in coverage
+                or "unread_candidates_not_examined" in coverage
+                or any(
+                    isinstance(item, dict)
+                    and (item.get("status") == "changed_not_read" or "candidate" in item)
+                    for item in coverage.get("items") or []
+                )
+            ):
+                # `0.20` named only sources an inventory read, and never
+                # looked for changed inputs no reader reads (#821), so a
+                # payload claiming either under that version is not that
+                # build's output.
+                raise ValueError("Legacy verifier cannot claim unread changed inputs")
+            if isinstance(comparison, dict) and (
+                comparison.get("comparison_status") == "partial"
+                or (
+                    isinstance(coverage, dict)
+                    and any(
+                        isinstance(item, dict) and item.get("scope") is not None
+                        for item in coverage.get("items") or []
+                    )
+                )
+            ):
+                # `0.20` reserved `scope` as always `null` and refused any
+                # comparison it could not complete (#808), so a partial one,
+                # or a limit naming a scope, is not that build's output.
+                raise ValueError("Legacy verifier cannot claim a partial host comparison")
+            if isinstance(comparison, dict) and (
+                any(key.startswith("input_script_") for key in comparison)
+                or any(
+                    isinstance(limit, dict) and limit.get("limit") == "unreadable"
+                    for limit in comparison.get("unchanged_limits") or []
+                )
+                or (
+                    isinstance(coverage, dict)
+                    and any(
+                        isinstance(item, dict) and item.get("status") == "script_not_resolved"
+                        for item in coverage.get("items") or []
+                    )
+                )
+            ):
+                # `0.20` never read a hook's script (#702).
+                raise ValueError("Legacy verifier cannot claim hook script dependencies")
+            # Its coverage reads as it was published: every item a read
+            # source, and the search for unread inputs not recorded.
+            return {**normalized, "verifier_schema_version": "0.21"}
+        if legacy_version in {"0.18", "0.19"}:
+            comparison = normalized.get("host_comparison")
+            if (
+                legacy_version == "0.18"
+                and isinstance(comparison, dict)
+                and "unchanged_limits" in comparison
+            ):
+                raise ValueError("Legacy verifier cannot claim unchanged comparison limits")
+            if isinstance(comparison, dict) and "coverage" in comparison:
+                raise ValueError("Legacy verifier cannot claim host comparison coverage")
+            if isinstance(comparison, dict) and (
+                "review" in comparison
+                or any(
+                    isinstance(row, dict) and "disposition" in row
+                    for row in comparison.get("rows") or []
+                )
+            ):
+                # Neither build presented its rows: it published no `review`
+                # block and no rule's disposition, so a payload that claims one
+                # under a `0.18`/`0.19` version is not that build's output (#795).
+                raise ValueError("Legacy verifier cannot claim how its rows were presented")
+            # v0.18 compared only complete inventories, so it named no limit: an
+            # empty list is exactly what that build knew (#721). Neither
+            # recorded what a comparison established per source, so coverage
+            # reads as not recorded, never as an empty list (#812).
+            return {**normalized, "verifier_schema_version": "0.21"}
+        if legacy_version == "0.17":
+            if "host_comparison" in normalized:
+                raise ValueError("Legacy verifier cannot claim host comparison evidence")
+            return {**normalized, "verifier_schema_version": "0.21", "host_comparison": None}
+        if legacy_version == "0.16":
+            if "host_comparison" in normalized:
+                raise ValueError("Legacy verifier cannot claim host comparison evidence")
+            # v0.16 already required current control, diff health and
+            # authorization. A discriminator migration cannot fill any of
+            # those blanks or synthesize permission from a diagnostic verdict.
+            if "conditional_file_edits" in normalized:
+                raise ValueError("Legacy verifier artifacts cannot carry conditional edit rules")
+            return {**normalized, "verifier_schema_version": "0.21", "conditional_file_edits": []}
         legacy = legacy_version in {
             "0.1",
             "0.2",
@@ -832,6 +932,9 @@ class VerifierArtifact(BaseModel):
             # could not mint or read the receipt, so ``false`` — publication is
             # refused on a blocked decision — is exactly what that build meant.
             "0.14",
+            # v0.15 froze before declaration review was embedded in the
+            # release-decision semantic coverage.
+            "0.15",
         }
         if not legacy:
             # Current artifacts must already carry the authoritative control
@@ -839,7 +942,13 @@ class VerifierArtifact(BaseModel):
             # control would turn an internal consistency failure into a trusted
             # handoff.  Only frozen prior readers are normalized.
             return normalized
-        normalized["verifier_schema_version"] = "0.15"
+        if "host_comparison" in normalized:
+            raise ValueError("Legacy verifier cannot claim host comparison evidence")
+        if "conditional_file_edits" in normalized:
+            raise ValueError("Legacy verifier artifacts cannot carry conditional edit rules")
+        normalized["verifier_schema_version"] = "0.21"
+        # Preserve the historical standing deny-list; never infer the new proof.
+        normalized.setdefault("conditional_file_edits", [])
         # A pre-v0.7 artifact recorded nothing about whether its diff was
         # readable. Defaulting that to ``complete`` would manufacture the one
         # claim the whole field exists to stop.
@@ -1093,14 +1202,24 @@ class VerifierArtifact(BaseModel):
                 raise ValueError("human control requires a human-owned, non-safe fix task")
             if self.control.state == "review_publishable":
                 # Publishing evidence is authority over the pull request, not
-                # over Shipgate: the only command a review route may authorize
-                # is the exact rerun that regenerates this same evidence.
+                # over Shipgate. Besides the exact evidence rerun, a provisional
+                # local-review result may name one human-owned durable-adoption
+                # route. That route changes the provenance question; it does
+                # not approve the resulting repository trust root.
                 rerun = self.fix_task.verification_command if self.fix_task is not None else None
                 permitted = {rerun} if rerun else set()
+                if self.fix_task is not None:
+                    permitted.update(
+                        repair.command
+                        for repair in self.fix_task.allowed_repairs
+                        if repair.actor == "human"
+                        and repair.kind == "durable_adoption"
+                        and repair.command
+                    )
                 if not set(self.control.allowed_next_commands) <= permitted:
                     raise ValueError(
-                        "a publishable review may authorize only the exact fix-task "
-                        "rerun command"
+                        "a publishable review may authorize only an exact fix-task "
+                        "rerun or human-owned durable-adoption command"
                     )
         self._assert_publication_rests_on_an_evaluated_change()
         self._assert_passed_substrate_is_consistent()

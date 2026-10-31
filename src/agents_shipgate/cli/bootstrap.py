@@ -29,23 +29,32 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
 import typer
 
 from agents_shipgate.cli.agent_mode import emit_agent_mode_error
+from agents_shipgate.cli.discovery.host_boundary import needs_host_route_payload
 from agents_shipgate.cli.workspace_guard import require_workspace
+from agents_shipgate.invocation import module_entry_argv
 
 _ENV_VAR = "AGENTS_SHIPGATE_AGENT_MODE"
 
 
 def _binary_command(extra_args: list[str], *, json_output: bool = True) -> list[str]:
     """Build the argv for invoking the same `agents-shipgate` binary
-    via ``python -m agents_shipgate``. Path-independent — works inside
-    a venv, a pipx install, or a source checkout."""
-    cmd = [sys.executable, "-m", "agents_shipgate", *extra_args]
+    via ``python -P -m agents_shipgate``. Path-independent — works inside
+    a venv, a pipx install, or a source checkout.
+
+    Each step runs with the workspace under review as its working
+    directory, and plain ``python -m`` puts that directory first on
+    ``sys.path``: a ``yaml/`` or ``agents_shipgate/`` package committed
+    there would run before detection read anything (#1020). ``-P`` drops
+    only that entry, so the environment — ``PYTHONPATH`` for a source
+    checkout and ``AGENTS_SHIPGATE_AGENT_MODE`` for the child's error
+    lines — still reaches the child."""
+    cmd = [*module_entry_argv(), *extra_args]
     if json_output and "--json" not in extra_args:
         cmd.append("--json")
     return cmd
@@ -94,6 +103,36 @@ def _run_step(
     }
 
 
+def _child_environment(env: dict[str, str]) -> dict[str, str]:
+    """``env`` with ``PYTHONPATH`` meaning what it meant to this process.
+
+    A relative or empty ``PYTHONPATH`` entry is resolved against the
+    working directory at import time, ``-P`` or not. Each step's working
+    directory is the workspace under review, so ``PYTHONPATH=src`` given
+    to this process would reach the child as ``<workspace>/src`` — the
+    same import from the reviewed repository that ``-P`` removes (#1020).
+    Anchoring those entries at this process's own directory keeps the
+    import path the caller set and nothing from the workspace.
+    """
+
+    raw = env.get("PYTHONPATH")
+    if not raw:
+        return env
+    try:
+        base = os.getcwd()
+    except OSError:
+        # No working directory to anchor to: drop the entries that would
+        # otherwise resolve inside the workspace.
+        base = None
+    entries: list[str] = []
+    for entry in raw.split(os.pathsep):
+        if os.path.isabs(entry):
+            entries.append(entry)
+        elif base is not None:
+            entries.append(os.path.join(base, entry) if entry else base)
+    return {**env, "PYTHONPATH": os.pathsep.join(entries)}
+
+
 def bootstrap_run(
     *,
     workspace: Path,
@@ -113,6 +152,7 @@ def bootstrap_run(
     """
     if env is None:
         env = dict(os.environ)
+    env = _child_environment(env)
     # Pre-flight: workspace must exist and be a directory. Without
     # this, _run_step's subprocess.run(cwd=...) blows up with
     # FileNotFoundError before bootstrap can produce a structured
@@ -176,6 +216,19 @@ def bootstrap_run(
     # the guard, not `agent_scope_truncated`: a single-scope workspace whose
     # only agent sits past the cap has the narrow flag false.
     parse_truncated = bool(detect_payload.get("python_parse_truncated"))
+    # The same predicate `detect` and `init` route on, read from the payload
+    # they publish rather than restated here: this guard already carried its
+    # own copy of the no-agent-surface rule, and a second spelling of the host
+    # rule beside it is how the three answers drift apart (#322).
+    if not manifest_already and needs_host_route_payload(detect_payload):
+        return {
+            "verdict": "host_review_required", "stopped": True,
+            "stop_reason": "Host discovery needs review through next_action; no setup files were written.",
+            "steps": steps, "release_decision": None,
+            "next_action": detect_payload.get("next_action"),
+            "next_actions": detect_payload.get("next_actions", []),
+            "control": detect_payload.get("control"),
+        }
 
     if (
         not is_agent_project
@@ -183,6 +236,8 @@ def bootstrap_run(
         and not plugin_candidates
         and not manifest_already
         and not parse_truncated
+        and detect_payload.get("host_boundary_candidates") == []
+        and detect_payload.get("host_discovery_incomplete_paths") == []
     ):
         return {
             "verdict": "no_agent_surface",
@@ -190,6 +245,7 @@ def bootstrap_run(
             "stop_reason": (
                 "detect says is_agent_project=false, suggested_sources=[], "
                 "codex_plugin_candidates=[], python_parse_truncated=false, "
+                "host_boundary_candidates=[], host_discovery_incomplete_paths=[], "
                 "and no shipgate.yaml exists. Bootstrap has nothing to do."
             ),
             "steps": steps,
@@ -393,7 +449,12 @@ def _locate_report(workspace: Path, manifest_path: Path) -> Path | None:
         # because of a --out override). Falling back risks reading a
         # stale report from the default location.
         return None
-    canonical = workspace / "agents-shipgate-reports" / "report.json"
+    # Imported here so the line-pinned subprocess allowlist above stays put.
+    from agents_shipgate.cli.current_workspace import DEFAULT_REPORTS_DIR
+
+    # The shared name, joined to the workspace as given: this path becomes the
+    # `apply-patches --from` argument, so its spelling is kept exactly.
+    canonical = workspace / DEFAULT_REPORTS_DIR / "report.json"
     if canonical.is_file():
         return canonical
     return None
@@ -542,7 +603,7 @@ def bootstrap(
     else:
         _emit_human_summary(result)
 
-    if result["stopped"] and result["verdict"] != "no_agent_surface":
+    if result["stopped"] and result["verdict"] not in {"no_agent_surface", "host_review_required"}:
         # Forward the underlying step's structured error so coding
         # agents get the same routing they'd get from a manual
         # invocation (#64 review P2). Bootstrap previously re-emitted
@@ -579,6 +640,8 @@ def _emit_human_summary(result: dict[str, Any]) -> None:
     typer.echo("")
     if result["stopped"]:
         typer.echo(f"Stopped: {result['stop_reason']}")
+        if result.get("next_action"):
+            typer.echo(f"Next: {result['next_action']}")
         return
     rd = result.get("release_decision")
     if rd:

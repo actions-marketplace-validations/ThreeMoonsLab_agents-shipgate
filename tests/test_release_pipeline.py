@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import re
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,13 @@ import pytest
 import yaml
 
 from scripts._release_support import ReleaseError
+from scripts.release_cadence import (
+    INTERVAL_DAYS,
+    OVERDUE_DAYS,
+    assess,
+    is_release_tag,
+)
+from scripts.release_cadence import main as cadence_main
 from scripts.release_notes import (
     MAX_BODY_CHARACTERS,
     assert_body_matches,
@@ -34,7 +42,7 @@ from scripts.release_notes import (
     extract_release_notes,
     notes_digest,
 )
-from scripts.release_publication import pypi_state, verify_manifest
+from scripts.release_publication import build_manifest, pypi_state, verify_manifest
 from scripts.release_sbom import dev_only_distributions, verify_release_sbom
 from scripts.update_locks import compile_command, prose_header
 from scripts.verify_dependency_lock import (
@@ -114,6 +122,19 @@ def _policy_cases(tier: str) -> list[dict[str, Any]]:
                 }
             )
     return cases
+
+
+def _policy_case_count(tier: str) -> int:
+    """How many cases a named policy demands, read from the policy itself.
+
+    Spelling the number here would make every count change a sweep through
+    unrelated assertions; the counts are pinned deliberately in
+    ``tests/test_safety_qualification.py``.
+    """
+
+    from scripts._release_support import QUALIFICATION_POLICIES
+
+    return QUALIFICATION_POLICIES[tier].case_count
 
 
 def _policy_summary(cases: list[dict[str, Any]], tier: str) -> dict[str, Any]:
@@ -448,7 +469,7 @@ def test_staging_rechecks_the_sbom_binding_before_publication() -> None:
     release = _load_workflow("release.yml")
 
     assert "scripts/release_sbom.py verify" in _job_commands(release["jobs"]["stage"])
-    assert release["jobs"]["publish"]["needs"] == ["verify", "stage"]
+    assert release["jobs"]["publish"]["needs"] == ["candidate", "stage"]
 
 
 # --------------------------------------------------------------------------
@@ -459,11 +480,21 @@ def test_staging_rechecks_the_sbom_binding_before_publication() -> None:
 def test_the_pipeline_separates_verification_staging_publication_and_finalisation() -> None:
     release = _load_workflow("release.yml")
 
-    assert list(release["jobs"]) == ["verify", "stage", "publish", "finalize"]
+    # The channel switch (#648) sits in front of the same four stages;
+    # `tests/test_release_advisory_pipeline.py` holds its shape.
+    assert list(release["jobs"]) == [
+        "channel",
+        "verify",
+        "verify_advisory",
+        "candidate",
+        "stage",
+        "publish",
+        "finalize",
+    ]
     assert release["jobs"]["verify"]["uses"] == "./.github/workflows/release-verify.yml"
-    assert release["jobs"]["stage"]["needs"] == "verify"
-    assert release["jobs"]["publish"]["needs"] == ["verify", "stage"]
-    assert release["jobs"]["finalize"]["needs"] == ["verify", "stage", "publish"]
+    assert release["jobs"]["stage"]["needs"] == "candidate"
+    assert release["jobs"]["publish"]["needs"] == ["candidate", "stage"]
+    assert release["jobs"]["finalize"]["needs"] == ["candidate", "stage", "publish"]
 
 
 def test_write_and_oidc_authority_are_never_held_together() -> None:
@@ -815,49 +846,169 @@ def _test_step_command(job: dict[str, Any], name: str) -> str:
     raise AssertionError(f"no step named {name!r}")
 
 
-def test_release_matches_ci_parallelism_and_excludes_perf() -> None:
-    release_test = _test_step_command(_load_workflow("release-verify.yml")["jobs"]["tests"], "Test")
-    ci_test = _test_step_command(_load_workflow("ci.yml")["jobs"]["test"], "Test")
+#: How many shards the suite is split into, in every workflow that splits it.
+#: CI and both release verifications partition with the same `conftest.py` from
+#: the same `tests/shard_seconds.json`, so they move together: adding a shard is
+#: one change to this number, the three matrices, the three
+#: `SHIPGATE_TEST_SHARDS` values and the two fragment counts below.
+SUITE_SHARDS = 6
 
-    # Same supported parallelism as CI: a release candidate should not spend
-    # its budget re-running serially what CI already parallelises.
-    assert "-n auto" in release_test
-    assert "-n auto" in ci_test
-    # Latency budgets stay a merge-time gate; shared-runner timing noise must
-    # not be able to fail a release candidate.
-    assert '-m "not perf"' in release_test
-    assert "tests/test_latency_budget.py" not in release_test
+_RELEASE_VERIFICATIONS = ("release-verify.yml", "release-advisory-verify.yml")
+
+
+def _sharded_test_step(workflow: str, job: str) -> dict[str, Any]:
+    for step in _load_workflow(workflow)["jobs"][job]["steps"]:
+        if str(step.get("name", "")).startswith("Test (shard"):
+            return step
+    raise AssertionError(f"{workflow} jobs.{job} has no sharded test step")
+
+
+def _ci_suite_step() -> str:
+    """CI's aggregate test command, wherever the workflow currently runs it.
+
+    It moved out of `jobs.test` into the sharded `jobs.suite` when one
+    aggregate run grew to within seconds of the job timeout. These tests are
+    about what the command *does*, so they follow it rather than pinning where
+    it lives — but they still find it by name, so a rename has to be
+    deliberate.
+    """
+
+    return str(_sharded_test_step("ci.yml", "suite")["run"])
+
+
+def _release_suite_step(workflow: str = "release-verify.yml") -> str:
+    """A release verification's shard command, in its `suite` job.
+
+    Release verification moved its suite out of `jobs.tests` into a sharded
+    `jobs.suite` for the same reason CI had (a single runner's 60 minutes were
+    1.5x the measured suite, and no margin once #964 landed). `jobs.tests` is
+    now the gate that follows it.
+    """
+
+    return str(_sharded_test_step(workflow, "suite")["run"])
+
+
+def _named_step(job: dict[str, Any], name: str) -> dict[str, Any]:
+    for step in job["steps"]:
+        if step.get("name") == name:
+            return step
+    raise AssertionError(f"no step named {name!r}")
+
+
+def _suite_matrix_and_count(workflow: str, job: str) -> tuple[list[int], int]:
+    """The shard indices a workflow runs and the count each partitions by."""
+
+    jobs = _load_workflow(workflow)["jobs"]
+    shards = jobs[job]["strategy"]["matrix"]["shard"]
+    count = next(
+        step["env"]["SHIPGATE_TEST_SHARDS"]
+        for step in jobs[job]["steps"]
+        if "SHIPGATE_TEST_SHARDS" in step.get("env", {})
+    )
+    return shards, int(count)
+
+
+def test_release_matches_ci_parallelism_and_excludes_perf() -> None:
+    ci_test = _ci_suite_step()
+
+    for workflow in _RELEASE_VERIFICATIONS:
+        release_test = _release_suite_step(workflow)
+        # Same supported parallelism as CI: a release candidate should not
+        # spend its budget re-running serially what CI already parallelises.
+        assert "-n auto" in release_test, workflow
+        assert "-n auto" in ci_test
+        # Latency budgets stay a merge-time gate; shared-runner timing noise
+        # must not be able to fail a release candidate.
+        assert '-m "not perf"' in release_test, workflow
+        assert "tests/test_latency_budget.py" not in release_test, workflow
+        # The release selection is a superset of CI's. CI leaves `slow` to the
+        # nightly run; the complete gate must not.
+        assert "not slow" not in release_test, workflow
+        assert '-m "not perf and not slow"' in ci_test
 
 
 def test_release_does_not_weaken_the_coverage_floor() -> None:
-    release_test = _test_step_command(_load_workflow("release-verify.yml")["jobs"]["tests"], "Test")
-    ci_test = _test_step_command(_load_workflow("ci.yml")["jobs"]["test"], "Test")
+    """The floor is 85 in both pipelines — and is measured over the whole suite.
 
-    assert "--cov-fail-under=85" in release_test
-    assert "--cov-fail-under=85" in ci_test
+    Both pipelines split the suite across jobs, so their shards each hold a
+    fragment of the coverage data. Two things have to be true and neither is
+    implied by the other: the combined data is gated at 85, and no shard sets a
+    threshold of its own. A `--cov-fail-under` on a sixth of the suite would be
+    a number that cannot mean what it says, and it would pass or fail for
+    reasons unrelated to the floor.
+    """
+
+    ci = _load_workflow("ci.yml")
+    assert "--cov-fail-under" not in _ci_suite_step()
+    assert "--cov=agents_shipgate" in _ci_suite_step()
+    combined = _job_commands(ci["jobs"]["coverage"])
+    assert "coverage combine" in combined
+    assert "--fail-under=85" in combined
+    # And the gate has to wait for every shard, or it would combine whatever
+    # happened to have finished.
+    assert ci["jobs"]["coverage"]["needs"] == ["suite"]
+
+    for name in _RELEASE_VERIFICATIONS:
+        release_test = _release_suite_step(name)
+        assert "--cov-fail-under" not in release_test, name
+        assert "--cov=agents_shipgate" in release_test, name
+        gate = _load_workflow(name)["jobs"]["tests"]
+        gate_commands = _job_commands(gate)
+        assert "coverage combine" in gate_commands, name
+        assert "--fail-under=85" in gate_commands, name
+        assert gate["needs"] == "suite", name
+
+
+def test_every_shard_index_the_matrix_runs_is_one_the_partition_counts() -> None:
+    """The matrix, the partition count and the fragment count agree.
+
+    A matrix of four over a count of three would drop a quarter of the suite
+    and leave every job green; a gate expecting fewer fragments than shards
+    would combine a partial measurement. They are written in separate places,
+    so they are compared here.
+    """
+
+    for workflow in ("ci.yml", *_RELEASE_VERIFICATIONS):
+        shards, count = _suite_matrix_and_count(workflow, "suite")
+        assert shards == list(range(1, count + 1)) == list(range(1, SUITE_SHARDS + 1)), workflow
+
+    ci_gate = _named_step(_load_workflow("ci.yml")["jobs"]["coverage"], "Combine and enforce the threshold")
+    assert ci_gate["env"]["EXPECTED_FRAGMENTS"] == SUITE_SHARDS
+    for workflow in _RELEASE_VERIFICATIONS:
+        reported = _named_step(
+            _load_workflow(workflow)["jobs"]["tests"],
+            "Require every shard to have reported, and to have tested this commit",
+        )
+        assert reported["env"]["EXPECTED_SHARDS"] == SUITE_SHARDS, workflow
 
 
 def test_adapter_static_only_lint_stays_covered_in_release() -> None:
     """It is excluded from the aggregate run, so it needs its own step or the
     trust-model invariant silently stops being checked at release time."""
 
-    tests_job = _load_workflow("release-verify.yml")["jobs"]["tests"]
-    aggregate = _test_step_command(tests_job, "Test")
-
-    assert "--ignore=tests/test_adapter_static_only.py" in aggregate
-    assert _step_index(tests_job, "tests/test_adapter_static_only.py -q") < _step_index(
-        tests_job, "--cov-fail-under=85"
-    )
+    for name in _RELEASE_VERIFICATIONS:
+        workflow = _load_workflow(name)["jobs"]
+        assert "--ignore=tests/test_adapter_static_only.py" in _release_suite_step(name), name
+        tests_job = workflow["tests"]
+        assert _step_index(tests_job, "tests/test_adapter_static_only.py -q") < _step_index(
+            tests_job, "--fail-under=85"
+        ), name
 
 
 def test_release_verification_timeout_is_documented_and_bounded() -> None:
-    workflow = _load_workflow("release-verify.yml")
-    source = (WORKFLOWS / "release-verify.yml").read_text(encoding="utf-8")
+    ci_timeout = _load_workflow("ci.yml")["jobs"]["suite"]["timeout-minutes"]
 
-    # The suite dominates one job; artifact sealing is much cheaper. Both are
-    # bounded, and neither number is an estimate.
-    assert workflow["jobs"]["tests"]["timeout-minutes"] == 20
-    assert workflow["jobs"]["artifact"]["timeout-minutes"] == 15
+    for name in _RELEASE_VERIFICATIONS:
+        workflow = _load_workflow(name)
+        # A shard is bounded, the gate that follows it is bounded, and sealing
+        # is bounded: none of the three is an estimate that nothing rechecks.
+        assert workflow["jobs"]["suite"]["timeout-minutes"] == 35, name
+        assert workflow["jobs"]["tests"]["timeout-minutes"] == 10, name
+        # A release shard runs CI's shard and the `slow` tests CI leaves out,
+        # so its budget is never tighter than CI's.
+        assert workflow["jobs"]["suite"]["timeout-minutes"] >= ci_timeout, name
+    source = (WORKFLOWS / "release-verify.yml").read_text(encoding="utf-8")
+    assert _load_workflow("release-verify.yml")["jobs"]["artifact"]["timeout-minutes"] == 15
     assert "Measured, not estimated" in source
 
 
@@ -865,6 +1016,15 @@ def test_perf_marker_is_declared_so_the_exclusion_is_meaningful() -> None:
     pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
     assert "perf: latency-budget" in pyproject
+
+
+def test_slow_marker_is_declared_so_the_exclusion_is_meaningful() -> None:
+    """An undeclared marker is a typo waiting to happen: `-m "not slow"` on a
+    test marked `slwo` would keep running it, and `-m slow` would not find it."""
+
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+    assert '"slow: ' in pyproject
 
 
 # --------------------------------------------------------------------------
@@ -920,14 +1080,18 @@ def test_publication_requires_a_rehearsal_of_this_exact_candidate() -> None:
     stage = _load_workflow("release.yml")["jobs"]["stage"]
     commands = _job_commands(stage)
 
-    # Bound to the source tree (and therefore the workflow revision)...
-    assert "actions/workflows/release-rehearsal.yml/runs?head_sha=${SOURCE_SHA}" in commands
-    assert "status=success" in commands
-    assert "No successful Release Rehearsal run" in commands
+    from scripts.release_channel import QUALIFIED, REHEARSAL_WORKFLOWS
+
+    # Bound to the source tree (and therefore the workflow revision), through
+    # the declared channel's own rehearsal file (#648)...
+    assert "actions/workflows/${REHEARSAL_WORKFLOW:?" in commands
+    assert "/runs?head_sha=${SOURCE_SHA}&status=success" in commands
+    assert "No successful ${REHEARSAL_WORKFLOW} run" in commands
+    assert REHEARSAL_WORKFLOWS[QUALIFIED] == "release-rehearsal.yml"
     # ...and to candidate identity, so a qualification artifact swapped between
     # the rehearsal and the tag is caught.
     assert "cmp -- rehearsed/candidate-manifest.json dist/candidate-manifest.json" in commands
-    assert _step_index(stage, "release-rehearsal.yml/runs") < _step_index(
+    assert _step_index(stage, "${REHEARSAL_WORKFLOW:?") < _step_index(
         stage, "gh release create"
     )
 
@@ -936,12 +1100,16 @@ def test_every_rehearsal_proves_the_provenance_gate_fails_closed() -> None:
     """The deliberate failure-path exercise is executed, not documented."""
 
     verify = _load_workflow("release-verify.yml")["jobs"]["artifact"]
-    step = verify["steps"][_step_index(verify, "fault-injected.whl")]
+    step = verify["steps"][_step_index(verify, "fault-injection/corrupted")]
 
     assert step["if"] == "inputs.mode == 'rehearsal'"
     assert "does not fail closed" in step["run"]
-    # It must assert the gate *rejects* the tampered wheel.
+    # It must assert the gate *rejects* the tampered wheel, on its payload,
+    # after an untouched copy under the same name passes (#615).
     assert "if python scripts/verify_wheel_provenance.py" in step["run"]
+    assert '--qualified "fault-injection/control/${wheel_name}"' in step["run"]
+    assert "does not match the qualified wheel" in step["run"]
+    assert "--qualified fault-injected.whl" not in step["run"]
 
 
 def test_rehearsal_publishes_inspectable_candidate_artifacts() -> None:
@@ -1009,16 +1177,26 @@ def test_every_caller_consumed_output_is_publicly_exported() -> None:
 
     import re
 
-    exported = set(_load_workflow("release-verify.yml")["on"]["workflow_call"]["outputs"])
+    from scripts.release_channel import CANDIDATE_OUTPUTS
+
+    # Publication reads verification through `candidate` (#648), which
+    # forwards exactly `CANDIDATE_OUTPUTS` from whichever workflow ran, plus
+    # the channel-keyed names it derives itself.
     consumed = set(
         re.findall(
-            r"needs\.verify\.outputs\.(\w+)",
+            r"needs\.candidate\.outputs\.(\w+)",
             (WORKFLOWS / "release.yml").read_text(encoding="utf-8"),
         )
     )
+    derived = {"channel", "rehearsal_workflow", "release_assets", "signed_assets"}
 
     assert consumed, "the caller consumes no outputs; the check would be vacuous"
-    assert consumed <= exported, f"not exported: {sorted(consumed - exported)}"
+    assert consumed <= set(CANDIDATE_OUTPUTS) | derived, sorted(
+        consumed - set(CANDIDATE_OUTPUTS) - derived
+    )
+    for workflow in ("release-verify.yml", "release-advisory-verify.yml"):
+        exported = set(_load_workflow(workflow)["on"]["workflow_call"]["outputs"])
+        assert set(CANDIDATE_OUTPUTS) <= exported, (workflow, set(CANDIDATE_OUTPUTS) - exported)
 
 
 def test_the_handoff_is_sealed_by_a_job_that_runs_no_candidate_tests() -> None:
@@ -1031,7 +1209,8 @@ def test_the_handoff_is_sealed_by_a_job_that_runs_no_candidate_tests() -> None:
     artifact = workflow["jobs"]["artifact"]
     commands = _job_commands(artifact)
 
-    assert set(workflow["jobs"]) == {"tests", "artifact"}
+    assert set(workflow["jobs"]) == {"suite", "tests", "artifact"}
+    assert workflow["jobs"]["tests"]["needs"] == "suite"
     assert artifact["needs"] == "tests"
     # The sealing job runs no suite, no plugins, no audit.
     assert "pytest" not in commands
@@ -1067,7 +1246,10 @@ def test_a_completed_transaction_is_left_entirely_alone() -> None:
     release = _load_workflow("release.yml")
 
     for job in ("publish", "finalize"):
-        assert release["jobs"][job]["if"] == "needs.stage.outputs.release_state != 'published'"
+        # The rest of the condition names each dependency's success (#648).
+        assert release["jobs"][job]["if"].endswith(
+            "&& needs.stage.outputs.release_state != 'published' }}"
+        )
     assert release["jobs"]["stage"]["outputs"]["release_state"] == (
         "${{ steps.release.outputs.release_state }}"
     )
@@ -1098,9 +1280,15 @@ def test_finalisation_verifies_remote_bytes_not_asset_names() -> None:
     assert "gh release download" in commands
     assert "verify-manifest" in commands
     assert '--expected-sha256 "${MANIFEST_SHA256}"' in commands
-    # `--require`, not `--allow`: a release missing a bundle is incomplete.
-    assert '--require "${WHEEL_FILENAME}.sigstore.json"' in commands
-    assert "--require agents-shipgate-sbom.json.sigstore.json" in commands
+    # Required, not merely allowed: a release missing a bundle is incomplete.
+    # Which bundles is the declared channel's, from `release_publication`.
+    # Checked on commands, not the comments that explain them.
+    commands = "\n".join(
+        line for line in commands.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "--require-signatures" in commands
+    assert '--expected-channel "${CHANNEL}"' in commands
+    assert "--allow" not in commands
     # The signature bundles are verified, not merely present.
     assert "sigstore verify identity" in commands
     assert _step_index(finalize, "sigstore verify identity") < _step_index(
@@ -1242,7 +1430,10 @@ def test_the_stdlib_invariant_checker_rejects_a_weakened_signed_artifact(
     for overrides, expected in [
         ({"qualification_tier": "test"}, "tier is not beta"),
         ({"production_qualified": False}, "not production_qualified"),
-        ({"cases": [{"id": "c0", "receipt_sha256": "0" * 64}]}, "cases, not 100"),
+        (
+            {"cases": [{"id": "c0", "receipt_sha256": "0" * 64}]},
+            f"cases, not {_policy_case_count('beta')}",
+        ),
         ({"runtime_behavior_proven": True}, "runtime behaviour"),
         ({"failures": ["x"]}, "reports failures"),
     ]:
@@ -1320,7 +1511,7 @@ def test_the_sealer_reads_the_governing_policy_from_the_version_not_the_artifact
 
     # The identical claim does not publish anything from 1.0 onwards -- and the
     # rejected tier does not get to pick the population either: the policy falls
-    # back to production, so the same artifact is also short 44 cases.
+    # back to production, so the same artifact is also short of its case count.
     with pytest.raises(ReleaseError) as excinfo:
         verify_qualification_binding(
             qualification_path=_artifact(post_1_0_wheel, "9.9.9"),
@@ -1328,18 +1519,26 @@ def test_the_sealer_reads_the_governing_policy_from_the_version_not_the_artifact
             tag="v9.9.9",
         )
     assert "tier is not beta" in str(excinfo.value)
-    assert "carries 56 cases, not 100" in str(excinfo.value)
+    assert (
+        f"carries {_policy_case_count('pre_1_0')} cases, "
+        f"not {_policy_case_count('beta')}" in str(excinfo.value)
+    )
 
     for overrides, tier, expected in [
         # A tier the version admits still owns its own policy, in both
-        # directions: 56 is not enough for `beta`, and 100 is not `pre_1_0`.
+        # directions: the pre-1.0 count is not enough for `beta`, and the
+        # production count is not `pre_1_0`.
         (
             {"qualification_tier": "beta", "production_qualified": True},
             "pre_1_0",
-            "cases, not 100",
+            f"cases, not {_policy_case_count('beta')}",
         ),
-        ({"qualification_tier": "pre_1_0"}, "beta", "cases, not 56"),
-        # `production_qualified` keeps meaning the 100-case bar.
+        (
+            {"qualification_tier": "pre_1_0"},
+            "beta",
+            f"cases, not {_policy_case_count('pre_1_0')}",
+        ),
+        # `production_qualified` keeps meaning the production bar.
         ({"production_qualified": True}, "pre_1_0", "without the production policy"),
         ({"qualified": False}, "pre_1_0", "not qualified"),
     ]:
@@ -1364,6 +1563,7 @@ def test_the_sealer_enforces_the_strata_and_floors_not_just_a_case_count(
     passes short -- both of which the exhaustive gate rejects.
     """
 
+    from scripts._release_support import QUALIFICATION_POLICIES
     from scripts.verify_qualification_binding import verify_qualification_binding
 
     version = "0.16.0b7"
@@ -1402,7 +1602,7 @@ def test_the_sealer_enforces_the_strata_and_floors_not_just_a_case_count(
         qualification_path=_write(conforming), wheel_path=wheel, tag=f"v{version}"
     )
 
-    # 56 cases, right count, no strata at all.
+    # The right number of cases, in no stratum at all.
     flat = [dict(case, profile="n8n", expected_decision="blocked", actual_decision="blocked")
             for case in conforming]
     with pytest.raises(ReleaseError, match="strata do not match the pre_1_0 policy"):
@@ -1431,11 +1631,24 @@ def test_the_sealer_enforces_the_strata_and_floors_not_just_a_case_count(
     # measurement can produce: `True`, and the JSON literal `1e309`, which
     # loads as `inf` and satisfies any lower bound while the exhaustive gate
     # rejects it for exceeding 1.0.
+    origin_floor = QUALIFICATION_POLICIES["pre_1_0"].minimum_qualified_origins
+    case_total = _policy_case_count("pre_1_0")
     for summary_override, expected in (
-        ({"qualified_origin_cases": 22}, "qualified_origin_cases is not an integer"),
-        ({"qualified_origin_cases": 57}, "qualified_origin_cases is not an integer"),
+        # One below the floor, and one above the corpus: no artifact can have
+        # more qualifying origins than it has cases.
+        (
+            {"qualified_origin_cases": origin_floor - 1},
+            "qualified_origin_cases is not an integer",
+        ),
+        (
+            {"qualified_origin_cases": case_total + 1},
+            "qualified_origin_cases is not an integer",
+        ),
         ({"qualified_origin_cases": True}, "qualified_origin_cases is not an integer"),
-        ({"qualified_origin_cases": 23.0}, "qualified_origin_cases is not an integer"),
+        (
+            {"qualified_origin_cases": float(origin_floor)},
+            "qualified_origin_cases is not an integer",
+        ),
         ({"cohen_kappa": 0.79}, "cohen_kappa is not a finite value"),
         ({"cohen_kappa": float("inf")}, "cohen_kappa is not a finite value"),
         ({"cohen_kappa": 1.5}, "cohen_kappa is not a finite value"),
@@ -1617,6 +1830,32 @@ def test_the_suite_and_the_sealer_must_agree_on_the_commit() -> None:
     assert "The suite ran against ${TESTED_SHA}" in sealer
 
 
+def test_the_gate_requires_every_shard_to_have_tested_the_commit_it_gates() -> None:
+    """Shards check out independently, six times over.
+
+    The sealer compares one `source_sha` with its own, which is the gate's. With
+    the suite in six jobs, that comparison says nothing about what the shards
+    ran unless the gate also holds each of them to its commit. Each shard
+    records the commit it tested beside its coverage fragment, and the gate
+    refuses a record that names another.
+    """
+
+    for name in _RELEASE_VERIFICATIONS:
+        jobs = _load_workflow(name)["jobs"]
+        collected = _named_step(jobs["suite"], "Collect this shard's evidence")
+        assert "source-sha.txt" in collected["run"], name
+        assert collected["env"]["TESTED_SHA"] == "${{ steps.tested.outputs.source_sha }}", name
+        checked = _named_step(
+            jobs["tests"], "Require every shard to have reported, and to have tested this commit"
+        )
+        assert checked["env"]["TESTED_SHA"] == "${{ steps.tested.outputs.source_sha }}", name
+        assert "source-sha.txt" in checked["run"], name
+        # The shard evidence is checked before the coverage it carries is used.
+        assert _step_index(jobs["tests"], "source-sha.txt") < _step_index(
+            jobs["tests"], "--fail-under=85"
+        ), name
+
+
 def test_the_rehearsal_cannot_pass_a_mutable_ref() -> None:
     rehearsal = _load_workflow("release-rehearsal.yml")
 
@@ -1643,9 +1882,11 @@ def test_an_already_published_release_must_be_complete_and_signed() -> None:
     required and verified here."""
 
     stage = _job_commands(_load_workflow("release.yml")["jobs"]["stage"])
+    # Comment lines explain the flag beside it; only the command may satisfy this.
+    stage = "\n".join(line for line in stage.splitlines() if not line.lstrip().startswith("#"))
 
-    assert '--require "${WHEEL_FILENAME}.sigstore.json"' in stage
-    assert "--require agents-shipgate-sbom.json.sigstore.json" in stage
+    assert "--require-signatures" in stage
+    assert "--allow" not in stage
     assert "sigstore verify identity" in stage
 
 
@@ -2078,7 +2319,7 @@ def test_the_release_body_is_the_changelog_section_not_a_placeholder() -> None:
     # Extracted before anything is created, from the checkout pinned to the
     # verified commit rather than from the tag.
     assert _step_index(stage, "scripts/release_notes.py") < _step_index(stage, "gh release create")
-    assert stage["steps"][0]["with"]["ref"] == "${{ needs.verify.outputs.source_sha }}"
+    assert stage["steps"][0]["with"]["ref"] == "${{ needs.candidate.outputs.source_sha }}"
 
 
 def test_the_notes_are_written_to_a_path_no_candidate_controls() -> None:
@@ -2114,10 +2355,24 @@ def test_all_three_extractions_are_bound_to_one_digest() -> None:
         verify["jobs"]["artifact"]["outputs"]["release_notes_sha256"]
         == "${{ steps.notes.outputs.release_notes_sha256 }}"
     )
+    # Both verification workflows publish it, and `candidate` forwards
+    # whichever ran (#648).
+    advisory = _load_workflow("release-advisory-verify.yml")
+    assert "release_notes_sha256" in advisory["on"]["workflow_call"]["outputs"]
+    assert (
+        advisory["jobs"]["artifact"]["outputs"]["release_notes_sha256"]
+        == "${{ steps.notes.outputs.release_notes_sha256 }}"
+    )
+    assert (
+        release["jobs"]["candidate"]["outputs"]["release_notes_sha256"]
+        == "${{ steps.select.outputs.release_notes_sha256 }}"
+    )
     for job in ("stage", "finalize"):
         commands = _job_commands(release["jobs"][job])
         assert '--expected-sha256 "${NOTES_SHA256}"' in commands, job
-        assert "needs.verify.outputs.release_notes_sha256" in json.dumps(release["jobs"][job]), job
+        assert "needs.candidate.outputs.release_notes_sha256" in json.dumps(
+            release["jobs"][job]
+        ), job
 
 
 def test_the_published_body_is_reapplied_in_the_call_that_undrafts() -> None:
@@ -2245,11 +2500,29 @@ def test_locks_installed_together_cannot_move_each_other() -> None:
 
 
 def test_the_lock_gate_runs_in_both_pipelines_before_the_suite() -> None:
-    for workflow, job in (("ci.yml", "test"), ("release-verify.yml", "tests")):
-        parsed = _load_workflow(workflow)["jobs"][job]
-        assert _step_index(parsed, "scripts/verify_dependency_lock.py") < _step_index(
-            parsed, "--cov-fail-under=85"
-        ), workflow
+    """A stale lock must fail by name, not as an ImportError inside the suite.
+
+    "Before" means *within the job that runs the suite*. When CI's suite moved
+    into its own sharded job, a copy of the gate left behind in `test` would
+    have raced it rather than preceded it — two jobs start together — so each
+    shard job carries the gate itself.
+    """
+
+    for name in _RELEASE_VERIFICATIONS:
+        jobs = _load_workflow(name)["jobs"]
+        # In each shard, before its tests...
+        assert _step_index(jobs["suite"], "scripts/verify_dependency_lock.py") < _step_index(
+            jobs["suite"], "-m pytest -n auto"
+        ), name
+        # ...and again in the gate, before the coverage floor it enforces.
+        assert _step_index(jobs["tests"], "scripts/verify_dependency_lock.py") < _step_index(
+            jobs["tests"], "--fail-under=85"
+        ), name
+
+    suite = _load_workflow("ci.yml")["jobs"]["suite"]
+    assert _step_index(suite, "scripts/verify_dependency_lock.py") < _step_index(
+        suite, "-m pytest -n auto"
+    )
 
 
 def test_the_committed_locks_still_describe_the_declared_requirements() -> None:
@@ -2362,6 +2635,202 @@ def test_a_lock_that_resolves_at_install_time_is_not_a_lock(tmp_path: Path) -> N
 
     with pytest.raises(ReleaseError, match="neither an exact pin nor a direct URL"):
         verify_lock_target(target, root=root)
+
+
+def test_parse_lock_accepts_valid_pin_shapes(tmp_path: Path) -> None:
+    root, target = _lock_pair(
+        tmp_path,
+        declared="demo>=1\npydantic[email]>=2\npydantic[dotenv,email]>=2\nuv>=0.12\npackage @ https://example.com/pkg.whl ; sys_platform == 'linux'\n",
+        pins=(
+            "demo==1.0 \\\n    --hash=sha256:aaaa\n"
+            "pydantic[email]==2.13.5 \\\n    --hash=sha256:bbbb\n"
+            "pydantic[email,dotenv]==2.13.5 \\\n    --hash=sha256:cccc\n"
+            "uv==0.12.5 \\\n    --hash=sha256:dddd\n"
+            "package @ https://example.com/pkg.whl ; sys_platform == 'linux' \\\n    --hash=sha256:eeee\n"
+        ),
+    )
+
+    # Should pass without raising ReleaseError about malformed pins
+    assert verify_lock_target(target, root=root) == []
+
+
+def test_parse_lock_allows_distinct_extras_to_coexist(tmp_path: Path) -> None:
+    root, target = _lock_pair(
+        tmp_path,
+        declared="demo>=1\n",
+        pins=(
+            "demo==1.0 \\\n    --hash=sha256:aaaa\n"
+            "demo[extra]==1.0 \\\n    --hash=sha256:bbbb\n"
+        ),
+    )
+
+    # Distinct extras may coexist when they resolve to the same distribution version.
+    assert verify_lock_target(target, root=root) == []
+
+
+def test_parse_lock_retains_extras_for_duplicate_checks(tmp_path: Path) -> None:
+    root, target = _lock_pair(
+        tmp_path,
+        declared="demo>=1\n",
+        pins=(
+            "demo[extra]==1.0 \\\n    --hash=sha256:aaaa\n"
+            "demo[extra]==2.0 \\\n    --hash=sha256:bbbb\n"
+        ),
+    )
+
+    with pytest.raises(ReleaseError, match="under the same marker"):
+        verify_lock_target(target, root=root)
+
+
+@pytest.mark.parametrize(
+    ("declared", "pin"),
+    [
+        ("demo[one]>=1\n", "demo==1.0"),
+        ("demo[one]>=1\ndemo[two]>=1\n", "demo[one,two]==1.0"),
+        ("demo>=1\n", "demo[one]==1.0"),
+        (
+            "demo[one] @ https://example.invalid/demo.whl\n",
+            "demo @ https://example.invalid/demo.whl",
+        ),
+    ],
+)
+def test_lock_matches_declarations_when_extras_are_stripped_or_combined(
+    tmp_path: Path, declared: str, pin: str
+) -> None:
+    root, target = _lock_pair(
+        tmp_path,
+        declared=declared,
+        pins=f"{pin} \\\n    --hash=sha256:aaaa\n    # via -r constraints/toolchain.in\n",
+    )
+
+    assert verify_lock_target(target, root=root) == []
+
+
+def test_lock_keeps_canonical_extras_on_one_distribution(tmp_path: Path) -> None:
+    root, target = _lock_pair(
+        tmp_path,
+        declared="demo>=1\n",
+        pins="Demo [Two_Features, one, one]==1.0 \\\n    --hash=sha256:aaaa\n",
+    )
+
+    pins = parse_lock(root / target.lock)
+
+    assert set(pins) == {"demo"}
+    assert pins["demo"][0].extras == ("one", "two-features")
+
+
+@pytest.mark.parametrize(
+    "other",
+    ["demo[one]==2.0", "demo[one] @ https://example.invalid/demo.whl"],
+)
+def test_extras_cannot_hide_conflicting_transitive_pins(tmp_path: Path, other: str) -> None:
+    # Neither variant is direct: conflict detection must not depend on a declaration.
+    root, target = _lock_pair(
+        tmp_path,
+        declared="parent>=1\n",
+        pins=(
+            "parent==1.0 \\\n    --hash=sha256:aaaa\n"
+            "demo==1.0 \\\n    --hash=sha256:bbbb\n"
+            f"{other} \\\n    --hash=sha256:cccc\n"
+        ),
+    )
+
+    with pytest.raises(ReleaseError, match="conflicting.*overlapping markers"):
+        verify_lock_target(target, root=root)
+
+
+def test_distinct_extras_may_resolve_differently_under_disjoint_markers(tmp_path: Path) -> None:
+    root, target = _lock_pair(
+        tmp_path,
+        declared="demo>=1\n",
+        pins=(
+            "demo[one]==1.0 ; python_full_version < '3.13' \\\n"
+            "    --hash=sha256:aaaa\n"
+            "demo[two]==2.0 ; python_full_version >= '3.13' \\\n"
+            "    --hash=sha256:bbbb\n"
+        ),
+    )
+
+    assert verify_lock_target(target, root=root) == []
+
+
+@pytest.mark.parametrize("other_name", ["demo", "demo[two]"])
+@pytest.mark.parametrize("other_version", ["1.0", "2.0"])
+def test_co_installed_locks_compare_distributions_across_extras(
+    tmp_path: Path, other_name: str, other_version: str
+) -> None:
+    first_root, first = _lock_pair(
+        tmp_path / "first",
+        declared="demo[one]>=1\n",
+        pins="demo[one]==1.0 \\\n    --hash=sha256:aaaa\n",
+    )
+    second_root, second = _lock_pair(
+        tmp_path / "second",
+        declared=f"{other_name}>=1\n",
+        pins=f"{other_name}=={other_version} \\\n    --hash=sha256:bbbb\n",
+    )
+    assert verify_lock_target(first, root=first_root) == []
+    assert verify_lock_target(second, root=second_root) == []
+    targets = (
+        LockTarget(lock="first/constraints/toolchain.txt", source="first/constraints/toolchain.in"),
+        LockTarget(lock="second/constraints/toolchain.txt", source="second/constraints/toolchain.in"),
+    )
+
+    problems = co_installed_problems(
+        root=tmp_path, targets=targets, groups=((targets[0].lock, targets[1].lock),)
+    )
+
+    assert bool(problems) == (other_version != "1.0"), problems
+    if problems:
+        assert "demo resolves differently" in problems[0]
+
+
+def test_invalid_pin_extras_are_rejected(tmp_path: Path) -> None:
+    root, target = _lock_pair(
+        tmp_path,
+        declared="demo>=1\n",
+        pins="demo[bad!]==1.0 \\\n    --hash=sha256:aaaa\n",
+    )
+
+    with pytest.raises(ReleaseError, match="invalid extras"):
+        parse_lock(root / target.lock)
+
+
+def test_duplicate_extras_are_compared_after_canonicalization(tmp_path: Path) -> None:
+    root, target = _lock_pair(
+        tmp_path,
+        declared="demo>=1\n",
+        pins=(
+            "demo[One_Feature,one_feature]==1.0 \\\n    --hash=sha256:aaaa\n"
+            "demo[one-feature]==1.0 \\\n    --hash=sha256:bbbb\n"
+        ),
+    )
+
+    with pytest.raises(ReleaseError, match="under the same marker"):
+        parse_lock(root / target.lock)
+
+
+@pytest.mark.parametrize(
+    ("declared", "pin", "expected"),
+    [
+        ("demo[one]>=2\n", "demo[one,two]==1.0", "does not satisfy"),
+        (
+            "demo[one] @ https://example.invalid/expected.whl\n",
+            "demo[two] @ https://example.invalid/other.whl",
+            "where the declaration names",
+        ),
+    ],
+)
+def test_matching_extras_still_checks_the_declared_version_and_source(
+    tmp_path: Path, declared: str, pin: str, expected: str
+) -> None:
+    root, target = _lock_pair(
+        tmp_path, declared=declared, pins=f"{pin} \\\n    --hash=sha256:aaaa\n"
+    )
+
+    problems = verify_lock_target(target, root=root)
+
+    assert any(expected in problem for problem in problems), problems
 
 
 # --------------------------------------------------------------------------
@@ -2580,7 +3049,7 @@ def test_the_token_bearing_jobs_check_out_the_installer_and_nothing_else() -> No
         assert with_["sparse-checkout"] == ".github/actions/install-release-toolchain", name
         assert with_["sparse-checkout-cone-mode"] is False, name
         assert with_["persist-credentials"] is False, name
-        assert with_["ref"] == "${{ needs.verify.outputs.source_sha }}", name
+        assert with_["ref"] == "${{ needs.candidate.outputs.source_sha }}", name
 
 
 # --------------------------------------------------------------------------
@@ -2826,6 +3295,19 @@ def test_the_locked_backend_satisfies_the_declared_build_system() -> None:
     assert build_system_problems() == []
 
 
+def test_build_system_matches_an_extras_qualified_backend_pin(tmp_path: Path) -> None:
+    (tmp_path / "constraints").mkdir()
+    (tmp_path / "constraints/build-backend.txt").write_text(
+        "hatchling[feature]==1.0 \\\n    --hash=sha256:aaaa\n", encoding="utf-8"
+    )
+    (tmp_path / "pyproject.toml").write_text(
+        '[build-system]\nrequires = ["hatchling>=1"]\nbuild-backend = "hatchling.build"\n',
+        encoding="utf-8",
+    )
+
+    assert build_system_problems(root=tmp_path) == []
+
+
 @pytest.mark.parametrize(
     ("requires", "backend", "expected"),
     [
@@ -2912,3 +3394,381 @@ def test_a_non_ascii_space_does_not_close_a_fence(tmp_path: Path) -> None:
 
     with pytest.raises(ReleaseError, match="unterminated code fence"):
         extract_release_notes(changelog_path=changelog, tag="v2.0.0")
+
+
+# --------------------------------------------------------------------------
+# #491 — release cadence, and the unqualified preview channel
+#
+# The channel is admissible under five conditions recorded in
+# `docs/release-evidence-policy-decision.md` § Amendment 2. Each condition is
+# a *reader* that must not be able to confuse a preview for a release, so each
+# gets a negative control here rather than a paragraph of prose there. The
+# reader with the most authority — `verify_safety_qualification_release.py` —
+# is exercised in `tests/test_safety_qualification_release.py` § #491, where
+# its fixtures live.
+# --------------------------------------------------------------------------
+
+PREVIEW_TAG_PREFIX = "preview-"
+
+
+def _preview() -> dict[str, Any]:
+    return _load_workflow("release-preview.yml")
+
+
+def test_no_job_in_the_preview_channel_can_reach_pypi() -> None:
+    """C1's backstop. The local version segment makes the artifact
+    unpublishable at the index, but a control that depends on the *artifact*
+    is not enough: the workflow must also hold no token that could upload
+    anything at all, so a wheel that somehow lost its local segment still has
+    no path to PyPI from here."""
+
+    preview = _preview()
+
+    assert preview["permissions"] == {}
+    for name, job in preview["jobs"].items():
+        # No OIDC token can be minted, and no environment can be approved into
+        # one. Together these are what make Trusted Publishing unreachable
+        # from this file regardless of what any step tries to run.
+        assert "id-token" not in job["permissions"], name
+        assert "environment" not in job, name
+        commands = _job_commands(job)
+        for verb in ("uv publish", "twine upload", "gh release upload"):
+            assert verb not in commands, (name, verb)
+
+
+def test_the_preview_version_carries_a_local_segment() -> None:
+    """C1 itself: `+preview.<date>.g<sha>`. PEP 440 forbids publishing a local
+    version to a public index, so this is what keeps `0.16.0` free — and PyPI's
+    immutability is why "free" matters: an unqualified upload would consume the
+    version permanently."""
+
+    build = _preview()["jobs"]["build"]
+    derive = _test_step_command(build, "Derive the preview version")
+
+    assert '+preview.$(date -u +%Y%m%d).g${SOURCE_SHA:0:7}' in derive
+    # A version that already carries a local segment is refused rather than
+    # nested, because `a+b+c` is not a PEP 440 version at all.
+    assert "already carries a local version" in derive
+
+    confirm = _test_step_command(
+        build, "Confirm the wheel describes itself as an unpublishable preview"
+    )
+    # Asserted on the built wheel's own METADATA, not on the string the
+    # workflow computed: the check has to survive a build that rewrote it.
+    assert "METADATA" in confirm
+    assert 'if "+" not in declared' in confirm
+
+
+def test_the_preview_wheel_reports_one_version_from_both_of_its_sites() -> None:
+    """The defect the first published preview actually shipped.
+
+    The version lives twice — `pyproject.toml` decides METADATA, and
+    `src/agents_shipgate/__init__.py` carries the `__version__` literal that
+    `--version` and `doctor` report. Stamping only the first produced a wheel
+    whose METADATA said `0.16.0+preview…` while the CLI said plain `0.16.0`:
+    indistinguishable from the qualified release, and enough to make `doctor`
+    emit a false `installed_version_differs` claiming two copies were shadowing
+    each other when the environment held exactly one.
+
+    Both halves are pinned: that the build stamps both files, and that the
+    *artifact* is checked for agreement afterwards. The second is what makes
+    this durable — it fails on any future divergence regardless of how the
+    stamping is spelled.
+    """
+
+    build = _preview()["jobs"]["build"]
+    stamp = _test_step_command(build, "Build the preview wheel")
+    confirm = _test_step_command(
+        build, "Confirm the wheel describes itself as an unpublishable preview"
+    )
+
+    assert '"pyproject.toml": r\'^version = "(?P<value>[^"]*)"$\'' in stamp
+    assert (
+        '"src/agents_shipgate/__init__.py": r\'^__version__ = "(?P<value>[^"]*)"$\'' in stamp
+    )
+    # The stamped file set is closed, so a third version site cannot be added
+    # to the tree and silently left behind here.
+    assert 'expected="pyproject.toml src/agents_shipgate/__init__.py "' in stamp
+    # And the artifact itself is required to agree.
+    assert 'archive.read("agents_shipgate/__init__.py")' in confirm
+    assert 'if match.group(1) != declared' in confirm
+
+
+def test_the_repository_has_exactly_the_two_version_sites_the_preview_stamps() -> None:
+    """The closed set above is only closed if the tree agrees with it.
+
+    A third literal version site added later would be stamped by nothing, and
+    the preview would ship a wheel that disagrees with itself again — the
+    workflow's own file-set guard would catch it, but only after someone cut a
+    preview. This fails in CI instead.
+    """
+
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    init = (REPO_ROOT / "src/agents_shipgate/__init__.py").read_text(encoding="utf-8")
+
+    assert len(re.findall(r'^version = "[^"]*"$', pyproject, re.MULTILINE)) == 1
+    assert len(re.findall(r'^__version__ = "[^"]*"$', init, re.MULTILINE)) == 1
+    # They must already agree in the committed tree, or a release build ships
+    # the same split the preview did.
+    assert re.search(r'^version = "([^"]*)"$', pyproject, re.MULTILINE).group(1) == re.search(
+        r'^__version__ = "([^"]*)"$', init, re.MULTILINE
+    ).group(1)
+
+
+def test_a_preview_ref_cannot_trigger_the_release_pipeline() -> None:
+    """C2. `release.yml` fires on `v*`; the preview publishes at
+    `preview-<version>`. Asserted against the workflow's actual trigger rather
+    than a remembered one, so narrowing the glob later cannot silently make
+    this stale."""
+
+    triggers = _load_workflow("release.yml")["on"]["push"]["tags"]
+
+    assert triggers == ["v*"]
+    assert not any(PREVIEW_TAG_PREFIX.startswith(pattern.rstrip("*")) for pattern in triggers)
+
+    create = _job_commands(_preview()["jobs"]["publish"])
+    assert 'gh release create "preview-${VERSION}"' in create
+    assert 'gh release create "v' not in create
+
+
+def test_a_preview_run_cannot_satisfy_the_mandatory_rehearsal() -> None:
+    """C3, and the reason the preview is a separate file rather than a third
+    `mode` of `release-verify.yml`.
+
+    `stage` locates the mandatory rehearsal *by workflow file*. A preview run
+    lives in a different file, so it is invisible to that query by
+    construction — not because an `if:` condition happens to be right."""
+
+    stage = _job_commands(_load_workflow("release.yml")["jobs"]["stage"])
+
+    assert "workflows/${REHEARSAL_WORKFLOW:?" in stage
+    from scripts.release_channel import REHEARSAL_WORKFLOWS
+
+    assert not any("preview" in name for name in REHEARSAL_WORKFLOWS.values())
+    assert "release-preview" not in (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
+    # And the reverse, read from the graph rather than the text: the preview
+    # calls no reusable workflow at all, so it cannot inherit a release job.
+    assert [job.get("uses") for job in _preview()["jobs"].values()] == [None, None]
+
+
+def test_the_preview_publishes_only_a_wheel_and_says_what_it_is_not() -> None:
+    """C4. Attaching an SBOM, a signature, or anything named `qualification`
+    would create exactly the "quietly implies qualification" outcome #491
+    forbade — most dangerously for a machine reader that checks whether a file
+    is *present* rather than what it says."""
+
+    publish = _job_commands(_preview()["jobs"]["publish"])
+
+    # Every artifact path the writing job handles, from the text rather than
+    # from a remembered list: exactly one, and it is the wheel. Checking the
+    # prose for "sbom" would fail on the release body, which names the SBOM
+    # precisely in order to say the preview has none.
+    assert set(re.findall(r"dist/\$\{[A-Z_]+\}|dist/[\w.*-]+", publish)) == {
+        "dist/${WHEEL_FILENAME}"
+    }
+    assert "this is not a release" in publish.lower()
+    assert "carries **no safety qualification**" in publish
+    # The non-claims are stated, not implied by the absence of an asset.
+    for absent in ("Not on PyPI", "Not a tag", "Not signed", "Not rehearsed"):
+        assert f"**{absent}" in publish, absent
+    # The body is written by this file, at the dispatched revision. A body
+    # assembled from build output would be candidate-controlled text on a
+    # `contents: write` job.
+    assert "notes-file" in publish
+    assert "--prerelease" in publish
+
+
+def test_the_writing_job_runs_no_candidate_code() -> None:
+    """The release splits authority this way and so does this: the job holding
+    `contents: write` never checks the repository out, so the only text it can
+    publish is the text in this workflow file."""
+
+    preview = _preview()
+    publish = preview["jobs"]["publish"]
+
+    assert publish["permissions"] == {"contents": "write"}
+    assert not any("actions/checkout" in str(step.get("uses", "")) for step in publish["steps"])
+    assert preview["jobs"]["build"]["permissions"] == {"contents": "read", "actions": "read"}
+
+
+def test_the_preview_builds_only_a_commit_ci_already_accepted() -> None:
+    """What "the verified build path" can honestly mean here. The
+    qualification-bound path cannot run while the trust root is `CHANGE_ME`, so
+    the preview's evidence is the gate that is available — and it is a
+    precondition, not a hope."""
+
+    build = _preview()["jobs"]["build"]
+    gate = _test_step_command(build, "Require a successful CI run for this exact commit")
+
+    assert "workflows/ci.yml/runs?head_sha=" in gate
+    assert "status=success" in gate
+    assert "exit 1" in gate
+    # The immutable SHA, for the reason `release.yml` uses it: a symbolic ref
+    # is re-resolved per checkout.
+    checkout = next(step for step in build["steps"] if "actions/checkout" in str(step.get("uses")))
+    assert checkout["with"]["ref"] == "${{ github.sha }}"
+
+
+def test_the_preview_wheel_comes_from_the_release_build_toolchain() -> None:
+    """The one property that makes a preview wheel comparable to a release
+    wheel: the same hash-locked closure and the same `--no-isolation`, so the
+    `Generator:` stamp and the backend are the release's, not the index's."""
+
+    build = _preview()["jobs"]["build"]
+    install = _test_step_command(build, "Install the hash-locked sealing toolchain")
+    compile_step = _test_step_command(build, "Build the preview wheel")
+
+    assert "--require-hashes" in install
+    assert "constraints/release-seal.txt" in install
+    assert "python -m build --wheel --no-isolation" in compile_step
+    # The only difference from the committed tree is the version, proved by a
+    # per-file round trip rather than asserted, over a closed file set.
+    assert "changed more than the version" in compile_step
+    assert "Stamping touched an unexpected file set" in compile_step
+
+
+def test_the_release_handoff_invariants_were_not_relaxed_to_fit_a_preview(
+    tmp_path: Path,
+) -> None:
+    """The temptation this records having refused. `build_manifest` requires
+    `tag == v<version>`, which a preview ref cannot satisfy; the correct
+    response was for the preview to produce no candidate manifest at all,
+    never to widen the check."""
+
+    wheel = tmp_path / WHEEL_FILENAME
+    _write_wheel(wheel)
+
+    with pytest.raises(ReleaseError, match="does not match wheel version"):
+        build_manifest(
+            tag="preview-9.9.9+preview.20260902.g1a2b3c4",
+            source_commit="a" * 40,
+            wheel_path=wheel,
+            asset_paths=[],
+            output_path=tmp_path / "candidate-manifest.json",
+        )
+
+    assert "candidate-manifest" not in (WORKFLOWS / "release-preview.yml").read_text(
+        encoding="utf-8"
+    )
+
+
+# --------------------------------------------------------------------------
+# #491 — the cadence metric
+# --------------------------------------------------------------------------
+
+_DAY = 86_400
+_NOW = 1_800_000_000
+
+
+@pytest.mark.parametrize(
+    ("age_days", "status"),
+    [
+        (0, "current"),
+        (29, "current"),
+        (30, "due"),
+        (45, "due"),
+        (46, "overdue"),
+        (56, "overdue"),
+    ],
+)
+def test_the_cadence_states_follow_the_approved_interval(age_days: int, status: str) -> None:
+    """30 days is the interval and 45 the defect threshold, per
+    `docs/release-runbook.md` § Cadence. The boundaries are pinned in both
+    directions because "over ~45" is the sentence a reader has to be able to
+    trust."""
+
+    cadence = assess([("v0.15.0", _NOW - age_days * _DAY)], now=_NOW)
+
+    assert (cadence.days_since_release, cadence.status) == (age_days, status)
+    assert cadence.interval_days == INTERVAL_DAYS
+    assert cadence.overdue_days == OVERDUE_DAYS
+
+
+def test_only_release_tags_count_as_shipping() -> None:
+    """A preview must not report the cadence as kept. The channel exists
+    *because* the cadence slipped, so counting one would suppress the signal
+    that justified it — and the repository's own non-release refs must not
+    count either."""
+
+    assert is_release_tag("v0.15.0")
+    assert is_release_tag("v0.16.0b7")
+    for ref in (
+        "preview-0.16.0+preview.20260902.g1a2b3c4",
+        "wip-sectiond",
+        "m3-pre-rebase",
+        "v0garbage",
+        "0.15.0",
+        "release-v0.15.0",
+    ):
+        assert not is_release_tag(ref), ref
+
+
+def test_a_preview_tag_beside_a_release_tag_does_not_move_the_number() -> None:
+    """The join, not the predicate: a newer preview ref sitting beside an older
+    release tag must leave the answer at the release."""
+
+    tags = [("v0.15.0", _NOW - 56 * _DAY)]
+    with_preview = tags + [("preview-0.16.0+preview.20260902.g1a2b3c4", _NOW - _DAY)]
+
+    assert assess(read_release_tags_filter(with_preview), now=_NOW) == assess(tags, now=_NOW)
+
+
+def read_release_tags_filter(tags: list[tuple[str, int]]) -> list[tuple[str, int]]:
+    """The filter `read_release_tags` applies, isolated from the git call."""
+
+    return [(ref, when) for ref, when in tags if is_release_tag(ref)]
+
+
+def test_an_unfetched_checkout_reports_unknown_rather_than_current() -> None:
+    """Fail-safe. A shallow checkout brings no tags, and a metric that answered
+    `0 days` there would report a cadence nobody kept — the same defect as not
+    having the metric at all."""
+
+    cadence = assess([], now=_NOW)
+
+    assert cadence.status == "unknown"
+    assert cadence.days_since_release is None
+    assert "tags may not be fetched" in cadence.note
+
+
+def test_ci_records_the_number_without_failing_the_wrong_author() -> None:
+    """A red check here would fail whichever unrelated change happened to
+    arrive after the interval lapsed, and that author cannot cut a release.
+    The step warns; `--fail-when-overdue` is for an operator and is not passed
+    here. Tags have to be fetched or the step reports `unknown` forever."""
+
+    test_job = _load_workflow("ci.yml")["jobs"]["test"]
+    command = _test_step_command(test_job, "Release cadence")
+    checkout = next(
+        step for step in test_job["steps"] if "actions/checkout" in str(step.get("uses"))
+    )
+
+    assert "scripts/release_cadence.py --github" in command
+    assert "--fail-when-overdue" not in command
+    assert checkout["with"]["fetch-tags"] is True
+
+
+def test_the_overdue_exit_code_exists_for_an_operator(tmp_path: Path) -> None:
+    """The flag CI does not pass still has to work, or the runbook's escalation
+    path is prose. Exercised through the CLI, because that is the surface an
+    operator or a scheduled job would use."""
+
+    assert cadence_main(["--repo", str(REPO_ROOT), "--json"]) == 0
+
+    empty = tmp_path / "not-a-repo"
+    empty.mkdir()
+    assert cadence_main(["--repo", str(empty), "--fail-when-overdue"]) == 0
+
+
+def test_every_cadence_surface_renders_from_one_value() -> None:
+    """The human line, the JSON and the step-summary table are three renderings
+    of one `Cadence`, so a status the table calls `overdue` can never read
+    `current` in the annotation beside it."""
+
+    cadence = assess([("v0.15.0", _NOW - 56 * _DAY)], now=_NOW)
+
+    assert cadence.as_dict()["status"] == "overdue"
+    assert cadence.note in cadence.as_line()
+    assert cadence.note in cadence.as_markdown()
+    assert "**overdue**" in cadence.as_markdown()
+    assert "56" in cadence.as_line() and "**56**" in cadence.as_markdown()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
 import hashlib
 import json
 import os
@@ -12,7 +13,7 @@ import stat
 import tempfile
 import unicodedata
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextvars import Token
 from datetime import date
 from pathlib import Path, PurePosixPath
@@ -21,9 +22,20 @@ from typing import Any
 from agents_shipgate import __version__
 from agents_shipgate.checks.verify import PROTECTED_FILE_EDITS
 from agents_shipgate.checks.verify_policy import touched_policy_surfaces
+from agents_shipgate.ci.exit_policy import effective_fail_on
 from agents_shipgate.ci.release_decision import SUGGESTED_DECLARATIONS_FILENAME
 from agents_shipgate.cli._artifact_lifecycle import clear_verifier_route_artifacts
 from agents_shipgate.cli._helpers import _apply_strict_plugins
+from agents_shipgate.cli.current_workspace import (
+    DEFAULT_REPORTS_DIR,
+    OutputDirectoryHoldsRepositoryContent,
+    classify_output_directory,
+    default_reports_dir,
+    explicit_output_path,
+    is_default_reports_dir,
+    output_directory_remedy,
+    worktree_exclusion,
+)
 from agents_shipgate.cli.discovery.scope import (
     ChangeScope,
     ScopeResolution,
@@ -39,6 +51,12 @@ from agents_shipgate.core.agent_handoff import build_agent_handoff
 from agents_shipgate.core.authorization_execution import (
     authorization_execute_command,
     ensure_authorization_runtime_is_external,
+)
+from agents_shipgate.core.capability_attestation import (
+    CapabilityDeltaAttestationInputs,
+    ObservedSubject,
+    coverage_from_scan,
+    project_capability_delta_attestation,
 )
 from agents_shipgate.core.capability_lock import (
     DEFAULT_CAPABILITY_LOCK_PATH,
@@ -62,6 +80,14 @@ from agents_shipgate.core.human_authorization import (
     default_human_authorization_trust_policy_path,
     evaluate_human_authorization,
 )
+from agents_shipgate.core.human_review_request import project_human_review_request
+from agents_shipgate.core.manifest_provenance import (
+    LOCAL_REVIEW_MANIFEST_NAME,
+    ManifestProvenance,
+    manifest_provenance,
+    provisional_manifest_note,
+)
+from agents_shipgate.core.operation_attribution import ReconstructedOperationBase
 from agents_shipgate.core.static_inputs import (
     StaticInputSnapshot,
     activate_static_input_snapshot,
@@ -74,18 +100,27 @@ from agents_shipgate.core.surface_exclusions import (
     nameable_subject,
 )
 from agents_shipgate.core.trust_roots import (
+    PathIdentityIssue,
+    conditional_instruction_edits,
     inspect_lexical_path_identity,
     is_configured_manifest,
+    read_identity_bound_bytes,
     read_identity_bound_text,
 )
 from agents_shipgate.core.verification_identity import (
+    UnsafeDirectoryComponent,
+    build_engine_requirement,
     build_executor,
     build_terminal_receipt,
     build_unit_result,
     build_verification_plan,
+    open_directory_beneath,
+    read_regular_file_at,
+    read_regular_file_beneath,
+    replace_file_at,
     worktree_overlay,
 )
-from agents_shipgate.invocation import retarget_command
+from agents_shipgate.invocation import render_command, retarget_command
 from agents_shipgate.packet.json_packet import load_packet_json, write_packet_json
 from agents_shipgate.report.capability_lock_diff_markdown import (
     render_capability_lock_diff_markdown,
@@ -101,7 +136,18 @@ from agents_shipgate.schemas.agent_control import (
     HumanControlAction,
 )
 from agents_shipgate.schemas.agent_control_envelope import MAX_ENVELOPE_PROSE_BYTES
-from agents_shipgate.schemas.capabilities import CapabilityLockDiffV1, CapabilityLockFileV1
+from agents_shipgate.schemas.capabilities import (
+    CapabilityFactV1,
+    CapabilityLockDiffV1,
+    CapabilityLockFileV1,
+)
+from agents_shipgate.schemas.capability_attestation import (
+    CAPABILITY_DELTA_ATTESTATION_ARTIFACT_KEY,
+    CAPABILITY_DELTA_ATTESTATION_FILENAME,
+    CapabilityDeltaVerificationRef,
+    render_attestation_json,
+)
+from agents_shipgate.schemas.capability_payload import CapabilityAnalysisCoverage
 from agents_shipgate.schemas.current_control import (
     CurrentControlOperation,
     CurrentControlWorkspaceIdentity,
@@ -117,6 +163,8 @@ from agents_shipgate.schemas.human_authorization import (
     authorization_review_items,
     build_human_authorization_request,
 )
+from agents_shipgate.schemas.human_review_request import HUMAN_REVIEW_REQUEST_FILENAME
+from agents_shipgate.schemas.manifest import CiConfig
 from agents_shipgate.schemas.report import (
     ReadinessReport,
     ReleaseDecision,
@@ -124,7 +172,11 @@ from agents_shipgate.schemas.report import (
     without_machine_patches,
 )
 from agents_shipgate.schemas.verification import VerificationContext
-from agents_shipgate.schemas.verification_identity import VerificationPlan, content_id
+from agents_shipgate.schemas.verification_identity import (
+    VerificationEngineRequirement,
+    VerificationPlan,
+    content_id,
+)
 from agents_shipgate.schemas.verifier import (
     MergeVerdict,
     VerifierArtifact,
@@ -132,6 +184,7 @@ from agents_shipgate.schemas.verifier import (
     VerifierCapabilityReview,
     VerifierDiffStatus,
     VerifierFixTask,
+    VerifierRepair,
     applicability_for,
     merge_verdict_for,
 )
@@ -161,25 +214,29 @@ from .git import (
     DiffContext,
     DiffInputError,
     active_replace_refs,
-    archive_tree,
+    archive_verification_tree,
     carries_manifest_like_yaml,
     collect_diff_context,
     commit_date,
     commit_sha,
+    detect_default_base,
     detect_default_base_with_notes,
     ensure_git_workspace,
     git_path,
     merge_base_sha,
+    path_ever_present_from,
     path_present_at_ref,
     read_bytes_at_ref,
     read_file_at_ref,
     ref_exists,
+    regular_file_at_ref,
     removes_a_yaml_file,
     removes_any_tracked_path,
     repository_identity,
     require_merge_base_sha,
     resolve_source_head_identity,
     resolve_tree_path_identity,
+    resolve_verify_base,
     tree_sha,
     working_tree_context,
     working_tree_paths,
@@ -189,16 +246,14 @@ HEAD_FORMATS = ["markdown", "json", "sarif"]
 # Verify owns the PR artifact contract and writes packet.json only; the
 # reviewer-facing Markdown surface is pr-comment.md.
 HEAD_PACKET_FORMATS = ["json"]
-DEFAULT_OUT_DIR = Path("agents-shipgate-reports")
+DEFAULT_OUT_DIR = DEFAULT_REPORTS_DIR
 BASE_CACHE_KEEP_ENTRIES = 16
 # Cache-key epoch for base-scan reuse.
 #
-# A cached base report is admitted on a content hash alone: that proves the
-# file was not tampered with, never that its CONTENTS still mean what the
-# current CLI expects of them. ``__version__`` is in the key but is not
-# sufficient on its own — a source checkout, an editable install, or any two
-# builds sharing one pre-release version string can change what a field means
-# without moving the version, and the stale entry is then reused verbatim.
+# The effective engine requirement now binds implementation, dependencies,
+# plugins and the policy catalog (#596); same-version reader changes cannot
+# reuse an older engine's entry. The epoch remains a cache-format boundary.
+# A report checksum detects byte corruption, not authenticated source provenance.
 #
 # Bump this whenever the MEANING of anything inside a cached base report
 # changes. Pre-existing entries then land on a key nothing computes and are
@@ -218,7 +273,10 @@ BASE_CACHE_KEEP_ENTRIES = 16
 #     a ``target_file`` naming a base archive that no longer exists. A cached
 #     report is admitted on its hash, so a poisoned entry would be served
 #     verbatim until its base tree changed.
-BASE_CACHE_KEY_EPOCH = 4
+# 5 — bounded imported-guard evidence retains each base source/dependency
+#     snapshot (#557). Older cached reports contain no comparable record;
+#     they must be regenerated rather than interpreted as guard absence.
+BASE_CACHE_KEY_EPOCH = 5
 MAX_HUMAN_AUTHORIZATION_BYTES = 1024 * 1024
 MAX_WORKTREE_MANIFEST_BYTES = 4 * 1024 * 1024
 MAX_WORKTREE_CHANGED_FILE_BYTES = 64 * 1024 * 1024
@@ -228,6 +286,197 @@ MAX_WORKTREE_CHANGED_FILE_BYTES = 64 * 1024 * 1024
 #: Deliberately excludes ``missing_manifest`` (first adoption: the base was
 #: read and has no gate) and the two states that never asked at all.
 _BASE_COMPARISON_FAILURES = frozenset({"ref_missing", "archive_failed", "scan_failed"})
+
+
+def _base_unresolved_route() -> tuple[VerifierDiffStatus, str, CodingAgentFetchBaseAction]:
+    """The stop for a base that was asked for and does not exist (#1023).
+
+    Without ``--base`` and without ``--no-base``, a run whose detection found
+    nothing used to read no committed change, publish that empty change set as
+    ``complete`` and grant merge: a pull request deleting the Shipgate workflow
+    on a ``develop`` repository was ``mergeable``. It is refused instead, with
+    the two flags that resolve it. The published vocabulary already has the
+    state (``ref_missing``, ``refs_missing``); ``base_unresolved`` names which
+    one this is, as other diff headlines name their reason.
+    """
+
+    headline = (
+        "No base ref could be detected (base_unresolved), so Shipgate read no "
+        "committed change and reached no verdict. Pass --base <ref> naming the "
+        "branch this change merges into, or --no-base to verify without a base."
+    )
+    status = VerifierDiffStatus(
+        completeness="unavailable",
+        reason="refs_missing",
+        detail=(
+            "base_unresolved: no base ref could be detected. Detection reads "
+            "origin/HEAD, origin/main and origin/master, and a local main or "
+            "master only in a repository with no remote; none is available here."
+        ),
+        remediation=(
+            "Pass --base <ref> naming the branch this change merges into once it "
+            "is available locally (in GitHub Actions, check out with "
+            "fetch-depth: 0 and set the Action's diff_base: target), or pass "
+            "--no-base to verify without a base, which compares no committed "
+            "change."
+        ),
+        fetch_repairable=True,
+    )
+    action = CodingAgentFetchBaseAction(
+        kind="fetch_base",
+        expects=(
+            "A local base ref for this change, passed as --base <ref>; or "
+            "--no-base to verify without one."
+        ),
+        why=headline,
+    )
+    return status, headline, action
+
+
+@dataclasses.dataclass(frozen=True)
+class _ManifestRemoval:
+    """What the compared side says about a manifest the evaluated tree lacks.
+
+    ``removed``: the comparison commit holds the configured manifest and the
+    evaluated tree does not, so this change removes the gate. ``absent``: the
+    base is shown not to hold one, or complete history shows there never was
+    one, which is setup's question. ``unresolved``: no base exists to ask.
+    ``unknown``: the base cannot show which, because its ref is not here or
+    its merge base cannot be read, and ``failure`` says why.
+    """
+
+    state: str
+    base: str | None = None
+    comparison: str | None = None
+    failure: DiffContext | None = None
+    notes: tuple[str, ...] = ()
+
+
+def _probe_manifest_removal(
+    *,
+    git_root: Path,
+    config_relative: Path,
+    base: str | None,
+    head: str,
+    archive_head: bool,
+    auto_base: bool,
+) -> _ManifestRemoval:
+    """Whether a missing manifest is a removed gate, before any setup route (#1023).
+
+    The setup route (``configure``, then ``init --write``) is right only where
+    no Shipgate gate existed. Deleting a committed ``shipgate.yaml`` reached it
+    too, and without a resolvable base an advisory run then exited 0. The
+    base is resolved exactly as a configured run resolves it, and the
+    comparison is the merge base, as a configured run's is: a manifest the
+    base added after this branch forked is not one this change removes. With
+    no base requested, a working-tree run still compares against ``HEAD``.
+    """
+
+    notes: tuple[str, ...] = ()
+    at_head: str | None = None
+    if base is None and auto_base:
+        resolution = resolve_verify_base(git_root, head)
+        notes = tuple(resolution.notes)
+        if not resolution.resolved:
+            return _ManifestRemoval(state="unresolved", notes=notes)
+        base, at_head = resolution.base, resolution.at_head
+    if base is not None:
+        try:
+            comparison: str | None = require_merge_base_sha(git_root, base, head)
+        except DiffInputError as exc:
+            # A base without the manifest cannot make this a removal. A named
+            # base that is not here at all says nothing either way, so the
+            # setup route keeps its precedence only where complete history
+            # proves the manifest never existed; otherwise this is an unknown
+            # base, refused like any other (#1023 review cycle 1).
+            held = path_present_at_ref(git_root, base, config_relative)
+            if held is False or (
+                held is None
+                and path_ever_present_from(git_root, head, config_relative) is False
+            ):
+                return _ManifestRemoval(state="absent", base=base, notes=notes)
+            return _ManifestRemoval(
+                state="unknown", base=base, failure=exc.context, notes=notes
+            )
+    elif archive_head and at_head is None:
+        # An explicit head with --no-base compares nothing at all.
+        return _ManifestRemoval(state="absent", notes=notes)
+    else:
+        comparison = commit_sha(git_root, head)
+    present = (
+        path_present_at_ref(git_root, comparison, config_relative)
+        if comparison is not None
+        else None
+    )
+    if present is None:
+        return _ManifestRemoval(
+            state="unknown",
+            base=base,
+            failure=DiffContext(
+                completeness="unavailable",
+                reason="git_failed",
+                detail=(
+                    "Git could not say whether the compared commit holds "
+                    f"{config_relative.as_posix()}."
+                ),
+            ),
+            notes=notes,
+        )
+    if not present:
+        return _ManifestRemoval(state="absent", base=base, notes=notes)
+    if archive_head and path_present_at_ref(git_root, head, config_relative) is not False:
+        # The requested head still holds it; only this checkout lacks it.
+        return _ManifestRemoval(state="absent", base=base, notes=notes)
+    return _ManifestRemoval(state="removed", base=base, comparison=comparison, notes=notes)
+
+
+def _manifest_removal_headline(
+    manifest: str, *, base: str | None, comparison: str
+) -> str:
+    holder = (
+        f"its merge base with {base} ({comparison[:12]})"
+        if base is not None
+        else f"the head commit ({comparison[:12]})"
+    )
+    return (
+        f"Shipgate manifest removed: this change removes {manifest}, which "
+        f"{holder} holds, so the release gate would stop running. A human must "
+        "approve removing Shipgate; do not delete the manifest to get past the "
+        "gate."
+    )
+
+
+def _configured_manifest_provenance(
+    *,
+    git_root: Path,
+    config_path: Path,
+    evaluated_ref: str,
+) -> tuple[ManifestProvenance, bool | None]:
+    """Classify config authority once from its filesystem and Git identities."""
+
+    logical_path = config_path
+    present = config_path.is_file()
+    if config_path.is_absolute():
+        try:
+            logical_path = config_path.resolve().relative_to(git_root.resolve())
+        except ValueError:
+            return (
+                manifest_provenance(
+                    config_path,
+                    present=present,
+                    committed_at_head=None,
+                ),
+                None,
+            )
+    committed = path_present_at_ref(git_root, evaluated_ref, logical_path)
+    return (
+        manifest_provenance(
+            logical_path,
+            present=present,
+            committed_at_head=committed,
+        ),
+        committed,
+    )
 
 
 @owns_current_control("verify")
@@ -253,12 +502,28 @@ def run_verify(
     pr_comment_style: str = "capability-review",
     auto_base: bool = False,
     authorization: Path | None = None,
+    openshell_proof_config: Path | None = None,
+    openshell_proof_required: bool = False,
 ) -> tuple[VerifierArtifact, ReadinessReport | None, int]:
+    if openshell_proof_config is not None:
+        from agents_shipgate.core.openshell_native import external_path
+
+        try:
+            external_path(str(openshell_proof_config), workspace.resolve())
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
     git_root = ensure_git_workspace(workspace.resolve())
     config_path, config_relative = _resolve_config_under_workspace(
         git_root,
         config,
         requested_workspace=workspace,
+    )
+    configured_manifest_provenance, config_blob_at_head = (
+        _configured_manifest_provenance(
+            git_root=git_root,
+            config_path=config_path,
+            evaluated_ref=head,
+        )
     )
     out_dir = _resolve_out_dir(
         git_root=git_root, requested_workspace=workspace.resolve(), out=out
@@ -293,11 +558,23 @@ def run_verify(
         if diff_from is not None
         else None
     )
+    # A reference inside the repository is content the change under review
+    # can rewrite. It is read as committed at the base, never from the head, and
+    # editing it is touching a trust root (#1024). One outside the repository
+    # is the operator's own and is read where it is.
+    diff_from_relative = _repository_relative_input(git_root, static_diff_from_path)
+    configured_input_roots = _configured_input_trust_roots(
+        git_root,
+        policy_packs=policy_pack_paths or [],
+        baseline=baseline_path,
+        diff_from=static_diff_from_path,
+    )
     _reject_output_input_overlap(
         git_root=git_root,
         out_dir=out_dir,
         inputs=[
             ("config", config_path),
+            *([("OpenShell trust config", openshell_proof_config)] if openshell_proof_config is not None else []),
             *([("baseline", baseline_path)] if baseline_path is not None else []),
             *[("policy pack", path) for path in (policy_pack_paths or [])],
             *(
@@ -306,6 +583,27 @@ def run_verify(
                 else []
             ),
         ],
+    )
+    if openshell_proof_config is not None:
+        from agents_shipgate.core.openshell_native import reject_native_output_overlap
+
+        try:
+            reject_native_output_overlap(openshell_proof_config, git_root, out_dir)
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
+    # Before anything is written, and for every route this run can take:
+    # `--head`, the worktree, and the manifest-free comparison below all leave
+    # this directory out of what they read.
+    _reject_output_directory_content(
+        git_root=git_root,
+        workspace=workspace,
+        out_dir=out_dir,
+        explicit=out is not None,
+        base=base,
+        head=head,
+        archive_head=archive_head,
+        auto_base=auto_base,
+        manifest_free=not config_path.is_file(),
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     # Invalidate before anything else moves. A prior terminal pointer must not
@@ -344,14 +642,167 @@ def run_verify(
         no_heuristics=no_heuristics,
         authorization=authorization,
     )
+    if openshell_proof_config is not None:
+        openshell_proof_config = Path(os.path.abspath(openshell_proof_config))
+        rerun_options.extend(["--openshell-proof-config", shlex.quote(str(openshell_proof_config))])
+    if openshell_proof_required:
+        rerun_options.append("--openshell-proof-required")
+
+    def publish_unscanned(
+        *,
+        base_ref: str | None,
+        base_status: VerifierBaseStatus,
+        diff_status: VerifierDiffStatus,
+        headline: str,
+        action: AgentControlAction,
+        notes: Sequence[str],
+    ) -> tuple[VerifierArtifact, None, int]:
+        """Publish a run that stopped before any scan, on its one route (#1023)."""
+
+        verifier = _build_verifier(
+            git_root=git_root,
+            config_path=config_path,
+            base=base_ref,
+            head=head,
+            changed_files=[],
+            diff_text="",
+            trigger=evaluate(
+                paths=[],
+                diff_text="",
+                manifest_present=config_path.is_file(),
+                user_requested=True,
+                input_status=INPUT_UNAVAILABLE,
+            ),
+            base_status=base_status,
+            base_tree=None,
+            diff_status=diff_status,
+            base_report=None,
+            base_notes=list(notes),
+            report=None,
+            head_status="failed",
+            head_exit_code=2,
+            out_dir=out_dir,
+            manifest_provenance_value=configured_manifest_provenance,
+            ci_mode=ci_mode,
+            headline_override=headline,
+            first_next_action_override=action,
+            worktree=not archive_head,
+            rerun_options=rerun_options,
+        )
+        _remove_scan_artifacts(out_dir)
+        _write_artifacts(
+            verifier,
+            verifier_path,
+            verify_run_path,
+            pr_comment_path,
+            report=None,
+            git_root=git_root,
+            manifest_provenance_value=configured_manifest_provenance,
+            config_path=config_path,
+            config_logical_path=config_relative.as_posix(),
+            baseline_path=baseline_path,
+            policy_pack_paths=policy_pack_paths or [],
+            plugins_enabled=plugins_enabled,
+            no_heuristics=no_heuristics,
+            fail_on=fail_on,
+            pr_comment_style=pr_comment_style,
+        )
+        return verifier, None, 2
+
+    if not config_path.is_file() and ref_exists(git_root, head):
+        # A deleted manifest is a removed gate, never first adoption, and a
+        # base that cannot be read cannot show which of the two this is.
+        removal = _probe_manifest_removal(
+            git_root=git_root,
+            config_relative=config_relative,
+            base=base,
+            head=head,
+            archive_head=archive_head,
+            auto_base=auto_base,
+        )
+        if removal.state == "unresolved":
+            status, headline, action = _base_unresolved_route()
+            return publish_unscanned(
+                base_ref=None,
+                base_status="ref_missing",
+                diff_status=status,
+                headline=headline,
+                action=action,
+                notes=[*removal.notes, status.detail or headline],
+            )
+        if removal.state == "unknown":
+            assert removal.failure is not None
+            failure = removal.failure
+            return publish_unscanned(
+                base_ref=removal.base,
+                base_status=(
+                    "ref_missing" if failure.reason == "refs_missing" else "archive_failed"
+                ),
+                diff_status=_diff_status_artifact(failure),
+                headline=_diff_failure_headline(failure) or failure.note,
+                action=_diff_failure_action(
+                    failure, expects=f"{removal.base}...{head}"
+                ),
+                notes=[
+                    *removal.notes,
+                    "Could not establish whether the compared commit holds "
+                    f"{config_relative.as_posix()}. {failure.note}",
+                ],
+            )
+        if removal.state == "removed":
+            assert removal.comparison is not None
+            headline = _manifest_removal_headline(
+                config_relative.as_posix(),
+                base=removal.base,
+                comparison=removal.comparison,
+            )
+            return publish_unscanned(
+                base_ref=removal.base,
+                base_status="skipped" if removal.base is not None else "not_requested",
+                diff_status=VerifierDiffStatus(
+                    completeness="unavailable",
+                    reason="not_attempted",
+                    detail=(
+                        "verify stopped at the removed manifest; the rest of the "
+                        "change was not read."
+                    ),
+                    remediation=(
+                        "A human decides whether Shipgate may be removed. To "
+                        "verify the change instead, restore the manifest and rerun."
+                    ),
+                ),
+                headline=headline,
+                action=HumanControlAction(kind="stop", why=headline),
+                notes=[*removal.notes, headline],
+            )
 
     if not config_path.is_file():
+        from .host_comparison import compare_host_refs, host_comparison_failure
+
+        # A manifest-free host comparison is advisory evidence, not a synthetic
+        # application policy. Explicit application inputs retain their failure.
+        host_comparison = None
+        if ci_mode != "strict" and not any((baseline, policy_packs, diff_from, authorization, fail_on, openshell_proof_config, openshell_proof_required)):
+            try:
+                host_comparison = compare_host_refs(
+                    workspace=git_root, base=base, head=head if archive_head else None,
+                    auto_base=auto_base, config_relative=config_relative, out_dir=out_dir,
+                )
+            except (OSError, ValueError, RuntimeError, ConfigError) as exc:
+                host_comparison = host_comparison_failure(git_root, head if archive_head else None, exc)
+        if host_comparison is not None:
+            return run_preview(
+                workspace=workspace, config=config, base=base,
+                head=head if archive_head else None, out=out,
+                pr_comment_style=pr_comment_style, auto_base=auto_base,
+                _host_comparison=host_comparison, _operation="verify",
+            )
         preview_command = _preview_verify_command(
             workspace=git_root,
             config=config_relative,
             base=base,
             head=head if archive_head else None,
-            out=out,
+            out=explicit_output_path(out) if out is not None else None,
             pr_comment_style=pr_comment_style,
             preview=True,
         )
@@ -394,6 +845,7 @@ def run_verify(
             head_status="failed",
             head_exit_code=2,
             out_dir=out_dir,
+            manifest_provenance_value=configured_manifest_provenance,
             ci_mode=ci_mode,
             headline_override=message,
             first_next_action_override=CodingAgentCommandAction(
@@ -416,6 +868,7 @@ def run_verify(
             pr_comment_path,
             report=None,
             git_root=git_root,
+            manifest_provenance_value=configured_manifest_provenance,
             config_path=config_path,
             config_logical_path=config_relative.as_posix(),
             baseline_path=baseline_path,
@@ -433,6 +886,11 @@ def run_verify(
     base_status: VerifierBaseStatus = "not_requested"
     base_tree: str | None = None
     base_report: Path | None = None
+    # What the published diff reference is *called*. It stays ``None`` for a
+    # caller-supplied ``--diff-from``, whose own path is already the answer;
+    # a cached base is named by its cache location, never by the run-private
+    # copy the run actually reads (#803).
+    base_report_reference: Path | None = None
     base_capability_lock: CapabilityLockFileV1 | None = None
     base_notes: list[str] = []
     diff_unavailable = False
@@ -477,6 +935,7 @@ def run_verify(
             head_status="failed",
             head_exit_code=2,
             out_dir=out_dir,
+            manifest_provenance_value=configured_manifest_provenance,
             ci_mode=ci_mode,
             headline_override=message,
             first_next_action_override=CodingAgentFetchBaseAction(
@@ -495,6 +954,7 @@ def run_verify(
             pr_comment_path,
             report=None,
             git_root=git_root,
+            manifest_provenance_value=configured_manifest_provenance,
             config_path=config_path,
             config_logical_path=config_relative.as_posix(),
             baseline_path=baseline_path,
@@ -514,8 +974,9 @@ def run_verify(
     if tree_config_relative is not None:
         config_relative = tree_config_relative
 
+    overlay_worktree_manifest = archive_head and config_blob_at_head is False
     worktree_manifest_text: str | None = None
-    if not archive_head:
+    if not archive_head or overlay_worktree_manifest:
         try:
             worktree_manifest_text = read_identity_bound_text(
                 git_root,
@@ -531,13 +992,26 @@ def run_verify(
     verification_date = commit_date(git_root, head)
 
     if base is None and auto_base:
-        detection = detect_default_base_with_notes(git_root, head)
+        detection = resolve_verify_base(git_root, head)
         base_notes.extend(detection.notes)
         if detection.base is not None:
             base = detection.base
             base_notes.append(
                 f"Auto-detected base {detection.base!r} for diff context; "
                 "pass --base to override or --no-base to disable."
+            )
+        elif not detection.resolved:
+            # Nothing to compare against is not an empty comparison: the
+            # committed change was never read, so no diff can be published as
+            # complete and no merge granted on it (#1023).
+            status, headline, action = _base_unresolved_route()
+            return publish_unscanned(
+                base_ref=None,
+                base_status="ref_missing",
+                diff_status=status,
+                headline=headline,
+                action=action,
+                notes=[*base_notes, status.detail or headline],
             )
 
     base_exists = False
@@ -601,7 +1075,7 @@ def run_verify(
             worktree_paths, worktree_diff = working_tree_context(
                 git_root,
                 comparison_ref=effective_worktree_ref,
-                exclude=out_dir,
+                exclude=worktree_exclusion(git_root, out_dir),
                 reject_index_hidden=True,
             )
             if committed_diff_complete:
@@ -622,7 +1096,7 @@ def run_verify(
                 else working_tree_paths(
                     git_root,
                     comparison_ref=head,
-                    exclude=out_dir,
+                    exclude=worktree_exclusion(git_root, out_dir),
                     reject_index_hidden=True,
                 )
             )
@@ -691,28 +1165,6 @@ def run_verify(
         user_requested=True,
         input_status=_trigger_input_status(diff_input),
     )
-    verifier = _build_verifier(
-        git_root=git_root,
-        config_path=config_path,
-        base=base,
-        head=head,
-        changed_files=changed_files,
-        diff_text=diff_text,
-        trigger=trigger,
-        base_status=base_status,
-        base_tree=base_tree,
-        diff_status=_diff_status_artifact(diff_input),
-        base_report=base_report,
-        base_notes=base_notes,
-        report=None,
-        head_status="skipped",
-        head_exit_code=0,
-        out_dir=out_dir,
-        ci_mode=ci_mode,
-        worktree=not archive_head,
-        rerun_options=rerun_options,
-    )
-
     if diff_unavailable:
         verifier = _build_verifier(
             git_root=git_root,
@@ -731,6 +1183,7 @@ def run_verify(
             head_status="failed",
             head_exit_code=2,
             out_dir=out_dir,
+            manifest_provenance_value=configured_manifest_provenance,
             ci_mode=ci_mode,
             first_next_action_override=diff_failure_action,
             headline_override=_diff_failure_headline(diff_input),
@@ -744,6 +1197,7 @@ def run_verify(
             pr_comment_path,
             report=None,
             git_root=git_root,
+            manifest_provenance_value=configured_manifest_provenance,
             config_path=config_path,
             config_logical_path=config_relative.as_posix(),
             baseline_path=baseline_path,
@@ -758,27 +1212,28 @@ def run_verify(
     if not trigger.get("run_shipgate"):
         if base and base_status == "not_requested":
             base_status = "skipped"
-            verifier = _build_verifier(
-                git_root=git_root,
-                config_path=config_path,
-                base=base,
-                head=head,
-                changed_files=changed_files,
-                diff_text=diff_text,
-                trigger=trigger,
-                base_status=base_status,
-                base_tree=base_tree,
-                diff_status=_diff_status_artifact(diff_input),
-                base_report=base_report,
-                base_notes=base_notes,
-                report=None,
-                head_status="skipped",
-                head_exit_code=0,
-                out_dir=out_dir,
-                ci_mode=ci_mode,
-                worktree=not archive_head,
-                rerun_options=rerun_options,
-            )
+        verifier = _build_verifier(
+            git_root=git_root,
+            config_path=config_path,
+            base=base,
+            head=head,
+            changed_files=changed_files,
+            diff_text=diff_text,
+            trigger=trigger,
+            base_status=base_status,
+            base_tree=base_tree,
+            diff_status=_diff_status_artifact(diff_input),
+            base_report=base_report,
+            base_notes=base_notes,
+            report=None,
+            head_status="skipped",
+            head_exit_code=0,
+            out_dir=out_dir,
+            manifest_provenance_value=configured_manifest_provenance,
+            ci_mode=ci_mode,
+            worktree=not archive_head,
+            rerun_options=rerun_options,
+        )
         _write_artifacts(
             verifier,
             verifier_path,
@@ -786,6 +1241,7 @@ def run_verify(
             pr_comment_path,
             report=None,
             git_root=git_root,
+            manifest_provenance_value=configured_manifest_provenance,
             config_path=config_path,
             config_logical_path=config_relative.as_posix(),
             baseline_path=baseline_path,
@@ -796,6 +1252,31 @@ def run_verify(
             pr_comment_style=pr_comment_style,
         )
         return verifier, None, 0
+
+    # Which changed files hold hooks of a plugin the project settings enable
+    # is read from both compared sides, exactly as `check` reads it (#809):
+    # the scanned head alone cannot show that a deleted hook file was one, so
+    # the two would publish different decisions for one change.
+    enabled_plugin_hooks = None
+    enabled_plugin_hook_issues: list = []
+    if base and base_exists:
+        from .host_comparison import enabled_plugin_hook_evidence
+
+        _worktree_snapshot, enabled_plugin_hooks, enabled_plugin_hook_issues = (
+            enabled_plugin_hook_evidence(
+                workspace=git_root,
+                changed_files=changed_files,
+                head_is_worktree=not archive_head,
+                base=base,
+                head=head,
+            )
+        )
+
+    if enabled_plugin_hooks and enabled_plugin_hooks.openshell:
+        trigger = evaluate(paths=changed_files, diff_text=diff_text,
+            manifest_present=config_path.exists(), user_requested=True,
+            input_status=_trigger_input_status(diff_input),
+            selected_host_paths=sorted(enabled_plugin_hooks.openshell.paths))
 
     report: ReadinessReport | None = None
     head_status = "failed"
@@ -812,7 +1293,9 @@ def run_verify(
     head_manifest_text: str | None = None
     head_capability_lock: CapabilityLockFileV1 | None = None
     capability_lock_diff: CapabilityLockDiffV1 | None = None
+    capability_attestation_inputs: CapabilityDeltaAttestationInputs | None = None
     head_human_context: HumanArtifactContext | None = None
+    native_observation = None
 
     def capture_capability_lock(lock: CapabilityLockFileV1) -> None:
         nonlocal head_capability_lock
@@ -822,12 +1305,24 @@ def run_verify(
         nonlocal head_human_context
         head_human_context = context
 
+    # With a base to read it from, an in-repository reference is taken from
+    # the base commit; the checkout's copy is not an input to this run.
+    diff_from_at_base = diff_from_relative is not None and bool(base) and base_exists
+    # Nor does the change under review set its own exit code: whatever the
+    # command line leaves open is floored at what the base declares (#1024).
+    base_ci: CiConfig | None = None
+    if base and base_exists and (ci_mode is None or fail_on is None):
+        base_ci, base_ci_note = _base_ci_policy(
+            git_root=git_root, base=base, config_relative=config_relative
+        )
+        if base_ci_note is not None:
+            base_notes.append(base_ci_note)
     external_snapshot_paths = [
         path
         for path in [
             baseline_path,
             *list(policy_pack_paths or []),
-            static_diff_from_path,
+            None if diff_from_at_base else static_diff_from_path,
         ]
         if path is not None
     ]
@@ -836,12 +1331,13 @@ def run_verify(
         external_paths=external_snapshot_paths,
         excluded_paths=[out_dir],
     )
-    if not archive_head:
+    if not archive_head or overlay_worktree_manifest:
         assert worktree_manifest_text is not None
         static_snapshot.preload(
             config_path,
             worktree_manifest_text.encode("utf-8"),
         )
+    if not archive_head:
         # The overlay set is HEAD-relative and the change set is merge-base-
         # relative, so a canceled path appears only in the former. Bind the
         # union: an overlay path the snapshot contains but never read is
@@ -853,19 +1349,60 @@ def run_verify(
         )
     static_snapshot_token = activate_static_input_snapshot(static_snapshot)
 
+    operation_base = None
+
+    @functools.cache
+    def engine_requirement() -> VerificationEngineRequirement:
+        # One capture per invocation, shared by base cache and final plan.
+        # Never reuse this value across invocations or engine validation reads.
+        return build_engine_requirement(plugins_enabled=plugins_enabled)
+
+    def capture_base_operations(tree, rows):
+        nonlocal operation_base
+        operation_base = ReconstructedOperationBase(tree=tree, rows=tuple(rows))
+
+    run_base: tempfile.TemporaryDirectory[str] | None = None
+
+    def run_base_report_dir() -> Path:
+        # The run's private copy of the base report, whether it came from a
+        # warm entry, a cold store or a run the cache was unavailable to
+        # (#638). It must outlive ``_prepare_base_report`` and nothing else:
+        # it belongs to this run, and only this run reads it (#803).
+        nonlocal run_base
+        if run_base is None:
+            run_base = tempfile.TemporaryDirectory(prefix="agents-shipgate-verify-base-")
+        return Path(run_base.name)
+
     try:
-        if diff_from is not None:
+        base_reference: Path | None = None
+        if diff_from_at_base:
+            assert base is not None and diff_from_relative is not None
+            base_reference, reference_note = _diff_reference_at_base(
+                git_root=git_root,
+                base=base,
+                relative=diff_from_relative,
+                run_report_dir=run_base_report_dir,
+            )
+            base_notes.append(reference_note)
+        if diff_from is not None and not diff_from_at_base:
             base_status = "diff_from_provided"
             assert static_diff_from_path is not None
             base_report = static_diff_from_path
             base_notes.append(
                 f"Using explicit diff reference: {_display_path(base_report, git_root)}"
             )
+        elif base_reference is not None:
+            base_status = "diff_from_provided"
+            base_report = base_reference
+            # Published under the path the operator named; the bytes are the
+            # base commit's, which the note above says.
+            base_report_reference = static_diff_from_path
         elif base and base_exists:
             (
                 base_status,
                 base_tree,
                 base_report,
+                base_report_reference,
                 base_capability_lock,
                 cache_notes,
             ) = _prepare_base_report(
@@ -878,6 +1415,9 @@ def run_verify(
                 no_heuristics=no_heuristics,
                 verbose=verbose,
                 evaluation_date=verification_date,
+                operation_callback=capture_base_operations,
+                engine_requirement_factory=engine_requirement,
+                run_report_dir=run_base_report_dir,
             )
             base_notes.extend(cache_notes)
 
@@ -907,14 +1447,18 @@ def run_verify(
             changed_files=changed_files,
         )
     except Exception:
-        reset_static_input_snapshot(static_snapshot_token)
+        try:
+            if run_base is not None:
+                run_base.cleanup()
+        finally:
+            reset_static_input_snapshot(static_snapshot_token)
         raise
 
     try:
         if archive_head:
             head_tmp = tempfile.TemporaryDirectory(prefix="agents-shipgate-verify-head-")
             head_tree_dir = Path(head_tmp.name) / "head"
-            archive_tree(git_root, head, head_tree_dir)
+            archive_verification_tree(git_root, head, head_tree_dir)
             # Resolve once the tree exists. The snapshot matches paths lexically,
             # and on macOS the temporary directory is reached through /var while
             # every adapter resolves its base directory to /private/var — two
@@ -923,6 +1467,10 @@ def run_verify(
             head_input_root = head_tree_dir
             head_tree = tree_sha(git_root, head)
             head_config_path = head_tree_dir / config_relative
+            if overlay_worktree_manifest:
+                assert worktree_manifest_text is not None
+                head_config_path.parent.mkdir(parents=True, exist_ok=True)
+                head_config_path.write_text(worktree_manifest_text, encoding="utf-8")
             _reject_symlink_components(
                 head_tree_dir,
                 config_relative,
@@ -952,7 +1500,9 @@ def run_verify(
             # already does for a worktree run.
             head_snapshot = StaticInputSnapshot(
                 head_tree_dir,
-                excluded_paths=[out_dir],
+                excluded_paths=[_map_optional_tree_path(
+                    git_root=git_root, tree_dir=head_tree_dir, path=out_dir,
+                )],
             )
             # Read the manifest once, here, and hand those exact bytes to the
             # scan. `load_manifest_with_positions` otherwise parses it twice —
@@ -1002,7 +1552,11 @@ def run_verify(
         # public two-value return contract or serializing the context.
         with (
             use_evaluation_date(date.fromisoformat(verification_date)),
-            override_human_manifest_committed(True if archive_head else None),
+            override_human_manifest_committed(
+                True
+                if archive_head and configured_manifest_provenance == "repository"
+                else None
+            ),
         ):
             head_snapshot_token = (
                 activate_static_input_snapshot(head_snapshot)
@@ -1010,14 +1564,32 @@ def run_verify(
                 else None
             )
             try:
+                if openshell_proof_config is not None or openshell_proof_required:
+                    from agents_shipgate.core.openshell_native import observe_native
+
+                    native_observation = observe_native(config_path=openshell_proof_config,
+                        required=openshell_proof_required, workspace=git_root, input_root=head_input_root)
+                    base_notes.append(f"OpenShell native containment: {native_observation.status} ({native_observation.reason_code}); modeled inputs only.")
+                scan_manifest_text = (
+                    head_manifest_text if archive_head else worktree_manifest_text
+                )
+                scan_ci_mode, exit_fail_on_floor, ci_notes = _exit_policy_base_floor(
+                    head_manifest_text=scan_manifest_text,
+                    base_ci=base_ci,
+                    base=base,
+                    ci_mode=ci_mode,
+                    fail_on=fail_on,
+                )
+                base_notes.extend(ci_notes)
                 report, head_exit_code = run_scan(
                     config_path=head_config_path,
                     output_dir=out_dir,
                     formats=HEAD_FORMATS,
-                    ci_mode=ci_mode,
+                    ci_mode=scan_ci_mode,
                     fail_on=fail_on,
                     baseline_path=head_baseline_path,
                     diff_from_path=base_report,
+                    diff_from_display_path=base_report_reference,
                     baseline_mode=baseline_mode,
                     policy_pack_paths=head_policy_pack_paths,
                     plugins_enabled=plugins_enabled,
@@ -1032,7 +1604,9 @@ def run_verify(
                         diff_text_available=bool(diff_text),
                         trigger_result=trigger,
                         configured_manifest_path=config_relative.as_posix(),
+                        manifest_provenance=configured_manifest_provenance,
                         manifest_introduced=manifest_introduced,
+                        configured_gate_introduced=configured_gate_introduced,
                         # A base ref was resolved and the comparison could not
                         # be performed. ``diff_from_path`` is simply ``None``
                         # there, which the head scan cannot tell apart from
@@ -1052,12 +1626,16 @@ def run_verify(
                         # (PR #404 review 2).
                         base_comparison_unavailable=base_status
                         in _BASE_COMPARISON_FAILURES,
+                        configured_trust_root_inputs=configured_input_roots,
+                        enabled_plugin_hooks=enabled_plugin_hooks,
+                        enabled_plugin_hook_issues=tuple(enabled_plugin_hook_issues),
+                        openshell_native=native_observation,
                     ),
                     capability_lock_callback=capture_capability_lock,
                     human_context_callback=capture_human_context,
-                    manifest_text=(
-                        head_manifest_text if archive_head else worktree_manifest_text
-                    ),
+                    manifest_text=scan_manifest_text,
+                    operation_base=operation_base,
+                    exit_fail_on_floor=exit_fail_on_floor,
                 )
             except AgentsShipgateError as exc:
                 # `run_scan` records the manifest it read, and when the head is
@@ -1112,14 +1690,18 @@ def run_verify(
         head_status = "succeeded"
         if head_capability_lock is not None:
             try:
-                capability_lock_diff = _write_capability_review_artifacts(
+                review_artifacts = _write_capability_review_artifacts(
                     git_root=git_root,
                     out_dir=out_dir,
                     base=base,
                     base_lock=base_capability_lock,
                     head_lock=head_capability_lock,
+                    head_report=report,
+                    base_report_path=base_report,
                     base_notes=base_notes,
                 )
+                capability_lock_diff = review_artifacts.diff
+                capability_attestation_inputs = review_artifacts.attestation
             except Exception as exc:  # noqa: BLE001 - review artifacts never gate.
                 base_notes.append(f"Capability review artifacts unavailable: {exc}")
     except ConfigError as exc:
@@ -1139,51 +1721,52 @@ def run_verify(
         head_exit_code = 4
         raise
     finally:
-        artifact_report = report if head_status == "succeeded" else None
-        if artifact_report is None:
-            _remove_scan_artifacts(out_dir)
-        verifier = _build_verifier(
-            git_root=git_root,
-            config_path=config_path,
-            base=base,
-            head=head,
-            changed_files=changed_files,
-            diff_text=diff_text,
-            trigger=trigger,
-            base_status=base_status,
-            base_tree=base_tree,
-            diff_status=_diff_status_artifact(diff_input),
-            head_tree=head_tree,
-            base_report=base_report,
-            base_notes=base_notes,
-            report=artifact_report,
-            head_status=head_status,
-            head_exit_code=head_exit_code,
-            out_dir=out_dir,
-            ci_mode=ci_mode,
-            manifest_introduced=manifest_introduced,
-            # Both halves, joined only here: the structural one was decided
-            # before the scan, and whether the introduction is unshared needs
-            # the scan's own record of the policy packs it loaded.
-            configured_gate_introduced=(
-                configured_gate_introduced
-                and _gate_introduction_is_unshared(
-                    artifact_report,
-                    git_root=git_root,
-                    config_relative=config_relative,
-                    changed_files=changed_files,
-                    external_policy_inputs=[
-                        baseline_path,
-                        static_diff_from_path,
-                        *list(policy_pack_paths or []),
-                    ],
-                )
-            ),
-            worktree=not archive_head,
-            worktree_ref=None if archive_head else effective_worktree_ref,
-            rerun_options=rerun_options,
-        )
         try:
+            artifact_report = report if head_status == "succeeded" else None
+            if artifact_report is None:
+                _remove_scan_artifacts(out_dir)
+            verifier = _build_verifier(
+                git_root=git_root,
+                config_path=config_path,
+                base=base,
+                head=head,
+                changed_files=changed_files,
+                diff_text=diff_text,
+                trigger=trigger,
+                base_status=base_status,
+                base_tree=base_tree,
+                diff_status=_diff_status_artifact(diff_input),
+                head_tree=head_tree,
+                base_report=base_report,
+                base_notes=base_notes,
+                report=artifact_report,
+                head_status=head_status,
+                head_exit_code=head_exit_code,
+                out_dir=out_dir,
+                manifest_provenance_value=configured_manifest_provenance,
+                ci_mode=ci_mode,
+                manifest_introduced=manifest_introduced,
+                # Both halves, joined only here: the structural one was decided
+                # before the scan, and whether the introduction is unshared needs
+                # the scan's own record of the policy packs it loaded.
+                configured_gate_introduced=(
+                    configured_gate_introduced
+                    and _gate_introduction_is_unshared(
+                        artifact_report,
+                        git_root=git_root,
+                        config_relative=config_relative,
+                        changed_files=changed_files,
+                        external_policy_inputs=[
+                            baseline_path,
+                            static_diff_from_path,
+                            *list(policy_pack_paths or []),
+                        ],
+                    )
+                ),
+                worktree=not archive_head,
+                worktree_ref=None if archive_head else effective_worktree_ref,
+                rerun_options=rerun_options,
+            )
             try:
                 _write_artifacts(
                     verifier,
@@ -1192,6 +1775,7 @@ def run_verify(
                     pr_comment_path,
                     report=artifact_report,
                     git_root=git_root,
+                    manifest_provenance_value=configured_manifest_provenance,
                     config_path=head_config_path,
                     config_logical_path=config_relative.as_posix(),
                     baseline_path=head_baseline_path,
@@ -1201,13 +1785,17 @@ def run_verify(
                     fail_on=fail_on,
                     pr_comment_style=pr_comment_style,
                     capability_lock_diff=capability_lock_diff,
+                    capability_attestation_inputs=capability_attestation_inputs,
                     human_context=head_human_context,
+                    engine_requirement_factory=engine_requirement,
                     input_root=head_input_root,
                     input_snapshot=head_snapshot,
+                    config_from_worktree=overlay_worktree_manifest,
                     diff_text=diff_text,
                     diff_from_path=base_report,
                     authorization_path=authorization,
                     verification_options={
+                        **({"openshell_native": native_observation.model_dump(mode="json")} if native_observation is not None else {}),
                         "archive_head": archive_head,
                         "baseline_mode": baseline_mode,
                         "strict_plugins": strict_plugins,
@@ -1228,10 +1816,16 @@ def run_verify(
                 # failures are secondary once the head scan has already failed.
                 pass
         finally:
-            if head_tmp is not None:
-                head_tmp.cleanup()
-            if static_snapshot_token is not None:
-                reset_static_input_snapshot(static_snapshot_token)
+            try:
+                if head_tmp is not None:
+                    head_tmp.cleanup()
+            finally:
+                try:
+                    if run_base is not None:
+                        run_base.cleanup()
+                finally:
+                    if static_snapshot_token is not None:
+                        reset_static_input_snapshot(static_snapshot_token)
     return verifier, report, head_exit_code
 
 
@@ -1246,20 +1840,56 @@ def _prepare_base_report(
     no_heuristics: bool,
     verbose: bool,
     evaluation_date: str,
+    operation_callback=None,
+    engine_requirement_factory: Callable[[], VerificationEngineRequirement] | None = None,
+    run_report_dir: Callable[[], Path] | None = None,
 ) -> tuple[
     VerifierBaseStatus,
     str | None,
     Path | None,
+    Path | None,
     CapabilityLockFileV1 | None,
     list[str],
 ]:
+    """Resolve the base report from the cache, or regenerate it from Git.
+
+    Returns the status, the base tree, the **run-private** report path, the
+    path to publish as this comparison's reference, the base capability lock
+    and the notes.
+
+    Whether the bytes came from a warm entry, a cold store or a run the cache
+    was unavailable to, they are written into ``run_report_dir()`` — a
+    directory the caller owns for the whole run — and that copy is the only one
+    anything downstream opens. Nothing reopens the cache pathname after it was
+    validated (#803). Without such a directory the cache cannot be used at all.
+
+    The second path is for display only: it is where a report for this entry
+    belongs in the cache, so the published reference is the same string for a
+    warm run, a cold run and a run that could not reach the cache, instead of
+    naming a temporary directory that no longer exists.
+    """
+
     notes: list[str] = []
     try:
         base_tree = tree_sha(git_root, base)
     except Exception as exc:  # noqa: BLE001 - optional base enrichment.
-        return "archive_failed", None, None, None, [f"Could not resolve base tree: {exc}"]
+        return "archive_failed", None, None, None, None, [
+            f"Could not resolve base tree: {exc}"
+        ]
 
-    cache_report = _cache_report_path(
+    try:
+        engine = (
+            engine_requirement_factory()
+            if engine_requirement_factory is not None
+            else build_engine_requirement(plugins_enabled=plugins_enabled)
+        )
+    except (OSError, ValueError):
+        return "scan_failed", base_tree, None, None, None, [
+            "Base engine identity is unavailable; the base cache was not used. "
+            f"Run {render_command(['doctor', '--json'])} and rerun verification "
+            "after repairing the install."
+        ]
+    cache_entry = _base_cache_entry(
         base_tree=base_tree,
         config_relative=config_relative,
         git_root=git_root,
@@ -1268,30 +1898,78 @@ def _prepare_base_report(
         plugins_enabled=plugins_enabled,
         no_heuristics=no_heuristics,
         evaluation_date=evaluation_date,
+        engine_requirement=engine,
     )
-    if cache_report.exists() and _cache_report_valid(cache_report):
-        base_lock, lock_notes = _load_cached_capability_lock(cache_report)
+    # Where a report for this entry belongs, published as this comparison's
+    # reference whichever route produced the bytes. Never opened.
+    display_report = cache_entry.report
+
+    def keep_for_this_run(data: bytes) -> Path:
+        """Write the validated bytes where only this run can reach them."""
+
+        if run_report_dir is None:
+            raise OSError("no run-scoped directory for the base report")
+        directory = run_report_dir()
+        destination = directory / _BASE_CACHE_REPORT_NAME
+        # The directory is this run's own, but this copy is the only base
+        # report every later consumer reads. Where descriptors allow it,
+        # publish it through the same no-follow boundary the cache uses, so
+        # nothing in this path is written through a link.
+        if _DESCRIPTOR_RELATIVE_BASE_CACHE:
+            handle = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                replace_file_at(
+                    handle,
+                    _BASE_CACHE_REPORT_NAME,
+                    data,
+                    temporary_prefix="base-report-",
+                    mode=0o600,
+                )
+            finally:
+                os.close(handle)
+        else:
+            destination.write_bytes(data)
+        return destination
+
+    unusable = (
+        "Could not keep the base report for this run; diff enrichment is unavailable."
+    )
+    # One no-follow probe settles the cache for this run: absent (cold),
+    # unavailable (a namespace component is a link, a non-directory or cannot
+    # be opened), or present and validated — in which case it also carries the
+    # validated bytes and the lock beside them (#638, #803).
+    probe = _probe_base_cache(cache_entry)
+    cache_unavailable = probe.unavailable
+    if probe.report is not None and operation_callback is None:
+        try:
+            run_report = keep_for_this_run(probe.report)
+        except OSError:
+            return "scan_failed", base_tree, None, None, None, [unusable]
         return (
             "succeeded",
             base_tree,
-            cache_report,
-            base_lock,
-            [f"Base report resolved for tree {base_tree}.", *lock_notes],
+            run_report,
+            display_report,
+            probe.lock,
+            [f"Base report resolved for tree {base_tree}.", *probe.lock_notes],
         )
-    if cache_report.exists():
-        notes.append("Discarded base cache entry whose content hash did not validate.")
-        cache_report.unlink(missing_ok=True)
+    if probe.present and probe.report is None:
+        notes.append(
+            "Regenerating cached base report.json from Git: the report or its checksum "
+            "is unreadable, corrupt or incompatible with this engine."
+        )
 
     with tempfile.TemporaryDirectory(prefix="agents-shipgate-verify-") as tmp:
         tmp_root = Path(tmp)
         base_tree_dir = tmp_root / "base"
         base_out = tmp_root / "reports"
         try:
-            archive_tree(git_root, base, base_tree_dir)
+            archive_verification_tree(git_root, base, base_tree_dir)
         except Exception as exc:  # noqa: BLE001 - optional base enrichment.
             return (
                 "archive_failed",
                 base_tree,
+                None,
                 None,
                 None,
                 [
@@ -1314,6 +1992,7 @@ def _prepare_base_report(
                 base_tree,
                 None,
                 None,
+                None,
                 [str(exc)],
             )
         if not base_config.is_file():
@@ -1322,8 +2001,35 @@ def _prepare_base_report(
                 base_tree,
                 None,
                 None,
+                None,
                 [f"Base tree does not contain {config_relative.as_posix()}."],
             )
+
+        # A checksum beside a cached report proves bytes agree, not that the
+        # operation model was read from this Git tree. Inspect the archived
+        # manifest before accepting a cache hit. OpenAPI bases are rescanned;
+        # other readers retain the cache and cannot contribute operation rows.
+        # The callback is private and never populated from report decoding.
+        try:
+            base_manifest = load_manifest_text(
+                read_static_input_bytes(base_config).decode("utf-8"), source=base_config
+            )
+        except (AgentsShipgateError, OSError, UnicodeError):
+            base_manifest = None
+        if (
+            operation_callback is not None
+            and base_manifest is not None
+            and not any(source.type == "openapi" for source in base_manifest.tool_sources)
+        ):
+            operation_callback(base_tree, [])
+            if probe.report is not None:
+                try:
+                    run_report = keep_for_this_run(probe.report)
+                except OSError:
+                    return "scan_failed", base_tree, None, None, None, [*notes, unusable]
+                return "succeeded", base_tree, run_report, display_report, probe.lock, [
+                    f"Base report resolved for tree {base_tree}.", *probe.lock_notes
+                ]
 
         base_capability_lock: CapabilityLockFileV1 | None = None
 
@@ -1368,6 +2074,7 @@ def _prepare_base_report(
                 base_tree,
                 None,
                 None,
+                None,
                 [
                     "Base scan failed without changing the head gate: "
                     f"{_stable_archive_error(exc, archive_root=tmp_root, label='base tree')}"
@@ -1379,6 +2086,7 @@ def _prepare_base_report(
                 base_tree,
                 None,
                 None,
+                None,
                 [f"Base scan exited {base_exit}; diff enrichment disabled."],
             )
         source_report = base_out / "report.json"
@@ -1388,8 +2096,11 @@ def _prepare_base_report(
                 base_tree,
                 None,
                 None,
+                None,
                 ["Base scan did not produce report.json; diff enrichment disabled."],
             )
+        if operation_callback is not None:
+            operation_callback(base_tree, base_report_model.tool_surface_facts.operation_attributions)
         # Base diff evidence is never patch-applicable. Strip checkout/output
         # coordinates so identical commits produce identical cached inputs
         # across worktrees and clones.
@@ -1407,17 +2118,311 @@ def _prepare_base_report(
             json.dumps(report_json_payload(base_report_model), indent=2),
             encoding="utf-8",
         )
-        _copy_report_to_cache(source_report, cache_report)
-        if base_capability_lock is not None:
-            _write_capability_lock_to_cache(base_capability_lock, cache_report)
-        else:
+        if base_capability_lock is None:
             notes.append("Base scan did not produce a capability lock; diff artifact disabled.")
-        _prune_base_scan_cache(cache_report.parents[1], keep=BASE_CACHE_KEEP_ENTRIES)
+        # These bytes, not a path: what is stored, what this run reads and what
+        # any later reader sees are one string of bytes read exactly once.
+        stored = source_report.read_bytes()
+        if cache_unavailable is None:
+            try:
+                # Report, checksum and lock share this one anchored directory.
+                with _base_cache_directory(
+                    cache_entry.metadata_root, cache_entry.components, create=True
+                ) as cache:
+                    _copy_report_to_cache(stored, cache)
+                    if base_capability_lock is not None:
+                        _write_capability_lock_to_cache(base_capability_lock, cache)
+            except UnsafeDirectoryComponent as exc:
+                cache_unavailable = exc
+            except OSError:
+                return "scan_failed", base_tree, None, None, None, [
+                    *notes,
+                    "Could not store the regenerated base report; diff enrichment is unavailable. "
+                    f"Check that {display_report.parent} is a writable cache directory and that "
+                    "report.json, report.sha256 and capabilities.lock.json are regular files, "
+                    "then rerun verification.",
+                ]
+            else:
+                _prune_base_scan_cache(cache_entry.metadata_root, keep=BASE_CACHE_KEEP_ENTRIES)
+        if cache_unavailable is not None:
+            # Nothing was written through the link, and nothing is read back.
+            notes.append(_base_cache_unavailable_note(cache_unavailable, cache_entry))
+        try:
+            # A cold run reads its own copy too: the entry it just published is
+            # a pathname like any other, and reopening it would reopen the race.
+            run_report = keep_for_this_run(stored)
+        except OSError:
+            return "scan_failed", base_tree, None, None, None, [*notes, unusable]
         notes.append(f"Base report resolved for tree {base_tree}.")
-    return "succeeded", base_tree, cache_report, base_capability_lock, notes
+    return "succeeded", base_tree, run_report, display_report, base_capability_lock, notes
 
 
-def _cache_report_path(
+# The base cache lives at ``<git metadata>/agents-shipgate/base-scans/<key>/``.
+# Git selects the metadata directory: a checkout's ``.git``, a linked
+# worktree's own Git dir, or wherever a ``.git`` link points. ``git_path``
+# resolves that selection once and it is the anchor. Everything below it is the
+# cache's lexical namespace, and every cache read, publication and prune goes
+# through ``_base_cache_directory``, which follows no link there (#638).
+_BASE_CACHE_NAMESPACE = ("agents-shipgate", "base-scans")
+_BASE_CACHE_REPORT_NAME = "report.json"
+_BASE_CACHE_CHECKSUM_NAME = "report.sha256"
+_BASE_CAPABILITY_LOCK_NAME = "capabilities.lock.json"
+_MAX_CACHED_REPORT_BYTES = 64 * 1024 * 1024
+_MAX_CACHED_CHECKSUM_BYTES = 128
+# The modes these files have always had: the report is an ordinary readable
+# artifact, the checksum and the capability lock are owner-only.
+_CACHE_REPORT_MODE = 0o644
+_CACHE_PRIVATE_MODE = 0o600
+
+# Descriptor-relative lookup, creation, rename, stat and removal are POSIX
+# facilities. Where one is missing (Windows), the boundary inspects each
+# namespace component lexically before a pathname operation instead: a settled
+# link, junction or non-directory is still refused, but a component replaced
+# between that inspection and the operation is not detected.
+_DESCRIPTOR_RELATIVE_BASE_CACHE = (
+    os.open in os.supports_dir_fd
+    and os.mkdir in os.supports_dir_fd
+    and os.rename in os.supports_dir_fd
+    and os.unlink in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+    and os.scandir in os.supports_fd
+    and bool(shutil.rmtree.avoids_symlink_attacks)
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class _BaseCacheEntry:
+    """One cache entry: Git's metadata directory and the key below the namespace."""
+
+    metadata_root: Path
+    key: str
+
+    @property
+    def components(self) -> tuple[str, ...]:
+        return (*_BASE_CACHE_NAMESPACE, self.key)
+
+    @property
+    def report(self) -> Path:
+        return self.metadata_root.joinpath(*self.components, _BASE_CACHE_REPORT_NAME)
+
+
+class _BaseCacheDirectory:
+    """An opened cache directory: the one boundary every cache file goes through.
+
+    Report, checksum and capability-lock reads and publication, and pruning,
+    all use this handle. With descriptor support it holds a descriptor reached
+    from the anchor without following a link, and names each file relative to
+    it; otherwise the namespace was inspected lexically when it was opened.
+    """
+
+    def __init__(
+        self,
+        *,
+        anchor: Path,
+        components: tuple[str, ...],
+        descriptor: int | None,
+    ) -> None:
+        self.anchor = anchor
+        self.components = components
+        self.path = anchor.joinpath(*components)
+        self._descriptor = descriptor
+
+    def present(self, name: str) -> bool:
+        """Whether any entry, of any kind, has this name; nothing is followed."""
+
+        try:
+            if self._descriptor is None:
+                (self.path / name).lstat()
+            else:
+                os.stat(name, dir_fd=self._descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        return True
+
+    def read(self, name: str, *, max_bytes: int, label: str) -> bytes:
+        """Read one singly-linked regular file; a link or other kind is refused."""
+
+        if self._descriptor is None:
+            return read_identity_bound_bytes(
+                self.anchor, Path(*self.components, name), max_bytes=max_bytes
+            )
+        return read_regular_file_at(
+            self._descriptor, name, max_size=max_bytes, label=label, single_link=True
+        )
+
+    def replace(
+        self, name: str, data: bytes, *, temporary_prefix: str, mode: int
+    ) -> None:
+        """Publish ``data`` atomically; a link at ``name`` is replaced, not followed.
+
+        ``mode`` is the published file's creation mode. Both boundaries set it
+        explicitly so the checksum and the capability lock keep the 0600 they
+        have always had, and the report the 0644.
+        """
+
+        if self._descriptor is not None:
+            replace_file_at(
+                self._descriptor, name, data, temporary_prefix=temporary_prefix, mode=mode
+            )
+            return
+        handle, temporary = tempfile.mkstemp(
+            dir=self.path, prefix=temporary_prefix, suffix=".tmp"
+        )
+        try:
+            with os.fdopen(handle, "wb") as stream:
+                # ``mkstemp`` creates at 0600. This is the Windows boundary,
+                # which has no ``fchmod`` and no POSIX mode to set. Where the
+                # fallback is forced on POSIX this is a best-effort widening to
+                # ``mode``: ``fchmod`` ignores the umask, so a restrictive umask
+                # publishes a wider file here than the descriptor boundary,
+                # which creates at ``mode`` masked by it.
+                fchmod = getattr(os, "fchmod", None)
+                if fchmod is not None:
+                    with contextlib.suppress(OSError):
+                        fchmod(stream.fileno(), mode)
+                stream.write(data)
+            os.replace(temporary, self.path / name)
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary)
+
+    def subdirectories(self) -> list[tuple[str, float]]:
+        """Real subdirectories and their mtimes. Links and junctions are not entries."""
+
+        found: list[tuple[str, float]] = []
+        target = self.path if self._descriptor is None else self._descriptor
+        with os.scandir(target) as iterator:
+            for item in iterator:
+                try:
+                    if not item.is_dir(follow_symlinks=False) or item.is_junction():
+                        continue
+                except OSError:
+                    continue
+                try:
+                    mtime = item.stat(follow_symlinks=False).st_mtime
+                except OSError:
+                    mtime = 0.0
+                found.append((item.name, mtime))
+        return found
+
+    def remove_tree(self, name: str) -> None:
+        """Remove one subdirectory tree without traversing a link at or below it."""
+
+        if self._descriptor is not None:
+            # ``avoids_symlink_attacks``: a link swapped in for ``name`` is refused.
+            shutil.rmtree(name, dir_fd=self._descriptor, ignore_errors=True)
+            return
+        target = self.path / name
+        metadata = target.lstat()
+        if (
+            stat.S_ISDIR(metadata.st_mode)
+            and not stat.S_ISLNK(metadata.st_mode)
+            and not target.is_junction()
+        ):
+            shutil.rmtree(target, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def _base_cache_directory(
+    anchor: Path,
+    components: Sequence[str],
+    *,
+    create: bool,
+) -> Iterator[_BaseCacheDirectory]:
+    """Open one cache directory below Git's metadata directory (#638).
+
+    ``anchor`` is the Git-selected metadata directory; links at or above it
+    are Git's selection and are not second-guessed. No component below it is
+    followed. A missing component raises ``FileNotFoundError`` unless
+    ``create``. A link, a non-directory, or a component that cannot be opened
+    or created raises ``UnsafeDirectoryComponent``: the cache is unavailable.
+    """
+
+    parts = tuple(components)
+    if _DESCRIPTOR_RELATIVE_BASE_CACHE:
+        descriptor = open_directory_beneath(anchor, parts, create=create)
+        try:
+            yield _BaseCacheDirectory(anchor=anchor, components=parts, descriptor=descriptor)
+        finally:
+            os.close(descriptor)
+        return
+    _inspect_base_cache_components(anchor, parts, create=create)
+    yield _BaseCacheDirectory(anchor=anchor, components=parts, descriptor=None)
+
+
+def _inspect_base_cache_components(
+    anchor: Path,
+    components: tuple[str, ...],
+    *,
+    create: bool,
+) -> None:
+    """The lexical fallback: refuse settled links, junctions and non-directories."""
+
+    current = anchor
+    for part in components:
+        current = current / part
+        for _attempt in range(2):
+            issue = inspect_lexical_path_identity(current.parent, Path(part))
+            if issue is not None:
+                raise UnsafeDirectoryComponent(current, _lexical_refusal_reason(issue))
+            try:
+                metadata = current.lstat()
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    current.mkdir()
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    raise UnsafeDirectoryComponent(
+                        current, f"could not be created ({exc.strerror or exc})"
+                    ) from exc
+                continue
+            except OSError as exc:
+                raise UnsafeDirectoryComponent(
+                    current, f"could not be opened ({exc.strerror or exc})"
+                ) from exc
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise UnsafeDirectoryComponent(current, "is not a directory")
+            try:
+                with os.scandir(current):
+                    pass
+            except OSError as exc:
+                raise UnsafeDirectoryComponent(
+                    current, f"could not be opened ({exc.strerror or exc})"
+                ) from exc
+            break
+        else:
+            raise UnsafeDirectoryComponent(current, "could not be created")
+
+
+def _lexical_refusal_reason(issue: PathIdentityIssue) -> str:
+    if issue.kind == "symlink":
+        return "is a symbolic link"
+    if issue.kind == "reparse_point":
+        return "is a junction or reparse point"
+    if issue.kind == "alias":
+        return "is spelled differently on disk"
+    return f"could not be inspected ({issue.detail})"
+
+
+def _base_cache_unavailable_note(exc: OSError, entry: _BaseCacheEntry) -> str:
+    if isinstance(exc, UnsafeDirectoryComponent):
+        subject = f"{exc.path} {exc.reason}"
+    else:
+        subject = f"{entry.metadata_root} could not be opened ({exc.strerror or exc})"
+    return (
+        f"Base-scan cache unavailable: {subject}. This run neither read nor wrote "
+        "the cache and regenerated the base report from Git. Make that path a "
+        "plain directory (or remove it so verification recreates it), then rerun "
+        "verification to reuse cached base reports."
+    )
+
+
+def _base_cache_entry(
     *,
     base_tree: str,
     config_relative: Path,
@@ -1427,9 +2432,12 @@ def _cache_report_path(
     plugins_enabled: bool | None,
     no_heuristics: bool,
     evaluation_date: str,
-) -> Path:
+    engine_requirement: VerificationEngineRequirement | None = None,
+) -> _BaseCacheEntry:
+    engine = engine_requirement or build_engine_requirement(plugins_enabled=plugins_enabled)
     payload = {
         "version": BASE_CACHE_KEY_EPOCH,
+        "engine_requirement_id": engine.engine_requirement_id,
         "agents_shipgate_version": __version__,
         "base_tree": base_tree,
         "config": config_relative.as_posix(),
@@ -1455,98 +2463,168 @@ def _cache_report_path(
     key = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()[:24]
-    return git_path(git_root, f"agents-shipgate/base-scans/{key}/report.json")
+    # Resolve Git's metadata root only; the namespace below it stays lexical.
+    # Resolving the report path itself would erase a refused link before the
+    # boundary could refuse it.
+    return _BaseCacheEntry(metadata_root=git_path(git_root, ""), key=key)
 
 
-def _copy_report_to_cache(source_report: Path, cache_report: Path) -> None:
-    cache_report.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        dir=cache_report.parent,
-        prefix="report-",
-        suffix=".tmp",
-        delete=False,
-    ) as handle:
-        temp_path = Path(handle.name)
+def _copy_report_to_cache(data: bytes, cache: _BaseCacheDirectory) -> None:
+    cache.replace(
+        _BASE_CACHE_REPORT_NAME,
+        data,
+        temporary_prefix="report-",
+        mode=_CACHE_REPORT_MODE,
+    )
+    # Recovery must replace a refused checksum alias, never follow it.
+    cache.replace(
+        _BASE_CACHE_CHECKSUM_NAME,
+        f"{hashlib.sha256(data).hexdigest()}\n".encode("ascii"),
+        temporary_prefix="checksum-",
+        mode=_CACHE_PRIVATE_MODE,
+    )
+
+
+def _validated_cache_report(cache: _BaseCacheDirectory) -> bytes | None:
+    """The entry's ``report.json`` bytes when they validate, else ``None``.
+
+    Returning the bytes rather than a verdict is the point: every later reader
+    in the run consumes exactly what was validated here, through this one
+    directory handle, instead of reopening the pathname afterwards (#803).
+    """
+
     try:
-        shutil.copy2(source_report, temp_path)
-        temp_path.replace(cache_report)
-        cache_report.with_suffix(".sha256").write_text(
-            f"{_sha256_file(cache_report)}\n",
-            encoding="ascii",
+        data = cache.read(
+            _BASE_CACHE_REPORT_NAME,
+            max_bytes=_MAX_CACHED_REPORT_BYTES,
+            label="cached base report",
         )
-    finally:
-        temp_path.unlink(missing_ok=True)
+        expected = cache.read(
+            _BASE_CACHE_CHECKSUM_NAME,
+            max_bytes=_MAX_CACHED_CHECKSUM_BYTES,
+            label="cached base report checksum",
+        ).decode("ascii").strip()
+        if re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+            return None
+        if expected != hashlib.sha256(data).hexdigest():
+            return None
+        report = ReadinessReport.model_validate_json(data)
+        if (
+            "report_schema_version" not in report.model_fields_set
+            or report.report_schema_version != ReadinessReport.model_fields[
+                "report_schema_version"
+            ].default
+        ):
+            return None
+    except (OSError, ValueError):
+        return None
+    return data
 
 
-def _cache_report_valid(cache_report: Path) -> bool:
-    digest_path = cache_report.with_suffix(".sha256")
-    if not digest_path.is_file():
-        return False
+@dataclasses.dataclass(frozen=True)
+class _BaseCacheProbe:
+    """What one no-follow open settled about the cache entry for this run."""
+
+    #: The validated ``report.json`` bytes, or ``None`` when there is no hit.
+    report: bytes | None = None
+    #: The capability lock read through the same handle as those bytes.
+    lock: CapabilityLockFileV1 | None = None
+    lock_notes: tuple[str, ...] = ()
+    #: Whether an entry named ``report.json``, of any kind, was there at all.
+    present: bool = False
+    #: Set when a namespace component made the cache unusable for this run.
+    unavailable: OSError | None = None
+
+
+def _probe_base_cache(entry: _BaseCacheEntry) -> _BaseCacheProbe:
+    """Settle the cache for this run in one open: absent, unavailable, or a hit.
+
+    A hit carries the bytes and the lock themselves rather than a pathname to
+    reopen, so the whole run consumes one directory generation (#638, #803).
+    """
+
     try:
-        expected = digest_path.read_text(encoding="ascii").strip()
-    except OSError:
-        return False
-    return bool(expected and expected == _sha256_file(cache_report))
+        with _base_cache_directory(
+            entry.metadata_root, entry.components, create=False
+        ) as cache:
+            if not cache.present(_BASE_CACHE_REPORT_NAME):
+                return _BaseCacheProbe()
+            data = _validated_cache_report(cache)
+            if data is None:
+                return _BaseCacheProbe(present=True)
+            lock, lock_notes = _cached_capability_lock(cache, entry)
+            return _BaseCacheProbe(
+                report=data, lock=lock, lock_notes=tuple(lock_notes), present=True
+            )
+    except FileNotFoundError:
+        return _BaseCacheProbe()
+    except OSError as exc:
+        return _BaseCacheProbe(unavailable=exc)
 
 
-def _base_capability_lock_cache_path(cache_report: Path) -> Path:
-    return cache_report.with_name("capabilities.lock.json")
+# Bounds for the two small verify-side reads of files an agent can place before
+# the run. Both refuse a FIFO or other non-regular entry instead of blocking
+# verify (#577).
+_MAX_CACHED_CAPABILITY_LOCK_BYTES = 64 * 1024 * 1024
+# A receipt over this cap is refused like any unreadable one, which fails
+# closed: the publish-only route is simply not offered.
+_MAX_DECLARATION_CONTINUATION_BYTES = 1024 * 1024
 
 
-def _load_cached_capability_lock(
-    cache_report: Path,
+def _cached_capability_lock(
+    cache: _BaseCacheDirectory,
+    entry: _BaseCacheEntry,
 ) -> tuple[CapabilityLockFileV1 | None, list[str]]:
-    cache_lock = _base_capability_lock_cache_path(cache_report)
-    if not cache_lock.exists():
-        return None, ["Cached base capability lock missing; capability diff may fall back."]
+    """Read the lock from the handle the report was validated through.
+
+    One handle for both means the report and the lock cannot come from two
+    directory generations, whatever happens to the namespace meanwhile (#803).
+    """
+
+    missing = "Cached base capability lock missing; capability diff may fall back."
     try:
-        return (
-            load_capability_lock_json(
-                cache_lock.read_text(encoding="utf-8"),
-                source=str(cache_lock),
-            ),
-            [],
-        )
-    except (OSError, InputParseError) as exc:
+        if not cache.present(_BASE_CAPABILITY_LOCK_NAME):
+            return None, [missing]
+        content = cache.read(
+            _BASE_CAPABILITY_LOCK_NAME,
+            max_bytes=_MAX_CACHED_CAPABILITY_LOCK_BYTES,
+            label="cached base capability lock",
+        ).decode("utf-8")
+        source = entry.report.with_name(_BASE_CAPABILITY_LOCK_NAME)
+        return load_capability_lock_json(content, source=str(source)), []
+    except FileNotFoundError:
+        return None, [missing]
+    except (OSError, ValueError, InputParseError) as exc:
         return None, [f"Cached base capability lock invalid; capability diff may fall back: {exc}"]
 
 
 def _write_capability_lock_to_cache(
     lock: CapabilityLockFileV1,
-    cache_report: Path,
+    cache: _BaseCacheDirectory,
 ) -> None:
-    cache_lock = _base_capability_lock_cache_path(cache_report)
-    cache_lock.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        dir=cache_lock.parent,
-        prefix="capabilities-",
-        suffix=".tmp",
-        delete=False,
-        mode="w",
-        encoding="utf-8",
-    ) as handle:
-        temp_path = Path(handle.name)
-        handle.write(render_capability_lock_json(lock))
-    try:
-        temp_path.replace(cache_lock)
-    finally:
-        temp_path.unlink(missing_ok=True)
+    cache.replace(
+        _BASE_CAPABILITY_LOCK_NAME,
+        render_capability_lock_json(lock).encode("utf-8"),
+        temporary_prefix="capabilities-",
+        mode=_CACHE_PRIVATE_MODE,
+    )
 
 
-def _prune_base_scan_cache(cache_root: Path, *, keep: int) -> None:
-    if keep <= 0 or not cache_root.is_dir():
+def _prune_base_scan_cache(metadata_root: Path, *, keep: int) -> None:
+    """Keep the newest ``keep`` entries; best effort, and never through a link."""
+
+    if keep <= 0:
         return
-    entries = [path for path in cache_root.iterdir() if path.is_dir()]
-    entries.sort(key=_safe_mtime, reverse=True)
-    for stale in entries[keep:]:
-        shutil.rmtree(stale, ignore_errors=True)
-
-
-def _safe_mtime(path: Path) -> float:
     try:
-        return path.stat().st_mtime
-    except OSError:
-        return 0.0
+        with _base_cache_directory(
+            metadata_root, _BASE_CACHE_NAMESPACE, create=False
+        ) as cache:
+            entries = cache.subdirectories()
+            entries.sort(key=lambda item: item[1], reverse=True)
+            for name, _mtime in entries[keep:]:
+                cache.remove_tree(name)
+    except (OSError, ValueError):
+        return
 
 
 def _bind_changed_files(
@@ -1619,6 +2697,183 @@ def _map_optional_tree_path(
     return tree_dir / relative
 
 
+def _repository_relative_input(git_root: Path, path: Path | None) -> Path | None:
+    """The repository path an operator-named input file has, if it has one."""
+
+    if path is None:
+        return None
+    try:
+        relative = path.relative_to(git_root)
+    except ValueError:
+        return None
+    return relative if relative.parts else None
+
+
+def _configured_input_trust_roots(
+    git_root: Path,
+    *,
+    policy_packs: Sequence[Path],
+    baseline: Path | None,
+    diff_from: Path | None,
+) -> dict[str, str]:
+    """The in-repository inputs this run was pointed at, by trust-root class.
+
+    Like the configured manifest, whatever a run reads as its policy, its
+    accepted debt or its comparison reference governs the gate wherever it
+    lives, and a change that edits it touches a trust root (#1024). The table
+    of globs cannot know these paths: they exist only on the command line.
+    """
+
+    roots: dict[str, str] = {}
+    for path, trust_root_class in (
+        *((pack, "policy") for pack in policy_packs),
+        (baseline, "shipgate_state"),
+        (diff_from, "shipgate_state"),
+    ):
+        relative = _repository_relative_input(git_root, path)
+        if relative is not None:
+            roots.setdefault(relative.as_posix(), trust_root_class)
+    return roots
+
+
+_BASE_DIFF_REFERENCE_NAME = "diff-from-reference.json"
+
+
+def _diff_reference_at_base(
+    *,
+    git_root: Path,
+    base: str,
+    relative: Path,
+    run_report_dir: Callable[[], Path],
+) -> tuple[Path | None, str]:
+    """Read an in-repository ``--diff-from`` as the base commit holds it (#1024).
+
+    The checkout's copy belongs to the change under review: a pull request that
+    regenerated the reference from its own head compared against itself. The
+    base's copy is written where only this run reads it. A base without one, or
+    with one that is not a readable regular file, has nothing to read, so the
+    run compares against a scan of the base instead, and says so.
+    """
+
+    spelled = relative.as_posix()
+    found = regular_file_at_ref(
+        git_root, base, relative, max_bytes=_MAX_CACHED_REPORT_BYTES
+    )
+    if found.state == "present":
+        assert found.data is not None
+        destination = run_report_dir() / _BASE_DIFF_REFERENCE_NAME
+        with destination.open("xb") as handle:
+            handle.write(found.data)
+        return destination, (
+            f"Using diff reference {spelled} as committed at {base!r}; the copy "
+            "in the change under review is not read."
+        )
+    why = (
+        f"{base!r} does not contain it"
+        if found.state == "absent"
+        else f"it could not be read at {base!r}: {found.reason}"
+    )
+    return None, (
+        f"Did not use --diff-from {spelled}: {why}. Comparing with a scan of "
+        f"{base!r} instead; the copy in the change under review is never read."
+    )
+
+
+def _base_ci_policy(
+    *,
+    git_root: Path,
+    base: str,
+    config_relative: Path,
+) -> tuple[CiConfig | None, str | None]:
+    """The ``ci`` block the base commit's manifest declares (#1024).
+
+    ``None`` with no note when the base has no manifest at all: the change
+    introduces the gate, and its own declaration is the only one there is.
+    ``None`` with a note when the base manifest cannot be read or validated.
+    """
+
+    found = regular_file_at_ref(
+        git_root, base, config_relative, max_bytes=MAX_WORKTREE_MANIFEST_BYTES
+    )
+    if found.state == "absent":
+        return None, None
+    reason = found.reason
+    if found.state == "present":
+        assert found.data is not None
+        try:
+            return (
+                load_manifest_text(
+                    found.data.decode("utf-8"), source=config_relative
+                ).ci,
+                None,
+            )
+        except (AgentsShipgateError, UnicodeDecodeError, ValueError) as exc:
+            reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+    return None, (
+        f"The exit policy follows the change's {config_relative.as_posix()}: "
+        f"the copy at {base!r} could not be read ({reason})."
+    )
+
+
+def _exit_policy_base_floor(
+    *,
+    head_manifest_text: str | None,
+    base_ci: CiConfig | None,
+    base: str | None,
+    ci_mode: str | None,
+    fail_on: list[str] | None,
+) -> tuple[str | None, list[str] | None, list[str]]:
+    """Floor the exit policy the command line left open at the base (#1024).
+
+    The change under review cannot lower its own exit code.
+
+    - Without ``--ci-mode``, the mode is ``strict`` if the base or the head
+      declares it. A change that adopts ``strict`` still takes effect in the
+      same pull request. The mode decides only the exit code: blockers are
+      ``{critical}`` plus ``fail_on``, and neither mode's default adds to
+      ``critical``.
+    - Without ``--fail-on``, the base's declared ``ci.fail_on`` is returned as
+      an exit-only floor. Every severity in it still fails CI, while the
+      blocker severities, the decision and ``fail_policy.fail_on`` keep the
+      head's list: a loosened list stays the human-review route
+      ``SHIP-VERIFY-POLICY-WEAKENED`` reports, not a blocker under the list it
+      loosens, and it fails CI until a human handles it.
+
+    An explicit flag remains the operator's override for its own knob.
+    Returns the mode to scan with (``None`` leaves the head manifest's own),
+    the exit floor, and a note for each knob the base held.
+    """
+
+    if base_ci is None or head_manifest_text is None:
+        return ci_mode, None, []
+    try:
+        head_ci = load_manifest_text(head_manifest_text).ci
+    except (AgentsShipgateError, ValueError):
+        # The head scan reports its own manifest error.
+        return ci_mode, None, []
+    notes: list[str] = []
+    resolved_mode = ci_mode
+    if ci_mode is None and base_ci.mode == "strict" and head_ci.mode != "strict":
+        resolved_mode = "strict"
+        notes.append(
+            f"The change declares ci.mode: {head_ci.mode} and {base!r} declares "
+            "strict; strict applies. Pass --ci-mode to override."
+        )
+    floor: list[str] | None = None
+    if fail_on is None and base_ci.fail_on:
+        floor = list(base_ci.fail_on)
+        head_list = effective_fail_on(resolved_mode or head_ci.mode, head_ci.fail_on)
+        added = [severity for severity in floor if severity not in head_list]
+        if added:
+            notes.append(
+                f"The change's ci.fail_on leaves out {', '.join(added)}, which "
+                f"{base!r} declares; a finding of that severity still fails CI "
+                "(exit 20), while the verdict follows the change's list. Pass "
+                "--fail-on to override."
+            )
+    return resolved_mode, floor, notes
+
+
 # File names that count as a Shipgate manifest when deciding whether a ref
 # already carries a gate. ``shipgate.yaml`` is the published default; the
 # configured name is added at call time so a repository that renamed its
@@ -1659,10 +2914,14 @@ def _rerun_options(
     # The workspace is unconditional: run from anywhere else and a bare command
     # either fails or evaluates a different checkout.
     options.extend(["--workspace", shlex.quote(str(git_root))])
-    if out_dir.resolve() != (git_root / DEFAULT_OUT_DIR).resolve():
+    # Compared with the Git root's default, not the requested workspace's: the
+    # rerun names `--workspace <git root>`, so that is where it writes unless told.
+    if out_dir.resolve() != default_reports_dir(git_root).resolve():
         # A non-default artifact directory has to be repeated, or the rerun
-        # writes elsewhere and leaves the requested one stale.
-        options.extend(["--out", shlex.quote(_display_path(out_dir, git_root))])
+        # writes elsewhere and leaves the requested one stale. Absolutely: a
+        # relative `--out` resolves against the directory the rerun is typed
+        # in, which is not this one's (#818).
+        options.extend(["--out", shlex.quote(str(out_dir))])
     if pr_comment_style and pr_comment_style != "capability-review":
         options.extend(["--pr-comment-style", shlex.quote(pr_comment_style)])
     if base is None and not auto_base:
@@ -2250,10 +3509,14 @@ def _declaration_continuation_holds(
 
     if comparison_ref is None:
         return False
-    receipt_path = out_dir / DECLARATION_CONTINUATION_ARTIFACT_NAME
     try:
         receipt = DeclarationContinuationV1.model_validate_json(
-            receipt_path.read_bytes()
+            read_regular_file_beneath(
+                out_dir,
+                DECLARATION_CONTINUATION_ARTIFACT_NAME,
+                max_size=_MAX_DECLARATION_CONTINUATION_BYTES,
+                label="declaration continuation receipt",
+            )
         )
     except (OSError, ValueError):
         return False
@@ -2955,6 +4218,30 @@ def _report_primary_headline(
     return f"{summary} Most severe: {title}."
 
 
+def _report_primary_within_budget(
+    report: ReadinessReport, *, byte_budget: int = MAX_ENVELOPE_PROSE_BYTES
+) -> str:
+    """Keep the generated verdict whole and spend the remainder on the title.
+
+    ``_bounded_bytes`` is safe for UTF-8, but applying it to the completed
+    headline can still cut the generated ``Most severe`` clause in half. The
+    only elastic part is the repository-derived blocker title, so measure the
+    fixed prose first and bound that title by bytes before composing the line.
+    """
+
+    full = _report_primary_headline(report)
+    if len(full.encode("utf-8")) <= byte_budget:
+        return full
+    summary = _report_primary_headline(report, title_byte_budget=0)
+    if len(summary.encode("utf-8")) >= byte_budget:
+        return _bounded_bytes(summary, byte_budget)
+    fixed = f"{summary} Most severe: ."
+    title_budget = byte_budget - len(fixed.encode("utf-8"))
+    if title_budget <= 0:
+        return summary
+    return _report_primary_headline(report, title_byte_budget=title_budget)
+
+
 def _blockers_outrank_governance(release_decision: ReleaseDecision | None) -> bool:
     """Whether a release blocker should lead the headline over the notice.
 
@@ -3021,6 +4308,7 @@ def _verifier_headline(
         carries the excluded subjects, and ``truncate_prose`` cuts bytes.
         """
 
+        primary = _bounded_bytes(primary, MAX_ENVELOPE_PROSE_BYTES)
         context = _fit_sentences(
             sentences, MAX_ENVELOPE_PROSE_BYTES - len(primary.encode("utf-8")) - 1
         )
@@ -3036,8 +4324,8 @@ def _verifier_headline(
         suffix is never touched by any of this.
         """
 
-        primary = _report_primary_headline(source)
         room = MAX_ENVELOPE_PROSE_BYTES - len(suffix.encode("utf-8")) - 1
+        primary = _report_primary_within_budget(source, byte_budget=max(room, 0))
         context = _fit_sentences(
             sentences, room - len(primary.encode("utf-8")) - 1
         )
@@ -3083,7 +4371,14 @@ def _verifier_headline(
             note,
         )
     if report is not None and report.agent_summary is not None:
-        return _lead(_one_clause(report.agent_summary.headline))
+        # The plain path is the common blocked-PR path: an already-adopted
+        # repository changed a capability without touching its trust root.
+        # Route it through the same picker as the two governance branches
+        # above so the one line copied into the PR comment and control envelope
+        # names the blocking cause rather than only counting blockers (#436).
+        # ``_report_primary_headline`` returns the summary unchanged when no
+        # blocker exists, so review/passed wording does not move.
+        return _lead(_report_primary_within_budget(report))
     if head_status == "skipped":
         return _lead(
             "No agent-capability changes detected; Shipgate did not need to run."
@@ -3123,6 +4418,8 @@ def _derive_verifier_control(
     pure_adoption_review: bool = False,
     configured_manifest: str | None = None,
     declaration_continuation: bool = False,
+    durable_adoption_command: str | None = None,
+    skip_subject_evaluated: bool = False,
 ) -> AgentControl:
     """Project verifier facts through the shared operational control engine."""
 
@@ -3164,9 +4461,16 @@ def _derive_verifier_control(
         or "Agents Shipgate verification completed."
     )
     if execution == "skipped" and release_decision is None:
-        return derive_agent_control(reason=reason)
+        return derive_agent_control(
+            reason=reason,
+            subject_evaluated=(
+                skip_subject_evaluated
+                and diff_status.completeness == "complete"
+                and first_next_action_override is None
+            ),
+        )
     if release_decision is not None and release_decision.decision == "passed":
-        return derive_agent_control(reason=reason)
+        return derive_agent_control(reason=reason, subject_evaluated=subject_evaluated)
 
     if first_next_action_override is not None:
         if isinstance(first_next_action_override, HumanControlAction):
@@ -3253,6 +4557,12 @@ def _derive_verifier_control(
         )
         or reason
     )
+    if durable_adoption_command is not None:
+        adoption_route = (
+            "A human must decide whether to adopt this provisional setup. "
+            f"If approved, the exact durable-adoption command is `{durable_adoption_command}`."
+        )
+        review_reason = _compose_with_reserved_suffix(review_reason, adoption_route)
     unsafe_block = bool(
         release_decision is not None
         and release_decision.decision == "blocked"
@@ -3264,13 +4574,14 @@ def _derive_verifier_control(
         # inventing a rerun. ``fix_task`` is present on every non-mergeable
         # verdict; an absent one simply offers no command.
         rerun = fix_task.verification_command if fix_task is not None else None
+        onward = durable_adoption_command or rerun
         return derive_agent_control(
             reason=reason,
             next_action=HumanControlAction(kind="review", why=review_reason),
             verify_required=True,
             human_review_required=True,
             publication_allowed=True,
-            allowed_next_commands=[rerun] if rerun else [],
+            allowed_next_commands=[onward] if onward else [],
             human_review_why=review_reason,
         )
     return derive_agent_control(
@@ -3355,6 +4666,44 @@ def _matched_diff_evidence(trigger: dict[str, Any]) -> bool:
     )
 
 
+def _embedded_trigger(trigger: dict[str, Any]) -> dict[str, Any]:
+    """The trigger result after the verifier has consumed its generic route.
+
+    Standalone trigger evaluation owns a useful ``next_action``: it tells a
+    caller that has not run the verifier yet to start with verify preview. Once
+    embedded in a verifier artifact, that precondition is already satisfied
+    and repeating the command creates a self-loop above the verifier's exact
+    control route (#414).
+
+    Preserve the evaluated route's kind and evidence — ``input_required`` and
+    ``stop`` are facts about the diff, not commands — while removing every
+    executable preview command. Precedence is explicit at the first action a
+    top-down reader encounters; only ``control.next_action`` and
+    ``control.allowed_next_commands`` are operational in a verifier artifact.
+    """
+
+    embedded = dict(trigger)
+    next_action = dict(trigger.get("next_action") or {})
+    next_action.setdefault("kind", "none")
+    next_action.update(
+        {
+            "command": None,
+            "why": (
+            "The verifier consumed the trigger route; follow "
+            "control.next_action for the current operation."
+            ),
+            "authoritative": False,
+            "authoritative_path": "control.next_action",
+        }
+    )
+    embedded["next_action"] = next_action
+    embedded["matched_rules"] = [
+        {**rule, "command": None} if isinstance(rule, dict) else rule
+        for rule in trigger.get("matched_rules", [])
+    ]
+    return embedded
+
+
 def _diff_failure_headline(context: DiffContext | None) -> str | None:
     """Summarize a diff-input failure in the terms its control route uses.
 
@@ -3437,6 +4786,7 @@ def _build_verifier(
     head_status: str,
     head_exit_code: int,
     out_dir: Path,
+    manifest_provenance_value: ManifestProvenance,
     ci_mode: str | None = None,
     preview: bool = False,
     headline_override: str | None = None,
@@ -3447,6 +4797,9 @@ def _build_verifier(
     worktree_ref: str | None = None,
     rerun_options: list[str] | None = None,
 ) -> VerifierArtifact:
+    provenance_note = provisional_manifest_note(manifest_provenance_value)
+    if report is not None and provenance_note is not None and provenance_note not in base_notes:
+        base_notes = [*base_notes, provenance_note]
     release_decision_model = report.release_decision if report is not None else None
     release_decision = (
         release_decision_model.model_dump(mode="json")
@@ -3488,6 +4841,11 @@ def _build_verifier(
         worktree=worktree,
     )
     resolved_report_path = str((out_dir / "report.json").resolve())
+    durable_adoption_command = (
+        render_command(["init", "--workspace", str(git_root), "--write", "--json"])
+        if manifest_provenance_value == "local_review"
+        else None
+    )
     fix_task = (
         None
         if safe_recovery
@@ -3506,6 +4864,22 @@ def _build_verifier(
             configured_gate_introduced=configured_gate_introduced,
         )
     )
+    if fix_task is not None and durable_adoption_command is not None:
+        fix_task.allowed_repairs.append(
+            VerifierRepair(
+                id="adopt-local-review-manifest",
+                actor="human",
+                kind="durable_adoption",
+                target=str(git_root / "shipgate.yaml"),
+                check_id="SHIP-VERIFY-LOCAL-REVIEW-PROVISIONAL",
+                command=durable_adoption_command,
+                reason=(
+                    "A human may choose to replace the provisional setup with "
+                    "a repository manifest; this command does not approve the "
+                    "resulting trust root."
+                ),
+            )
+        )
     can_merge = _can_merge_without_human(
         merge_verdict=merge_verdict,
         release_decision=release_decision_model,
@@ -3575,6 +4949,13 @@ def _build_verifier(
         base_status=base_status,
         base_ref=base,
         diff_status=resolved_diff_status,
+        skip_subject_evaluated=(
+            resolved_diff_status.completeness == "complete"
+            and trigger.get("input_status") == "complete"
+            and trigger.get("evaluation_status") == "evaluated"
+            and trigger.get("run_shipgate") is False
+            and first_next_action_override is None
+        ),
         manifest_introduced=manifest_introduced,
         pure_adoption_review=pure_adoption_review,
         configured_manifest=_display_path(config_path, git_root),
@@ -3583,6 +4964,7 @@ def _build_verifier(
         # written against. A ref-bound run evaluates committed objects and has
         # nothing for the receipt to be about.
         declaration_continuation=declaration_continuation,
+        durable_adoption_command=durable_adoption_command,
     )
     return VerifierArtifact(
         declaration_continuation=declaration_continuation,
@@ -3593,7 +4975,7 @@ def _build_verifier(
         changed_files=changed_files,
         diff_text_available=bool(diff_text),
         diff_status=resolved_diff_status,
-        trigger=trigger,
+        trigger=_embedded_trigger(trigger),
         base_status=base_status,
         base_tree_sha=base_tree,
         head_tree_sha=head_tree,
@@ -3632,6 +5014,9 @@ def _build_verifier(
         headline=headline,
         fix_task=fix_task,
         forbidden_file_edits=list(PROTECTED_FILE_EDITS),
+        conditional_file_edits=conditional_instruction_edits(
+            workspace=git_root, config=_display_path(config_path, git_root), canonical=True,
+        ),
         forbidden_actions=list(FORBIDDEN_SHORTCUTS),
         artifacts=artifacts,
     )
@@ -3699,6 +5084,8 @@ def _remove_scan_artifacts(out_dir: Path) -> None:
         "base.capabilities.lock.json",
         "capability-lock-diff.json",
         "capability-lock-diff.md",
+        CAPABILITY_DELTA_ATTESTATION_FILENAME,
+        HUMAN_REVIEW_REQUEST_FILENAME,
         # Remediation instructions must not outlive the report they describe:
         # an early verifier reset would otherwise clear report.json and leave a
         # scaffold behind asking for declarations nothing is measuring.
@@ -3795,19 +5182,35 @@ def _evaluate_authorization_overlay(
             ),
             None,
         )
+    if plan.inputs.options.get("manifest_provenance") != "repository":
+        return (
+            AuthorizationEvaluationV1.not_applicable(
+                "authorization_requires_committed_repository_manifest"
+            ),
+            None,
+        )
+    # Fixed prerequisite names expose where context construction stopped,
+    # without publishing exception text or fragments of an external grant.
+    context_failure = "authorization_context_report_missing"
     try:
         if report is None:
             raise ValueError("authorization requires a release report")
+        context_failure = "authorization_context_runtime_validation_failed"
         ensure_authorization_runtime_is_external(workspace)
+        context_failure = "authorization_context_replace_refs_inspection_failed"
         if active_replace_refs(workspace):
+            context_failure = "authorization_context_replace_refs_present"
             raise ValueError("authorization rejects repositories with Git replace refs")
+        context_failure = "authorization_context_grant_load_failed"
         grant = _load_external_human_authorization(
             authorization_path,
             workspace=workspace,
         )
+        context_failure = "authorization_context_review_set_failed"
         review_items = authorization_review_items(report.release_decision.model_dump(mode="json"))
         git = plan.subject.git
         if git.snapshot_kind != "committed_tree" or git.worktree_overlay_sha256 is not None:
+            context_failure = "authorization_context_subject_not_committed"
             raise ValueError("authorization requires a committed Git subject")
         if not (
             git.base_commit_sha
@@ -3816,11 +5219,14 @@ def _evaluate_authorization_overlay(
             and git.head_tree_sha
             and git.source_head_commit_sha
         ):
+            context_failure = "authorization_context_subject_identity_incomplete"
             raise ValueError("authorization requires complete committed PR tree identity")
         signed_source = grant.statement.request
         if signed_source.source_engine_requirement_id != plan.engine.engine_requirement_id:
+            context_failure = "authorization_context_source_engine_mismatch"
             raise ValueError("authorization source engine differs from the current engine")
         if signed_source.source_executor_id != verifier.executor_id:
+            context_failure = "authorization_context_source_executor_mismatch"
             raise ValueError("authorization source executor differs from the current executor")
         # These two IDs are signer-authenticated provenance labels. Unlike the
         # engine, executor, request, subject, decision, tree, review-set, and
@@ -3828,6 +5234,7 @@ def _evaluate_authorization_overlay(
         # set are not transported into this second verification pass. Copying
         # them preserves the exact signed request; it is not an independent
         # provenance check by this verifier.
+        context_failure = "authorization_context_request_build_failed"
         expected_request = build_human_authorization_request(
             repository_id=git.repository_id,
             source_receipt_id=signed_source.source_receipt_id,
@@ -3846,7 +5253,10 @@ def _evaluate_authorization_overlay(
             operation=grant.statement.request.operation,
         )
     except (OSError, ValueError, json.JSONDecodeError):
-        return AuthorizationEvaluationV1.rejected("authorization_context_invalid"), None
+        return (
+            AuthorizationEvaluationV1.rejected("authorization_context_invalid", context_failure),
+            None,
+        )
 
     evaluation = evaluate_human_authorization(
         grant,
@@ -3900,6 +5310,7 @@ def _write_artifacts(
     *,
     report: ReadinessReport | None,
     git_root: Path,
+    manifest_provenance_value: ManifestProvenance,
     operation: CurrentControlOperation = "verify",
     config_path: Path,
     config_logical_path: str | None = None,
@@ -3910,9 +5321,12 @@ def _write_artifacts(
     fail_on: list[str] | None,
     pr_comment_style: str,
     capability_lock_diff: CapabilityLockDiffV1 | None = None,
+    capability_attestation_inputs: CapabilityDeltaAttestationInputs | None = None,
     human_context: HumanArtifactContext | None = None,
+    engine_requirement_factory: Callable[[], VerificationEngineRequirement] | None = None,
     input_root: Path | None = None,
     input_snapshot: StaticInputSnapshot | None = None,
+    config_from_worktree: bool = False,
     diff_text: str = "",
     diff_from_path: Path | None = None,
     authorization_path: Path | None = None,
@@ -3921,6 +5335,10 @@ def _write_artifacts(
     evaluation_date: str | None = None,
 ) -> None:
     verifier_path.parent.mkdir(parents=True, exist_ok=True)
+    # An optional question must not outlive the run that could offer it.
+    review_request_path = verifier_path.with_name(HUMAN_REVIEW_REQUEST_FILENAME)
+    review_request_path.unlink(missing_ok=True)
+    verifier.artifacts.pop("human_review_request_json", None)
     portable_diff_from_path: Path | None = None
     if diff_from_path is not None and diff_from_path.is_file():
         portable_diff_from_path = verifier_path.with_name(
@@ -4035,11 +5453,16 @@ def _write_artifacts(
         else None
     )
     external_input_root = verifier_path.parent
+    from agents_shipgate.core.verification_input_currency import auxiliary_input_origin
+
     portable_policy_pack_paths = [
         _write_portable_static_input(
             path,
             root=external_input_root,
             category="policy-packs",
+            source_logical_path=auxiliary_input_origin(
+                path, input_root=resolved_input_root, git_root=git_root
+            )["path"],
         )
         for path in policy_pack_paths
     ]
@@ -4056,10 +5479,26 @@ def _write_artifacts(
             baseline_path,
             root=external_input_root,
             category="baseline",
+            source_logical_path=auxiliary_input_origin(
+                baseline_path, input_root=resolved_input_root, git_root=git_root
+            )["path"],
         )
         if baseline_path is not None and baseline_was_captured
         else None
     )
+    auxiliary_origins = {
+        portable: auxiliary_input_origin(original, input_root=resolved_input_root, git_root=git_root)
+        for original, portable in zip(policy_pack_paths, portable_policy_pack_paths, strict=True)
+    }
+    if portable_baseline_path is not None:
+        auxiliary_origins[portable_baseline_path] = auxiliary_input_origin(
+            baseline_path, input_root=resolved_input_root, git_root=git_root
+        )
+    if portable_diff_from_path is not None:
+        auxiliary_origins[portable_diff_from_path] = auxiliary_input_origin(
+            diff_from_path, input_root=resolved_input_root, git_root=git_root,
+            generated=verifier.base_status != "diff_from_provided",
+        )
     logical_config = config_logical_path or (
         config_path.resolve().relative_to(resolved_input_root).as_posix()
         if resolved_input_root in config_path.resolve().parents
@@ -4108,6 +5547,9 @@ def _write_artifacts(
     )
     try:
         plan = build_verification_plan(
+            _engine_requirement=(
+                engine_requirement_factory() if engine_requirement_factory is not None else None
+            ),
             git_root=git_root,
             input_root=resolved_input_root,
             config_path=config_path,
@@ -4141,12 +5583,15 @@ def _write_artifacts(
                 "fail_on": sorted(fail_on or []),
                 "no_heuristics": no_heuristics,
                 "plugins_enabled": plugins_enabled is not False,
+                "manifest_provenance": manifest_provenance_value,
                 **resolved_options,
             },
             plugins_enabled=plugins_enabled,
             worktree_overlay_paths=worktree_overlay_paths,
             external_input_root=external_input_root,
             captured_input_paths=captured_input_paths,
+            auxiliary_origins=auxiliary_origins,
+            config_from_worktree=config_from_worktree,
         )
     finally:
         if plan_snapshot_token is not None:
@@ -4158,6 +5603,14 @@ def _write_artifacts(
         json.dumps(plan.model_dump(mode="json"), indent=2, sort_keys=True),
         encoding="utf-8",
     )
+    if "openshell_native" in plan.inputs.options:
+        native_path = verifier_path.with_name("openshell-native.json")
+        from agents_shipgate.schemas.openshell_native import NativeEvidence
+
+        native_evidence = NativeEvidence.model_validate({"observation": plan.inputs.options["openshell_native"],
+            "request_id": plan.request_id, "subject": plan.subject.model_dump(mode="json")})
+        native_path.write_text(json.dumps(native_evidence.model_dump(mode="json"), indent=2, sort_keys=True), encoding="utf-8")
+        verifier.artifacts["openshell_native_json"] = _display_path(native_path, git_root)
     unit_result = build_unit_result(
         plan=plan,
         status=("succeeded" if verifier.execution in {"succeeded", "skipped"} else "failed"),
@@ -4188,6 +5641,22 @@ def _write_artifacts(
     verifier.engine_requirement_id = plan.engine.engine_requirement_id
     verifier.executor_id = executor.executor_id
     verifier.decision_id = decision_id
+    review_request = project_human_review_request(verifier=verifier, report=report, plan=plan)
+    if review_request is not None:
+        review_request_path.write_text(
+            json.dumps(review_request.model_dump(mode="json"), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        verifier.artifacts["human_review_request_json"] = _display_path(
+            review_request_path.resolve(), git_root
+        )
+    _write_capability_delta_attestation(
+        verifier=verifier,
+        plan=plan,
+        inputs=capability_attestation_inputs,
+        out_dir=verifier_path.parent,
+        git_root=git_root,
+    )
     evaluation, accepted_grant = _evaluate_authorization_overlay(
         authorization_path=authorization_path,
         verifier=verifier,
@@ -4253,6 +5722,7 @@ def _write_artifacts(
             style=pr_comment_style,
             capability_lock_diff=capability_lock_diff,
             human_context=human_context,
+            human_review_request=review_request,
         ),
         encoding="utf-8",
     )
@@ -4368,14 +5838,35 @@ def _publish_run_control(
             out_dir=out_dir,
             git_root=git_root,
             verifier=verifier,
+            operation=operation,
         ),
         # A preview never runs a scan, so report.json and packet.json in this
         # directory belong to some earlier run.  Binding them would present two
         # generations as one current artifact set.
         artifact_keys=(
-            VERIFIER_ROUTE_CONTROL_ARTIFACT_KEYS if operation == "preview" else None
+            _PREVIEW_CONTROL_ARTIFACT_KEYS
+            if operation == "preview"
+            else VERIFIER_ROUTE_CONTROL_ARTIFACT_KEYS
+            if verifier.host_comparison is not None
+            else None
         ),
     )
+
+
+#: What a ``verify --preview`` pointer binds: the verifier route it wrote, never
+#: the verification plan. In a configured repository the preview still records
+#: a plan (``verify-run.json`` embeds it), but that plan is the request a
+#: ``verify`` would make, built from what the manifest declares, and nothing it
+#: names was read: a preview runs no adapter. Bound, the plan made its input
+#: capture the preview's currency test, and a plan whose inputs were never
+#: captured has no census to reconfirm — so every refresh refused with "input
+#: directory capture is unavailable", and ``verify --preview --format control``
+#: sent the caller to a human for it (#807). Unbound, a configured preview is
+#: read exactly as a manifest-free one: against the working tree it read.
+#: A plan that *is* bound and lacks its census still refuses, as before.
+_PREVIEW_CONTROL_ARTIFACT_KEYS: frozenset[str] = VERIFIER_ROUTE_CONTROL_ARTIFACT_KEYS - {
+    "verification_plan"
+}
 
 
 def _current_control_workspace_identity(
@@ -4383,12 +5874,17 @@ def _current_control_workspace_identity(
     out_dir: Path,
     git_root: Path,
     verifier: VerifierArtifact,
+    operation: CurrentControlOperation = "verify",
 ) -> CurrentControlWorkspaceIdentity:
     """Bind what this run was evaluated against.
 
     The verification plan is the authoritative source when the run produced
     one, because that is the same subject the receipt closes over.  Runs that
-    stopped before plan construction fall back to the verifier's coarser view.
+    stopped before plan construction fall back to the verifier's coarser view,
+    and so does every preview: its pointer binds no plan
+    (:data:`_PREVIEW_CONTROL_ARTIFACT_KEYS`), and a plan identity on a
+    plan-less pointer would ask the reader to recompute an overlay over paths
+    it has no record of.
 
     That fallback binds *this worktree's* HEAD, which is deliberately not
     ``head_ref``: a preview reads project markers from the working tree, so the
@@ -4409,8 +5905,10 @@ def _current_control_workspace_identity(
     directory it was pointed at to find the pointer at all.
     """
 
+    if verifier.host_comparison is not None and verifier.host_comparison.input_identity is not None:
+        return verifier.host_comparison.input_identity
     plan_path = out_dir / "verification-plan.json"
-    if plan_path.is_file() and not plan_path.is_symlink():
+    if operation != "preview" and plan_path.is_file() and not plan_path.is_symlink():
         try:
             plan = VerificationPlan.model_validate_json(plan_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -4418,14 +5916,23 @@ def _current_control_workspace_identity(
         if plan is not None:
             return workspace_identity_from_plan(plan)
     bound, overlay = _safe_worktree_overlay(git_root, exclude=out_dir)
+    head_commit = _safe_worktree_sha(git_root, commit_sha)
     return CurrentControlWorkspaceIdentity(
         repository=_safe_repository_identity(git_root),
         head_ref=verifier.head_ref,
-        head_commit_sha=_safe_worktree_sha(git_root, commit_sha),
+        head_commit_sha=head_commit,
         # An evaluated tree, when the run recorded one, is what this answer
         # describes; otherwise the worktree's own HEAD tree is.
         head_tree_sha=verifier.head_tree_sha or _safe_worktree_sha(git_root, tree_sha),
-        snapshot_kind="worktree_overlay" if bound else None,
+        # Inside a repository the answer always rests on its working tree, so
+        # the pointer says so even when the overlay could not be read here —
+        # Git configuration the worktree readers refuse, a read bound, a
+        # timeout. Declaring no snapshot kind instead left the reader nothing
+        # to compare, and it returned such a pointer as current over any later
+        # edit, while the same configuration refused every other pointer
+        # (#813). A preview reaches this path in every repository since it
+        # stopped binding its plan (#807), a configured one included.
+        snapshot_kind="worktree_overlay" if bound or head_commit is not None else None,
         worktree_overlay_sha256=overlay,
     )
 
@@ -4439,12 +5946,19 @@ def _safe_worktree_overlay(git_root: Path, *, exclude: Path) -> tuple[bool, str 
     the clean case as unbound instead would leave the pointer with nothing to
     validate, and a later edit invisible — which is the state this is fixing.
 
-    ``bound=False`` is the genuinely unknown case, and it declares no snapshot
-    kind at all rather than manufacturing currency from an unreadable tree.
+    ``bound=False`` is the genuinely unknown case. Inside a repository the
+    pointer still declares a worktree snapshot, with no overlay: the reader
+    then refuses it, with the cause, for as long as the tree cannot be read,
+    and afterwards reads it as current only over a tree identical to HEAD —
+    the committed evidence a run falls back on when it could not read the tree
+    either. Declaring no snapshot kind, as this once did, skipped that check
+    entirely. Outside a repository nothing is declared, and nothing is compared.
     """
 
     try:
-        changed, _ = working_tree_context(git_root, exclude=exclude)
+        changed, _ = working_tree_context(
+            git_root, exclude=worktree_exclusion(git_root, exclude)
+        )
         rows = worktree_overlay(git_root, list(changed))
     except Exception:  # noqa: BLE001 - pointer identity is best-effort here.
         return (False, None)
@@ -4553,6 +6067,23 @@ def _static_input_sha256(path: Path | None) -> str | None:
     ).hexdigest()
 
 
+@dataclasses.dataclass(frozen=True)
+class _CapabilityReviewArtifacts:
+    """What the capability review produced, for the surfaces that consume it.
+
+    ``attestation`` is ``None`` whenever the delta cannot be projected — no
+    base, an unreadable base lock — which is the same condition that leaves
+    ``diff`` ``None``. It is a separate field rather than something derived
+    from ``diff`` because the two carry different things: the diff is the
+    reviewer-facing lock comparison, and the attestation inputs are the
+    capability facts plus the analysed-surface coverage the exported payload
+    needs.
+    """
+
+    diff: CapabilityLockDiffV1 | None = None
+    attestation: CapabilityDeltaAttestationInputs | None = None
+
+
 def _write_capability_review_artifacts(
     *,
     git_root: Path,
@@ -4560,14 +6091,16 @@ def _write_capability_review_artifacts(
     base: str | None,
     base_lock: CapabilityLockFileV1 | None,
     head_lock: CapabilityLockFileV1,
+    head_report: ReadinessReport | None,
+    base_report_path: Path | None,
     base_notes: list[str],
-) -> CapabilityLockDiffV1 | None:
+) -> _CapabilityReviewArtifacts:
     lock_path = out_dir / "capabilities.lock.json"
     base_lock_path = out_dir / "base.capabilities.lock.json"
     lock_path.write_text(render_capability_lock_json(head_lock), encoding="utf-8")
     if not base:
         base_notes.append("Capability lock diff unavailable: no --base ref was provided.")
-        return None
+        return _CapabilityReviewArtifacts()
     used_scan_derived_base = base_lock is not None
     if base_lock is None:
         base_lock = _load_base_capability_lock(
@@ -4576,7 +6109,7 @@ def _write_capability_review_artifacts(
             base_notes=base_notes,
         )
     if base_lock is None:
-        return None
+        return _CapabilityReviewArtifacts()
     base_lock_path.write_text(render_capability_lock_json(base_lock), encoding="utf-8")
     diff = diff_capability_locks(
         base_lock,
@@ -4599,7 +6132,187 @@ def _write_capability_review_artifacts(
             "Capability lock diff compared the base reviewed envelope at "
             f"{DEFAULT_CAPABILITY_LOCK_PATH.as_posix()}."
         )
-    return diff
+    return _CapabilityReviewArtifacts(
+        diff=diff,
+        attestation=CapabilityDeltaAttestationInputs(
+            base_facts=tuple(base_lock.capabilities),
+            head_facts=tuple(head_lock.capabilities),
+            base_coverage=_capability_analysis_coverage(
+                agent_id=base_lock.source.agent_id,
+                facts=base_lock.capabilities,
+                # Only a scan-derived base has a report describing the very
+                # scan that produced these facts. A base lock read from the
+                # committed envelope, or a ``--diff-from`` report, describes a
+                # different run, and comparing one run's catalog against
+                # another run's capability set would name subjects as
+                # unanalysed that were never in that catalog at all.
+                observed=(
+                    _observed_subjects_from_report_json(base_report_path)
+                    if used_scan_derived_base
+                    else None
+                ),
+            ),
+            head_coverage=_capability_analysis_coverage(
+                agent_id=head_lock.source.agent_id,
+                facts=head_lock.capabilities,
+                observed=(
+                    _observed_subjects(head_report) if head_report is not None else None
+                ),
+            ),
+        ),
+    )
+
+
+def _capability_analysis_coverage(
+    *,
+    agent_id: str,
+    facts: Sequence[CapabilityFactV1],
+    observed: list[ObservedSubject] | None,
+) -> CapabilityAnalysisCoverage:
+    """Name the observed-but-unanalysed subjects, or say the side is unknown.
+
+    ``observed is None`` is the fail-open shape made visible: the comparison
+    was needed and could not be made, so the side publishes ``unavailable``
+    rather than an empty ``complete`` a consumer would read as "nothing was
+    left out" (#437).
+    """
+
+    if observed is None:
+        return CapabilityAnalysisCoverage(
+            status="unavailable",
+            subjects_outside_analysis=(),
+        )
+    return coverage_from_scan(agent_id=agent_id, observed=observed, analysed=facts)
+
+
+def _observed_subjects(report: ReadinessReport) -> list[ObservedSubject] | None:
+    """The catalog the scan read — every tool, bound or not.
+
+    ``None``, never a shortened list, when a row carries no canonical id. A
+    dropped row is a subject that silently stops being *observed*, so it can
+    never be reported as outside analysis either — which is the #437 defect
+    reached by a different route. Losing the whole side is honest; losing one
+    row is not.
+    """
+
+    observed: list[ObservedSubject] = []
+    for tool in report.tool_surface_facts.tools:
+        if not tool.tool_id:
+            return None
+        observed.append(
+            ObservedSubject(
+                tool_id=tool.tool_id,
+                name=tool.name,
+                provider=tool.provider,
+            )
+        )
+    return observed
+
+
+def _observed_subjects_from_report_json(path: Path | None) -> list[ObservedSubject] | None:
+    """Read the base scan's catalog back off disk.
+
+    Returns ``None`` — not an empty list — for anything it cannot establish: a
+    missing file, unreadable bytes, or a report that predates
+    ``tool_surface_facts``. An empty catalog and an unread one are different
+    claims, and only the first may be published as ``complete``.
+    """
+
+    if path is None or not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    facts = payload.get("tool_surface_facts")
+    if not isinstance(facts, dict):
+        return None
+    rows = facts.get("tools")
+    if not isinstance(rows, list):
+        return None
+    observed: list[ObservedSubject] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            return None
+        tool_id = row.get("tool_id")
+        name = row.get("name")
+        provider = row.get("provider")
+        if not isinstance(tool_id, str) or not tool_id:
+            # Not `continue`: a row with no canonical id is a subject that
+            # silently stops being observed, and an unobserved subject can
+            # never be reported as outside analysis.
+            return None
+        if not isinstance(name, str) or not isinstance(provider, str):
+            return None
+        observed.append(ObservedSubject(tool_id=tool_id, name=name, provider=provider))
+    return observed
+
+
+def _write_capability_delta_attestation(
+    *,
+    verifier: VerifierArtifact,
+    plan: VerificationPlan,
+    inputs: CapabilityDeltaAttestationInputs | None,
+    out_dir: Path,
+    git_root: Path,
+) -> None:
+    """Publish the capability delta as a standalone in-toto attestation (#470).
+
+    Written here rather than beside the lock diff because this is the first
+    point at which the run has both halves the statement binds together: the
+    resolved Git subject, and the ``input_set_id`` that chains it back to
+    ``verification-receipt.json``.
+
+    **Only a committed tree is attestable.** A worktree-overlay run scanned
+    bytes that are not in any tree object, so publishing the head tree id as
+    "what was reviewed" would attest content nobody can fetch. The condition is
+    the one the human-authorization path already requires, for the same reason.
+
+    Never gates and never raises: a review artifact that could not be produced
+    is a note on the run, not a failure of it.
+    """
+
+    if inputs is None:
+        return
+    git = plan.subject.git
+    if (
+        git.snapshot_kind != "committed_tree"
+        or git.worktree_overlay_sha256 is not None
+        or not git.base_tree_sha
+        or not git.head_tree_sha
+    ):
+        verifier.base_notes.append(
+            "Capability delta attestation not written: it attests a committed "
+            "tree, and this run evaluated a worktree snapshot. Re-run with "
+            "--head <ref> to attest the committed state."
+        )
+        return
+    try:
+        attestation = project_capability_delta_attestation(
+            inputs.base_facts,
+            inputs.head_facts,
+            subject_name=git.repository_id,
+            base_tree_sha=git.base_tree_sha,
+            head_tree_sha=git.head_tree_sha,
+            head_commit_sha=git.head_commit_sha,
+            base_analysis_coverage=inputs.base_coverage,
+            head_analysis_coverage=inputs.head_coverage,
+            verification=CapabilityDeltaVerificationRef(
+                status="bound",
+                input_set_id=plan.inputs.input_set_id,
+                subject_id=plan.subject.subject_id,
+            ),
+        )
+        path = out_dir / CAPABILITY_DELTA_ATTESTATION_FILENAME
+        path.write_text(render_attestation_json(attestation), encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001 - review artifacts never gate.
+        verifier.base_notes.append(f"Capability delta attestation unavailable: {exc}")
+        return
+    verifier.artifacts[CAPABILITY_DELTA_ATTESTATION_ARTIFACT_KEY] = _display_path(
+        path.resolve(), git_root
+    )
 
 
 def _load_base_capability_lock(
@@ -4636,14 +6349,22 @@ def _resolve_out_dir(
     control pointer, and `init`'s managed ignore lands in the project while
     the reports it is meant to cover land somewhere else (#363 review).
 
-    An explicit ``--out`` keeps resolving against the repository root, so
-    every existing invocation that names a directory still writes exactly
-    where it wrote before.
+    An explicit ``--out`` is the caller's path: absolute as given, relative
+    against the current directory (:func:`explicit_output_path`, the rule
+    ``agent control --reports-dir``, ``scan --out`` and ``audit --host --out``
+    follow). It used to resolve against the repository root, so ``verify
+    --workspace ../repo --out reports`` wrote an untracked directory into the
+    scanned checkout, and ``agent control --reports-dir reports`` from the same
+    shell read another one. The command line says so when a relative spelling
+    now lands elsewhere (#818).
+
+    The default is :func:`default_reports_dir`, the rule `agent control` reads
+    by, so a refresh from any directory finds what this run published (#575).
     """
 
     if out is not None:
-        return _resolve_under_workspace(git_root, out)
-    return _resolve_under_workspace(requested_workspace, DEFAULT_OUT_DIR)
+        return explicit_output_path(out).resolve()
+    return default_reports_dir(requested_workspace).resolve()
 
 
 def _resolve_under_workspace(workspace: Path, path: Path) -> Path:
@@ -4927,18 +6648,15 @@ def _write_portable_static_input(
     *,
     root: Path,
     category: str,
+    source_logical_path: str | None = None,
 ) -> Path:
     """Copy one captured external input into the reproducible artifact graph."""
 
-    data = read_static_input_bytes(path, max_bytes=64 * 1024 * 1024)
-    digest = hashlib.sha256(data).hexdigest()
-    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", path.name).strip("._")
-    if not safe_name:
-        safe_name = "input"
-    target = root / "verification-inputs" / category / f"{digest[:16]}-{safe_name}"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(data)
-    return target
+    from agents_shipgate.core.verification_input_currency import write_portable_input
+
+    return write_portable_input(
+        path, root=root, category=category, source_logical_path=source_logical_path
+    )
 
 
 def _reject_output_input_overlap(
@@ -4965,11 +6683,110 @@ def _reject_output_input_overlap(
         )
 
 
+def _reject_output_directory_content(
+    *,
+    git_root: Path,
+    workspace: Path,
+    out_dir: Path,
+    explicit: bool,
+    base: str | None,
+    head: str,
+    archive_head: bool,
+    auto_base: bool,
+    manifest_free: bool = False,
+) -> None:
+    """Refuse an output directory that holds repository content (#804).
+
+    Every read this run makes of the working tree — the change set, the
+    overlay its pointer binds, the manifest-free host comparison, the static
+    input census — leaves the output directory out, so that the run's own
+    reports are not read as part of the change. An output directory holding
+    anything else therefore hid it: ``--out .claude`` turned a widened
+    ``.claude/settings.json`` from ``human_review_required`` into ``complete``
+    and ``mergeable``, and ``--out docs`` kept a pointer current across every
+    later edit there. The overlap check above covers only the inputs named on
+    the command line; this covers everything Git would report.
+
+    Decided before the pointer is invalidated or anything is written, by the
+    one classifier every refresh applies, so a directory refused here can
+    never hold a pointer that reads as current. The commits this run compares
+    are resolved here too, the way the run resolves them, because a file one
+    of them holds beneath the directory is content the exclusion can hide even
+    when nothing is left on disk: a committed ``git rm .claude/settings.json``
+    read as ``complete`` under ``--out .claude``. Which commits those are
+    depends on the route. A worktree run diffs the working tree against the
+    merge base with the directory excluded, so the merge base counts. An
+    archived ``--head`` run diffs the merge base against the head in full and
+    excludes the directory only from the head tree it reads, so only the
+    evaluated head counts: a change that removes committed files from the
+    directory shows up in its own diff, and refusing it would fail the
+    Action's run for the change that stops committing reports. A base that
+    does not resolve compares nothing, and the run itself then reports the
+    diff it could not read.
+
+    Without a manifest the run also takes the host comparison, whose
+    auto-detected base may be a local ``main`` in a repository with no remote,
+    and whose merge base the pointer records. That base is compared too:
+    otherwise this check accepted a directory whose removal the reader then
+    found against the recorded merge base, and the run's own pointer refused
+    the moment it was published.
+    """
+
+    compared: list[str] = []
+    try:
+        head_commit = commit_sha(git_root, head)
+        if head_commit is not None:
+            compared.append(head_commit)
+        if not archive_head:
+            bases = [base] if base is not None else []
+            if base is None and auto_base:
+                bases.append(resolve_verify_base(git_root, head).base)
+                if manifest_free and head_commit is not None:
+                    bases.append(
+                        detect_default_base(
+                            git_root,
+                            head_commit,
+                            allow_local_when_no_remote=True,
+                            allow_equal_head=True,
+                        )
+                    )
+            for candidate in dict.fromkeys(ref for ref in bases if ref):
+                merge_base = merge_base_sha(git_root, candidate, head)
+                if merge_base is not None:
+                    compared.append(merge_base)
+    except Exception:  # noqa: BLE001 - the run reports an unreadable ref itself.
+        pass
+    refusal = classify_output_directory(git_root, out_dir, compared=compared)
+    if refusal is None:
+        return
+    default = is_default_reports_dir(workspace, out_dir)
+    shown = _display_path(out_dir, git_root)
+    subject = (
+        f"Verifier --out {shown}"
+        if explicit
+        else f"The default verifier output directory {shown}"
+    )
+    raise OutputDirectoryHoldsRepositoryContent(
+        f"{subject} {refusal.reason}. verify leaves its output directory out of "
+        "the change set it decides on, so anything there besides its own "
+        "reports would be hidden from the decision and from every later check "
+        f"that it is current. {output_directory_remedy(default=default, kind=refusal.kind)}",
+        directory=out_dir,
+        refusal=refusal,
+        default=default,
+    )
+
+
 def _shell_join(parts: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in parts)
 
 
-def _preview_init_command(workspace: Path, *, scope: ChangeScope | None = None) -> str:
+def _preview_init_command(
+    workspace: Path,
+    *,
+    scope: ChangeScope | None = None,
+    local_review: bool = False,
+) -> str:
     command_workspace = _preview_command_workspace(workspace, scope=scope)
     return retarget_command(
         _shell_join(
@@ -4978,7 +6795,7 @@ def _preview_init_command(workspace: Path, *, scope: ChangeScope | None = None) 
                 "init",
                 "--workspace",
                 str(command_workspace),
-                "--write",
+                "--local-review" if local_review else "--write",
                 "--json",
             ]
         )
@@ -5350,6 +7167,9 @@ def _preview_verify_command(
     if head is not None:
         parts.extend(["--head", head])
     if out is not None:
+        # Callers pass the caller's spelling anchored to its directory: a
+        # relative `--out` would resolve against wherever this command is
+        # later typed (#818).
         parts.extend(["--out", str(out)])
     if pr_comment_style and pr_comment_style != "capability-review":
         parts.extend(["--pr-comment-style", pr_comment_style])
@@ -5379,6 +7199,8 @@ def run_preview(
     out: Path | None,
     pr_comment_style: str = "capability-review",
     auto_base: bool = False,
+    _host_comparison=None,
+    _operation: str = "preview",
 ) -> tuple[VerifierArtifact, None, int]:
     """Lightweight relevance check for ``agents-shipgate verify --preview``.
 
@@ -5390,6 +7212,7 @@ def run_preview(
     project a monorepo pull request is about (#363).
     """
     requested_root = workspace.resolve()
+    in_git = True
     try:
         root = ensure_git_workspace(requested_root)
     except ConfigError:
@@ -5397,6 +7220,7 @@ def run_preview(
         # one does exist, use the same repository root and path coordinates as
         # the full verifier so its authorized command evaluates the same gate.
         root = requested_root
+        in_git = False
     config_path, config_relative = _resolve_config_under_workspace(
         root,
         config,
@@ -5410,12 +7234,25 @@ def run_preview(
         out_dir=out_dir,
         inputs=[("config", config_path)],
     )
+    if in_git:
+        # Outside Git there is no change set to leave anything out of.
+        _reject_output_directory_content(
+            git_root=root,
+            workspace=workspace,
+            out_dir=out_dir,
+            explicit=out is not None,
+            base=base,
+            head=head or "HEAD",
+            archive_head=head is not None,
+            auto_base=auto_base,
+            manifest_free=not config_path.is_file(),
+        )
     out_dir.mkdir(parents=True, exist_ok=True)
     # Preview is a non-terminal operation, so it starts by denying whatever a
     # previous run left behind rather than leaving it current beside a preview.
     begin_current_control(
         out_dir,
-        operation="preview",
+        operation=_operation,
         reason=(
             "A verification preview is in progress; no decision in this "
             "directory is current until it publishes one."
@@ -5476,7 +7313,7 @@ def run_preview(
             worktree_paths, worktree_diff = working_tree_context(
                 root,
                 comparison_ref=comparison_ref,
-                exclude=out_dir,
+                exclude=worktree_exclusion(root, out_dir),
             )
         except Exception:  # noqa: BLE001 - preview must never crash.
             worktree_paths, worktree_diff = [], ""
@@ -5510,6 +7347,16 @@ def run_preview(
         head=head,
         base=base,
     )
+    host_comparison = _host_comparison
+    if host_comparison is None and not manifest_present and diff_input is None:
+        from .host_comparison import compare_host_refs, host_comparison_failure
+        try:
+            host_comparison = compare_host_refs(
+                workspace=root, base=base, head=head, auto_base=auto_base,
+                config_relative=config_relative, out_dir=out_dir,
+            )
+        except (OSError, ValueError, RuntimeError, ConfigError) as exc:
+            host_comparison = host_comparison_failure(root, head, exc)
     resolution = preview_scope.resolution
     scope = resolution.scope
     scoped_config = (
@@ -5551,13 +7398,17 @@ def run_preview(
     # installs the local contract, default agent kit, and advisory CI workflow
     # for unconfigured workspaces so cold-start agents do not need to infer the
     # next command from README prose.
-    init_command = _preview_init_command(workspace, scope=scope)
+    init_command = _preview_init_command(
+        workspace,
+        scope=scope,
+        local_review=config_path.name == LOCAL_REVIEW_MANIFEST_NAME,
+    )
     verify_command = _preview_verify_command(
         workspace=workspace,
         config=config,
         base=base,
         head=head,
-        out=out,
+        out=explicit_output_path(out) if out is not None else None,
         pr_comment_style=pr_comment_style,
     )
     scoped_verify_command = _preview_verify_command(
@@ -5565,7 +7416,7 @@ def run_preview(
         config=config,
         base=base,
         head=head,
-        out=out,
+        out=explicit_output_path(out) if out is not None else None,
         pr_comment_style=pr_comment_style,
         scope=scope,
     )
@@ -5660,7 +7511,7 @@ def run_preview(
                 config=config,
                 base=base,
                 head=head,
-                out=out,
+                out=explicit_output_path(out) if out is not None else None,
                 pr_comment_style=pr_comment_style,
                 scope=ChangeScope(
                     directory=root / relative,
@@ -5693,6 +7544,32 @@ def run_preview(
             why="Shipgate is already set up here; run verify on the PR diff.",
         )
         headline = "Shipgate is configured; run verify on the PR to get a merge verdict."
+    elif host_comparison is not None:
+        from agents_shipgate.invocation import join_argv
+        next_action = CodingAgentCommandAction(
+            kind="discover",
+            command=join_argv(["agents-shipgate", "audit", "--host", "--workspace", str(root), "--json"]),
+            why="Read the repository-declared host inventory and its coverage limits; no manifest or baseline is required.",
+        )
+        if "shallow_history" in host_comparison.incomparable_reasons:
+            next_action = CodingAgentFetchBaseAction(
+                kind="fetch_base", expects="complete Git history",
+                why="The checkout is shallow. Run git fetch --unshallow (or use fetch-depth: 0 in CI), then rerun the same comparison.",
+            )
+        headline = (
+            f"{len(host_comparison.rows)} repository-declared host capability row(s). "
+            "Advisory comparison only; no application release policy configured."
+            if host_comparison.comparison_status == "comparable"
+            # Partial (#808): the rows are known, the comparison is not whole,
+            # and the route is the incomplete one's. The rows are named where
+            # they are published: the control envelope's `capability_rows`
+            # projects a partial comparison as incomparable, with none.
+            else f"Host comparison is partial: {len(host_comparison.rows)} repository-declared "
+            "host capability row(s) outside what it could not compare, listed under "
+            "host_comparison in verifier.json; review its input limits before interpreting changes."
+            if host_comparison.comparison_status == "partial"
+            else "Host comparison is incomplete; review its input limits before interpreting changes."
+        )
     elif resolution.contested:
         # Several projects own part of this change. `init` at the root would
         # refuse deterministically, so recommending it would be recommending
@@ -5769,13 +7646,14 @@ def run_preview(
         changed_files=changed_files,
         diff_text_available=bool(diff_text),
         diff_status=_diff_status_artifact(diff_input),
-        trigger=trigger,
+        trigger=_embedded_trigger(trigger),
         base_status="not_requested",
         base_notes=notes,
         execution="not_run",
         head_status="not_run",
         head_exit_code=0,
-        mode="preview",
+        host_comparison=host_comparison,
+        mode="preview" if _operation == "preview" else "advisory",
         merge_verdict="unknown",
         applicability="not_evaluated",
         can_merge_without_human=False,
@@ -5783,6 +7661,9 @@ def run_preview(
         authorization=AuthorizationEvaluationV1.not_requested(),
         headline=headline,
         forbidden_file_edits=list(PROTECTED_FILE_EDITS),
+        conditional_file_edits=conditional_instruction_edits(
+            workspace=root, config=_display_path(config_path, root), canonical=True,
+        ),
         forbidden_actions=list(FORBIDDEN_SHORTCUTS),
         artifacts={
             "verifier_json": _display_path(verifier_path.resolve(), root),
@@ -5798,10 +7679,11 @@ def run_preview(
         pr_comment_path,
         report=None,
         git_root=root,
+        manifest_provenance_value="unknown",
         # A preview is never a merge decision.  Scoping the pointer to the
         # preview operation makes "complete" unrepresentable for this run, so
         # an agent cannot read a preview as authorization to finish.
-        operation="preview",
+        operation=_operation,
         config_path=config_path,
         config_logical_path=config_relative.as_posix(),
         baseline_path=None,

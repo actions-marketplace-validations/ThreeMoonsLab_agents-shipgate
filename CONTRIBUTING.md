@@ -1,6 +1,46 @@
 # Contributing
 
-Yes, please contribute.
+## Contribution stance (2026-10-06)
+
+**Scoped contributions are welcome; the engine stays maintainer-led.** Agents
+Shipgate has one maintainer ([MAINTAINERS.md](MAINTAINERS.md)), and its value
+rests on a deterministic, static trust model that every change has to keep
+intact. So:
+
+- **Wanted from anyone:** bug reports with a reproduction, adoption feedback,
+  false-positive or false-negative cases from real pull requests, and check
+  requests, through the [issue templates](.github/ISSUE_TEMPLATE/).
+- **Pull requests welcome without asking first:** issues labelled
+  [`good first issue`](https://github.com/ThreeMoonsLab/agents-shipgate/labels/good%20first%20issue)
+  (each states its acceptance, and its approach is already agreed in the
+  issue), documentation fixes, and new test cases that pin existing behavior.
+  The `help wanted` label is reserved and not in use yet.
+- **Open an issue and agree the approach before writing code** for anything
+  that changes a reader, a check, a schema, a CLI command, a published JSON
+  field, or path, identity or containment handling (for example
+  `core/verification_identity.py`). An unsolicited pull request in these areas
+  may be closed with an explanation rather than merged, however good the code.
+  [Surface discipline](#surface-discipline) applies to every new surface.
+- **Agent-authored contributions** are treated like any other: say in the pull
+  request that a coding agent wrote it and which one, confirm that a person
+  read the diff, and expect the same review. Agents reporting product feedback
+  should use the [`agent_feedback`](.github/ISSUE_TEMPLATE/agent_feedback.yml)
+  template.
+- **Response:** the maintainer aims to reply to a new issue or pull request
+  within seven days. This is a single-person aim, not a service commitment,
+  and support capacity is still pending acceptance in
+  [#494](https://github.com/ThreeMoonsLab/agents-shipgate/issues/494) (see
+  [MAINTAINERS.md](MAINTAINERS.md)); [SECURITY.md](SECURITY.md) governs
+  vulnerability reports.
+
+Revisit this stance at the first qualified-gate release
+([#572](https://github.com/ThreeMoonsLab/agents-shipgate/issues/572)) or on
+2026-12-31, whichever comes first.
+
+Start architecture or release-contract work with the current
+[accepted-decision index](docs/decisions.md). It links the governing contracts,
+the v0.1 defaults they supersede, and accepted directions that still have open
+implementation obligations.
 
 ## Local Setup
 
@@ -14,6 +54,15 @@ pytest
 `python -m pip install -e ".[dev]"` still works and is fine for a quick look,
 but it resolves fresh, so it is not the environment CI and the release run. The
 locked closure above is; reproducing a CI failure locally starts with it.
+
+`pytest` runs every test. Pull-request CI runs `-m "not perf and not slow"`:
+`perf` (latency budgets, which run alone in the `test` job) and `slow` are left
+out. A `slow` test runs nightly (`slow-tests.yml`) and in release verification,
+so marking one moves its cost off every pull request without removing it. Mark
+a test `slow` only when it is heavy and unlikely to be the one that catches a
+regression, because a failure is then found a day later than a pull request
+would have found it, and the per-pull-request coverage floor no longer counts
+it. `pytest -m "not perf and not slow"` reproduces what a pull request runs.
 
 ## Running the CLI
 
@@ -76,6 +125,18 @@ stale fails there by name rather than as a puzzling import error. See
 [`docs/release-runbook.md`](docs/release-runbook.md#the-environment-is-locked-and-it-is-cis)
 for which job installs which lock.
 
+Dependabot groups each week's minor and patch version updates into one pull
+request per ecosystem. Major bumps, security updates, `uv` and the harness's
+`claude-agent-sdk` still arrive individually. Dependabot edits the hash locks
+as plain requirement files, so a grouped pip PR is a request, never merged
+as-is. To act on it, raise any floor it changes in `pyproject.toml` or a
+`constraints/*.in`, then recompile only the locks it touches, for example
+`python scripts/update_locks.py constraints/dev.txt`, with the `uv` version
+`constraints/release-publish.in` pinned before the PR. A recompile refreshes
+that lock's whole closure, not only the bumped pin, so check its diff for
+unrelated movement, dropped environment markers and extras-qualified pins
+before pushing.
+
 ## Changing the CHANGELOG
 
 Entries go under `## Unreleased`. Cutting a release renames that heading to
@@ -90,9 +151,47 @@ part of the release, not documentation about it.
 ./shipgate doctor --config samples/support_refund_agent/shipgate.yaml
 ./shipgate scan --config samples/support_refund_agent/shipgate.yaml
 ./shipgate list-checks
+python scripts/regenerate_goldens.py --check
 ```
 
+### Sample goldens
+
+The [golden generator](scripts/regenerate_goldens.py) owns the 24 committed
+artifacts in seven `samples/*/expected/` directories. With the normal development
+dependencies and Git available:
+
+```bash
+python scripts/regenerate_goldens.py                       # regenerate all
+python scripts/regenerate_goldens.py conductor_agent       # one sample
+python scripts/regenerate_goldens.py --check                # read-only drift check
+```
+
+It scans disposable copies with the source-tree writers; the caller's working
+tree, manifests, declarations and CI summary are not scan output destinations.
+Generation validates the entire selected set before writing any expected file.
+Exit 0 means generated/matching, 1 means drift in check mode, and 2 means the
+recipe could not finish. Every drift names its file. An added expected artifact
+requires an explicit recipe; deleting one does not remove it from the check.
+`tests/test_regenerate_goldens.py` invokes the actual `--check` command in the
+normal CI suite. Existing behavioral assertions remain independent oracles;
+do not regenerate away a changed verdict, open question or safety regression.
+
+The recipe pins packet time, preserves the ordinary and cold-manifest states,
+uses relative output paths under the manifest, normalizes only known path
+fields, and writes LF bytes. Text inputs in the disposable copy are normalized
+to LF too, so a Windows checkout does not change the manifest bytes bound by
+the sample pointer. Scans disable installed plugins and isolate inherited Git
+configuration; symlinked fixture paths and leaked temporary paths are errors. The
+Conductor scan pointer is rebound **after** normalization and has no predecessor
+from another generating run; it retains scan-only permissions, never a verifier
+receipt or release authority. These development fixtures are not qualification
+evidence. #569 still owns the actual report 1.0 freeze and migration fixtures.
+
 ## Contribution Areas
+
+These are the areas where contributions fit. Except for documentation and
+tests, start with an issue first, as the
+[contribution stance](#contribution-stance-2026-10-06) says.
 
 - new deterministic checks;
 - loader hardening and OpenAPI edge cases;
@@ -123,6 +222,16 @@ Before adding one, the PR description must answer, in a sentence or two:
 3. **Does it respect the [roadmap non-goals](ROADMAP.md#explicit-non-goals)?**
    No second verdict; more adapters is not the roadmap; no agent execution, LLM
    calls, or network access in the default path.
+
+Once a surface exists, [`docs/distribution-surfaces.md`](docs/distribution-surfaces.md)
+governs what it is allowed to *say*: every surface that answers a question the
+engine also answers must give the engine's answer, or record in that registry
+what it does not answer. Adding or changing one means adding its row there and
+its claims in `tests/test_distribution_surface_parity.py` — the two are checked
+against each other, so neither can be updated alone. A surface that cannot be
+brought to parity is a **gap**: it needs a row in that document's *Known parity
+gaps* table with an owning issue, and an `xfail(strict=True)` row in the parity
+test, so the day the fix lands the exemption fails and has to be retired.
 
 If the answer to (1) is unclear, the default is **don't** — open an issue
 instead. Deleting or consolidating surface never needs this new-surface
@@ -179,6 +288,11 @@ CI runs `python scripts/generate_schemas.py --check` and fails fast
 with a unified diff if a committed schema drifts from the live model.
 The same drift is also caught by `tests/test_schema_roundtrip.py`, so
 your test suite will reject the change locally before CI does.
+After a report or contract change, run
+`python scripts/regenerate_goldens.py`, inspect the semantic diff, then run
+`python scripts/regenerate_goldens.py --check` and the affected behavioral
+tests. The [sample recipe](#sample-goldens) owns path and digest normalization;
+do not update a version stamp or pointer hash by hand.
 
 ## Check Contributions
 

@@ -340,6 +340,12 @@ def test_action_output_extraction_preserves_existing_fields_and_adds_verify_run(
     _write_json(
         output_dir / "verifier.json",
         {
+            # No receipt beside it, so a verifier written before receipts
+            # (#1022), naming the report it wrote as every verify run with a
+            # head scan does; real verify output is in
+            # tests/test_verification_receipt_consumers.py.
+            "verifier_schema_version": "0.4",
+            "head_report_json": "agents-shipgate-reports/report.json",
             "execution": "succeeded",
             "head_status": "succeeded",
             "merge_verdict": "mergeable",
@@ -437,7 +443,7 @@ def _verifier(
     assert report.release_decision is not None
     decision = report.release_decision.decision
     if can_merge:
-        control = derive_agent_control(reason="Static verification passed.")
+        control = derive_agent_control(reason="Static verification passed.", subject_evaluated=True)
     elif fix_task is not None and fix_task.actor == "coding_agent" and fix_task.safe_to_attempt:
         assert fix_task.verification_command
         control = derive_agent_control(

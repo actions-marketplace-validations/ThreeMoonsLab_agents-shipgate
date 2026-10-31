@@ -1,6 +1,294 @@
 # Current Agent Contract
 
+Runtime contract v42, unreleased, stops an empty preflight plan from minting
+authority (#610). Through preflight `0.5` a plan that named nothing to route
+returned the shared `complete` state, whose `permissions` grant `merge` and
+`report_complete`, with no verifier identity behind it. Preflight `0.6` has its
+own control union: `planning_only`, `agent_action_required` and
+`human_review_required`. `planning_only` is new and means only that
+planning finished, because the plan named no changed file, capability request
+or host permission request and no drift signal fired; it has no `next_action`.
+Preflight never returns `complete` or `review_publishable`, and every
+permission is `false` on every route, in the model and in
+[`docs/preflight-schema.v0.6.json`](preflight-schema.v0.6.json) alike, so
+leaving files out of a plan can never stand in for an evaluation of the
+change: preflight never authorizes merge or completion. `0.5` stays frozen
+and readable as a
+`--base-preflight`; `minimum_control_contract_version` stays `21`, because
+the shared `AgentControl` union is unchanged and a reader that does not know
+`planning_only` cannot mistake it for `complete`. See
+[the migration note](../STABILITY.md#planning-only-preflight-610).
+
+Runtime contract v41, new in 1.2.0, names the changed inputs a host comparison
+does not read (#821). A zero-row comparison used to print "No static
+host-grant changes detected" for a pull request that added a Cursor plugin's
+`mcp.json` or moved a marketplace plugin's pinned `sha`, exactly as for a
+docs-only one. Verifier `0.21` and `shipgate diff --json` (capability diff
+`0.4`) now add, inside the existing `coverage` block, a `changed_not_read`
+item for each path in the comparison's own changed-file set that a bounded,
+documented candidate rule names and no reader of this entry read, with its
+`candidate` rule (`plugin_mcp_config`, `plugin_manifest_mcp_servers`,
+`plugin_manifest_hooks`, `plugin_hook_file`, `unparsed_plugin_manifest`,
+`cursor_project_hooks`, `nested_host_settings`, `external_plugin_source`) and,
+for an external plugin source, the source it names as `detail`, never fetched.
+`read_sources_only` is `false` while such an item is named, and
+`unread_candidates` (`examined`, `not_examined`, or `null` for not recorded)
+with `unread_candidates_not_examined` say whether the change set was examined
+and how many candidates were not, past the bound or because a file their rule
+needed was not read or did not parse. An item is never a row, a widening, a
+loading claim or a `check` violation. The one route it moves: a manifest-free
+`verify` whose only host-relevant change is such an input, or a changed
+candidate it counts as not examined, publishes that comparison instead of the
+setup route, and on `verify --preview` the next
+action for that change is `discover` (`audit --host`) with the comparison
+published, where it was `initialize` (`init --write`) with none, in an
+agent-related workspace too, as it already was when the change edited a host
+file this entry reads. `minimum_control_contract_version`
+stays `21`, and a `0.20` verifier reads with the search not recorded. See
+[the migration note](../STABILITY.md#unread-changed-inputs-821).
+
+Still contract v41, new in 1.2.0: a plugin directory a host comparison cannot
+compare no longer hides the changes outside it (#808). Where every blocking
+limit that refused the comparison is a plugin-reference limit bounded by its
+plugin directory, and no compared source depends on that directory, verifier
+`0.21` and `shipgate diff --json` (capability diff `0.4`) publish
+`comparison_status: partial`: the same `incomparable_reasons`, the `rows`,
+`review` and `unchanged_limits` established outside the directory, and the
+directory as `scope` on each such `blocking_limit` coverage item, which
+`0.20` reserved as always `null`. Treat `partial` as `incomparable` for any
+decision: every control state, permission, next action and `check` decision
+is the refusal's, the control envelope's `capability_rows` projects it as
+`incomparable` with no rows, and `check`, whose boundary result cannot name a
+directory, still refuses its comparison. A `0.20` verifier claiming a partial
+comparison or a `scope` is refused. See
+[the migration note](../STABILITY.md#partial-host-comparison-808).
+
+Unreleased, still contract v42: a plain instruction document (`AGENTS.md`,
+`AGENTS.override.md`, `CLAUDE.md`) that both sides read directly and that is
+refused only because it is past the 256 KiB instruction bound is withheld the
+same way (#973): the comparison is `partial`, and the document's own path is
+the `scope` of its `blocking_limit` item, with `limit: unsupported` (a hook
+script's own-path scope is `unreadable`). A blocking limit both sides carry
+ends its `detail` with whether Git shows the file changed in this change, is
+byte-identical, or neither. Treat `partial` as before. See
+[the migration note](../STABILITY.md#oversized-instruction-document-973).
+
+Runtime contract v41, extended in place, also reads how a coding agent is
+launched inside a workflow job (#823). Host-grants `0.6` shipped in 1.1.0, so
+host-grants inventory, baseline and drift schemas move to `0.7`, and a workflow
+grant adds `agent_launches[]`, `unread_agent_runs[]` and `checkout_refs[]`,
+each omitted when empty. An agent launch is a step whose `uses:` is a
+documented agent action (`anthropics/claude-code-action`,
+`anthropics/claude-code-base-action`, `openai/codex-action`) with the
+permission inputs it declares, or a `run:` that is one line of plain words
+running `claude -p` / `codex exec` under `bash` or `sh`, with its documented
+permission flags; its `job`, `step`, `agent`, `form` (`read`, or `unresolved`
+with `inputs_not_a_mapping`), `settings[]` (`name`, `value`,
+`unresolved_reason`, `holds_expression`), `widening_rules[]` (`rule`,
+`setting`) and `job_secrets[]`. Shell is not parsed: any other `run:` that
+mentions `claude` or `codex` is an `unread_agent_runs[]` entry (`job`, `step`,
+`agent`), a named non-blocking limit that publishes none of its text, is never
+compared and gives no row; and `claude_args` / `codex-args` are read only as a
+plain list of words, any other value being `unread_arguments`, compared by a
+digest and read for no rule. A checkout ref is each `actions/checkout` step's
+`with.ref`, `null` for the default. Values are compared as text and never
+executed. A JSON object in a `settings` or `mcp_config` input publishes its
+shape and none of its free text — key names, with each string a
+`<withheld:…>` digest except those a host reader publishes (a permission rule,
+a documented setting's value, an MCP server's command name and URL host) — so
+an MCP server's arguments and a hook's command are compared but never
+published; a URL publishes its scheme and host. Only a documented rule a job's
+launches gain — bypassed permission checks (a flag, or JSON settings whose
+`defaultMode` is `bypassPermissions`), a bypassed or `danger-full-access`
+sandbox (`permission-profile: :danger-full-access` included, and in a
+`codex exec` step without `--sandbox` a `--config` override of `sandbox_mode`
+or `default_permissions` that selects it), `safety-strategy: unsafe`, or a
+user gate opened to `*` — raises `workflow_agent_widened_<added|changed>` and
+makes the row `widened`. A rule is read only from text this audit reads
+exactly, and one a launch already met in a job it left, one where an unread
+step of the job became a read launch, or one where the job's launch before
+held an expression or an unread argument input the rule is read from, is named
+and not claimed. Every other edit is `changed`, and a workflow row that runs an
+agent ends its `why` with the job facts beside each agent step. An action whose
+`with:` is not a mapping is `unresolved` and a named non-blocking limit; a
+setting holding credential-shaped text, prose included, is published redacted,
+compared as published and a named non-blocking limit, and a checkout ref
+holding it is a blocking limit, as a redacted step reference is. A `0.4`–`0.6`
+baseline holding a workflow grant is incomparable
+(`baseline_workflow_agent_launches_unavailable`); one without a workflow stays
+comparable. It moves neither #821's verifier `0.21` nor its capability diff
+`0.4`, and `minimum_control_contract_version` stays `21`. See
+[the migration note](../STABILITY.md#workflow-agent-launches-contract-v41-823).
+
+The same runtime contract v41, new in 1.2.0, also names what changed in a hook and
+in an MCP server's launch arguments (#819). Host-grants inventory, baseline and
+drift schemas move to `0.7`: a hook grant adds `handlers[]` (each handler's
+group `matcher`, its `command` as `{executable, sha256}` and its `timeout`)
+and `omitted_handlers`, and an MCP server grant adds `package` and
+`args_sha256`. No command or argument text is published: a command is its
+executable's name, when that is a plain token, and a digest; the arguments are
+one package specification of a strict shape and a digest of the rest. A hook
+row names the changed field, `PostToolUse: matcher Edit → Edit|Write|Bash` or
+`command changed` with both digests, and a version pin moving to `@latest` is
+a `package` difference, in the text and in `review.changes[].change`. The
+members display what `config_sha256` already binds, so grant equality and the
+inventory digests leave them out: they move no row value, row count, verifier
+or capability-diff schema, a `0.6` baseline without workflow grants stays comparable with no new row
+or reason, and `minimum_control_contract_version` stays `21`. A saved baseline
+holds none of the members. See
+[the migration note](../STABILITY.md#hook-mcp-detail-fields-819).
+
+Previous runtime contract v40 reads the action reference each workflow step declares
+(#771). Host-grants inventory, baseline and drift schemas move to `0.6`, and a
+workflow grant adds `step_actions[]`: the job, the step (`id`, else `name`,
+else `steps[N]`), the declared `uses`, and its `form` — `remote`, `docker`, or
+`unresolved` with a reason. Moving a step from a pinned SHA to `@main` is a
+`changed` row naming the job and step, with `expands: false`: a reference
+names different code, not new token scopes. Local `./` actions stay unread
+(#701). A `0.4` or `0.5` baseline holding a workflow grant is incomparable
+(`baseline_workflow_step_actions_unavailable`); one without a workflow stays
+comparable, and `minimum_control_contract_version` stays `21`. See
+[the migration note](../STABILITY.md#workflow-step-action-references-contract-v40-771).
+The same contract and `0.6` schemas, new in 1.1.0, also read the named secrets a
+job passes to a reusable workflow (#693): a reusable call adds
+`secret_mappings[]` (the destination, the source name from
+`${{ secrets.NAME }}`, `form` and `unresolved_reason`) and `uses_redacted`.
+Pointing a destination at a different source is a `changed` row with
+`expands: false`; a reusable target or secret name that redacts is a blocking
+limit rather than a comparison, while a literal or another expression is a
+named non-blocking limit that leaves coverage complete. See
+[the migration note](../STABILITY.md#reusable-workflow-secret-mappings-contract-v40-693).
+The same contract and `0.6` schemas, new in 1.1.0, publish every workflow label
+redacted (#802): a job id, a step's `id` or `name`, a trigger and a
+permission scope name shaped like a credential (`ghp_…`, `AKIA…`) or holding
+userinfo after `scheme://` are redacted in every field, row and `check`
+evidence that names them, and `config_sha256` is computed over the redacted
+labels. Ordinary names are unchanged. One redacted label still compares. Two
+distinct job ids or triggers in a workflow, or scope names in one
+`permissions` mapping, that publish alike are a blocking limit: while they
+exist, `check`, `audit --host --save-baseline` and drift refuse on every run.
+See [the migration note](../STABILITY.md#workflow-label-redaction-contract-v40-802).
+New in 1.1.0, still contract v40: every host comparison says what it
+established (#812). Verifier `0.20` adds `host_comparison.coverage`, and
+`shipgate diff --json` (capability diff `0.3`) the same block: a capped list of sources with
+their `side` (`base`, `head`, `both`), a `status` (`compared` with its `rows`,
+zero on both sides only for a file proven byte-identical,
+`changed_without_grant_change`, `changed_without_rows`, `unchanged_not_proven`,
+or on an incomparable result `blocking_limit` with its `limit` kind) and
+`omitted_items`. It is evidence beside the rows; it moves no
+row, reason, control state, permission or next action, and `null` means not
+recorded. A `0.19` verifier reads with `coverage: null`. See
+[the migration note](../STABILITY.md#host-comparison-coverage-812).
+New in 1.1.0, still contract v40: the same two versions publish what the text
+says about those rows, so a machine consumer and a reader cannot disagree
+(#795). A row adds `disposition` (`allow`, `ask`, `deny`, or `null` for
+another grant kind) on every route that publishes rows, and
+`host_comparison.review`, the same block `diff --json` carries, adds the
+changes the text prints — each with the `row_indexes` it stands for, a
+`direction` that may be `widened`, `narrowed` or `moved`, its cells, `why` and
+one `expands` — plus `summary` (`{rows, changes, widenings}`), `question` and
+`reproduce_command`. A joined change whose two sides read alike is refused, so
+`check` and a provided diff publish rows alone. Every row value and the row
+count are unchanged, and `null` means not recorded. See
+[the migration note](../STABILITY.md#host-diff-review-json-795).
+
+Previous runtime contract v39 reads through an in-tree link at a boundary path (#700).
+A link such as `CLAUDE.md -> AGENTS.md` or `.claude/skills -> ../.agents/skills`
+that resolves inside the repository is read at its target and published under
+its own path. Host-grants inventory, baseline and drift schemas move to `0.5`,
+which adds `artifacts[].resolved_through`, the in-tree paths the read
+followed, present only on such an artifact. An external, escaping or dangling
+target, a link inside a linked directory, a chain past eight hops, and a
+directory link that could only hide a `**/` match still refuse. A `0.4`
+baseline stays comparable, and `minimum_control_contract_version` stays `21`.
+See
+[the migration note](../STABILITY.md#link-read-through-at-boundary-paths-contract-v39-700).
+
+Previous runtime contract v38 lets the control envelope name what host capability
+changed (#662). `shipgate.agent_control/v1` gains an optional
+`capability_rows` block on `check --format agent-control-json`,
+`verify --format control` and `agent control`. It holds up to five rows,
+the rows the engine called an expansion first, plus `omitted_rows`,
+`comparison_status`, `incomparable_reasons` and `unchanged_limit_count`.
+It is evidence beside the control and moves no state, permission or route.
+It is omitted when no host comparison ran, so those envelopes are
+byte-identical. The envelope object is closed, so a reader that validates
+against the v37 schema rejects an envelope carrying the block. That break
+is deliberate. `minimum_control_contract_version` stays `21`. See
+[the migration note](../STABILITY.md#host-capability-rows-in-the-control-envelope-contract-v38-662).
+
+Previous runtime contract v37 names the limits a host comparison compared past (#721).
+Verifier `0.19` adds `host_comparison.unchanged_limits`, and `shipgate diff`
+(capability diff `0.2`) carries the same list. A surface that is partial
+(`unsupported`, `parse_failed`) or experimental on both sides, and
+byte-identical between them, no longer refuses the whole comparison: the rest
+is compared and each limit is named. A limit that changed, appears on one side
+only, or is `unreadable` still refuses. `check`'s boundary result cannot name
+limits yet and keeps refusing. See
+[the migration note](../STABILITY.md#unchanged-comparison-limits-contract-v37-721).
+
+Previous runtime contract v36 freezes the report contract at `1.0` (#569). No field is
+added, renamed, retyped or removed: the emitted shape is exactly the one v35
+advertised as report `0.43`, so a consumer written against `0.43` reads a
+`1.0` report unchanged. What moved is the promise. `1.x` is additive-only; a
+change that cannot be expressed additively needs `2.0`; a deprecation cycle is
+counted in shipped releases, never in time on unreleased `main`; and every
+published schema URL keeps its bytes forever. The production qualification
+policy's `required_report_schema_version` moves with the engine to `1.0`, and
+issuance of the `pre_1_0` qualification tier is retired — existing `pre_1_0`
+artifacts stay readable, nameable and scoreable, they are simply not produced
+any more.
+
+Pre-freeze `0.x` reports are no longer accepted as *input* to this engine.
+Every external report boundary — `--diff-from`, `explain-finding`, `findings`,
+`scenario suggest`, and `packet` from a report — refuses one by name and names
+the regeneration route, instead of validating it against a model whose
+defaults would stand in for blocks it never recorded. Every superseded schema
+stays published for reading archived artifacts. Operational control shapes are
+byte-identical, so `minimum_control_contract_version` stays at `21`. See
+[`docs/report-1-0-contract.md`](report-1-0-contract.md).
+
+Previous runtime contract v35 adds manifest-free host comparison evidence in verifier `0.18` and named boundary rows in `shipgate.agent_boundary_result/v3`. Comparison health and captured input identity remain separate from release and control authority. See [the migration note](../STABILITY.md#manifest-free-host-review-contract-v35-684).
+
+Previous runtime contract v34 advertises host inventory, baseline and drift schema `0.4`: workflow permission projections and reusable secret recipients. Operational control is unchanged; older baselines cannot prove that unrecorded recipients were absent. See [the migration note](../STABILITY.md#workflow-capability-comparison-contract-v34-685).
+
+Runtime contract v33 adds `host_boundary_candidates[]` and
+`host_discovery_incomplete_paths[]` to discovery. They describe recognized
+configuration paths and traversal the bounded census could not see through,
+never parsed grants. An incomplete census withholds the product-wide negative
+and publishes no candidates; it does not fail the classification. A host-only
+workspace follows `audit --host` without creating a manifest. `init` and
+`bootstrap` hand off without setup writes; incomplete input cannot publish a
+product-wide negative. Existing operational control and persisted evidence
+schemas are unchanged; all setup permissions remain false.
+
+Runtime contract v32 separates instruction prose from supported parsed permission
+structure across verification, preflight, host drift and generated edit hooks.
+It publishes verifier v0.17, handoff v9, preflight v0.5 and host evidence v0.3;
+preflight v0.6 (#610) keeps that structure and changes only its control.
+Raw identity still changes on prose edits; legacy evidence is never upgraded to
+a new permission claim. `conditional_file_edits` is a standing routing rule with
+`grants_authority: false`, separate from unconditional `forbidden_file_edits`.
+See [the comparison and migration contract](engineering/instruction-structure-boundary.md).
+
+
+Runtime contract v31 adds a read-only
+[external review decision evaluator](human-review-decision.md) for the bounded
+[`human-review-request.json`](human-review-request.md) class. It verifies current
+scope, host key trust, reviewer eligibility and expiry and returns separate
+evaluation evidence. It writes no artifact and grants no merge or completion
+authority. The shared control union and all existing persisted schema
+identifiers are unchanged; the minimum control contract stays at 21.
+GitHub acquisition and persistence remain an integration obligation.
+
 The single, current statement of what AI coding agents and CI integrations should read from Agents Shipgate output. When the contract changes, update [STABILITY.md](../STABILITY.md) first, then this file. Other agent-facing surfaces (`AGENTS.md`, `llms.txt`, `.well-known/agents-shipgate.json`, the slash command, the skill, the FAQ) link here instead of restating field lists.
+
+For contributors changing the contract: regenerate schemas with
+`python scripts/generate_schemas.py`, then run
+`python scripts/regenerate_goldens.py` and its `--check` mode using the
+[committed sample recipe](../CONTRIBUTING.md#sample-goldens). Review actual
+artifact changes and preserve behavioral assertions; sample regeneration does
+not freeze a release contract or qualify a candidate wheel.
 
 ## Current versions
 
@@ -9,6 +297,107 @@ Verify the installed CLI contract locally before relying on hard-coded docs:
 ```bash
 agents-shipgate contract --json
 ```
+
+### 1.0.0 declaration-review migration
+
+Runtime contract v29 coordinates the public artifacts that carry changed
+action declarations: report v0.43 (now frozen at `1.0`), packet v0.18, and verifier v0.16.
+`minimum_control_contract_version` remains 21 because the operational control
+envelope is unchanged.
+
+Read
+`release_decision.evidence_coverage.semantic_coverage.declaration_review` for
+the base-vs-head reviewer projection. It includes added, removed, and
+semantically modified declaration rows. A requested comparison that could not
+run is distinct from an available comparison with no changes; missing or
+conflicting identity and semantic evidence gaps cannot earn an
+`evidence_consistent` status. Report Markdown, packets, PR comments,
+annotations, and the GitHub summary consume the same bounded projection.
+
+See the
+[declaration-review migration note](../STABILITY.md#migration-note-unreleased-declaration-review).
+
+### Earlier projection-only migration
+
+That change moved no schema or runtime-contract version; the v0.42 report
+schema gained the typed `unattested_surface` gap and optional
+`EvidenceGap.policy_id`.
+Completed blocked verifier runs now append the deterministically selected worst
+blocker to the plain headline as well as the adoption/self-approval branches;
+that same headline feeds `control.reason` and `control.next_action.why`. Runs
+with no blocker do not gain the clause. A genuinely incomplete enumeration
+remains `incomplete_surface`; a lower-confidence extraction without an
+enumeration defect is the distinct `unattested_surface` gap, and only an explicit
+`surface: enumerated` adapter fact earns positive enumeration wording. Its
+remedy asks for reviewed attestation. Policy gaps retain their exact identity
+in structured `policy_id`, while
+policy-evidence gap prose no longer prefixes `why` with an engine-owned
+`builtin-*` policy id. Public and organization-defined check ids remain stable
+labels. Branch on the typed gap kind and `policy_id`, never on the explanatory
+sentences. See the
+[verifier-explanation migration note](../STABILITY.md#migration-note-unreleased-verifier-explanations).
+
+Standalone trigger evaluation is unchanged. Inside a verifier artifact,
+however, its generic route has already been consumed. Embedded
+`trigger.next_action` therefore preserves the evaluated kind while clearing
+its command and adding `authoritative: false` and
+`authoritative_path: "control.next_action"`; the self-referential preview
+command is not repeated. Commands on embedded `matched_rules[]` are cleared as
+well. In verifier, verify-run, and preview output, follow
+only `control.next_action` and `control.allowed_next_commands`. See the
+[embedded-trigger migration note](../STABILITY.md#migration-note-unreleased-embedded-trigger-routing).
+
+### Emitted next actions terminate
+
+Following `control.next_action.command` — or the human `Next:` line, which is
+the same routing rendered for a person — reaches a terminal. Three properties
+hold, and `tests/test_next_action_chains_terminate.py` walks every entry
+command on a host-only and a manifest repository to keep them holding:
+
+- **No cycle.** No chain returns to a question it already asked. Output
+  format is not part of a step's identity: `audit --host` and
+  `audit --host --json` ask the same thing, and treating them as different
+  steps is what once hid a three-command loop
+  (`verify --preview` → `init --write` → `audit --host` → `verify --preview`).
+- **No workspace loss.** Every emitted command names the same `--workspace`
+  it was produced for. A step that drops it does not continue the walk; it
+  starts a different one against the caller's current directory, which is
+  the silent retargeting the [invocation policy](diagnostics.md#invocation-policy)
+  exists to prevent.
+- **Every step is runnable.** An emitted command names a Shipgate command
+  that accepts it. Prose that names no command is a terminal: it hands the
+  reader a decision, not another lap.
+
+A run that evaluated no gate says so. `verify --preview` on a repository with
+nothing to gate reports `execution: "not_run"` and
+`applicability: "not_evaluated"`, and the human line reads
+`Agents Shipgate verify: not evaluated` rather than `failed`.
+
+Runtime contract v28 publishes the capability delta as a **standalone
+attestation**. `verify` writes
+`agents-shipgate-reports/capability-delta-attestation.json`: an
+[in-toto](https://github.com/in-toto/attestation) Statement whose
+`predicateType` is
+`https://threemoonslab.com/agents-shipgate/capability-delta/v1` and whose
+predicate carries the frozen `shipgate.capability_payload/v1` **delta view**
+unchanged. The contract now names the predicate type, both schema versions,
+both schema paths, and the artifact, so a consumer can discover the format
+without reading our source. Full specification:
+[`docs/capability-delta-attestation.md`](capability-delta-attestation.md).
+
+Read it when you want *what the agent can do after this change* as a portable
+fact — a runtime gateway, a policy engine, a dashboard, another CI system.
+Nothing about the gate moves: the attestation carries no verdict, no severity
+and no release impact, and `release_decision.decision` remains the only release
+decision signal.
+
+Two things a consumer must branch on. The attestation is written **only for a
+committed-tree subject** — a worktree run publishes a note on
+`verifier.base_notes[]` and no file, because the bytes it evaluated are not in
+any tree object. And `predicate.verification.status` is `bound` or `unbound`:
+only `bound` chains to `verification-receipt.json` through `input_set_id`, and
+a consumer that needs that chain checks the status rather than probing for
+absent fields. Everything else is unchanged from v27.
 
 Runtime contract v27 finishes the v24 rollout on the stream v24 left out.
 **Every** agent-mode error line from `detect`, `init`, and `doctor` now carries
@@ -269,8 +658,9 @@ remain supported.
 
 Runtime contract v23 spells every emitted command for the invocation that
 produced it. A run started with `python -m agents_shipgate` now proposes
-`<sys.executable> -m agents_shipgate ...` instead of a console script its
-environment may not have; a console-script run is unchanged. Actions with
+`<sys.executable> -P -m agents_shipgate ...` instead of a console script its
+environment may not have (`-P` keeps the repository it is run from off
+`sys.path`); a console-script run is unchanged. Actions with
 `kind="command"` in `next_actions[]` also carry `executable[]` and `args[]` —
 **the authoritative runnable form on every platform**; run them as
 `[*executable, *args]` with no shell. The pair is computed from `command` and
@@ -416,30 +806,33 @@ Downstream repos generated with
 `init --agent-instructions=default` get the minimal local copy at
 `.shipgate/agent-contract.json`.
 
-- Latest release: `v0.15.0`
-- In-tree runtime: `0.16.0b7` — see [pyproject.toml](../pyproject.toml)
-- Runtime contract: `27` (minimum control contract: `21`)
-- Current report schema: `0.42` — [`docs/report-schema.v0.42.json`](report-schema.v0.42.json)
-- Current packet schema: `0.17` — [`docs/packet-schema.v0.17.json`](packet-schema.v0.17.json)
+- Latest release: `v1.2.0`
+- In-tree runtime: `1.2.0` — see [pyproject.toml](../pyproject.toml)
+- Runtime contract: `42` (minimum control contract: `21`)
+- Current report schema: `1.0`, frozen, superseding `0.43` — [`docs/report-schema.v1.0.json`](report-schema.v1.0.json); the `1.x` rules are in [`docs/report-1-0-contract.md`](report-1-0-contract.md)
+- Current packet schema: `0.18` — [`docs/packet-schema.v0.18.json`](packet-schema.v0.18.json)
 - Current shared agent result schema: `agent_result_v3` — [`docs/agent-result-schema.v3.json`](agent-result-schema.v3.json)
-- Current verifier schema: `0.15` — [`docs/verifier-schema.v0.15.json`](verifier-schema.v0.15.json) (v0.14 and earlier stay frozen; `0.15` adds `declaration_continuation`, the one fact that lets a blocked decision authorize publication)
+- Current verifier schema: `0.21` — [`docs/verifier-schema.v0.21.json`](verifier-schema.v0.21.json) (`0.20` and earlier stay frozen; `0.20` says what each host comparison established, source by source, and `0.21` also names the changed inputs it does not read)
 - Current verify-run schema: `shipgate.verify_run/v5` — [`docs/verify-run-schema.v5.json`](verify-run-schema.v5.json)
 - Current verification identity schemas: [`plan v1`](verification-plan-schema.v1.json), [`unit result v1`](verification-unit-result-schema.v1.json), [`artifact manifest v1`](verification-artifact-manifest-schema.v1.json), and [`terminal receipt v1`](verification-receipt-schema.v1.json)
 - Current control pointer schema: `shipgate.current_control/v1` — [`docs/current-control-schema.v1.json`](current-control-schema.v1.json)
 - Current agent control envelope schema: `shipgate.agent_control/v1` — [`docs/agent-control-schema.v1.json`](agent-control-schema.v1.json)
 - Current human-authorization schemas: request, signed grant, verifier evaluation, and external trust policy v1 — [`docs/human-authorization-schema.v1.json`](human-authorization-schema.v1.json)
-- Current agent handoff schema: `shipgate.agent_handoff/v8` — [`docs/agent-handoff-schema.v8.json`](agent-handoff-schema.v8.json)
-- Current agent boundary result schema: `shipgate.agent_boundary_result/v2` — [`docs/agent-boundary-result-schema.v2.json`](agent-boundary-result-schema.v2.json)
+- Current agent handoff schema: `shipgate.agent_handoff/v9` — [`docs/agent-handoff-schema.v9.json`](agent-handoff-schema.v9.json)
+- Current agent boundary result schema: `shipgate.agent_boundary_result/v3` — [`docs/agent-boundary-result-schema.v3.json`](agent-boundary-result-schema.v3.json)
 - Frozen deprecated Codex projection: `shipgate.codex_boundary_result/v2` — [`docs/codex-boundary-result-schema.v2.json`](codex-boundary-result-schema.v2.json)
-- Current preflight schema: `0.4` — [`docs/preflight-schema.v0.4.json`](preflight-schema.v0.4.json)
+- Current preflight schema: `0.6` — [`docs/preflight-schema.v0.6.json`](preflight-schema.v0.6.json) (`0.5` and earlier stay frozen; `0.6` adds `planning_only` and denies every permission on every route)
 - Current downstream local agent contract schema: `10`
 - Current capability standard: `0.5` — [`docs/capability-standard.md`](capability-standard.md)
 - Current capability lock schema: `0.8` — [`docs/capability-lock-schema.v0.8.json`](capability-lock-schema.v0.8.json)
 - Current capability lock diff schema: `0.9` — [`docs/capability-lock-diff-schema.v0.9.json`](capability-lock-diff-schema.v0.9.json)
+- Current capability payload schema: `shipgate.capability_payload/v1` — [`docs/capability-payload-schema.v1.json`](capability-payload-schema.v1.json), specified in [`docs/capability-payload.md`](capability-payload.md)
+- Current capability delta attestation: `shipgate.capability_delta_attestation/v1`, predicate type `https://threemoonslab.com/agents-shipgate/capability-delta/v1` — [`docs/capability-delta-attestation-schema.v1.json`](capability-delta-attestation-schema.v1.json), specified in [`docs/capability-delta-attestation.md`](capability-delta-attestation.md)
 - Current attestation schema: `0.5` — [`docs/attestation-schema.v0.5.json`](attestation-schema.v0.5.json)
 - Current registry schema: `0.4` — [`docs/registry-schema.v0.4.json`](registry-schema.v0.4.json)
 - Current org evidence bundle schema: `shipgate.org_evidence_bundle/v2` — [`docs/org-evidence-bundle-schema.v2.json`](org-evidence-bundle-schema.v2.json)
-- Current host-grants inventory, baseline, and drift schemas: `0.2` — [`inventory`](host-grants-inventory-schema.v0.2.json), [`baseline`](host-grants-baseline-schema.v0.2.json), [`drift`](host-grants-drift-schema.v0.2.json)
+- Current host-grants inventory, baseline, and drift schemas: `0.9` — [`inventory`](host-grants-inventory-schema.v0.9.json), [`baseline`](host-grants-baseline-schema.v0.9.json), [`drift`](host-grants-drift-schema.v0.9.json). Version 0.9 adds explicit local OpenShell composition, provider profile provenance and effective-snapshot metadata, and, on a reusable workflow call whose permission ceiling holds a write scope and whose target is in the same repository, `callee_permissions` and `callee_write_scopes` (#921); historical host schemas remain frozen. See [OpenShell support](openshell-support.md) and [workflow token scopes](host-boundary-support.md#workflow-token-scopes).
+- Optional OpenShell native trust/evidence schemas: `1` — [`trust`](openshell-native-trust-schema.v1.json), [`evidence`](openshell-native-evidence-schema.v1.json). Only explicit external trust inputs enable local execution; the default remains static. Native containment never grants merge authority. See [OpenShell support](openshell-support.md#optional-native-containment).
 - Current trigger catalog schema: `0.4` — [`docs/triggers.json`](triggers.json)
 - Current governance benchmark catalog schema: `0.2` — [`docs/governance-benchmark-catalog-schema.v0.2.json`](governance-benchmark-catalog-schema.v0.2.json)
 - Current governance benchmark result schema: `0.2` — [`docs/governance-benchmark-result-schema.v0.2.json`](governance-benchmark-result-schema.v0.2.json)
@@ -457,6 +850,36 @@ below it describes *a* run; only the pointer says *which* run. A non-zero exit
 from the reader means no control identity is current here and the caller holds
 no authority — not that the previous answer still stands.
 
+Without `--reports-dir`, the reader looks where a default `verify --workspace`
+publishes: `agents-shipgate-reports` under `--workspace`, so `agent control
+--workspace <repo>` finds that run from any directory. An explicit
+`--reports-dir` is read as given — a relative path resolves against the current
+directory — and no other directory is searched in its place. An explicit
+`verify --out` follows the same rule, as do `scan --out` and `audit --host
+--out`, so `verify --out <dir>` and `agent control --reports-dir <dir>` typed in
+one shell name one directory. Where a relative `--out` names a different
+directory than the `1.0.0` rule did (the Git root for `verify`, the manifest's
+directory for `scan`), a `note:` line on stderr names both. A refusal names
+the absolute directory it searched, and its recovery command writes back to it,
+naming it as an absolute `--out` even where the producing run's recorded command
+carried a relative one; a `verify` command a run emits names `--out` absolutely
+whenever it carries one.
+
+The reports directory is left out of the change set the reader checks, just as
+`verify` leaves its output directory out of the change set it decides on, so
+it must hold nothing else Git would report. A directory inside the repository
+that holds a committed path (at `HEAD`, or at the merge base a worktree pointer
+records and since removed), a staged or untracked unignored path that is not a
+Shipgate artifact, or any trust-root path whatever its name, or that lies
+inside a trust root Git does not ignore, is refused as `workspace_unverifiable`
+whatever the pointer's state, and `verify` refuses to write into one. The
+recovery for that refusal is the producing run's own verification command with
+only `--out` removed, publishing into the default directory with the same
+`--config`, base and policy options, or a review step when the default
+directory is the one refused (recognized by physical identity). A gitignored
+directory, one outside the repository, and one holding only uncommitted
+Shipgate artifacts outside any trust root are read as before.
+
 **The promoted read for a coding-agent control loop is one command.**
 `agents-shipgate agent control --workspace .` runs the currency protocol and
 returns the `shipgate.agent_control/v1` envelope, which already carries the
@@ -467,12 +890,69 @@ for anything reading the artifacts directly. A run can skip the second command
 entirely with `agents-shipgate verify --format control`, which emits the same
 envelope for the run it just performed.
 
+The compact reader validates **every entry in `current-control.json.artifacts`**.
+It does not follow the terminal receipt into optional artifacts absent from that
+map. For example, a successful read does not validate `human-review-request.json`
+merely because the bound receipt references it. Changed, missing, oversized, or
+symlinked receipt-only files leave the compact read unchanged; those same
+conditions on pointer-bound files make it refuse.
+
+For API consumers, `read_current_control(..., capture=...)` returns selected
+bytes from the same pass that validated every pointer entry. `capture` neither
+reduces validation nor adds optional files: a requested unbound key is absent
+from the returned `artifacts`. Consume these captured bytes instead of reopening
+their paths. A consumer that needs a receipt-only artifact must also call
+`load_validated_receipt_artifacts`, compare its returned receipt with the
+pointer-captured `verification_receipt`, and consume the returned closure bytes.
+The full loader rejects invalid optional files. It proves a coherent artifact
+snapshot, not current workspace state or permission to act; retain the currency
+checks below and revalidate before consequential actions. See the
+[consumer boundary and resource bounds](verification-reproducibility.md#current-control-and-receipt-closure)
+for the exact distinction. Standalone renderers such as `agent handoff` do not
+implicitly perform this current-control protocol.
+
 Byte consistency is not generation consistency. A pointer whose artifacts all
 still hash correctly can describe a workspace that one commit has moved past, so
 the reader compares the bound `workspace_identity` against the live repository —
 repository, HEAD commit, and HEAD tree — and refuses on any drift. Completion
 authority is never returned without that comparison: a reader that cannot
-resolve the workspace reports it as unverified rather than passing.
+resolve the workspace reports it as unverified rather than passing. Nor is any
+other state of a pointer that binds a Git identity (a HEAD, a base, a merge
+base, an overlay or a snapshot kind): when `agent control`, `verify --format
+control` or the human-review decision reader cannot observe the workspace at
+all — `.git` is missing or unreadable, or Git refuses the checkout — that
+pointer is refused with exit `4`, `workspace_unverifiable`
+(`workspace_unverified` for a `complete` pointer), whatever its state. A
+pointer that binds no Git identity, such as `verify --preview` run outside a
+Git checkout, has nothing to compare and still reads.
+
+Every refusal caused by a workspace that could not be read leads with why, in
+one bounded, redacted sentence that names the Git configuration key or path
+and never a configuration value or file content, and `agent control`'s
+`next_actions[0]` follows that cause:
+
+- **Git configuration the worktree readers refuse**: an executable
+  `filter.<driver>.clean`/`smudge`/`process` in the repository's own Git
+  config, a `filter=` attribute on a tracked path (any repository with Git
+  LFS-tracked files has one), repository-local `diff.*` configuration (git-crypt sets
+  `diff.git-crypt.textconv`), or a non-empty `.git/info/attributes`. The
+  action is `kind: "review"` for a human. Re-running `verify`, with or without
+  `--head`, does not change the answer: the refresh reads the working tree
+  under that configuration for every pointer, a committed-tree one included,
+  so **no `verify` or `agent control` answer in such a repository reads as
+  current while the configuration is in place**. Shipgate never advises
+  removing it. `agents-shipgate diff` still reports the host-grant changes,
+  read-only and without authority.
+- **A reports directory that holds repository content**: the recovery above,
+  away from that directory.
+- **An uncommitted change beyond a static read bound, or a Git timeout**: the
+  producing `verify` command, after committing or shrinking the change.
+- **Anything else**, including a workspace that is not a Git checkout: the
+  producing `verify` command, as before.
+
+Global and system Git configuration are not read, so an LFS filter configured
+only globally (`git lfs install`) does not trigger the first cause; a tracked
+file carrying the `filter=lfs` attribute does.
 
 When the decision named a base, that base is compared too. A decision about
 `base...HEAD` is a decision about that range, and advancing the base — a merge,
@@ -497,6 +977,25 @@ Uncommitted work is checked according to what the decision actually covered:
   covered, and a stale `human_review_required` must not keep enforcing a
   pre-change stop. Re-running the same archived `--head` verification cannot
   clear that, so the refusal routes to a worktree verification instead.
+- A **preview** (`operation: "preview"`) decided nothing about the inputs a
+  plan names, so its pointer binds no `verification_plan` — also in a
+  repository with a manifest, where the preview still records the plan a
+  `verify` would run and `verify-run.json` embeds it. Its path set is
+  therefore not recorded: the overlay of every path that differs from HEAD is
+  recomputed live and compared with the one it was read from, so any tracked
+  edit, new untracked file or removal refuses it as `workspace_changed`, and
+  restoring the tree it read makes it current again. A configured and a
+  manifest-free preview are read the same way, whether their reports are in
+  the default directory, another directory inside the repository or beside
+  it (#807). Inside a repository such a pointer always declares the worktree
+  snapshot, even when its overlay could not be read, so under Git
+  configuration the worktree readers refuse it is refused with the cause like
+  every other pointer; one published over an overlay it could not read is
+  current, once the tree can be read, only over a tree identical to HEAD.
+  A pointer that does bind a plan is read against that plan's
+  recorded inputs, and one whose plan lacks its input-directory census is
+  refused as `workspace_unverifiable`, as before; see
+  [the census](verification-reproducibility.md).
 
 An overlay row carries content *and* the two metadata axes Git itself tracks:
 entry kind and the executable bit. Content alone is not the capability —
@@ -513,7 +1012,7 @@ entry points into the same one decision engine.
   repair, or stop*. Prefer
   validate `agents-shipgate-reports/verification-receipt.json`, then read
   `agents-shipgate-reports/agent-handoff.json` for the compact
-  `shipgate.agent_handoff/v8` view: lead with `control.state`, then read
+  `shipgate.agent_handoff/v9` view: lead with `control.state`, then read
   `control.next_action`, `gate.merge_verdict`, and `reproducibility.run_id` for the
   content-addressed verify identity. `verifier.json` remains the authoritative
   controller substrate and `verify-run.json` remains the detailed run
@@ -551,7 +1050,9 @@ accepts any `--out` name under its artifacts root, so an older canonical receipt
 must not be mistaken for the one a run just closed. A `scan` or `preview`
 pointer is structurally incapable of authorizing completion or merge, and each
 binds only the artifacts it actually wrote: a `scan --format markdown` after a
-verify does not claim that verifier's `report.json`. While a run is in flight the pointer reads
+verify does not claim that verifier's `report.json`. A `preview` binds its
+verifier route and never the `verification-plan.json` a manifest lets it
+record, because it read none of that plan's inputs. While a run is in flight the pointer reads
 `lifecycle_state: "in_progress"` with `control.state: "unavailable"`,
 `must_stop: true`, so an interrupted or crashed run leaves a directory that
 denies cached control rather than one that still authorizes it. Consumers built
@@ -571,6 +1072,26 @@ newer scan. `verify` calls the same scan pipeline internally and writes a fresh,
 mutually consistent verifier artifact set afterward. Supporting commands that
 only need an in-memory report, including `baseline save`, scan into an isolated
 temporary directory so they preserve the current report and verifier evidence.
+
+## Reader strings are in the reader's language
+
+`headline`, `summary`, `control.reason` and every `why` are read by a
+person. They carry no field paths and no internal nouns —
+`tests/test_reader_vocabulary.py` runs every shipped fixture and fails on
+`control.state`, `input_set_id`, `binding graph`, `Route H`,
+`exclusion ledger`, or an enum identifier written into a sentence.
+
+The enum *values* are untouched: `release_decision.decision` is still
+`insufficient_evidence`, because a machine consumer gates on it. What the
+guard forbids is that identifier appearing in prose written for a person.
+"The agent's tool binding graph is incomplete" became "some tools cannot be
+traced to an agent that can call them" — the thing to fix, rather than the
+model it is fixed in.
+
+Root `--help` lists the six commands that carry a reader from a fresh
+checkout to an answer: `diff`, `check`, `verify`, `audit`, `init`,
+`doctor`. `--help-all` lists every command. Prominence is a reading aid,
+never a claim about what exists.
 
 ## Primary vs supporting surfaces
 
@@ -593,7 +1114,7 @@ they do not replace the gate above and must not introduce a second verdict.
 proactive routing surface for coding agents before edits. It accepts a single
 `PreflightPlanV1` object with `changed_files[]`, optional `diff_text`,
 `capability_requests[]`, `host_permission_requests[]`, and
-`context.{agent,task}`. The emitted `PreflightResultV3` reports protected
+`context.{agent,task}`. The emitted `PreflightResultV6` reports protected
 surfaces, forbidden shortcut actions, required evidence for proposed high-risk
 capabilities, host-grant drift when a host baseline is present, deterministic
 `signals[]`, `control`, `requires_verify`, `verification_command`,
@@ -603,7 +1124,10 @@ only appends valid built-in `tool_sources` rows may mark that manifest touch
 authorizes proposal authorship only: existing rows and all other manifest
 values must be unchanged, authority-bearing fields and custom adapters are
 excluded, and the resulting trust-root diff still requires human review. It is
-not a second gate; it must never be read as passed or mergeable. The release
+not a second gate; it must never be read as passed or mergeable. Its `control.state`
+is `planning_only`, `agent_action_required` or `human_review_required`,
+never `complete`, and every `control.permissions` value is `false` on all
+three (#610). The release
 gate remains `release_decision.decision`.
 
 ## Read these first for release gating
@@ -620,7 +1144,70 @@ In `agents-shipgate-reports/report.json`:
 - `release_decision.evidence_coverage.semantic_coverage.declaration_questions` (v0.37+) — the same action surface counted as a questionnaire: `{total, answered, open, open_by_dimension, open_questions[]}`. A *question* is one `(action, dimension)` a reviewed `action_surface.actions` row has to answer, and only `effect` and `authority` are counted — an action whose effect the scan established by itself (an OpenAPI method, an MCP annotation) was never asked and is not in `total`, and an inventory or `agent_bindings` declaration has no per-action counterfactual to score against. `answered` is exact rather than optimistic: it counts dimensions that gap when the same action is re-resolved *without* its declaration. `total == answered + open`, and `open_by_dimension` sums to `open`. `open_questions[]` is the answer order and joins to `evidence_gaps[].subject_id`. v0.38 ranks it by the ceiling of what an answer can establish: the actions nothing has bounded first — no effect evidence, a protocol default standing in for its absence, or only a heuristic reading the scan may not act on — then the actions a reviewed declaration or policy-eligible source evidence established, strongest-acting first, with `effect` before `authority` within one action. Position is not severity: the action at the top is the one *least* is known about. Nothing here gates; it is a projection of counts the decision already made, published so a coding agent (and the generated questionnaire) can report progress instead of a gap tally.
 - `release_decision.evidence_coverage.policy_gap_count` and top-level `policy_evidence_gaps[]` (v0.33+) — policy applicability that is heuristic-only, mixed, unknown, or conflicting. These rows are outside Findings and cannot be suppressed, baselined, severity-overridden, acknowledged, or removed by `--no-heuristics`; any row prevents `passed`.
 - `release_decision.evidence_coverage.identity_coverage` (v0.30+) — `{total_observations, canonical_tools, bound_tools, pass_eligible_tools, ambiguous_name_count, gap_count, reason_counts}`. Provider-scoped observations remain separate unless an exact reviewed `tool_identity.bindings[]` entry joins them. Any ambiguous selector, invalid binding, or conflicting identity prevents `passed`.
-- `release_decision.evidence_coverage.evidence_gaps[]` (v0.26+; semantic kinds added v0.29) — one structured row per measurable gap: `{kind, subject, source_type, source_ref, why, next_action}`. In addition to `low_confidence_tool` and `source_warning`, v0.29 adds `incomplete_surface`, `missing_effect_evidence`, `inferred_effect_only`, `conflicting_effect_evidence`, `missing_authority_evidence`, `partial_authority_evidence`, `conflicting_authority_evidence`, and `invalid_semantic_annotation`. v0.36 adds `declaration_below_inferred_evidence`: the declared effect is weaker than evidence this scan inferred for the same action. The declaration still stands as the operative effect — heuristics never drive a verdict — but the action is not evidence-backed-pass until a reviewer raises the declared effect or adds `action_surface.actions[].override` with the `evidence` they checked and the `reason` it does not apply. An acknowledged override keeps the action pass-eligible and is reported as one semantic review concern, so the run can never read `passed`. Each acknowledgement is also emitted as a row in `release_decision.evidence_coverage.semantic_coverage.acknowledged_overrides[]` (v0.36+) naming the action, both readings, the hint source, any source evidence that agrees, and the reviewer's evidence and reason — the packet's §1 and the PR comment render it, because a count is not a review surface. The acknowledgement is consumed by policy applicability as well, so applying it reaches the review route rather than trading one gap for another. Semantic next actions use `declare_action_effect`, `declare_action_authority`, `declare_tool_inventory`, `provide_complete_inventory`, or `resolve_semantic_conflict`, include accepted values and exact source/manifest pointers, and are always human-routed. v0.37 adds `next_action.observed_readings[]` on effect rows — `{effect, sources[], observed}`, the distinct readings this scan's non-declaration evidence supports, so the row can be answered without opening `action_surface_facts`. Where those readings support one conservative answer, `next_action.declaration_template` carries it **pre-filled** instead of a `<REVIEW_REQUIRED>` blank. That value is a proposal, not an assertion: it is drawn from the closed `ActionEffect` vocabulary (never from source content), it is never weaker than any reading, and it is offered only where something was observed — a protocol default standing in for the absence of evidence, or a heuristic reading of `read`, keeps the blank. Their declaration placeholders carry `auto_apply=false` and `requires_human_review=true`, and a pre-filled template is still operative only once a human merges it into the manifest. **v0.41 adds `next_action.authorable_by`** (`coding_agent` | `human`, default `human`) — who may write the *first draft* of the answer. It is `coding_agent` only where the scan filled every blank in `declaration_template` **and** the gap kind is not one that asks a person to look again (`declaration_drift` restates a confirmed answer beside a moved pin and stays `human`, because an agent re-stamping the pin would close the request the row exists for). Such a row also carries `suggested_patch_kind: "declare_action"` and a `next_action.patch` that is *exactly* the template, split into the keys naming the action and the fields written — the schema rejects any other pairing, and `target_path` is relative to `manifest_dir` so the row reads the same in the packet, the SARIF file, and a cached base scan. `auto_apply` stays `false` and `requires_human_review` stays `true` on every row: the manifest is the trust root, so a declaration reaches the gate only through a human merge whoever typed it. The patch is outside `apply-patches --kinds` by default and is applied by the `confirm_declarations` control route that proposes it. v0.37 also re-routes `partial_authority_evidence`: it is raised when the *source's* authority evidence is ambiguous or incomplete, and the resolver preserves it whatever the manifest declares ("reviewed authority cannot replace ambiguous or incomplete source authority alternatives"). Its `next_action.kind` is therefore `provide_source` with no declaration template, rather than a `declare_action_authority` block that could not close the row it was printed on. It is excluded from `declaration_questions` for the same reason. Work the rows in order instead of guessing; Agents Shipgate never auto-asserts effect or authority.
+- `release_decision.evidence_coverage.evidence_gaps[]` (v0.26+;
+  semantic kinds added v0.29) — one structured row per measurable gap:
+  `{kind, subject, source_type, source_ref, policy_id, why, next_action}`.
+  `policy_id` is optional and present on policy-applicability rows; it retains
+  exact machine identity even when an engine-owned id is intentionally omitted
+  from adopter prose. In addition to `low_confidence_tool` and
+  `source_warning`, semantic rows include `incomplete_surface` for enumeration
+  failure and `unattested_surface` when lower-confidence extraction lacks
+  reviewed inventory attestation without an enumeration defect. Only an exact
+  adapter `surface: enumerated` fact earns positive enumeration wording. Other
+  semantic kinds include `missing_effect_evidence`, `inferred_effect_only`,
+  `conflicting_effect_evidence`, `missing_authority_evidence`,
+  `partial_authority_evidence`, `conflicting_authority_evidence`, and
+  `invalid_semantic_annotation`.
+
+  v0.36 adds `declaration_below_inferred_evidence`: the declared effect is
+  weaker than evidence this scan inferred for the same action. The declaration
+  still stands as the operative effect — heuristics never drive a verdict —
+  but the action is not evidence-backed-pass until a reviewer raises the
+  declared effect or adds `action_surface.actions[].override` with the
+  `evidence` they checked and the `reason` it does not apply. An acknowledged
+  override keeps the action pass-eligible and is reported as one semantic
+  review concern, so the run can never read `passed`. Each acknowledgement is
+  also emitted in
+  `release_decision.evidence_coverage.semantic_coverage.acknowledged_overrides[]`
+  naming the action, both readings, the hint source, any source evidence that
+  agrees, and the reviewer's evidence and reason. The packet's §1 and the PR
+  comment render it, and policy applicability consumes it, so applying an
+  override reaches review rather than trading one gap for another.
+
+  Semantic next actions use `declare_action_effect`,
+  `declare_action_authority`, `declare_tool_inventory`,
+  `provide_complete_inventory`, or `resolve_semantic_conflict`, include
+  accepted values and exact source/manifest pointers, and are human-routed.
+  v0.37 adds `next_action.observed_readings[]` on effect rows —
+  `{effect, sources[], observed}` — so the row can be answered without opening
+  `action_surface_facts`. Where those readings support one conservative answer,
+  `next_action.declaration_template` carries it pre-filled instead of a
+  `<REVIEW_REQUIRED>` blank. The value is a proposal, never an assertion: it
+  comes from the closed `ActionEffect` vocabulary, is never weaker than any
+  reading, and is offered only where something was observed. A protocol
+  default standing in for absent evidence, or a heuristic `read`, keeps the
+  blank. The placeholders carry `auto_apply=false` and
+  `requires_human_review=true`; only a reviewed manifest edit makes one
+  operative.
+
+  v0.41 adds `next_action.authorable_by` (`coding_agent` | `human`, default
+  `human`) — who may write the first draft. It is `coding_agent` only where the
+  scan filled every blank in `declaration_template` and the gap is not one that
+  asks a person to look again. `declaration_drift` therefore stays human-owned.
+  An agent-authorable row carries `suggested_patch_kind: "declare_action"` and
+  a `next_action.patch` exactly matching the template, split into the action
+  selector and fields written; the schema rejects any other pairing.
+  `target_path` is relative to `manifest_dir`. `auto_apply` stays false and
+  `requires_human_review` stays true for every row, and the patch remains
+  outside `apply-patches --kinds` by default; only the
+  `confirm_declarations` route proposes it.
+
+  v0.37 also re-routes `partial_authority_evidence`: it is raised when source
+  authority evidence is ambiguous or incomplete, and persists whatever the
+  manifest declares. Its action is `provide_source` with no declaration
+  template, not a declaration that could not close the row, and it is excluded
+  from `declaration_questions` for the same reason. Work the rows in order
+  instead of guessing; Agents Shipgate never auto-asserts effect or authority.
 - `loaded_policy_packs[].{source,sha256,sha256_status,owner}` (v0.27+) — policy-pack distribution and ownership metadata for organization audit. `sha256_status` is `"verified"` only when the manifest pin matched; otherwise it is `"unpinned"`. This is report metadata; normal pack matching and release gating still come from deterministic rules and `release_decision.decision`.
 - `findings[].support` (v0.33+) — typed predicate support with status, effective confidence, policy/block eligibility, claim IDs, evidence bases, predicate rows, and `support_hash`. Rule confidence and `block: true` are ceilings/requests; they cannot upgrade the support. Baseline matching for supported findings requires the same support hash.
 - `findings[].policy_routing` (v0.28+) — optional policy-pack owner, reviewers, and approval-routing metadata. This is non-enforcing reviewer/audit metadata, not `Finding.evidence`; it does not affect fingerprints, suppressions, baselines, `blocks_release`, or `release_decision`.
@@ -680,12 +1267,12 @@ fingerprints, baselines, run IDs, or release gating.
 
 The remaining v0.22 verifier blocks are reviewer-facing projections / declared inputs — none gates independently (`release_decision.decision` stays the only gate). They populate with real values only under `verify` mode (a `VerificationContext` from `agents-shipgate verify` or an equivalent scan context); a plain `scan` emits their stable empty shape:
 
-- `capability_change` (v0.22+, semantic metadata v0.23+) — the diff-derived capability delta, grouped into `{enabled, added, removed, broadened, narrowed}` member lists over `action_surface_diff` / `tool_surface_diff`. Each `CapabilityChangeMember` carries `{id, direction, subject_kind, tool, action, scope, before_scope, after_scope, before_capability_id, after_capability_id, changed_hashes, semantic_direction, semantic_changes, risk_tags, release_impact, provenance_kind, confidence, rationale, related_finding_ids}`. `broadened` = more effective capability (wider scope, escalated effect, removed control); `narrowed` = less (removed scope, added control). `semantic_direction` explains the proven capability-level movement (`added | removed | broadened | narrowed | mixed | unknown | evidence_only`), and `semantic_changes[]` gives field-level reasons when a base action snapshot is available. `enabled: false` when no base diff is available.
+- `capability_change` (v0.22+, semantic metadata v0.23+) — the diff-derived capability delta, grouped into `{enabled, added, removed, broadened, narrowed}` member lists over `action_surface_diff` / `tool_surface_diff`. Each `CapabilityChangeMember` carries `{id, direction, subject_kind, tool, action, scope, before_scope, after_scope, before_capability_id, after_capability_id, changed_hashes, semantic_direction, semantic_changes, risk_tags, release_impact, provenance_kind, confidence, rationale, related_finding_ids}`. `broadened` = more effective capability (wider scope, escalated effect, removed control); `narrowed` = less (removed scope, added control). `semantic_direction` explains the proven capability-level movement (`added | removed | broadened | narrowed | mixed | unknown | evidence_only`), and `semantic_changes[]` gives field-level reasons when a base action snapshot is available. `enabled: false` when no base diff is available. A member with an empty `tool` and `subject_kind: "scope"` whose `scope` reads `"<agent> -> MCP binding <slot> <axis>"` is an agent's **remote binding** — the endpoint, credential reference, transport or tool filter of a remote MCP server it mounts (#538). `tool` is empty because no remote leaf was enumerated and none is invented; `before_scope` / `after_scope` carry the two sides. Only the tool-filter axis claims a direction; for the others `broadened` is the block's documented opaque-direction bucket and the `rationale` says so, because a host name or an environment variable name establishes no privilege level.
 - `protected_surface_changes` (v0.22+) — list of touched release trust roots, each `{path, kind, glob, related_finding_ids}`. Derived from the active `SHIP-VERIFY-*` findings, so every row's `related_finding_ids` resolves to a real `findings[]` entry and the rollup can never disagree with the gate. A row means "a protected file was touched"; purely-semantic weakenings with no file path stay in `findings[]` and surface via `verifier_summary` flags.
 - `effective_policy` (v0.22+) — normalized (not text-diff) snapshot of the release-policy surface for base-vs-head weakening comparison: `{ci_mode, fail_on[], suppressed_check_ids[], waiver_scopes[], severity_overrides{}, baseline_integrity_mode, baseline_fingerprints[], ci_gate_present}`. Every list/dict is sorted for byte-stable output; derived purely from the manifest (plus accepted-debt fingerprints). It describes the policy the repository **declares**, not the policy this invocation runs under: `--ci-mode` / `--fail-on` move `ci_mode` / `fail_on` at the top level of the report but never here, so two runs of the same tree produce the same snapshot and a base-vs-head comparison stays repository-vs-repository.
 - `human_ack` (v0.22+) — declared human-acknowledgement state, `{required, satisfied, acks[], outstanding[]}`. Within the static boundary, acknowledgement is **declared evidence only — never inferred** (human authority cannot be synthesized). A trust-root weakening (`SHIP-VERIFY-POLICY-WEAKENED`, `-POLICY-BASE-ABSENT`, `-CI-GATE-REMOVED`, `-BASELINE-OR-WAIVER-EXPANDED`) makes a surface `required`; it is `satisfied` only by a matching `human_ack` entry in `shipgate.yaml` (owner + reason + affected surface, optional expiry). `required == (acks-covering-required) + outstanding`. The acknowledgement section lives in `shipgate.yaml` — itself a trust root — so a coding agent cannot add its own ack without tripping `SHIP-VERIFY-TRUST-ROOT-TOUCHED`.
 
-New `SHIP-VERIFY-*` reason codes (v0.22+, category `verify` — suppression-immune and floor-protected; emit only under `verify` mode): `SHIP-VERIFY-POLICY-WEAKENED` (base-vs-head policy weakened), `SHIP-VERIFY-POLICY-BASE-ABSENT` (0.16+; a policy trust root changed with no base snapshot to compare against — split out of `-POLICY-WEAKENED` so a first adoption no longer reports a weakening that could not have happened; evidence `kind` is `manifest_introduced` or `base_snapshot_unavailable`, and only the former reports `policy_weakened: false`), `SHIP-VERIFY-BASELINE-OR-WAIVER-EXPANDED` (suppression/waiver/baseline broadened), `SHIP-VERIFY-CI-GATE-REMOVED` (Shipgate CI workflow deleted), `SHIP-VERIFY-AGENT-INSTRUCTIONS-WEAKENED` (agent-instruction trust root changed; routed to human review), `SHIP-VERIFY-TRIGGER-CATALOG-DRIFT` (trigger catalog changed). They are ordinary `Finding`s routed through `release_decision` — never a second verdict.
+New `SHIP-VERIFY-*` reason codes (v0.22+, category `verify` — suppression-immune and floor-protected; emit only under `verify` mode): `SHIP-VERIFY-POLICY-WEAKENED` (base-vs-head policy weakened), `SHIP-VERIFY-POLICY-BASE-ABSENT` (0.16+; a policy trust root changed with no base snapshot to compare against — split out of `-POLICY-WEAKENED` so a first adoption no longer reports a weakening that could not have happened; evidence `kind` is `manifest_introduced` or `base_snapshot_unavailable`, and only the former reports `policy_weakened: false`), `SHIP-VERIFY-BASELINE-OR-WAIVER-EXPANDED` (suppression/waiver/baseline broadened), `SHIP-VERIFY-CI-GATE-REMOVED` (Shipgate CI workflow deleted), `SHIP-VERIFY-AGENT-INSTRUCTIONS-WEAKENED` (deprecated compatibility ID; no findings; supported structural changes remain covered by the shared trust-root comparison), `SHIP-VERIFY-TRIGGER-CATALOG-DRIFT` (trigger catalog changed). They are ordinary `Finding`s routed through `release_decision` — never a second verdict.
 
 The action exposes these as outputs `decision`, `blocker_count`, `review_item_count`, `ci_would_fail` (v0.8+).
 For verifier-cycle PR workflows it also exposes additive outputs
@@ -747,7 +1334,13 @@ emits a `verifier.json` with
 next recommended action: an exact
 `init --workspace <workspace> --write --json`
 command for unconfigured repos, or an exact `verify` command for configured
-repos using the supplied workspace/config/base/head/out arguments. Use it as the
+repos using the supplied workspace/config/base/head/out arguments.
+`verify --preview --format control` prints that same state and command, and an
+`agent control` refresh of the pointer it published returns them until the
+working tree moves. Where the working tree cannot be read, both withhold them
+and lead with the cause instead
+([how a preview is read](#two-read-entry-points)).
+Use it as the
 first touch before a full scan. To evaluate just the run/skip trigger, run
 `agents-shipgate trigger --base origin/main --head HEAD --json`.
 
@@ -761,7 +1354,7 @@ never as a separately derived identity. It has no wall-clock timestamp and is
 not a second gate.
 
 `agents-shipgate-reports/agent-handoff.json` carries
-`schema_version: "shipgate.agent_handoff/v8"` and top-level sections
+`schema_version: "shipgate.agent_handoff/v9"` and top-level sections
 `gate`, `control`, `fix_task`, `blocked_by[]`,
 `remediation_plan[]`, `capability_review`, `authorization`, `reproducibility`,
 and `artifacts`.
@@ -781,7 +1374,7 @@ agents-shipgate agent handoff --from agents-shipgate-reports/verifier.json --jso
 ```
 
 In `agents-shipgate-reports/verifier.json`, read the fields below (full
-schema [`docs/verifier-schema.v0.15.json`](verifier-schema.v0.15.json)). **Lead
+schema [`docs/verifier-schema.v0.21.json`](verifier-schema.v0.21.json)). **Lead
 with `control.state`.** Every release and merge field below is a mirror or
 deterministic projection of `report.json`; the authorization evaluation is an
 operational overlay and cannot change those fields.
@@ -809,14 +1402,19 @@ operational overlay and cannot change those fields.
 - `trigger` — the run/skip evaluation. Read `evaluation_status` first; two of
   its three values withhold the verdict, and in both `should_run` /
   `run_shipgate` / `skip` / `skip_reason` are `null`. Never read `null` as
-  `false`.
-  - `"not_evaluated"` — the diff could not be read. `next_action.kind` is
-    `"input_required"`; repair the input. `skip_reason` is never `"no_match"`
-    for inputs that were not fully read.
+  `false`. The embedded `next_action` is diagnostic only: it preserves the
+  evaluated kind but carries no command, sets `authoritative: false`, and
+  points at `control.next_action`, which is the route to follow. Embedded
+  `matched_rules[]` carry no commands either. The standalone
+  `agents-shipgate trigger --json` command retains its own actionable
+  `next_action`.
+  - `"not_evaluated"` — the diff could not be read. Repair the input through
+    `control.next_action`; `skip_reason` is never `"no_match"` for inputs that
+    were not fully read.
   - `"unclassified"` — the diff *was* read in full and no rule classified some
     or all of the changed files. That is a fact about the catalog, not about
-    the PR, so the skip is withheld and `next_action` routes forward to the
-    scan. `surface_exclusions.entries[]` lists the unclassified files.
+    the PR, so the skip is withheld and `control.next_action` routes forward
+    to the scan. `surface_exclusions.entries[]` lists the unclassified files.
 
   `stop_conditions_fired` is the raw block result; `stop_conditions_terminal`
   says whether it decided. A matched `run_shipgate`/`force_run` rule overrides
@@ -847,7 +1445,10 @@ operational overlay and cannot change those fields.
   additive and locked to `"verified"` whenever a `release_decision` is present.
 - `can_merge_without_human` — `bool`.
 - `decision` — mirror of `release_decision.decision` (or `null` when no scan ran).
-- `headline` — single-sentence, PR-comment-friendly summary (or `null`).
+- `headline` — single-sentence, PR-comment-friendly summary (or `null`). Every
+  completed blocked run names the deterministically selected worst blocker as
+  `Most severe: <title>.`, ordered by severity, check id, then title. A run
+  with no blocker adds no cause clause.
 - `authorization` — the
   `shipgate.human_authorization_evaluation/v1` result. Only `accepted` can
   expose a command, and that command must exactly match both
@@ -977,7 +1578,13 @@ lease OID.
 
 `verifier.json` also carries `trigger`, `base_status`, `head_status`, `base_ref`,
 `head_ref`, `changed_files`, `base_notes`, the embedded `release_decision`, and an
-`artifacts` map. When present, `artifacts.capability_lock_json`,
+`artifacts` map. In `verifier.json` each artifact path (and `head_report_json`,
+`base_report_json`) inside the repository is relative to `workspace`, the Git
+root, and one outside it is absolute. `verify --format json` prints the same
+object with those relative paths spelled for the invoking shell: relative to
+its current directory when beneath it, absolute otherwise, so they open as
+printed; from the Git root the two are identical. When present,
+`artifacts.capability_lock_json`,
 `artifacts.base_capability_lock_json`,
 `artifacts.capability_lock_diff_json`, and
 `artifacts.capability_lock_diff_markdown` are review artifacts only; they do not
@@ -1018,10 +1625,10 @@ second verdict.
 agent-boundary-json` is the local static multi-host boundary command. The
 `--agent` value is caller identity, never a coverage selector. The command emits
 exactly one stdout JSON object using
-`schema_version: "shipgate.agent_boundary_result/v2"` and the schema in
-[`agent-boundary-result-schema.v2.json`](agent-boundary-result-schema.v2.json).
-The old `codex-boundary-json` spelling remains a deprecated `0.16.x`
-compatibility projection of the same assessment.
+`schema_version: "shipgate.agent_boundary_result/v3"` and the schema in
+[`agent-boundary-result-schema.v3.json`](agent-boundary-result-schema.v3.json).
+The old `codex-boundary-json` spelling remains a deprecated compatibility
+projection of the same assessment, kept through `1.x`.
 
 Read `input_coverage`, `host_coverage[]`, `affected_hosts[]`, `policies[]`,
 `issues[]`, `pending_review[]`, and `excluded_scopes[]` before relying on the
@@ -1061,6 +1668,10 @@ The runtime contract also exposes stable non-gating integration fields:
 `agent_handoff_artifact`, `agent_interface_operations[]`, `exit_code_policy`,
 `mcp_tools[]`,
 `capability_lock_schema_version`, `capability_lock_diff_schema_version`,
+`capability_payload_schema_version`, `capability_payload_schema_path`,
+`capability_delta_attestation_schema_version`,
+`capability_delta_attestation_schema_path`,
+`capability_delta_predicate_type`, `capability_delta_attestation_artifact`,
 `capability_standard_version`,
 `governance_benchmark_catalog_schema_version`,
 `governance_benchmark_result_schema_version`, and
@@ -1159,8 +1770,8 @@ For reviewer-shaped output, also read the **Release Evidence Packet** at
 `[pdf]` extras are installed). The packet is a supporting/provisional reviewer
 projection, not a second gate. Packet outputs are redacted by the same default
 privacy layer as the report. The packet has fixed reviewer sections governed by
-[`docs/packet-schema.v0.17.json`](packet-schema.v0.17.json) — see
-[STABILITY.md §Release Evidence Packet](../STABILITY.md#release-evidence-packet-v017).
+[`docs/packet-schema.v0.18.json`](packet-schema.v0.18.json) — see
+[STABILITY.md §Release Evidence Packet](../STABILITY.md#release-evidence-packet-v018).
 Packet schema `0.9` carries the report's evidence-backed semantic coverage and
 gap remediation contract. Packet §1 also mirrors
 `static_analysis_only=true`, `runtime_behavior_verified=false`, and
@@ -1213,9 +1824,9 @@ Companion prompt: [`prompts/explain-finding-to-user.md`](../prompts/explain-find
 
 - [STABILITY.md](../STABILITY.md) — full alpha stability contract. Source of truth for everything above.
 - [AGENTS.md](../AGENTS.md) — agent-facing instructions: install, run, single-turn flow, error semantics.
-- [`docs/report-schema.v0.42.json`](report-schema.v0.42.json) — machine-validatable JSON Schema for the current report.
+- [`docs/report-schema.v1.0.json`](report-schema.v1.0.json) — machine-validatable JSON Schema for the current report.
 - [`docs/privacy.md`](privacy.md) and [`docs/report-sensitive-fields.json`](report-sensitive-fields.json) — default redaction behavior and sensitive-field inventory.
-- [`docs/packet-schema.v0.17.json`](packet-schema.v0.17.json) — machine-validatable JSON Schema for the current packet.
+- [`docs/packet-schema.v0.18.json`](packet-schema.v0.18.json) — machine-validatable JSON Schema for the current packet.
 - [`docs/checks.json`](checks.json) — check catalog, including `mvp_tier` for MVP/readiness triage.
 
 ## See also

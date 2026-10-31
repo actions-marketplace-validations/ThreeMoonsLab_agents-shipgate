@@ -11,20 +11,59 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import math
 import os
+import posixpath
 import re
 import stat
 import sys
 import tomllib
-from dataclasses import dataclass, field
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 import yaml
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
-from agents_shipgate.core.boundary_registry import BOUNDARY_ADAPTERS
+from agents_shipgate import _perf
+from agents_shipgate.core.boundary_registry import (
+    BOUNDARY_ADAPTERS,
+    CLAUDE_PLUGIN_DEFAULT_HOOKS,
+    CLAUDE_PLUGIN_MARKETPLACE,
+    boundary_adapters_for_path,
+    is_claude_plugin_manifest_path,
+    is_claude_plugin_marketplace_path,
+    is_claude_plugin_reference_path,
+    is_explicit_boundary_file_path,
+    is_hook_declaration_file_name,
+    is_plugin_manifest_path,
+    plugin_manifest_root,
+)
+from agents_shipgate.core.claude_permission_rules import (
+    carve_out_predecessors,
+    carve_out_widens,
+    covering_rule,
+    is_carve_out,
+    same_spelling,
+    unconsulted_path_rule,
+)
+from agents_shipgate.core.hook_command_shape import (
+    UnsupportedCommand,
+    parse_command,
+)
+from agents_shipgate.core.hook_matcher_reach import (
+    CLAUDE_TOOL_NAME_EVENTS,
+    NO_TOOL_NAME,
+    POSSIBLE,
+    claude_tool_matcher_reach,
+)
+from agents_shipgate.core.hook_script_capture import capture_hook_script
+from agents_shipgate.core.hook_script_reference import (
+    MAX_HOOK_SCRIPT_HANDLERS,
+    hook_script_reference,
+)
 from agents_shipgate.core.host_boundary import (
     _is_wildcard_allow,
     _is_write,
@@ -34,7 +73,63 @@ from agents_shipgate.core.host_boundary import (
     _transport_hint,
     _trigger_names,
 )
-from agents_shipgate.core.privacy import SENSITIVE_VALUE_KEYS
+from agents_shipgate.core.host_input_failure import (
+    MAX_FAILURE_TEXT,
+    HostInputFailure,
+    HostInventoryReadError,
+    safe_failure_text,
+)
+from agents_shipgate.core.host_settings import (
+    CLAUDE_COMMAND_OBJECT_SETTINGS,
+    CLAUDE_COMMAND_SETTINGS,
+    CLAUDE_LIST_SETTINGS,
+    CLAUDE_SCALAR_SETTINGS,
+    SettingRating,
+    claude_env_rating,
+    claude_setting_values,
+    rate_claude_setting,
+    read_at_top_level,
+)
+from agents_shipgate.core.inline_hook_allow import inline_allow_facts
+from agents_shipgate.core.instruction_structure import (
+    classify_instruction,
+    instruction_profile,
+    unresolved_reason_is_invalid_syntax,
+)
+from agents_shipgate.core.jsonc import is_vscode_mcp_path, loads_jsonc
+from agents_shipgate.core.mcp_host_selection import (
+    UNATTRIBUTED_MCP_HOST,
+    declared_component_paths,
+    is_mcp_config_path,
+    plugin_reference,
+    select_mcp_hosts,
+)
+from agents_shipgate.core.mcp_launch_source import (
+    launch_source_pin,
+    launch_source_resolution,
+)
+from agents_shipgate.core.openshell import (
+    OpenShellCollectionBudget,
+    OpenShellReadError,
+    parse_policy,
+    parse_selection,
+    policy_field_paths,
+)
+from agents_shipgate.core.openshell_compare import compare_openshell_grants
+from agents_shipgate.core.openshell_inputs import capture_openshell_input
+from agents_shipgate.core.permission_lattice import (
+    canonical_rule,
+    exec_equivalent_argument,
+    permission_pairing_group,
+    scoped_risk,
+    subsumes,
+    whole_tool_risk,
+)
+from agents_shipgate.core.privacy import (
+    AUTH_SCHEME_PATTERN,
+    SENSITIVE_VALUE_KEYS,
+    redact_text,
+)
 from agents_shipgate.core.trust_roots import (
     IdentityBoundReadSession,
     IdentityReadBudget,
@@ -46,8 +141,15 @@ from agents_shipgate.schemas.host_grants import (
     HOST_GRANTS_DRIFT_SCHEMA_VERSION,
     HOST_GRANTS_INVENTORY_SCHEMA_VERSION,
     HostGrantsBaselineV2,
-    HostGrantsDriftV2,
-    HostGrantsInventoryV2,
+    HostGrantsBaselineV3,
+    HostGrantsBaselineV4,
+    HostGrantsBaselineV5,
+    HostGrantsBaselineV6,
+    HostGrantsBaselineV7,
+    HostGrantsBaselineV8,
+    HostGrantsBaselineV9,
+    HostGrantsDriftV9,
+    HostGrantsInventoryV9,
 )
 
 HOST_GRANTS_SCHEMA_VERSION = HOST_GRANTS_BASELINE_SCHEMA_VERSION
@@ -75,18 +177,40 @@ _CREDENTIAL_CONTAINER_KEYS = frozenset({"headers"})
 _SECRET_ARG_RE = re.compile(
     r"(?i)(--?(?:api[-_]?key|auth|authorization|cookie|credential|password|secret|token))(=)(.+)"
 )
+#: A credential header's value, with the authentication scheme that may lead
+#: it: ``Authorization: Bearer <token>`` is redacted whole. Without the
+#: optional scheme the scheme word alone was taken as the value, and the token
+#: after it was published. The scheme alternation is the shared output
+#: redaction's (``core.privacy``), so the two cannot drift.
 _HEADER_SECRET_RE = re.compile(
     r"(?i)\b(authorization|proxy-authorization|cookie|set-cookie|x-api-key)"
-    r"(\s*:\s*)([^\s'\";,\)]+)"
+    rf"(\s*:\s*)((?:{AUTH_SCHEME_PATTERN}\s+)?[^\s'\";,\)]+)"
 )
 _BEARER_SECRET_RE = re.compile(r"(?i)\b(bearer)(\s+)([^\s'\";,\)]+)")
+#: ``NAME=value`` whose name holds a credential word. The lookahead states what
+#: every match needs after the name's whole run of name characters, ``=`` and
+#: a value's first character, so a long run with neither after it is passed
+#: over in one scan instead of being retried at every split of the run, which
+#: took time quadratic in its length (#819 review: 40,000 characters of
+#: ``password`` took 1.6 seconds). It matches exactly what the pattern without
+#: it matches, with the same groups: a name can only end where its run ends,
+#: since what follows it must be whitespace or ``=``, so ``config_sha256`` is
+#: unchanged.
 _ASSIGNMENT_SECRET_RE = re.compile(
-    r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|CREDENTIAL)[A-Z0-9_]*)"
+    r"(?i)\b(?=[A-Z0-9_]*+\s*+=\s*+[^\s'\";,\)])"
+    r"([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|CREDENTIAL)[A-Z0-9_]*)"
     r"(\s*=\s*)([^\s'\";,\)]+)"
 )
 _SPACE_ARG_SECRET_RE = re.compile(
     r"(?i)(--?(?:api[-_]?key|auth|authorization|cookie|credential|password|secret|token))"
-    r"(\s+)([^\s'\";,\)]+)"
+    r"(\s+|=)([^\s'\";,\)]+)"
+)
+#: ``curl -u user:password`` and its spellings: the part after the first
+#: ``:`` is a password. Only a value holding ``:`` is read as one, so an
+#: unrelated ``-u`` flag (``sort -u file``) keeps its argument.
+_USER_ARG_SECRET_RE = re.compile(
+    r"(?i)((?:^|(?<=[\s(]))(?:-u|--user|--proxy-user|-U))(\s+|=)"
+    r"([^\s'\";,\):]+:)([^\s'\";,\)]+)"
 )
 _URL_RE = re.compile(r"(?:https?|wss?)://[^\s'\"<>]+")
 
@@ -97,12 +221,21 @@ class HostStaticParseCache:
 
     max_entries: int = MAX_HOST_STATIC_ENTRIES
     max_total_bytes: int = MAX_HOST_STATIC_TOTAL_BYTES
+    reference_workspace: Path | None = None
+    hook_script_reads: dict[str, dict[str, Any]] = field(default_factory=dict)
+    hook_script_absences: set[str] = field(default_factory=set)
+    openshell_selected_paths: set[str] = field(default_factory=set)
+    openshell_input_reads: dict[str, dict[str, Any]] = field(default_factory=dict)
+    openshell_input_absences: set[str] = field(default_factory=set)
     _reads: dict[tuple[str, str], tuple[str | None, str | None]] = field(
         default_factory=dict
     )
     _parses: dict[
         tuple[str, str], tuple[Any, str | None, str | None]
     ] = field(default_factory=dict)
+    _openshell_parses: dict[tuple[str, str, str], tuple[Any, str | None, str | None]] = field(
+        default_factory=dict, repr=False,
+    )
     read_counts: dict[str, int] = field(default_factory=dict)
     parse_counts: dict[str, int] = field(default_factory=dict)
     _budget: IdentityReadBudget = field(init=False, repr=False)
@@ -113,6 +246,20 @@ class HostStaticParseCache:
     )
     _resource_bound_error: str | None = field(default=None, init=False, repr=False)
     _finished: bool = field(default=False, init=False, repr=False)
+    _read_failures: dict[tuple[str, str], HostInputFailure] = field(
+        default_factory=dict, init=False, repr=False,
+    )
+    input_failures: dict[str, HostInputFailure] = field(default_factory=dict, init=False)
+    terminal_failure: HostInputFailure | None = field(default=None, init=False)
+
+    @property
+    def configured_limits(self) -> tuple[tuple[str, int], ...]:
+        return (
+            ("aggregate_entries", self.max_entries),
+            ("aggregate_bytes", self.max_total_bytes),
+            ("repository_entries", MAX_HOST_REPOSITORY_ENTRIES),
+            ("per_file_bytes", MAX_HOST_CONFIG_BYTES),
+        )
 
     def __post_init__(self) -> None:
         self._budget = IdentityReadBudget(
@@ -135,24 +282,47 @@ class HostStaticParseCache:
                 self._reads[key] = (None, self._resource_bound_error)
             else:
                 try:
-                    self._reads[key] = _safe_read(
+                    text, error, failure = _safe_read(
                         path,
                         containment_root=containment_root,
                         reader=self.reader_for(containment_root),
+                        limits=self.configured_limits,
                     )
-                except IdentityReadBudgetExceeded as exc:
-                    self._resource_bound_error = (
-                        "static host-boundary inventory exceeded its aggregate "
-                        f"resource bound ({exc})"
+                    self._reads[key] = (text, error)
+                    if failure is not None:
+                        self._read_failures[key] = failure
+                except IdentityReadBudgetExceeded:
+                    self.terminal_failure = HostInputFailure(
+                        reason="resource_bound_exceeded", phase="source_read",
+                        source=str(path), limits=self.configured_limits,
                     )
+                    self._read_failures[key] = self.terminal_failure
+                    self._resource_bound_error = self.terminal_failure.summary()
                     self._reads[key] = (None, self._resource_bound_error)
                 except (OSError, NotImplementedError, ValueError):
-                    self._reads[key] = (
-                        None,
-                        "symbolic links or filesystem aliases in configuration "
-                        "paths are not followed",
+                    failure = HostInputFailure(
+                        reason="input_unreadable", phase="source_read",
+                        source=str(path), limits=self.configured_limits,
                     )
+                    self._read_failures[key] = failure
+                    self._reads[key] = (None, failure.summary())
         return self._reads[key]
+
+    def read_issue(
+        self, *, path: Path, containment_root: Path, source: str,
+        host: str, kind: str, message: str,
+    ) -> dict[str, Any]:
+        """Bind the exact read's facts to its generated inventory issue identity."""
+        failure = self._read_failures.get(self._key(path, containment_root))
+        if failure is not None:
+            failure = replace(failure, source=source)
+            message = failure.summary() + " " + failure.recovery()
+        issue = _inventory_issue(
+            kind=kind, host=host, source=source, message=message, blocking=True,
+        )
+        if failure is not None:
+            self.input_failures[issue["issue_id"]] = failure
+        return issue
 
     @property
     def resource_bound_error(self) -> str | None:
@@ -168,10 +338,17 @@ class HostStaticParseCache:
         for key in sorted(self._sessions):
             try:
                 self._sessions[key].finish()
-            except IdentityReadBudgetExceeded as exc:
-                self._resource_bound_error = (
-                    "static host-boundary inventory exceeded its aggregate "
-                    f"resource bound ({exc})"
+            except IdentityReadBudgetExceeded:
+                self.terminal_failure = HostInputFailure(
+                    reason="resource_bound_exceeded", phase="snapshot_validation",
+                    source=key, limits=self.configured_limits,
+                )
+                self._resource_bound_error = self.terminal_failure.summary()
+                raise
+            except (OSError, NotImplementedError, ValueError):
+                self.terminal_failure = HostInputFailure(
+                    reason="snapshot_validation_failed", phase="snapshot_validation",
+                    source=key,
                 )
                 raise
         self._finished = True
@@ -208,6 +385,9 @@ class HostStaticParseCache:
                 data = tomllib.loads(text)
             elif path.suffix in {".yml", ".yaml"}:
                 data = yaml.safe_load(text)
+            elif is_vscode_mcp_path(path.as_posix()):
+                # VS Code reads `mcp.json` as JSON with comments (#659).
+                data = loads_jsonc(text)
             else:
                 data = json.loads(text)
         except (tomllib.TOMLDecodeError, json.JSONDecodeError, yaml.YAMLError) as exc:
@@ -224,11 +404,106 @@ class HostStaticParseCache:
 
 
 @dataclass(frozen=True)
+class PluginScopeFacts:
+    """The plugin reference graph one inventory was read through (#808).
+
+    Private reader facts, never published. They are what bounds a
+    plugin-reference limit to a directory: every hook file a plugin can select
+    lies under its directory, because a reference that leaves it is refused
+    rather than followed (#714), so a limit raised there can only hide grants
+    published under that directory — except inline hooks a marketplace entry
+    outside it declares for that plugin, which ``inline_roots`` names.
+    """
+
+    #: ``{issue id: the plugin directories whose references raised it}``;
+    #: ``None`` in the set when the reference named a path outside its plugin,
+    #: so no directory bounds what it hides.
+    issue_roots: Mapping[str, frozenset[str | None]] = field(default_factory=dict)
+    #: ``{inline hook source, as its grants publish it: its plugin directory}``.
+    inline_roots: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class HostBoundarySnapshot:
     """Reusable normalized snapshot for audit/check/verify projections."""
 
     inventory: dict[str, Any]
     cache: HostStaticParseCache
+    input_failures: dict[str, HostInputFailure] = field(default_factory=dict)
+    #: Issues raised while reading a plugin manifest, a marketplace or a hook
+    #: file only a plugin selects (#714). Private reader facts, never
+    #: published: `check`, which cannot name a limit, leaves them out of its
+    #: completeness, except on a changed file that holds hooks of a plugin
+    #: the project settings enable (#809).
+    plugin_reference_issue_ids: frozenset[str] = frozenset()
+    #: The repository paths of the files that declare hooks of a plugin this
+    #: repository's project settings enable (#809): every hook file such a
+    #: plugin selects, and a manifest or marketplace whose inline hooks it
+    #: loads. The same selection publishes those hooks as
+    #: ``project_enabled_plugin``. A private reader fact, never published:
+    #: `check` routes a change to one of these files to protected-surface
+    #: review, as it routes a settings layer.
+    enabled_plugin_hook_sources: frozenset[str] = frozenset()
+    #: The hook files such a plugin selects that the reader does not open
+    #: (#809): a name other than `hooks.json` or `<name>-hooks.json`, or a
+    #: directory the walk skips. The host loads their hooks and the inventory
+    #: names each one as a limit, so a change to one is input `check` could
+    #: not read, never a change it may allow. Private, never published.
+    enabled_plugin_unread_hook_files: frozenset[str] = frozenset()
+    #: The directory each of those issues is bounded by (#808): what `diff`
+    #: and `verify` may leave uncompared while comparing the rest.
+    plugin_scopes: PluginScopeFacts = field(default_factory=PluginScopeFacts)
+
+
+@dataclass(frozen=True)
+class EnabledPluginHookFiles:
+    """Selected plugin hook declarations and host executable references.
+
+    Private snapshot facts, gathered across the sides of a change a
+    caller could read, so `check` and `verify` decide from the same evidence.
+    """
+
+    #: Files the reader opened that declare such hooks
+    #: (``HostBoundarySnapshot.enabled_plugin_hook_sources``).
+    sources: frozenset[str] = frozenset()
+    #: Files such a plugin selects whose hooks the reader did not read
+    #: (``HostBoundarySnapshot.enabled_plugin_unread_hook_files``).
+    unread: frozenset[str] = frozenset()
+    #: Selected literal executable references, identified separately per host.
+    scripts: frozenset[tuple[str, str]] = frozenset()
+    openshell: Any = None
+    #: ``(host, path)`` for each `.mcp.json` the inventory published, under
+    #: the hosts whose declarations select it (#936), so `check` names the
+    #: host the comparison names rather than the registry's file-name guess.
+    mcp_hosts: frozenset[tuple[str, str]] = frozenset()
+
+    @classmethod
+    def of(cls, snapshot: HostBoundarySnapshot) -> EnabledPluginHookFiles:
+        return cls(
+            sources=snapshot.enabled_plugin_hook_sources,
+            unread=snapshot.enabled_plugin_unread_hook_files,
+            scripts=frozenset(
+                (grant["host"], entry["path"])
+                for grant in snapshot.inventory["grants"]
+                if grant.get("kind") == "hook"
+                and hook_loading_basis(grant) in {"host_configuration", "project_enabled_plugin"}
+                for entry in grant.get("script_inputs") or []
+                if entry.get("path") and entry.get("basis")
+            ),
+            mcp_hosts=frozenset(
+                (str(artifact["host"]), str(artifact["path"]))
+                for artifact in snapshot.inventory["artifacts"]
+                if artifact.get("kind") == "mcp" and is_mcp_config_path(str(artifact["path"]))
+            ),
+        )
+
+    def union(self, other: EnabledPluginHookFiles) -> EnabledPluginHookFiles:
+        return EnabledPluginHookFiles(
+            sources=self.sources | other.sources, unread=self.unread | other.unread,
+            scripts=self.scripts | other.scripts,
+            openshell=self.openshell or other.openshell,
+            mcp_hosts=self.mcp_hosts | other.mcp_hosts,
+        )
 
 
 def _canonical(value: Any) -> str:
@@ -270,16 +545,214 @@ def _sanitize_url(value: str) -> str:
     return urlunsplit((parsed.scheme, netloc, path, "", ""))
 
 
-def _sanitize_sensitive_string(value: str) -> str:
-    value = _URL_RE.sub(lambda match: _sanitize_url(match.group(0)), value)
+def _sanitize_sensitive_string(
+    value: str, *, url: Callable[[str], str] = _sanitize_url
+) -> str:
+    value = _URL_RE.sub(lambda match: url(match.group(0)), value)
     value = _HEADER_SECRET_RE.sub(r"\1\2<redacted>", value)
     value = _BEARER_SECRET_RE.sub(r"\1\2<redacted>", value)
     value = _ASSIGNMENT_SECRET_RE.sub(r"\1\2<redacted>", value)
     value = _SPACE_ARG_SECRET_RE.sub(r"\1\2<redacted>", value)
+    value = _USER_ARG_SECRET_RE.sub(r"\1\2\3<redacted>", value)
     match = _SECRET_ARG_RE.fullmatch(value)
     if match:
         return f"{match.group(1)}=<redacted>"
     return value
+
+
+_PATH_REDACTION_MARKER = re.compile(r"\[REDACTED:[^\]]+\]|<redacted>")
+
+
+def _redaction_digest(value: str) -> str:
+    """The short digest a redacted public label carries of its exact value (#590, #922).
+
+    Two values that redact alike stay two labels, and nothing of either is
+    published: twelve hex digits of the SHA-256 of the value as written.
+    """
+
+    return hashlib.sha256(value.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+
+
+#: The wildcard a redacted URL component ends with, which is the scope a
+#: permission rule grants and holds nothing private: a segment wildcard
+#: (``/*``, ``/**``), a continuation (``*``) or the legacy prefix ``:*``.
+_URL_WILDCARD_SUFFIX = re.compile(r"(?:/\*+|:\*|\*+)$")
+
+#: Rule structure a URL match swallows: `_URL_RE` stops only at whitespace,
+#: quotes and angle brackets, so the ``)`` closing ``Bash(curl http://h/x)``,
+#: and a shell separator after a URL, would otherwise be read as URL text.
+_URL_TRAILING_DELIMITERS = frozenset(";,|&")
+
+
+def _closing_delimiters(text: str) -> int:
+    """Where a URL matched inside rule text ends, before the delimiters that follow it.
+
+    A trailing ``)`` is the rule's (or a shell group's) only when the URL
+    leaves it unbalanced, so ``https://h/wiki/Foo_(bar)`` keeps its own.
+    """
+
+    end = len(text)
+    surplus = text.count(")") - text.count("(")
+    while end:
+        last = text[end - 1]
+        if last == ")" and surplus > 0:
+            surplus -= 1
+        elif last not in _URL_TRAILING_DELIMITERS:
+            break
+        end -= 1
+    return end
+
+
+def _published_url_part(value: str, marker: str) -> str:
+    """A URL path, query or fragment as a permission rule publishes it (#922).
+
+    Nothing but stars and slashes (``/``, ``/*``, ``/**``) is scope, not a
+    private path, and is published as written. Anything else is ``marker``
+    followed by the wildcard it ends with, so `/api/*` and `/api/health`
+    read ``/<redacted-path>/*`` and ``/<redacted-path>``.
+    """
+
+    if set(value) <= {"*", "/"}:
+        return value
+    suffix = _URL_WILDCARD_SUFFIX.search(value)
+    return marker + (suffix.group(0) if suffix else "")
+
+
+def _compared_query(query: str) -> str:
+    """A query as a rule's identity reads it: a secret-named parameter's value masked.
+
+    As an MCP server's URL query is digested (#723): the parameters compare,
+    and rotating a token's value does not.
+    """
+
+    try:
+        pairs = parse_qsl(query, keep_blank_values=True)
+    except ValueError:
+        return query
+    if not pairs:
+        return query
+    return "&".join(f"{name}={'<secret>' if _is_secret_key(name) else item}" for name, item in pairs)
+
+
+def _rule_url(text: str, *, compared: bool) -> str:
+    """One URL inside a permission rule, as published or as compared (#922).
+
+    Published, the scheme and host (with its port) are as an MCP server's URL
+    publishes them (#723), and userinfo, a path, a query and a fragment never
+    are. Unlike :func:`_sanitize_url`, which publishes a whole value, this
+    keeps what the rule around the URL needs to be read: the delimiters after
+    it, each component's trailing wildcard, and a marker for each component
+    withheld, instead of dropping a query or fragment silently.
+
+    ``compared`` is the text a rule's identity digest reads instead: the
+    path, query and fragment that decide what the rule reaches, with userinfo
+    and a secret-named query value masked as credentials, so rotating one is
+    no change.
+    """
+
+    end = _closing_delimiters(text)
+    url, closing = text[:end], text[end:]
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return (url if compared else "<redacted-url>") + closing
+    if parsed.scheme not in {"http", "https", "ws", "wss", "sse"}:
+        return text
+    _userinfo, at, host = parsed.netloc.rpartition("@")
+    try:
+        _port = parsed.port
+    except ValueError:
+        # A port that is not a number may be anything, a credential included.
+        if not compared:
+            host = "<invalid-host>"
+    # The scheme and host as written: a rule matches text, and `urlsplit`
+    # lowercases a scheme, so `HTTP://h/` would publish a rule it is not.
+    rendered = f"{url[: len(parsed.scheme)]}://{'<redacted>@' if at else ''}{host}"
+    rendered += parsed.path if compared else _published_url_part(parsed.path, "/<redacted-path>")
+    # `urlsplit` drops an empty query or fragment; the rule text keeps its `?` or `#`.
+    if "?" in url.partition("#")[0]:
+        rendered += "?" + (
+            _compared_query(parsed.query)
+            if compared else _published_url_part(parsed.query, "<redacted-query>")
+        )
+    if "#" in url:
+        rendered += "#" + (
+            parsed.fragment
+            if compared else _published_url_part(parsed.fragment, "<redacted-fragment>")
+        )
+    return rendered + closing
+
+
+#: The URL markers :func:`public_permission_rule` stamps with the rule's digest.
+_RULE_URL_MARKER = re.compile(r"<redacted-(?:path|query|fragment|url)>|<invalid-host>")
+
+
+def public_permission_rule(rule: str) -> str:
+    """A permission rule as every host reader publishes and compares it (#922).
+
+    Credential-shaped text is redacted as in any other published value, and a
+    URL as :func:`_rule_url` publishes it, so the rule keeps its closing
+    delimiter and the scope its wildcards grant: ``Bash(curl
+    http://localhost:8000/*)`` is published as written, and the ``/health``
+    beside it as ``Bash(curl http://localhost:8000/<redacted-path>~…)``.
+
+    Where the published text withholds part of a URL that decides what the
+    rule reaches, its first URL marker carries a short digest of the rule as
+    compared, in its documented spelling
+    (``/<redacted-path>~1a2b3c4d5e6f``), as a redacted host path
+    carries one (#590): two rules that publish alike stay two grants, two
+    rows and two changes, and the digest publishes neither. It reads no
+    credential, so rotating a token, a password in userinfo or a
+    secret-named query value is no change, as before.
+
+    The published text is what every route compares, a saved baseline
+    included, so they cannot disagree. A marker is shell syntax to the
+    permission lattice, so a rule holding one is never proven covered by
+    another: the model reads it as a widening rather than guess.
+    """
+
+    published = _sanitize_sensitive_string(rule, url=lambda text: _rule_url(text, compared=False))
+    if published == rule:
+        return rule
+    compared = _sanitize_sensitive_string(rule, url=lambda text: _rule_url(text, compared=True))
+    if compared == published:
+        # Only credentials were withheld: the published text is the identity.
+        return published
+    # Of the documented spelling, so `…/x:*)` and `…/x *)` share a digest and
+    # still read as one grant respelled (#918), as their raw texts do.
+    digest = _redaction_digest(canonical_rule(compared))
+    return _RULE_URL_MARKER.sub(lambda match: f"{match.group(0)}~{digest}", published, count=1)
+
+
+def public_host_path(source: str) -> str:
+    """The location a host inventory publishes for one exact source (#590).
+
+    Inside the reader a path is identity; outside it, it is a published string.
+    Credential-shaped bytes in a directory or file name must not reach that
+    string, so each path component is redacted on its own: a greedy secret
+    pattern can never swallow the separator and the file name after it, which
+    instruction profiles and precedence ranks read.
+
+    Whenever anything was redacted, the marker carries a short digest of the
+    exact source, so two sources that redact alike stay two locations and one
+    cannot inherit the other's grants, coverage or recovery evidence. A redacted
+    path is a label, not a locator: reads and ids always use the exact source.
+    """
+
+    components = source.split("/")
+    redacted = [_sanitize_sensitive_string(redact_text(part) or "") for part in components]
+    if redacted == components:
+        return source
+    digest = _redaction_digest(source)
+    marked = [
+        _PATH_REDACTION_MARKER.sub(lambda match: f"{match.group(0)}~{digest}", part)
+        for part in redacted
+    ]
+    if marked == redacted:
+        # A pattern rewrote a component without leaving a marker to stamp.
+        index = next(i for i, (a, b) in enumerate(zip(components, redacted, strict=True)) if a != b)
+        marked[index] = f"{marked[index]}~{digest}"
+    return "/".join(marked)
 
 
 def _redact_secret_values(value: Any, *, parent_key: str | None = None) -> Any:
@@ -325,8 +798,115 @@ def _redact_secret_values(value: Any, *, parent_key: str | None = None) -> Any:
     return value
 
 
+def _url_capability_parts(value: Any, *, parent_key: str | None = None) -> list[dict[str, Any]]:
+    """The query of each URL, for the change digest only.
+
+    Published fields drop a URL's query because it carries tokens and project
+    identifiers. The change digest must still see it: a Supabase server's
+    `read_only=true` and `features=…` decide which tools an agent gets, and
+    removing one produced no row when only the redacted URL was hashed (#723).
+    Nothing returned here is published; it is hashed with the redacted config.
+
+    The path stays out on purpose. A webhook-style path is itself the secret,
+    and rotating one must stay quiet
+    (`test_drift_all_env_header_value_rotation_quiet_but_key_addition_fires`).
+    A digest cannot tell a capability path (`/read` → `/admin`) from a secret
+    one, so a path-only change remains unseen; that limit is recorded on #723.
+
+    It walks what `_redact_secret_values` keeps: secret keys, `env` and
+    `headers` contribute nothing, and a secret-named query parameter
+    contributes its name, never its value. A URL without a query adds nothing,
+    so a command server, a bare host or a path-only URL keeps its earlier digest.
+    """
+
+    if parent_key is not None and _is_secret_key(parent_key):
+        return []
+    parts: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        for key, inner in sorted(value.items(), key=lambda item: str(item[0])):
+            key_text = str(key)
+            if (
+                key_text == "policyHelper"
+                or _is_secret_key(key_text)
+                or parent_key in _CREDENTIAL_CONTAINER_KEYS
+                or key_text in {"env", "headers"}
+            ):
+                continue
+            parts.extend(_url_capability_parts(inner, parent_key=key_text))
+        return parts
+    if isinstance(value, list):
+        skip_next = False
+        for item in value:
+            if skip_next:
+                skip_next = False
+                continue
+            if isinstance(item, str) and (
+                _SECRET_ARG_RE.fullmatch(item)
+                or item.lower().lstrip("-").replace("-", "_") in _SECRET_KEY_MARKERS
+            ):
+                skip_next = not _SECRET_ARG_RE.fullmatch(item)
+                continue
+            parts.extend(_url_capability_parts(item, parent_key=parent_key))
+        return parts
+    if isinstance(value, str):
+        for match in _URL_RE.finditer(value):
+            try:
+                parsed = urlsplit(match.group(0))
+                query = parse_qsl(parsed.query, keep_blank_values=True)
+            except ValueError:
+                parts.append({"url": "<unparsable-url>", "raw": match.group(0)})
+                continue
+            if not query:
+                continue
+            parts.append({
+                "url": _sanitize_url(match.group(0)),
+                "query": sorted(
+                    [name, "<secret>" if _is_secret_key(name) else item]
+                    for name, item in query
+                ),
+            })
+    return parts
+
+
 def redacted_config_sha256(config: Any) -> str:
-    return _sha(_redact_secret_values(config))
+    redacted = _redact_secret_values(config)
+    url_parts = _url_capability_parts(config)
+    if not url_parts:
+        return _sha(redacted)
+    return _sha({"redacted": redacted, "url_capability": url_parts})
+
+
+def published_setting_value(grant: dict[str, Any]) -> Any:
+    """The value a setting grant was read with, as far as its published fields say (#827).
+
+    A `permission_mode` or `sandbox` grant publishes its value as text, and a
+    JSON `true` and the string `"True"` both publish `True`. Its digest is of
+    the value itself, so a candidate the text allows — a boolean, `null`, a
+    number, a list or an object — is the value exactly when it reproduces that
+    digest. Anything else is the published text. Nothing is read beyond the
+    grant, so a grant from a saved baseline answers the same way.
+    """
+
+    text = grant.get("value")
+    setting = grant.get("setting")
+    if not isinstance(text, str) or not isinstance(setting, str):
+        return text
+    candidates: list[Any] = [True, False, None]
+    try:
+        candidates.append(json.loads(text))
+    except ValueError:
+        pass
+    for candidate in candidates:
+        if isinstance(candidate, str):
+            continue
+        rendered = (
+            _canonical(candidate) if isinstance(candidate, (dict, list)) else str(candidate)
+        )
+        if rendered == text and (
+            redacted_config_sha256({setting: candidate}) == grant.get("config_sha256")
+        ):
+            return candidate
+    return text
 
 
 def _display_path(path: Path, *, root: Path, home: Path) -> str:
@@ -340,31 +920,63 @@ def _display_path(path: Path, *, root: Path, home: Path) -> str:
         return str(path)
 
 
+def _issue_source_label(source: str) -> str:
+    """The bounded, single-line form of an issue's source, and its identity (#590).
+
+    Built on :func:`public_host_path` and deliberately not re-run through the
+    whole-string sanitizers in ``safe_failure_text``: a greedy assignment
+    pattern would swallow the digest and the file name after the redacted
+    component, and two unreadable sources would print as one.
+
+    Every lossy step leaves a digest of the exact source. Redaction does so in
+    :func:`public_host_path`. Replacing control characters and bounding the
+    length do so here, at the end. So two sources that display alike never
+    share a label, and the issue id can bind the label without merging them.
+    """
+
+    public = public_host_path(source)
+    label = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", public)
+    if label == public and len(label) <= MAX_FAILURE_TEXT:
+        return label
+    suffix = "~" + hashlib.sha256(source.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+    if len(label) + len(suffix) > MAX_FAILURE_TEXT:
+        label = label[: MAX_FAILURE_TEXT - len(suffix) - 1] + "…"
+    return label + suffix
+
+
 def _inventory_issue(
     *, kind: str, host: str, source: str, message: str, blocking: bool
 ) -> dict[str, Any]:
+    shown = _issue_source_label(source)
+    message = safe_failure_text(message)
     return {
-        "issue_id": _stable_id("host_issue", kind, host, source, message),
+        "issue_id": _stable_id("host_issue", kind, host, shown, message),
         "kind": kind,
         "host": host,
-        "source": source,
+        "source": shown,
         "message": message,
         "blocking": blocking,
     }
 
 
 def _artifact(
-    *, host: str, scope: HostScope, source: str, kind: str, status: str, data: Any = None
+    *, host: str, scope: HostScope, source: str, kind: str, status: str, data: Any = None,
+    resolved_through: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    return {
+    artifact = {
         "artifact_id": _stable_id("host_artifact", host, scope, source, kind),
         "host": host,
         "scope": scope,
-        "path": source,
+        "path": public_host_path(source),
         "kind": kind,
         "parse_status": status,
         "redacted_sha256": redacted_config_sha256(data) if data is not None else None,
     }
+    if resolved_through:
+        # The in-tree paths a read followed from a linked boundary path (#700):
+        # a retargeted link is then a changed artifact, not a silent substitution.
+        artifact["resolved_through"] = [public_host_path(hop) for hop in resolved_through]
+    return artifact
 
 
 def _grant_base(
@@ -375,7 +987,7 @@ def _grant_base(
         "grant_id": _stable_id("host_grant", host, scope, source, kind, identity),
         "host": host,
         "scope": scope,
-        "source": source,
+        "source": public_host_path(source),
         "kind": kind,
         "config_sha256": redacted_config_sha256(config),
         "access": access,
@@ -388,13 +1000,17 @@ def _safe_read(
     *,
     containment_root: Path,
     reader: IdentityBoundReadSession | None = None,
-) -> tuple[str | None, str | None]:
+    limits: tuple[tuple[str, int], ...] = (),
+) -> tuple[str | None, str | None, HostInputFailure | None]:
     lexical_root = Path(os.path.abspath(os.path.normpath(os.fspath(containment_root))))
     lexical_path = Path(os.path.abspath(os.path.normpath(os.fspath(path))))
     try:
         relative = lexical_path.relative_to(lexical_root)
     except ValueError:
-        return None, "path is outside the allowlisted static configuration root"
+        failure = HostInputFailure(
+            reason="input_unreadable", phase="source_read", source=str(path),
+        )
+        return None, failure.summary(), failure
     owns_reader = reader is None
     if reader is None:
         reader = IdentityBoundReadSession(
@@ -409,47 +1025,93 @@ def _safe_read(
     except IdentityReadBudgetExceeded:
         if not owns_reader:
             raise
-        return None, "static host-boundary read exceeded its aggregate resource bound"
-    except (OSError, NotImplementedError, ValueError) as exc:
-        message = str(exc)
-        if "singly-linked regular file" in message:
-            return None, "configuration path is not one singly-linked regular file"
-        if "file exceeds" in message:
-            return None, f"file exceeds the {MAX_HOST_CONFIG_BYTES}-byte static audit limit"
-        if "changed" in message:
-            return None, "configuration path changed identity while it was read"
-        if isinstance(exc, (OSError, NotImplementedError)):
-            return None, f"file could not be read as UTF-8 ({exc.__class__.__name__})"
-        return None, (
-            "symbolic links or filesystem aliases in configuration paths are "
-            "not followed"
+        failure = HostInputFailure(
+            reason="resource_bound_exceeded", phase="source_read",
+            source=str(path), limits=limits,
         )
+        return None, failure.summary(), failure
+    except (OSError, NotImplementedError, ValueError):
+        failure = HostInputFailure(
+            reason="input_unreadable", phase="source_read",
+            source=str(path), limits=limits,
+        )
+        return None, failure.summary(), failure
     try:
-        return raw.decode("utf-8", errors="strict"), None
+        return raw.decode("utf-8", errors="strict"), None, None
     except UnicodeDecodeError:
-        return None, "file could not be read as UTF-8 (UnicodeDecodeError)"
+        failure = HostInputFailure(
+            reason="input_unreadable", phase="utf8_decode", source=str(path),
+        )
+        return None, failure.summary(), failure
+
+
+def _claude_permission_shape_error(data: Any) -> str | None:
+    """Validate only the known permission containers; unknown settings stay allowed."""
+
+    if not isinstance(data, dict):
+        return "settings must be an object"
+    if "permissions" not in data:
+        return None
+    permissions = data["permissions"]
+    if not isinstance(permissions, dict):
+        return "permissions must be an object"
+    for disposition in ("allow", "deny", "ask"):
+        if disposition not in permissions:
+            continue
+        rules = permissions[disposition]
+        if not isinstance(rules, list) or any(
+            not isinstance(rule, str) or not rule.strip() for rule in rules
+        ):
+            return f"permissions.{disposition} must be an array of non-empty strings"
+    return None
 
 
 def _load_structured(
     *, path: Path, source: str, host: str, kind: str, scope: HostScope,
     containment_root: Path, cache: HostStaticParseCache,
     artifacts: list[dict[str, Any]], issues: list[dict[str, Any]],
+    resolved_through: tuple[str, ...] = (),
 ) -> Any:
     data, error_kind, error_message = cache.parse(
         path, containment_root=containment_root
     )
     if error_kind is not None:
         assert error_message is not None
-        issues.append(_inventory_issue(
+        issues.append(cache.read_issue(
+            path=path, containment_root=containment_root,
             kind=error_kind,
             host=host,
             source=source,
             message=error_message,
-            blocking=True,
         ))
-        artifacts.append(_artifact(host=host, scope=scope, source=source, kind=kind, status="failed"))
+        artifacts.append(_artifact(
+            host=host, scope=scope, source=source, kind=kind, status="failed",
+            resolved_through=resolved_through,
+        ))
         return None
-    artifacts.append(_artifact(host=host, scope=scope, source=source, kind=kind, status="parsed", data=data))
+    if host == "claude-code" and kind in {"config", "hooks"}:
+        # A hook file is not a settings file: no host reads `permissions`
+        # from it, so only its top-level shape is checked (#714).
+        shape_error = (
+            _claude_permission_shape_error(data)
+            if kind == "config"
+            else None if isinstance(data, dict) else "a hook file must be an object"
+        )
+        if shape_error is not None:
+            issues.append(_inventory_issue(
+                kind="unsupported", host=host, source=source,
+                message=f"Cannot interpret Claude settings: {shape_error}; repair the field and rerun the audit.",
+                blocking=True,
+            ))
+            artifacts.append(_artifact(
+                host=host, scope=scope, source=source, kind=kind, status="unsupported",
+                resolved_through=resolved_through,
+            ))
+            return None
+    artifacts.append(_artifact(
+        host=host, scope=scope, source=source, kind=kind, status="parsed", data=data,
+        resolved_through=resolved_through,
+    ))
     return data
 
 
@@ -468,18 +1130,287 @@ def _endpoint(server: Any) -> str | None:
     return None
 
 
+#: Bounds on the hook and MCP detail a grant publishes (#819). A matcher past
+#: its bound ends in ``…``; handlers past theirs are counted in
+#: ``omitted_handlers``; a timeout written as more digits than a word's bound
+#: is published as its cut text.
+MAX_DETAIL_WORD_CHARS = 80
+MAX_DETAIL_MATCHER_CHARS = 120
+MAX_HOOK_HANDLERS = 16
+#: A matcher longer than this is not published (#819 review, cycle 5). The
+#: published-label redaction has patterns whose time is quadratic in their
+#: input, so a 128 KiB matcher took 4.2 seconds to read, and a matcher cut
+#: before that redaction runs could publish part of a credential.
+MAX_DETAIL_MATCHER_INPUT_CHARS = 1024
+#: What a grant publishes in place of an executable name, or a timeout written
+#: as text, that is not a plain token (#819).
+DETAIL_NOT_SHOWN = "<not-shown>"
+#: A plain token: the one shape in which an executable's name, or a timeout
+#: written as text, is published (#819).
+_PLAIN_TOKEN_RE = re.compile(r"[A-Za-z0-9._+-]{1,80}")
+
+
+def _bounded_detail(text: str, limit: int = MAX_DETAIL_WORD_CHARS) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _detail_string_rules(text: str) -> str:
+    """A matcher's text through the digest's string rule and the published-label rule (#802, #819)."""
+
+    return published_workflow_label(_sanitize_sensitive_string(text))
+
+
+def _plain_token(text: str) -> str:
+    """``text`` when it is a plain token no redaction rule rewrites, else :data:`DETAIL_NOT_SHOWN` (#819)."""
+
+    if _PLAIN_TOKEN_RE.fullmatch(text) and _detail_string_rules(text) == text:
+        return text
+    return DETAIL_NOT_SHOWN
+
+
+def _published_matcher(value: Any) -> str:
+    """A matcher as it may be published: the published-label redaction, then the bound (#819).
+
+    A matcher is a string of at most :data:`MAX_DETAIL_MATCHER_INPUT_CHARS`
+    characters as ``config_sha256``'s input holds it; any other value is
+    :data:`DETAIL_NOT_SHOWN`, so no structured text a file puts there is
+    published and the published-label redaction never reads a long one. The
+    bound is on that input's text, not the file's, so two matchers that input
+    holds alike publish alike (#819 review, cycle 6): the digest's own string
+    rule, which runs over every matcher already, is linear.
+    """
+
+    if not isinstance(value, str):
+        return DETAIL_NOT_SHOWN
+    held = _sanitize_sensitive_string(value)
+    if len(held) > MAX_DETAIL_MATCHER_INPUT_CHARS:
+        return DETAIL_NOT_SHOWN
+    return _bounded_detail(published_workflow_label(held), MAX_DETAIL_MATCHER_CHARS)
+
+
+#: A package specification an MCP server's arguments may publish, and nothing
+#: else of them (#819): an npm ``name@version`` or ``@scope/name@version``
+#: (a version of at least two parts, a ``^``/``~`` range on one, or a common
+#: dist-tag), a PyPI ``name==version``, or an OCI image reference with a
+#: registry or namespace path and a tag or a ``sha256`` digest.
+_PACKAGE_SPEC_RE = re.compile(
+    r"(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*"
+    r"@(?:[~^]?v?\d+(?:\.\d+){1,2}(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?"
+    r"|latest|next|beta|alpha|canary|rc|stable|experimental|nightly|insiders|dev|preview)"
+    r"|[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?(?:\[[A-Za-z0-9._,-]+\])?"
+    r"==\d+(?:\.\d+)+(?:(?:a|b|rc)\d+)?(?:\.post\d+)?(?:\.dev\d+)?"
+    r"|[a-z0-9][a-z0-9._-]*(?::\d+)?(?:/[a-z0-9][a-z0-9._-]*)+"
+    r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}(?:@sha256:[0-9a-f]{64})?|@sha256:[0-9a-f]{64})"
+)
+MAX_DETAIL_PACKAGE_CHARS = 200
+#: Flags a package runner writes before the package it runs (``npx -y``,
+#: ``uvx --from``, ``docker run -i --rm``). After any other flag an argument
+#: may be that flag's value, so it is never published as a package; that
+#: includes ``uvx --with``, whose value is an extra requirement beside the
+#: server rather than the server (#819 review, cycle 5).
+_PACKAGE_PREFIX_FLAGS = frozenset({
+    "-y", "--yes", "--package", "--from", "--spec", "-i", "--interactive", "--rm",
+    "--init", "-q", "--quiet",
+})
+#: What the published package stands for in the digest of the arguments, so a
+#: package change is named once, by the package.
+_PACKAGE_MARKER = "<package>"
+
+
+def _published_package_index(args: list[Any], redacted: list[Any]) -> int | None:
+    """The index of the argument an MCP server publishes as its package, or ``None`` (#819).
+
+    The first argument that matches :data:`_PACKAGE_SPEC_RE` in full, that
+    neither the digest's input redaction (``redacted``, index for index) nor
+    the published-label redaction rewrites, and that follows no flag but one
+    of :data:`_PACKAGE_PREFIX_FLAGS`.
+    """
+
+    for index, item in enumerate(args):
+        previous = redacted[index - 1] if index else None
+        if (
+            isinstance(item, str)
+            and len(item) <= MAX_DETAIL_PACKAGE_CHARS
+            and redacted[index] == item
+            and _PACKAGE_SPEC_RE.fullmatch(item)
+            and published_workflow_label(item) == item
+            and not (
+                isinstance(previous, str)
+                and previous.startswith("-")
+                and previous not in _PACKAGE_PREFIX_FLAGS
+            )
+        ):
+            return index
+    return None
+
+
+def _mcp_launch_args(config: dict[str, Any]) -> tuple[str | None, str | None]:
+    """An MCP server's published ``package`` and ``args_sha256`` (#819).
+
+    No argument text is published but the package
+    (:func:`_published_package_index`). Every argument contributes to
+    ``args_sha256``, the digest of the declared ``args`` as
+    ``config_sha256``'s input holds them (:func:`redacted_config_sha256`),
+    with the package replaced by :data:`_PACKAGE_MARKER` and the package's
+    position digested beside them, so the package and the digest determine
+    the arguments even when one of them is a literal marker (#819 review,
+    cycle 5); ``args`` that is not a list is digested as declared. Both are
+    ``None`` when no ``args`` is declared.
+    """
+
+    if "args" not in config:
+        return None, None
+    args = config["args"]
+    if isinstance(args, list):
+        index = _published_package_index(args, _redact_secret_values(args))
+        if index is not None:
+            marked = [*args[:index], _PACKAGE_MARKER, *args[index + 1 :]]
+            return args[index], redacted_config_sha256({"args": marked, "package_index": index})
+    return None, redacted_config_sha256(args)
+
+
+#: A name ``env_vars`` may publish: the shape of an environment variable's name
+#: and no more, so a ``NAME=value`` entry or any other text is never published
+#: (#795).
+_ENV_VAR_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,79}")
+
+
+def _mcp_env_var_names(config: dict[str, Any]) -> list[str]:
+    """The names an MCP server's ``env_vars`` list declares, as written (#795).
+
+    ``env_keys`` publishes the keys of the ``env`` map; a server that passes
+    variables through by name declares them in an ``env_vars`` list instead,
+    which the key names never held. A name is published only when it is a
+    plain environment-variable name that neither the redaction
+    ``config_sha256``'s input applies (:func:`_redact_secret_values`) nor the
+    label redaction (:func:`published_workflow_label`) rewrites, so a value, a
+    ``NAME=value`` entry, an object, a token-shaped string or the entry a
+    credential word before it makes the digest redact is not. Their declared
+    order is kept, so an edit that only reorders the list can be told from an
+    edit to its names. Display-only: the list is already in
+    ``config_sha256``'s input, which is where a change to any entry, published
+    or not, becomes a row.
+    """
+
+    declared = config.get("env_vars")
+    if not isinstance(declared, list):
+        return []
+    as_digested = _redact_secret_values(declared, parent_key="env_vars")
+    return [
+        item for item, digested in zip(declared, as_digested, strict=True)
+        if isinstance(item, str) and item == digested and _ENV_VAR_NAME.fullmatch(item)
+        and published_workflow_label(item) == item
+    ]
+
+
+def _mcp_launch_source(config: dict[str, Any]) -> dict[str, Any] | None:
+    if _transport_hint(config) != "stdio" or "url" in config:
+        return None
+    args = config.get("args")
+    redacted = _redact_secret_values(args)
+    command = config.get("command")
+    fact = launch_source_pin(command, args)
+    if fact is None:
+        return None
+    pin, index = fact
+    if args[index] != redacted[index] and not args[index].startswith("git+"):
+        return None
+    # Git URLs never publish their path/ref. The bounded parser establishes
+    # only pin state from a credential-free literal URL before path redaction;
+    # interpreting <redacted-path> as a real ref would invent mutability.
+    # Reuse #819's exact publication gate. Bare names and Git URLs remain
+    # withheld even when their pin state can be established.
+    shown = _published_package_index(args, redacted)
+    source: dict[str, Any] = {"pin": pin, "package": args[index] if shown == index else None}
+    # Where the launcher finds an unversioned `npx` package is not established
+    # by the declaration (#933): published beside the pin, never instead of it.
+    resolution = launch_source_resolution(command, args, index)
+    if resolution is not None:
+        source["resolution"] = resolution
+    return source
+
+
+#: VS Code's prompted-input reference, e.g. `"API_KEY": "${input:apiKey}"`.
+_VSCODE_INPUT_REF = re.compile(r"\$\{input:([^}]+)\}")
+#: The documented top level of `.vscode/mcp.json` (#731). Anything else is not
+#: modeled, so the file's coverage stays partial rather than silently complete.
+_VSCODE_MCP_TOP_LEVEL = frozenset({"servers", "inputs", "sandbox"})
+
+
+def _vscode_mcp_extras(
+    data: Any, *, scope: HostScope, source: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """What `.vscode/mcp.json` says beyond its server set (#731).
+
+    `sandbox` and a server's `sandboxEnabled` decide whether a server runs
+    isolated, so they are sandbox grants: turning one off widens what the server
+    can reach. `envFile` names environment the file does not contain; it is
+    recorded as a non-blocking limit on that server. `inputs` holds prompt
+    definitions only, and their values never appear in the file.
+    """
+
+    grants: list[dict[str, Any]] = []
+    issues: list[dict[str, Any]] = []
+    if not isinstance(data, dict):
+        return grants, issues
+    sandbox = data.get("sandbox")
+    if isinstance(sandbox, dict):
+        for setting, value in sorted(sandbox.items()):
+            grants.append(_setting_grant(
+                host="vscode", scope=scope, source=source, kind="sandbox",
+                setting=f"sandbox.{setting}", value=value, access="unknown", risk="high",
+            ))
+    for name, server in sorted(_server_map(data).items()):
+        if not isinstance(server, dict):
+            continue
+        if "sandboxEnabled" in server:
+            enabled = server["sandboxEnabled"]
+            grants.append(_setting_grant(
+                host="vscode", scope=scope, source=source, kind="sandbox",
+                setting=f"servers.{name}.sandboxEnabled", value=enabled,
+                access="admin" if enabled is False and _transport_hint(server) == "stdio" else "unknown",
+                risk="high",
+            ))
+        if "envFile" in server:
+            issues.append(_inventory_issue(
+                kind="unsupported", host="vscode", source=source,
+                message=(
+                    f"server {name!r} reads environment from envFile, whose "
+                    "contents a static audit does not read"
+                ),
+                blocking=False,
+            ))
+    for key in sorted(str(item) for item in data if str(item) not in _VSCODE_MCP_TOP_LEVEL):
+        issues.append(_inventory_issue(
+            kind="unsupported", host="vscode", source=source,
+            message=f"top-level key {key!r} is not part of the modeled .vscode/mcp.json shape",
+            blocking=True,
+        ))
+    return grants, issues
+
+
 def _mcp_grants(
     data: Any, *, host: str, scope: HostScope, source: str
 ) -> list[dict[str, Any]]:
     grants: list[dict[str, Any]] = []
     for name, server in sorted(_server_map(data).items()):
         config = server if isinstance(server, dict) else {"value": server}
+        digested = config
+        if host == "vscode" and isinstance(server, dict):
+            # `sandboxEnabled` is its own sandbox grant (#731), so one edit is one
+            # row. An `${input:…}` reference's name enters the digest; the value
+            # VS Code prompts for never exists in the file.
+            digested = {key: value for key, value in config.items() if key != "sandboxEnabled"}
+            refs = sorted(set(_VSCODE_INPUT_REF.findall(json.dumps(config, sort_keys=True, default=str))))
+            if refs:
+                digested = {**digested, "input_refs": refs}
         base = _grant_base(
             host=host, scope=scope, source=source, kind="mcp_server",
-            identity=str(name), config=config, access="external", risk="high",
+            identity=str(name), config=digested, access="external", risk="high",
         )
         env = config.get("env") if isinstance(config.get("env"), dict) else {}
         headers = config.get("headers") if isinstance(config.get("headers"), dict) else {}
+        package, args_sha256 = _mcp_launch_args(config)
         grants.append({
             **base,
             "server": str(name),
@@ -487,6 +1418,10 @@ def _mcp_grants(
             "endpoint": _endpoint(config),
             "env_keys": sorted(str(key) for key in env),
             "header_keys": sorted(str(key) for key in headers),
+            "env_var_names": _mcp_env_var_names(config),
+            "package": package,
+            "args_sha256": args_sha256,
+            "launch_source": _mcp_launch_source(config),
         })
     return grants
 
@@ -498,11 +1433,29 @@ def _permission_rule_grants(
         return []
     grants: list[dict[str, Any]] = []
     for disposition in ("allow", "ask", "deny"):
+        # A Claude Code `!` deny or ask rule carves paths out of the rules
+        # listed before it in the same list (#974). Grants are sorted, so the
+        # position that decides its effect is recorded on the grant itself:
+        # an ordering-only edit that changes what it carves is then a change.
+        carves = (
+            carve_out_predecessors(_string_entries(permissions.get(disposition)))
+            if host == "claude-code" and disposition in {"deny", "ask"}
+            else {}
+        )
         for raw_rule in sorted(_string_entries(permissions.get(disposition))):
-            rule = _sanitize_sensitive_string(raw_rule)
+            rule = public_permission_rule(raw_rule)
             wildcard = disposition == "allow" and _is_wildcard_allow(raw_rule)
-            access = "admin" if wildcard else ("execute" if disposition == "allow" else "none")
-            risk = "critical" if wildcard else ("high" if disposition == "allow" else "low")
+            if wildcard:
+                # Not every whole-tool grant reaches the same thing. Rating
+                # `Read(**)` beside `Bash(*)` put four of eight grants at
+                # `critical` on an ordinary repository, and a severity
+                # column that cries critical at reading files is one a
+                # reviewer stops reading (#657).
+                access, risk = whole_tool_risk(raw_rule)
+            elif disposition == "allow":
+                access, risk = scoped_risk(raw_rule)
+            else:
+                access, risk = "none", "low"
             grants.append({
                 **_grant_base(
                     host=host, scope=scope, source=source, kind="permission_rule",
@@ -512,6 +1465,12 @@ def _permission_rule_grants(
                 "disposition": disposition,
                 "rule": rule,
                 "wildcard": wildcard,
+                **(
+                    {"carves_from": sorted({
+                        public_permission_rule(earlier) for earlier in carves[raw_rule]
+                    })}
+                    if raw_rule in carves else {}
+                ),
             })
     return grants
 
@@ -542,20 +1501,532 @@ def _setting_grant(
     }
 
 
-def _hooks_grants(data: Any, *, host: str, scope: HostScope, source: str) -> list[dict[str, Any]]:
+#: Why a hook grant is in the inventory (#714). Parsing a hook file proves the
+#: file exists; it does not prove a host loads it.
+#:
+#: * ``host_configuration`` — declared in a file the host documents loading for
+#:   this scope (Claude Code settings layers, Codex `hooks.json`).
+#: * ``project_enabled_plugin`` — selected by a Claude Code plugin that this
+#:   repository's own project settings enable (`enabledPlugins`), from a
+#:   marketplace those settings register (`extraKnownMarketplaces`) as a
+#:   `directory` or `file` source inside this repository, which lists the
+#:   plugin with a source inside it. Claude Code leaves only a plugin from an
+#:   external source waiting for a manual install, so this one loads once the
+#:   folder is trusted, and its hooks are published as loaded.
+#: * ``plugin_selected`` — a hook file or inline object that a Claude Code
+#:   plugin manifest or marketplace entry in this repository selects, without
+#:   that enablement. Whether the plugin is installed or enabled is external
+#:   state, so selection is established and loading is not.
+#: * ``declared_only`` — a hook file nothing in this repository selects.
+#: * ``unestablished`` — a hook-file grant published with none of the plugin
+#:   signatures below. Never produced by this reader; nothing about its
+#:   selection is claimed.
+HookLoadingBasis = Literal[
+    "host_configuration", "project_enabled_plugin", "plugin_selected", "declared_only",
+    "unestablished",
+]
+
+#: The `access`/`risk` pair the reader publishes for each basis it produces.
+#: The pairs differ so the basis survives in a saved baseline without a new
+#: field: `medium` is conditional authority, a command that runs only once
+#: the plugin is enabled. A project-enabled plugin's hook shares the settings
+#: pair because both are hooks the host loads for this project. The two are
+#: told apart by `source`: a plugin hook's is a hook file, a manifest or a
+#: marketplace entry, never a settings layer.
+_HOOK_ACCESS_BY_BASIS: dict[str, tuple[str, str]] = {
+    "host_configuration": ("execute", "high"),
+    "project_enabled_plugin": ("execute", "high"),
+    "plugin_selected": ("execute", "medium"),
+    # Nothing establishes what this file can do, because nothing establishes
+    # that anything runs it. Not "none": the declaration is kept visible.
+    "declared_only": ("unknown", "unknown"),
+}
+
+#: The bases whose hooks a host loads for this project. Only these earn an
+#: expansion signal (#714).
+LOADED_HOOK_BASES: frozenset[str] = frozenset({"host_configuration", "project_enabled_plugin"})
+
+
+#: Shell reserved words, which open a compound command rather than name a
+#: program, so a command that starts with one names no executable (#819).
+_SHELL_RESERVED_WORDS = frozenset({
+    "case", "coproc", "do", "done", "elif", "else", "esac", "fi", "for", "function", "if", "in",
+    "select", "then", "time", "until", "while",
+})
+
+
+def _hook_command(value: Any, shell: Any = None) -> dict[str, Any] | None:
+    """A hook's command as its grant publishes it: the executable's name, a digest and a shape (#819, #934).
+
+    The command's text is never published. ``sha256`` is the digest of the
+    whole command as ``config_sha256``'s input holds it
+    (:func:`redacted_config_sha256`), so it moves only when that digest does,
+    and a value that input redacts moves neither. ``executable`` is the last
+    ``/`` or ``\\`` segment of the command's first whitespace-separated word
+    as that input holds it, quotes around the segment removed, when that
+    segment is a plain token no redaction rule rewrites (:func:`_plain_token`),
+    and :data:`DETAIL_NOT_SHOWN` otherwise: a leading ``NAME=value``
+    assignment, a word whose quote a blank leaves open (``'my tool.sh'``), a
+    shell reserved word such as ``if`` (:data:`_SHELL_RESERVED_WORDS`) or a
+    URL, a first word holding ``://`` as written or as that input holds it,
+    is never named: that input keeps a URL's host and drops the rest, so its
+    last segment would be the host (#819 review, cycle 5). It is a label, not
+    a claim about what a host runs.
+
+    ``shape`` or ``shape_limit`` (#934) says what is in a command beyond its
+    first word, as :func:`_command_shape` reads it.
+    """
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    written = value.split(maxsplit=1)[0]
+    sanitized = _sanitize_sensitive_string(value)
+    words = sanitized.split(maxsplit=1)
+    first = words[0] if words else ""
+    named = (
+        first not in _SHELL_RESERVED_WORDS
+        and not (first.count("'") % 2 or first.count('"') % 2)
+        and "://" not in written
+        and "://" not in first
+    )
+    name = re.split(r"[/\\]", first)[-1].strip("'\"") if named else ""
+    return {
+        "executable": _plain_token(name),
+        "sha256": redacted_config_sha256(value),
+        **_command_shape(value, sanitized, shell),
+    }
+
+
+#: How many distinct program names, and how many redirects, a command's shape lists.
+MAX_SHAPE_COMMANDS = 12
+MAX_SHAPE_REDIRECTS = 8
+#: The text a command is read from keeps these markers in place of a withheld
+#: value; a marker holds ``<`` and ``>``, which a shell reads as redirects.
+_REDACTION_MARKER_RE = re.compile(r"<(?:redacted(?:-[a-z]+)?|invalid-host)>")
+#: What a marker is read as: a character no plain token holds, so a word
+#: carrying one is never named (#934).
+_MARKER_WORD = "\N{REPLACEMENT CHARACTER}"
+#: A line continuation, which a shell removes before it reads the words.
+_LINE_CONTINUATION_RE = re.compile(r"\\\r?\n")
+#: A token of this length or longer that is only letters and digits and holds
+#: both is read as a generated key (a hex digest, a base64-like secret), not
+#: a program's or a file's name, whatever shape no redaction rule knows it by
+#: (#934). A name with a separator (``-``, ``_``, ``.``) is not read so.
+_GENERATED_TOKEN_CHARS = 20
+_ALNUM_RE = re.compile(r"[A-Za-z0-9]+")
+
+
+def _path_looks_generated(path: str) -> bool:
+    """Whether any segment of a path, or any part of one between dots, looks generated."""
+
+    return any(_looks_generated(part) for part in re.split(r"[/.]", path))
+
+
+def _looks_generated(token: str) -> bool:
+    return (
+        len(token) >= _GENERATED_TOKEN_CHARS
+        and _ALNUM_RE.fullmatch(token) is not None
+        and any(char.isdigit() for char in token)
+        and any(char.isalpha() for char in token)
+    )
+#: Programs that run the script named by one of their arguments (#934).
+_SCRIPT_INTERPRETER_RE = re.compile(
+    r"(?:python[0-9.]*|pythonw|py|node|nodejs|deno|bun|tsx|ts-node|ruby|perl|php|lua|"
+    r"bash|sh|zsh|dash|ksh|pwsh|powershell)"
+)
+
+
+def _redirect_target(target: str | None) -> str:
+    """A redirect's target as a shape publishes it: a repository-relative path, ``/dev/null``, or nothing.
+
+    A path of the shape :data:`_HOOK_SCRIPT_ARG_RE` publishes for a script,
+    without its extension requirement, that no redaction rule rewrites. An
+    absolute path, a path through ``..`` or ``~``, a variable, a quoted
+    string and any other word is :data:`DETAIL_NOT_SHOWN`.
+    """
+
+    if target == "/dev/null":
+        return target
+    if (
+        target is not None
+        and len(target) <= MAX_DETAIL_SCRIPT_CHARS
+        and _REDIRECT_TARGET_RE.fullmatch(target)
+        and _detail_string_rules(target) == target
+        and not _path_looks_generated(target)
+    ):
+        return target
+    return DETAIL_NOT_SHOWN
+
+
+def _command_script(statements: list[Any]) -> str | None:
+    """The script path a command runs, as a hook's ``args`` publish one (#972, #934).
+
+    The first command whose own word is a script path, or whose program is an
+    interpreter (:data:`_SCRIPT_INTERPRETER_RE`) with a script path among its
+    first arguments, by the rule :func:`_published_script_index` applies to
+    ``args``: nothing a redaction rule rewrites, alone or after the arguments
+    before it, and no path that leaves the repository. A path argument of any
+    other program is not a script that runs.
+    """
+
+    for statement in statements:
+        word = statement.word
+        if word is None:
+            continue
+        if (
+            len(word) <= MAX_DETAIL_SCRIPT_CHARS
+            and _HOOK_SCRIPT_ARG_RE.fullmatch(word)
+            and _detail_string_rules(word) == word
+        ):
+            return word
+        if _SCRIPT_INTERPRETER_RE.fullmatch(word.rsplit("/", 1)[-1]):
+            args = list(statement.args)
+            index = _published_script_index(args, _redact_secret_values(args))
+            if index is not None:
+                return args[index]
+    return None
+
+
+def _command_shape(value: str, sanitized: str, shell: Any) -> dict[str, Any]:
+    """What a hook's inline command is made of, or why it is not described (#934).
+
+    Read from the command as ``config_sha256``'s input holds it
+    (``sanitized``), so a value that input withholds is withheld here and a
+    rotation it ignores changes nothing. A command that continues a line with
+    a backslash is read with the lines joined, as a shell reads it, and
+    withheld again from that: the string rule takes the backslash for the
+    value of ``--token \\`` and leaves the value on the next line, where it
+    would be a command's name. Returned as ``{"shape": {…}}`` or
+    ``{"shape_limit": reason}``, never both: ``too_long`` (past
+    :data:`~agents_shipgate.core.hook_command_shape.MAX_COMMAND_CHARS`),
+    ``unsupported_shell`` (a ``shell`` setting other than ``bash`` or ``sh``)
+    and ``unsupported_syntax`` (a form the bounded reader of
+    :mod:`agents_shipgate.core.hook_command_shape` refuses whole).
+
+    Only plain tokens (:func:`_plain_token`), counts and a script or redirect
+    path of the strict shapes above are published; a word, an argument and a
+    quoted string never are. A program that is not a plain token (a variable,
+    a substitution, a quoted or glob word) is counted in ``unnamed``. Nothing
+    here says what a command does, whether a host runs it, or in which
+    direction an edit moves authority.
+    """
+
+    if shell is not None and shell not in {"bash", "sh"}:
+        return {"shape_limit": "unsupported_shell"}
+    if _LINE_CONTINUATION_RE.search(value):
+        sanitized = _sanitize_sensitive_string(_LINE_CONTINUATION_RE.sub("", value))
+    try:
+        structure = parse_command(_REDACTION_MARKER_RE.sub(_MARKER_WORD, sanitized))
+    except UnsupportedCommand as refusal:
+        return {"shape_limit": refusal.limit}
+    names: dict[str, None] = {}
+    unnamed = 0
+    for statement in structure.statements:
+        # A URL's last segment would be its host, which the sanitized text keeps.
+        name = (
+            _plain_token(statement.word.rsplit("/", 1)[-1])
+            if statement.word is not None and "://" not in statement.word else DETAIL_NOT_SHOWN
+        )
+        if name == DETAIL_NOT_SHOWN or _looks_generated(name):
+            unnamed += 1
+        else:
+            names.setdefault(name)
+    listed = list(names)[:MAX_SHAPE_COMMANDS]
+    redirects = [
+        f"{operator} {_redirect_target(target)}" for operator, target in structure.redirects
+    ]
+    script = _command_script(structure.statements)
+    if script is not None and _path_looks_generated(script):
+        script = None
+    return {"shape": {
+        "commands": listed,
+        **({"commands_more": len(names) - len(listed)} if len(names) > len(listed) else {}),
+        **({"unnamed": unnamed} if unnamed else {}),
+        "statements": len(structure.statements),
+        "pipes": structure.pipes,
+        "substitutions": structure.substitutions,
+        "control_flow": structure.control,
+        "quoted": structure.quoted,
+        **({"redirects": redirects[:MAX_SHAPE_REDIRECTS]} if redirects else {}),
+        **(
+            {"redirects_more": len(redirects) - MAX_SHAPE_REDIRECTS}
+            if len(redirects) > MAX_SHAPE_REDIRECTS else {}
+        ),
+        **({"script": script} if script else {}),
+    }}
+
+
+#: A script path a hook's ``args`` may publish, and nothing else of them
+#: (#972): a relative path, optionally led by ``./`` or the braced
+#: ``${CLAUDE_PROJECT_DIR}`` or ``${CLAUDE_PLUGIN_ROOT}`` placeholder, of
+#: segments of letters, digits, ``.``, ``_`` and ``-``, whose last segment ends
+#: in a script extension. No absolute path, URL, flag, assignment or other
+#: word is published, so a positional value no redaction rule recognises stays
+#: inside a digest, as an MCP server's arguments do (#819).
+_HOOK_SCRIPT_ARG_RE = re.compile(
+    r"(?:\$\{CLAUDE_(?:PROJECT_DIR|PLUGIN_ROOT)\}/|\./)?"
+    # No `.` or `..` segment: a path leaving the repository is never published.
+    r"(?:(?!\.\.?/)[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]*[A-Za-z0-9_-]"
+    r"\.(?:py|sh|bash|zsh|js|mjs|cjs|ts|mts|cts|rb|pl|php|ps1|lua)"
+)
+MAX_DETAIL_SCRIPT_CHARS = 200
+#: A redirect target a command's shape may publish (#934): the script path
+#: above without its extension and without ``..`` segments.
+_REDIRECT_TARGET_RE = re.compile(
+    r"(?:\$\{CLAUDE_(?:PROJECT_DIR|PLUGIN_ROOT)\}/|\./)?"
+    r"(?:(?!\.\.?/)[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]*[A-Za-z0-9_-]"
+)
+#: How many arguments before a script candidate are read with it, so a value
+#: only its neighbours mark as a credential (``Bearer <value>``, ``-u
+#: user:<value>``, ``Authorization: Bearer <value>``) is never published:
+#: every published-value pattern spans at most four words.
+_SCRIPT_ARG_CONTEXT = 3
+#: What the published script stands for in the digest of a hook's arguments,
+#: so a script change is named once, by the script.
+_SCRIPT_MARKER = "<script>"
+
+
+def _published_script_index(args: list[Any], redacted: list[Any]) -> int | None:
+    """The index of the argument a hook handler publishes as its script, or ``None`` (#972).
+
+    Only the first argument shaped as :data:`_HOOK_SCRIPT_ARG_RE` in full is a
+    candidate, so at most one is read. It is published when neither the
+    digest's input redaction (``redacted``, index for index) nor the
+    published-label redaction rewrites it, and the same rules, run over it
+    with the arguments before it, leave it whole at the end: ``["Bearer",
+    "x.py"]`` publishes no script. A neighbour that is not a string, or is
+    longer than :data:`MAX_DETAIL_MATCHER_INPUT_CHARS`, publishes none
+    either, so the label patterns, quadratic in their input, never read a long
+    one.
+    """
+
+    for index, item in enumerate(args):
+        if not (
+            isinstance(item, str)
+            and len(item) <= MAX_DETAIL_SCRIPT_CHARS
+            and _HOOK_SCRIPT_ARG_RE.fullmatch(item)
+        ):
+            continue
+        before = args[max(0, index - _SCRIPT_ARG_CONTEXT) : index]
+        if (
+            redacted[index] != item
+            or _detail_string_rules(item) != item
+            or not all(
+                isinstance(word, str) and len(word) <= MAX_DETAIL_MATCHER_INPUT_CHARS
+                for word in before
+            )
+        ):
+            return None
+        context = " ".join([*before, item])
+        published = _detail_string_rules(context)
+        if published != context and not published.endswith(" " + item):
+            return None
+        return index
+    return None
+
+
+def _hook_args(handler: dict[str, Any]) -> dict[str, Any]:
+    """A hook handler's published ``args`` (#972): a script path and a digest, never their text.
+
+    ``script`` is the argument :func:`_published_script_index` publishes, or
+    ``None``; ``sha256`` is the digest of the declared ``args`` as
+    ``config_sha256``'s input holds them (:func:`redacted_config_sha256`),
+    with the script replaced by :data:`_SCRIPT_MARKER` and its position
+    digested beside them, exactly as an MCP server's ``package`` and
+    ``args_sha256`` are (:func:`_mcp_launch_args`). So an edit to the script
+    alone names the script alone, and a value that input redacts moves
+    neither. ``args`` that is not a list is digested as declared.
+    """
+
+    args = handler["args"]
+    if isinstance(args, list):
+        index = _published_script_index(args, _redact_secret_values(args))
+        if index is not None:
+            marked = [*args[:index], _SCRIPT_MARKER, *args[index + 1 :]]
+            return {
+                "script": args[index],
+                "sha256": redacted_config_sha256({"args": marked, "script_index": index}),
+            }
+    return {"script": None, "sha256": redacted_config_sha256(args)}
+
+
+#: The documented boolean and enumerated hook handler settings a grant
+#: publishes, in the order a row names them (#971, #972): ``type``
+#: (``command``, ``http``, ``mcp_tool``, ``prompt`` or ``agent``), ``async``
+#: and ``asyncRewake`` (a background run, and one that wakes Claude on exit
+#: code 2), ``shell`` (``bash`` or ``powershell``) and ``once``
+#: (https://code.claude.com/docs/en/hooks#common-fields and
+#: #command-hook-fields). Each is published only when the handler declares
+#: it, by the rule a timeout is (:func:`_hook_timeout`), so a value that is
+#: not a boolean, a finite number or a plain token is
+#: :data:`DETAIL_NOT_SHOWN`. A value is a declaration, never a claim about
+#: when or how the hook runs.
+HOOK_HANDLER_SETTINGS: tuple[str, ...] = ("type", "async", "asyncRewake", "shell", "once")
+
+
+def _hook_handlers(config: Any, *, host: str | None = None, event: str | None = None) -> tuple[list[dict[str, Any]] | None, int]:
+    """Every handler one hook event declares, as its grant publishes them (#819).
+
+    Only the documented shape is read: a list of matcher groups, each an
+    object with a ``hooks`` list of handler objects whose ``command``, when
+    present, is a string. Anything else is ``None``, so the detail is not
+    shown rather than guessed at, and the row still reports the change through
+    ``config_sha256``. At most :data:`MAX_HOOK_HANDLERS` handlers are listed,
+    and only those are read for publishing: a group's matcher is read once,
+    and only when one of its handlers is listed, so a file of many handlers
+    under one long matcher reads it no more than once (#819 review, cycle 5).
+    A Claude Code handler of an event whose matcher filters the tool name
+    also carries ``matcher_reach``, whether that matcher can match any tool
+    name (#940, :mod:`agents_shipgate.core.hook_matcher_reach`). A handler
+    that declares ``args`` publishes them as a script path and a digest
+    (:func:`_hook_args`), and one that declares a setting of
+    :data:`HOOK_HANDLER_SETTINGS` publishes its value (#971, #972).
+    """
+
+    if not isinstance(config, list):
+        return None, 0
+    handlers: list[dict[str, Any]] = []
+    declared = 0
+    for group in config:
+        if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+            return None, 0
+        entries = group["hooks"]
+        if not all(
+            isinstance(handler, dict) and isinstance(handler.get("command", ""), str)
+            for handler in entries
+        ):
+            return None, 0
+        listed = entries[: max(0, MAX_HOOK_HANDLERS - declared)]
+        declared += len(entries)
+        if not listed:
+            continue
+        matcher = group.get("matcher")
+        published = None if matcher is None else _published_matcher(matcher)
+        reach = (
+            {"matcher_reach": _matcher_reach(matcher, published)}
+            if host == "claude-code" and event in CLAUDE_TOOL_NAME_EVENTS else {}
+        )
+        handlers.extend(
+            {
+                "matcher": published,
+                "command": _hook_command(handler.get("command"), handler.get("shell")),
+                "timeout": _hook_timeout(handler.get("timeout")),
+                **({"args": _hook_args(handler)} if handler.get("args") is not None else {}),
+                **{
+                    setting: _hook_timeout(handler[setting])
+                    for setting in HOOK_HANDLER_SETTINGS
+                    if handler.get(setting) is not None
+                },
+                **(
+                    inline_allow_facts(group, handler)
+                    if host == "claude-code" and event == "PreToolUse" else {}
+                ),
+                **reach,
+            }
+            for handler in listed
+        )
+    return handlers, max(0, declared - MAX_HOOK_HANDLERS)
+
+
+def _matcher_reach(matcher: Any, published: str | None) -> str:
+    """Whether a Claude Code tool-event matcher can match any tool name, as its handler publishes it (#940).
+
+    Decided on the declared matcher, never on the published label, which
+    redaction and the length cut may have changed. A matcher published as
+    :data:`DETAIL_NOT_SHOWN` (longer than the bound as ``config_sha256``'s
+    input holds it, or not a string) is ``possible``: the bound is the
+    published matcher's, so two matchers that input holds alike decide
+    alike, and a row never names a mismatch it cannot show.
+    """
+
+    if published == DETAIL_NOT_SHOWN:
+        return POSSIBLE
+    return claude_tool_matcher_reach(matcher)
+
+
+def _hook_timeout(timeout: Any) -> bool | int | float | str | None:
+    """A handler's ``timeout`` as its grant publishes it (#819).
+
+    A boolean, a finite float, or an integer whose digits fit the word bound,
+    is published as the value it is. An integer with more digits than
+    :data:`MAX_DETAIL_WORD_CHARS` is published as its digits, cut and ending in
+    ``…`` (#819 review); a string as written when it is a plain token
+    (:func:`_plain_token`); and any other value, an infinite or
+    not-a-number float among them, as :data:`DETAIL_NOT_SHOWN`. No two of
+    these publish alike: a boolean, or such a float, was published as the
+    text a string could spell, so ``true`` → ``"true"`` and ``Infinity`` →
+    ``"inf"`` read as no difference (#819 review, cycle 6). An integer is
+    never converted to a float, so one too large for a float is not an error.
+    """
+
+    if timeout is None or isinstance(timeout, bool):
+        return timeout
+    if isinstance(timeout, int):
+        # The bit length bounds the digits before any conversion to text:
+        # 4 bits per decimal digit is more than enough (log2(10) < 3.33).
+        if timeout.bit_length() <= 4 * MAX_DETAIL_WORD_CHARS and len(str(timeout)) <= MAX_DETAIL_WORD_CHARS:
+            return timeout
+        return _bounded_detail(str(timeout))
+    if isinstance(timeout, float) and math.isfinite(timeout):
+        return timeout
+    if isinstance(timeout, str):
+        return _plain_token(timeout)
+    return DETAIL_NOT_SHOWN
+
+
+def _hooks_grants(
+    data: Any, *, host: str, scope: HostScope, source: str,
+    basis: HookLoadingBasis = "host_configuration",
+) -> list[dict[str, Any]]:
     hooks = data.get("hooks") if isinstance(data, dict) else None
     if not isinstance(hooks, dict):
         return []
-    return [
-        {
+    access, risk = _HOOK_ACCESS_BY_BASIS[basis]
+    grants: list[dict[str, Any]] = []
+    for event, config in sorted(hooks.items()):
+        handlers, omitted = _hook_handlers(config, host=host, event=str(event))
+        grants.append({
             **_grant_base(
                 host=host, scope=scope, source=source, kind="hook",
-                identity=str(event), config=config, access="execute", risk="high",
+                identity=str(event), config=config, access=access, risk=risk,
             ),
             "event": str(event),
-        }
-        for event, config in sorted(hooks.items())
-    ]
+            "handlers": handlers,
+            "omitted_handlers": omitted,
+        })
+    return grants
+
+
+def hook_loading_basis(grant: dict[str, Any]) -> HookLoadingBasis:
+    """The loading basis of one published hook grant (#714).
+
+    Read back from the published fields, so a saved baseline, a drift payload
+    and a capability row classify one grant the same way. A Claude Code hook
+    whose source is a hook file, a plugin manifest or a marketplace entry,
+    rather than a settings layer, is classified only by the exact pair the
+    reader publishes for a plugin basis. A grant carrying none of those pairs
+    was not recorded with a basis, so it is ``unestablished`` and no
+    selection is inferred from its name.
+
+    One pair is shared with history. `1.0.0` recorded every hook file as
+    `execute`/`high`, which is the ``project_enabled_plugin`` pair, and no
+    published field is free to tell them apart without a schema change. The
+    engine reads a basis only from the current side of a change: the wording
+    of an added or changed row, and the expansion signal. A removal, the only
+    row described from a baseline's grant, names no basis. So nothing a
+    `1.0.0` baseline holds is described as an enabled plugin's hook.
+    """
+
+    source = str(grant.get("source") or "").replace("\\", "/").split("#", 1)[0]
+    pair = (grant.get("access"), grant.get("risk"))
+    if grant.get("host") == "claude-code" and is_claude_plugin_reference_path(source):
+        for basis in ("project_enabled_plugin", "plugin_selected", "declared_only"):
+            if pair == _HOOK_ACCESS_BY_BASIS[basis]:
+                return basis  # type: ignore[return-value]
+        return "unestablished"
+    if grant.get("access") == "unknown":
+        return "unestablished"
+    return "host_configuration"
 
 
 def _claude_grants(data: Any, *, scope: HostScope, source: str) -> list[dict[str, Any]]:
@@ -563,21 +2034,13 @@ def _claude_grants(data: Any, *, scope: HostScope, source: str) -> list[dict[str
         return []
     grants = _permission_rule_grants(data.get("permissions"), host="claude-code", scope=scope, source=source)
     permissions = data.get("permissions") if isinstance(data.get("permissions"), dict) else {}
-    mode_keys = (
-        "defaultMode", "disableBypassPermissionsMode", "allowManagedPermissionRulesOnly",
-        "allowManagedHooksOnly", "skipDangerousModePermissionPrompt",
-        "enableAllProjectMcpServers", "disableAllHooks",
-    )
-    for setting in mode_keys:
-        container = permissions if setting in permissions else data
-        if setting in container:
-            value = container[setting]
-            risky = setting in {"skipDangerousModePermissionPrompt", "enableAllProjectMcpServers"} and bool(value)
-            grants.append(_setting_grant(
-                host="claude-code", scope=scope, source=source, kind="permission_mode",
-                setting=setting, value=value, access="admin" if risky else "unknown",
-                risk="critical" if risky else "medium",
-            ))
+    # One rating per value, shared with `check` and the rows (#827).
+    for item in claude_setting_values(data):
+        rating = rate_claude_setting(item.setting, item.value)
+        grants.append(_setting_grant(
+            host="claude-code", scope=scope, source=source, kind="permission_mode",
+            setting=item.setting, value=item.value, access=rating.access, risk=rating.risk,
+        ))
     for path in sorted(_string_entries(permissions.get("additionalDirectories")) + _string_entries(data.get("additionalDirectories"))):
         projected_path = _privacy_projected_path(path)
         grant = _grant_base(
@@ -605,10 +2068,176 @@ def _claude_grants(data: Any, *, scope: HostScope, source: str) -> list[dict[str
                     host="claude-code", scope=scope, source=source, kind="plugin_or_app",
                     identity=str(name), config={"enabled": enabled}, access="execute", risk="high",
                 ),
-                "name": str(name), "enabled": bool(enabled),
+                "name": str(name), "enabled": enabled if isinstance(enabled, bool) else None,
+            })
+    # `enabledPlugins` entries install from these, so a marketplace added or
+    # re-pointed changes what an enabled plugin runs (#720). Named with a
+    # prefix: a marketplace and a plugin never compete for one precedence key.
+    marketplaces = data.get("extraKnownMarketplaces")
+    if isinstance(marketplaces, dict):
+        for name, config in sorted(marketplaces.items()):
+            label = f"marketplace:{name}"
+            grants.append({
+                **_grant_base(
+                    host="claude-code", scope=scope, source=source, kind="plugin_or_app",
+                    identity=label, config=config, access="external", risk="high",
+                ),
+                "name": label, "enabled": None,
             })
     grants.extend(_hooks_grants(data, host="claude-code", scope=scope, source=source))
+    grants.extend(_claude_command_grants(data, scope=scope, source=source))
     return grants
+
+
+def _claude_command_grants(data: dict[str, Any], *, scope: HostScope, source: str) -> list[dict[str, Any]]:
+    """The settings Claude Code runs as a command, and the ``env`` entries that redirect it or load code (#1027).
+
+    A command setting (:data:`CLAUDE_COMMAND_SETTINGS`) is rated as a hook a
+    settings file declares, ``execute``/``high``: its whole value is the
+    grant's digest, and its command is published as a hook handler's is
+    (:func:`_hook_command`), never as text. An ``env`` entry is a grant only
+    for a name :func:`claude_env_rating` models, published by name with the
+    value digested and withheld; every other entry stays out of the grants,
+    and its value out of every digest a comparison reads. A ``null`` value
+    declares nothing to run.
+    """
+
+    grants: list[dict[str, Any]] = []
+    for setting in CLAUDE_COMMAND_SETTINGS:
+        value = data.get(setting)
+        if value is None:
+            continue
+        if setting in CLAUDE_COMMAND_OBJECT_SETTINGS:
+            command = value.get("command") if isinstance(value, dict) else None
+        else:
+            command = value
+        published = _hook_command(command)
+        grants.append({
+            **_grant_base(
+                host="claude-code", scope=scope, source=source, kind="command_setting",
+                identity=setting, config=value, access="execute", risk="high",
+            ),
+            "setting": setting,
+            **({"command": published} if published is not None else {}),
+        })
+    env = data.get("env")
+    if isinstance(env, dict):
+        for name, value in sorted(env.items(), key=lambda item: str(item[0])):
+            rating = _claude_env_rating(str(name))
+            if rating is None:
+                continue
+            grants.append({
+                **_grant_base(
+                    host="claude-code", scope=scope, source=source, kind="env",
+                    identity=str(name), config=value, access=rating.access, risk=rating.risk,
+                ),
+                "name": str(name),
+            })
+    return grants
+
+
+def _claude_env_rating(name: str) -> SettingRating | None:
+    """The rating of an ``env`` name the settings reader models, or ``None`` (#1027).
+
+    A modelled name is also one the grant may publish: a plain environment
+    variable name that no redaction rule rewrites and that names no secret.
+    """
+
+    if (
+        not _ENV_VAR_NAME.fullmatch(name)
+        or _is_secret_key(name)
+        or published_workflow_label(name) != name
+    ):
+        return None
+    return claude_env_rating(name)
+
+
+#: The ``permissions`` keys the settings reader compares.
+_CLAUDE_READ_PERMISSION_KEYS = frozenset({
+    "allow", "ask", "deny", "additionalDirectories", *CLAUDE_SCALAR_SETTINGS,
+})
+#: Top-level settings the reader compares when they hold an object.
+_CLAUDE_READ_OBJECT_KEYS = frozenset({"sandbox", "enabledPlugins", "extraKnownMarketplaces", "hooks"})
+#: A settings key an artifact may publish (#1027).
+_SETTINGS_KEY_RE = re.compile(r"[A-Za-z0-9$._+-]{1,80}")
+
+
+def _published_settings_key(key: str) -> str:
+    """A settings key as published: as written when plain and no redaction rule rewrites it (#1027)."""
+
+    if _SETTINGS_KEY_RE.fullmatch(key) and _detail_string_rules(key) == key:
+        return key
+    return DETAIL_NOT_SHOWN
+
+
+def _claude_key_read(data: dict[str, Any], key: str) -> bool:
+    """Whether a grant reader of this entry compares top-level ``key`` of a settings document (#1027)."""
+
+    value = data[key]
+    return (
+        key in CLAUDE_COMMAND_SETTINGS
+        or (key in _CLAUDE_READ_OBJECT_KEYS and isinstance(value, dict))
+        or (key == "additionalDirectories" and isinstance(value, list))
+        or read_at_top_level(data, key)
+    )
+
+
+def _claude_unmodelled_keys(data: Any) -> list[dict[str, str]]:
+    """The keys of one Claude Code settings document that no reader of this entry compares (#1027).
+
+    Each top-level key no grant reader compares, each key inside
+    ``permissions`` other than the rules, the additional directories and the
+    modelled scalar settings (``permissions.<key>``), and ``env`` for the
+    entries whose names the reader does not model. Each is published with
+    the digest of the key and its value as ``config_sha256``'s input holds
+    them, so a comparison can name the ones that changed; an ``env`` value or
+    a secret-named value is redacted there, so rotating one moves nothing.
+    """
+
+    if not isinstance(data, dict):
+        return []
+    unread: list[tuple[str, dict[str, Any]]] = []
+    for raw_key, value in data.items():
+        key = str(raw_key)
+        if key == "permissions" and isinstance(value, dict):
+            unread.extend(
+                (f"permissions.{inner}", {"permissions": {inner: item}})
+                for inner, item in value.items()
+                if str(inner) not in _CLAUDE_READ_PERMISSION_KEYS
+            )
+        elif key == "env" and isinstance(value, dict):
+            rest = {name: item for name, item in value.items() if _claude_env_rating(str(name)) is None}
+            if rest:
+                unread.append((key, {key: rest}))
+        elif not _claude_key_read(data, key):
+            unread.append((key, {key: value}))
+    return sorted(
+        (
+            {"key": _published_settings_key(label), "sha256": redacted_config_sha256(held)}
+            for label, held in unread
+        ),
+        key=lambda entry: (entry["key"], entry["sha256"]),
+    )
+
+
+def _claude_unmodelled_commands(data: dict[str, Any]) -> list[str]:
+    """Top-level keys no reader compares whose value is shaped as a command Claude Code runs (#1027).
+
+    An object holding a string ``command``, the shape of ``statusLine`` and
+    a hook handler, or a string under a ``…Helper`` key, the shape of
+    ``apiKeyHelper``. ``policyHelper`` raises its own limit.
+    """
+
+    found: list[str] = []
+    for raw_key, value in data.items():
+        key = str(raw_key)
+        if key == "policyHelper" or _claude_key_read(data, key):
+            continue
+        if (isinstance(value, dict) and isinstance(value.get("command"), str)) or (
+            key.endswith("Helper") and isinstance(value, str)
+        ):
+            found.append(_published_settings_key(key))
+    return sorted(set(found))
 
 
 def _privacy_projected_path(value: str) -> str:
@@ -656,7 +2285,9 @@ def _codex_grants(data: Any, *, scope: HostScope, source: str) -> list[dict[str,
     apps = data.get("apps")
     if isinstance(apps, dict):
         for name, config in sorted(apps.items()):
-            enabled = config.get("enabled") if isinstance(config, dict) else None
+            # Codex documents `apps.<id>.enabled` as defaulting to true, so a
+            # declared app table without the key is enabled (#820).
+            enabled = config.get("enabled", True) if isinstance(config, dict) else None
             grants.append({
                 **_grant_base(
                     host="codex", scope=scope, source=source, kind="plugin_or_app",
@@ -756,79 +2387,2665 @@ def _cursor_grants(data: Any, *, scope: HostScope, source: str) -> list[dict[str
     return grants
 
 
-def _workflow_grant(data: Any, *, source: str) -> dict[str, Any] | None:
+#: How much a declared scope level grants, for scopes that publish alike (#802).
+_LEVEL_WIDTH = {"read": 1, "write": 2}
+
+
+def _workflow_permissions(value: Any, job: str, collided: set[str]) -> dict[str, Any]:
+    """Normalize one job's effective declaration, retaining unknown defaults.
+
+    ``job`` is the job's published label. Scope names publish through the same
+    label rule (#802); every declared scope counts toward a collision, a
+    ``none`` one too, because it is what separates two declarations that
+    would otherwise publish alike. Scopes that publish alike keep the widest
+    level among them, so a collision (itself a blocking limit) never reads a
+    declared ``write`` as ``read``.
+    """
+    state = "explicit"
+    permissions: dict[str, str] = {}
+    if value is None:
+        state = "repository_default"
+    elif isinstance(value, str) and value in {"read-all", "write-all"}:
+        permissions = {"*": value.removesuffix("-all")}
+    elif isinstance(value, dict) and all(
+        isinstance(scope, str) and isinstance(level, str) and level in {"read", "write", "none"}
+        for scope, level in value.items()
+    ):
+        shown = _published_labels(value, kind=_SCOPE_LABELS, collided=collided)
+        for scope, level in sorted(value.items(), key=lambda item: (shown[item[0]], item[0])):
+            label = shown[scope]
+            if level != "none" and _LEVEL_WIDTH[level] > _LEVEL_WIDTH.get(permissions.get(label, ""), 0):
+                permissions[label] = level
+    else:
+        state = "unresolved"
+    return {"job": job, "state": state, "permissions": permissions}
+
+
+#: ``owner/repo[/path]@ref``. The reference is compared as declared text and
+#: never resolved: a branch, tag and commit SHA are equally opaque here (#771).
+_REMOTE_STEP_ACTION_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[^@\s]+)?@[^@\s]+")
+_DOCKER_STEP_ACTION_RE = re.compile(r"docker://\S+")
+#: ``@algorithm:hex`` ending a reference is an image digest, not registry userinfo.
+_TRAILING_DIGEST_RE = re.compile(r"@[A-Za-z0-9_+.-]+:[0-9a-fA-F]{32,}\Z")
+#: ``scheme://`` opening a reference, in any letter case.
+_REFERENCE_SCHEME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
+_UNREADABLE_STEP_REASONS = frozenset({"steps_not_a_list", "step_not_a_mapping"})
+
+
+def _redact_step_text(value: str) -> str:
+    """Step text as it may be published.
+
+    Known token shapes (``ghp_…``, ``AKIA…``, ``xoxb-…``) go through the
+    report redactor, then credential assignments and URLs through the host one.
+    """
+
+    return _sanitize_sensitive_string(redact_text(value) or "")
+
+
+def _redact_reference(text: str) -> str:
+    """A ``uses:`` value or a name as it may be published; differs from ``text`` when redacted.
+
+    ``docker://user:password@registry/image`` carries registry credentials in
+    its userinfo, which neither redactor recognises, so the userinfo is
+    replaced whole. A password may itself hold ``/``, ``:`` or ``@`` (a base64
+    key file routinely does), so the authority is never taken to end at the
+    first ``/``: once a trailing ``@algorithm:hex`` image digest is set aside,
+    the userinfo is everything before the *last* ``@``.
+
+    - After any ``scheme://`` (``docker://`` in any letter case, or a scheme
+      GitHub would reject), every remaining ``@`` belongs to userinfo.
+    - Without a scheme, the last ``@`` opens the ref of ``owner/repo[/path]@ref``,
+      so what precedes it is userinfo only when it holds a ``:`` or another
+      ``@``. An owner or repository name holds neither; an action path that does
+      is refused as redacted rather than risk publishing a password. A marker
+      the redactors already wrote is not itself read as userinfo.
+
+    ``docker://image@sha256:<hex>``, a tag, a port and ``owner/repo/path@ref``
+    are kept as written.
+    """
+
+    display = _redact_step_text(text)
+    scheme = _REFERENCE_SCHEME_RE.match(display)
+    rest = display[scheme.end():] if scheme else display
+    digest = _TRAILING_DIGEST_RE.search(rest)
+    body, suffix = (rest[: digest.start()], rest[digest.start():]) if digest else (rest, "")
+    userinfo, at, remainder = body.rpartition("@")
+    if not at:
+        return display
+    unmarked = _PATH_REDACTION_MARKER.sub("", userinfo)
+    if scheme is None and ":" not in unmarked and "@" not in unmarked:
+        return display
+    prefix = scheme.group().lower() if scheme else ""
+    return f"{prefix}<redacted>@{remainder}{suffix}"
+
+
+#: A whitespace-delimited token of free text.
+_LABEL_TOKEN_RE = re.compile(r"\S+")
+#: What a URI scheme may hold (RFC 3986 §3.1): an ASCII letter first, then these.
+_SCHEME_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+.-"
+_SCHEME_NON_LETTERS = "0123456789+.-"
+
+
+def _label_scheme_end(token: str) -> int:
+    """The index just past the ``://`` of the token's first ``scheme://``, else ``-1``.
+
+    A scheme is an ASCII letter and then letters, digits, ``+``, ``.`` or
+    ``-`` running up to ``://``; it may start anywhere in the token, so
+    ``(docker://…`` and ``9docker://…`` hold ``docker://``. Each ``://`` is
+    tried in order: take the run of scheme characters just before it, and
+    its first letter opens the scheme. A ``://`` with no letter before it
+    (``9://``, ``+://``) opens none, so the next one is tried.
+
+    Linear in the token (#802 review: a backtracking pattern was quadratic).
+    ``/`` ends a run, so the run before one ``://`` never reaches back past
+    the previous one, and each segment between them is read once.
+    """
+
+    lower = 0
+    separator = token.find("://")
+    while separator != -1:
+        segment = token[lower:separator]
+        run = segment[len(segment.rstrip(_SCHEME_CHARS)):]
+        if run.lstrip(_SCHEME_NON_LETTERS):
+            return separator + 3
+        lower = separator + 3
+        separator = token.find("://", lower)
+    return -1
+
+
+def _redact_token_userinfo(match: re.Match[str]) -> str:
+    token = match.group()
+    end = _label_scheme_end(token)
+    if end == -1:
+        return token
+    rest = token[end:]
+    digest = _TRAILING_DIGEST_RE.search(rest)
+    body, suffix = (rest[: digest.start()], rest[digest.start():]) if digest else (rest, "")
+    _, at, remainder = body.rpartition("@")
+    return f"{token[:end]}<redacted>@{remainder}{suffix}" if at else token
+
+
+def _redact_label_userinfo(text: str) -> str:
+    """``text`` with the userinfo of every ``scheme://…@`` token replaced (#802).
+
+    The ``scheme://`` rule of :func:`_redact_reference`, applied to each
+    whitespace-delimited token of free text rather than to a whole reference:
+    in a token holding ``scheme://`` (:func:`_label_scheme_end`), once a
+    trailing ``@algorithm:hex`` digest is set aside, everything between the
+    first ``scheme://`` and the token's last ``@`` is userinfo, so a password
+    holding ``/``, ``:`` or ``@`` is covered. Only such tokens are read, and
+    what precedes the scheme in the token is kept. Calling
+    :func:`_redact_reference` on a label would replace the words before the
+    token too (``Pull docker://ci:pw@gcr.io/img`` → ``<redacted>@gcr.io/img``)
+    and read scheme-less prose as userinfo (``Tag v1:beta@2`` → ``<redacted>@2``).
+
+    Linear in ``text``: a label may be as long as the workflow file itself.
+    """
+
+    if "://" not in text:
+        return text
+    return _LABEL_TOKEN_RE.sub(_redact_token_userinfo, text)
+
+
+def published_workflow_label(text: str) -> str:
+    """A workflow label as it may be published (#802).
+
+    A label is text GitHub reads as a name: a job id, a step's ``id`` or
+    ``name``, a trigger, a permission scope. Each goes through the redaction
+    step text does — known token shapes (``ghp_…``, ``AKIA…``, ``xoxb-…``) and
+    credential assignments and URLs — and then the userinfo of any
+    ``scheme://…@`` token inside it, so ``Pull docker://ci:<password>@gcr.io/img``
+    publishes ``Pull docker://<redacted>@gcr.io/img``. Ordinary names such as
+    ``build``, ``deploy-prod``, ``secret-scan``, ``token-refresh``, ``contents``
+    or ``pull_request`` are never rewritten.
+
+    Every published job label, prefix and row, and ``check``'s evidence, uses
+    this one rule, so no surface names a job another way. Two reads compare
+    by what they published, so ``config_sha256`` and every compared fact are
+    built from these labels, and :func:`_published_labels` refuses when two
+    raw labels in one workflow publish alike.
+    """
+
+    return _redact_label_userinfo(_redact_step_text(text))
+
+
+def _published(text: str, *, label: bool = False) -> tuple[str, bool]:
+    """``text`` as it may be published, and whether redaction rewrote it (#767, #802).
+
+    The one rule for workflow text that is both published and compared: a
+    step's ``uses:``, a job's reusable-workflow ``uses:``, and the destination
+    and source names of a secret it passes. Rewritten text cannot be compared.
+    Two distinct values may publish alike, and a digest of either would be a
+    digest of the credential, so a caller marks the entry redacted and
+    :func:`_uncompared_workflow_text` makes the workflow a blocking limit.
+
+    ``label=True`` publishes a job id, trigger or permission scope name by
+    :func:`published_workflow_label` instead. A redacted label still compares:
+    one token-shaped job id, alone in its workflow, identifies its job as well
+    as the raw text did. What cannot compare is two distinct labels that
+    publish alike, which :func:`_published_labels` records.
+    """
+
+    display = published_workflow_label(text) if label else _redact_reference(text)
+    return display, display != text
+
+
+#: What a label collision names, in the order a limit lists them (#802).
+_JOB_LABELS = "job ids"
+_TRIGGER_LABELS = "trigger names"
+_SCOPE_LABELS = "permission scope names"
+_LABEL_KINDS = (_JOB_LABELS, _TRIGGER_LABELS, _SCOPE_LABELS)
+
+
+def _published_labels(raws: Any, *, kind: str, collided: set[str]) -> dict[str, str]:
+    """Each raw label in one namespace and the label it publishes as (#802).
+
+    A namespace is one workflow's jobs, its triggers, or one ``permissions``
+    mapping. When two distinct raw labels in it publish alike, ``kind`` is
+    added to ``collided``: they would compare as one job, trigger or scope,
+    so :func:`_uncompared_workflow_text` makes the workflow a blocking limit.
+    A single redacted label is not a collision and refuses nothing.
+    """
+
+    names = [str(raw) for raw in raws]
+    shown = {name: _published(name, label=True)[0] for name in names}
+    if len(set(shown.values())) < len(names):
+        collided.add(kind)
+    return shown
+
+
+def _step_label(step: dict[Any, Any], index: int) -> str:
+    """The step's ``id``, else its ``name``, else ``steps[N]`` (zero-based).
+
+    Evidence for finding the step, never part of the comparison, so renaming
+    a step or reordering steps that declare the same references stays quiet.
+    Published by :func:`published_workflow_label`; two steps whose labels
+    publish alike still compare by their references.
+    """
+
+    for key in ("id", "name"):
+        value = step.get(key)
+        if isinstance(value, str) and value.strip():
+            return published_workflow_label(value.strip())
+    return f"steps[{index}]"
+
+
+def _unreadable_step(job: str, step: str, reason: str) -> dict[str, Any]:
+    """A ``steps`` shape GitHub would reject, recorded rather than read as empty.
+
+    Nothing from the value is published: it may be any text at all.
+    """
+
+    return {"job": job, "step": step, "uses": None, "form": "unresolved", "unresolved_reason": reason}
+
+
+def _step_action(job: str, step: dict[Any, Any], index: int) -> dict[str, Any] | None:
+    """One step's declared ``uses:``, or ``None`` when it declares no remote one.
+
+    A local ``./…`` reference is outside this reader: composite actions stay
+    unread (#701), so it is neither listed nor counted as inspected. Anything
+    Shipgate does not resolve to an action identity is kept, as ``unresolved``
+    with the reason, rather than guessed or dropped. A value the credential
+    redactor rewrites cannot be both published and compared, so it is
+    ``redacted``, and the reader records a blocking coverage issue for it.
+    ``job`` is the job's published label (#802).
+    """
+
+    if "uses" not in step:
+        return None
+    value = step["uses"]
+    entry: dict[str, Any] = {
+        "job": job,
+        "step": _step_label(step, index),
+        "uses": None,
+        "form": "unresolved",
+        "unresolved_reason": None,
+    }
+    if not isinstance(value, str):
+        return {**entry, "unresolved_reason": "not_a_string"}
+    text = value.strip()
+    if text.startswith("./"):
+        return None
+    display, redacted = _published(text)
+    if redacted:
+        return {**entry, "uses": display, "unresolved_reason": "redacted"}
+    if "${{" in text:
+        return {**entry, "uses": text, "unresolved_reason": "expression"}
+    if _DOCKER_STEP_ACTION_RE.fullmatch(text):
+        return {**entry, "uses": text, "form": "docker"}
+    if _REMOTE_STEP_ACTION_RE.fullmatch(text):
+        return {**entry, "uses": text, "form": "remote"}
+    return {**entry, "uses": text, "unresolved_reason": "unsupported_reference"}
+
+
+def step_action_key(entry: dict[str, Any]) -> tuple[str, str, str, str]:
+    """What a step reference is compared by: its job and the reference, not the step."""
+
+    return (
+        str(entry["job"]),
+        str(entry["form"]),
+        str(entry.get("unresolved_reason") or ""),
+        "" if entry.get("uses") is None else str(entry["uses"]),
+    )
+
+
+# --- agent launches (#823) ----------------------------------------------------------
+#
+# How a coding agent is launched inside a job: a known agent action's permission
+# inputs, a literal agent CLI command in a `run:` step, and the ref each
+# `actions/checkout` step declares. Every value is compared as declared text; no
+# action is fetched, no command is run and no expression is evaluated.
+#
+# Shell is not parsed (#823 review cycle 4). A `run:` is read only when it is one
+# line of plain words — no quote, expansion, operator, redirection, comment or
+# continuation, so every POSIX shell splits it at its blanks and nowhere else —
+# whose program is a known agent CLI; `claude_args` and `codex-args` are read
+# only when they are such a list of words, which each action's own splitter reads
+# the same way. Every other form is never guessed at: a `run:` that mentions an
+# agent CLI is named as an unread step, and an argument input as an unread
+# setting, each a non-blocking limit that publishes none of its text.
+
+
+@dataclass(frozen=True)
+class _AgentAction:
+    """What one documented agent action's inputs mean to this reader (#823).
+
+    ``inputs`` are compared as text. ``gates`` are comma-separated user lists
+    where a ``*`` entry opens the gate to every user (to every bot, for
+    ``allowed_bots``). ``args`` names the input
+    that carries agent CLI arguments, read, when it is a plain list of words,
+    for the documented widening rules. ``modes`` are ``(input, value, rule)``: an
+    input whose value is itself a documented widening. ``settings`` names the
+    input that holds Claude Code settings, JSON or a path; written as JSON, its
+    ``defaultMode`` is read as the settings reader reads it (#823 review).
+    """
+
+    family: Literal["claude", "codex"]
+    inputs: tuple[str, ...]
+    gates: tuple[str, ...] = ()
+    args: str | None = None
+    modes: tuple[tuple[str, str, str], ...] = ()
+    settings: str | None = None
+
+
+_CLAUDE_BASE_ACTION = _AgentAction(
+    family="claude",
+    inputs=(
+        "allowed_tools", "claude_args", "disallowed_tools", "mcp_config",
+        "plugin_marketplaces", "plugins", "settings",
+    ),
+    args="claude_args",
+    settings="settings",
+)
+
+#: The documented agent actions, by ``owner/repo`` (matched case-insensitively,
+#: at any ref). The input names are those the actions' own `action.yml`
+#: declare; `allowed_tools`, `disallowed_tools` and `mcp_config` are the
+#: Claude actions' earlier inputs, still read when a workflow sets them. The
+#: base action is published both as its own repository and as the
+#: `base-action` directory of `anthropics/claude-code-action`.
+_AGENT_ACTIONS: dict[str, _AgentAction] = {
+    "anthropics/claude-code-action": _AgentAction(
+        family="claude",
+        inputs=(
+            "additional_permissions", "allowed_bots", "allowed_non_write_users",
+            "allowed_tools", "claude_args", "disallowed_tools", "mcp_config",
+            "plugin_marketplaces", "plugins", "settings",
+        ),
+        gates=("allowed_bots", "allowed_non_write_users"),
+        args="claude_args",
+        settings="settings",
+    ),
+    "anthropics/claude-code-base-action": _CLAUDE_BASE_ACTION,
+    "anthropics/claude-code-action/base-action": _CLAUDE_BASE_ACTION,
+    "openai/codex-action": _AgentAction(
+        family="codex",
+        inputs=(
+            "allow-bot-users", "allow-bots", "allow-users", "codex-args",
+            "permission-profile", "safety-strategy", "sandbox",
+        ),
+        gates=("allow-users",),
+        args="codex-args",
+        # `:danger-full-access` is Codex's reserved name for its built-in
+        # full-access permission profile, the profile form of the
+        # `danger-full-access` sandbox (#823 review).
+        modes=(
+            ("sandbox", "danger-full-access", "danger_full_access"),
+            ("permission-profile", ":danger-full-access", "danger_full_access"),
+            ("safety-strategy", "unsafe", "unsafe_safety_strategy"),
+        ),
+    ),
+}
+
+#: Flag spelling -> (primary spelling, arity): ``0`` takes no value, ``1`` one,
+#: ``None`` every following word up to the next one starting with ``-``, as the
+#: CLI's variadic options read them. From Claude Code's CLI reference.
+#: ``--settings`` and ``--mcp-config`` are not listed: a value passing one is
+#: not read at all (:data:`_UNREAD_ARGUMENT_FLAGS`).
+_CLAUDE_FLAGS: dict[str, tuple[str, int | None]] = {
+    "--permission-mode": ("--permission-mode", 1),
+    "--dangerously-skip-permissions": ("--dangerously-skip-permissions", 0),
+    "--allow-dangerously-skip-permissions": ("--allow-dangerously-skip-permissions", 0),
+    "--allowedTools": ("--allowedTools", None),
+    "--allowed-tools": ("--allowedTools", None),
+    "--disallowedTools": ("--disallowedTools", None),
+    "--disallowed-tools": ("--disallowedTools", None),
+    "--add-dir": ("--add-dir", None),
+    "--permission-prompt-tool": ("--permission-prompt-tool", 1),
+}
+
+#: The same for ``codex exec``, from the Codex CLI's shared option definitions.
+_CODEX_FLAGS: dict[str, tuple[str, int | None]] = {
+    "--sandbox": ("--sandbox", 1),
+    "-s": ("--sandbox", 1),
+    "--dangerously-bypass-approvals-and-sandbox": ("--dangerously-bypass-approvals-and-sandbox", 0),
+    "--yolo": ("--dangerously-bypass-approvals-and-sandbox", 0),
+    "--approve-for-me": ("--approve-for-me", 0),
+    "--not-so-yolo": ("--approve-for-me", 0),
+    "--dangerously-bypass-hook-trust": ("--dangerously-bypass-hook-trust", 0),
+    "--add-dir": ("--add-dir", 1),
+    "--config": ("--config", 1),
+    "-c": ("--config", 1),
+    "--profile": ("--profile", 1),
+    "-p": ("--profile", 1),
+}
+
+_AGENT_FLAG_TABLES = {"claude": _CLAUDE_FLAGS, "codex": _CODEX_FLAGS}
+
+#: The agent action inputs a documented widening rule is read from.
+AGENT_RULE_INPUTS: frozenset[str] = frozenset(
+    name
+    for spec in _AGENT_ACTIONS.values()
+    for name in (
+        *spec.gates,
+        *(mode for mode, _value, _rule in spec.modes),
+        *(item for item in (spec.args, spec.settings) if item),
+    )
+)
+
+#: The widening each documented rule names, as a row's ``why`` says it.
+AGENT_WIDENING_RULES: dict[str, str] = {
+    "bypass_permissions": "skips permission checks (bypassPermissions)",
+    "bypass_approvals_and_sandbox": "bypasses approvals and the sandbox",
+    "danger_full_access": "runs without a sandbox (danger-full-access)",
+    "unsafe_safety_strategy": "runs without privilege restrictions (safety-strategy: unsafe)",
+    "open_gate": "accepts runs triggered by any user",
+}
+
+#: A user gate whose ``*`` entry admits any bot rather than any user.
+_BOT_GATES = frozenset({"allowed_bots"})
+
+
+def agent_rule_text(rule: str, detail: str) -> str:
+    """How a row's ``why`` names one documented rule: ``detail`` is the gate an ``open_gate`` opened."""
+
+    if rule == "open_gate" and detail in _BOT_GATES:
+        return f"accepts runs triggered by any bot ({detail}: *)"
+    return AGENT_WIDENING_RULES[rule] + (f" ({detail}: *)" if detail else "")
+
+
+#: A literal checkout ref that names pull request code, not the base branch's:
+#: the documented pull request and workflow-run head expressions, and
+#: ``refs/pull/<n>/head`` or ``/merge``.
+_PULL_REQUEST_CODE_REF_RE = re.compile(
+    r"\$\{\{\s*(?:github\.event\.pull_request\.(?:head\.(?:sha|ref)|merge_commit_sha)"
+    r"|github\.head_ref|github\.event\.workflow_run\.head_(?:sha|branch))\s*\}\}"
+    r"|refs/pull/(?:\d+|\$\{\{[^}]*\}\})/(?:head|merge)"
+)
+
+#: Triggers that run with the base repository's context on input from people
+#: who need not hold write access, as the support page lists them.
+UNTRUSTED_INPUT_TRIGGERS = ("issue_comment", "issues", "pull_request_target", "workflow_run")
+
+_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+_SECRET_REFERENCE_RE = re.compile(r"\bsecrets\.([A-Za-z_][A-Za-z0-9_]*)")
+#: One ``${{ … }}`` expression's body and its closing ``}}``, or an unterminated
+#: ``${{`` to the end of the text, which names no secret. A lazy match that
+#: must find ``}}`` scanned to the end from every ``${{``, so text holding many
+#: unterminated ones took quadratic time (#823 review cycle 7).
+_EXPRESSION_RE = re.compile(r"\$\{\{(.*?)(\}\}|\Z)", re.S)
+
+
+def pull_request_code_ref(ref: str | None) -> bool:
+    """Whether a published checkout ref names pull request code (#823)."""
+
+    return ref is not None and _PULL_REQUEST_CODE_REF_RE.fullmatch(ref.strip()) is not None
+
+
+# --- the only forms read: plain lists of words (#823 review cycle 4) --------------------
+#
+# Four review cycles each found a shell form a parser mis-read, so none is
+# parsed. A word made only of these characters means the same to a POSIX shell,
+# to shell-quote (which the Claude actions split `claude_args` with, after making
+# `()|&;<>` literal) and to string-argv (which `openai/codex-action` splits
+# `codex-args` with): no quote, `$`, backtick, backslash, `#`, `~`, glob,
+# brace, bracket, `!`, `@`, `;`, `&`, `|`, `<`, `>` or non-ASCII character is
+# among them, so the words are exactly the text split at its blanks.
+
+#: A word of a plain `run:` command.
+_PLAIN_RUN_WORD_RE = re.compile(r"[A-Za-z0-9_./:=,%+-]+")
+#: A word of a plain argument input: parentheses too, which neither action's
+#: splitter reads as anything but a character (`Bash(git:status)`), while a
+#: shell would.
+_PLAIN_ARGUMENT_WORD_RE = re.compile(r"[A-Za-z0-9_./:=,%+()-]+")
+#: Flags whose value the host readers withhold or read from a file: a value
+#: passing one, in any spelling, is not read (#823 review cycle 4).
+_UNREAD_ARGUMENT_FLAGS = frozenset({"--settings", "--mcp-config"})
+#: A known agent CLI's name as a word of its own: a `run:` that holds one
+#: mentions that agent.
+_AGENT_CLI_MENTION_RE = re.compile(r"(?<![A-Za-z0-9_])(claude|codex)(?![A-Za-z0-9_])")
+#: The shells a plain `run:` is read for, by the program a declared `shell:` names.
+_READ_SHELLS = frozenset({"bash", "sh"})
+
+
+def _plain_words(words: list[str], pattern: re.Pattern[str]) -> list[str] | None:
+    """``words``, when each is made of plain characters and none is an unread flag, else ``None``."""
+
+    words = [word for word in words if word]
+    if not words or not all(pattern.fullmatch(word) for word in words):
+        return None
+    if any(word.split("=", 1)[0] in _UNREAD_ARGUMENT_FLAGS for word in words):
+        return None
+    return words
+
+
+def _argument_words(text: str) -> list[str] | None:
+    """An agent action's argument input as its words, when it is a plain list of them.
+
+    Blanks and newlines separate words, as both actions' splitters read
+    them. ``None`` — the input is not read — for anything else: a quote, a
+    ``${{ }}`` expression, ``$``, a backtick, a comment, a shell separator,
+    JSON, a ``--settings`` or ``--mcp-config`` flag, or any other character
+    outside the plain set.
+    """
+
+    return _plain_words(re.split(r"[ \t\r\n]+", text), _PLAIN_ARGUMENT_WORD_RE)
+
+
+def _run_words(run: str) -> list[str] | None:
+    """A ``run:`` as the words of its one command, when it is one line of plain words.
+
+    Only spaces and tabs separate words, as the shell reads them; a second
+    line, and every character outside the plain set, is ``None``.
+    """
+
+    text = run.strip(" \t\n")
+    if "\n" in text:
+        return None
+    return _plain_words(re.split(r"[ \t]+", text), _PLAIN_RUN_WORD_RE)
+
+
+def _run_command(run: str) -> tuple[str, list[str]] | None:
+    """The agent CLI a plain one-command ``run:`` launches headless, and its arguments.
+
+    After any ``NAME=value`` assignments, the program's file name must be
+    ``claude`` with ``-p``/``--print`` among its arguments, or ``codex`` with
+    ``exec`` (or its alias ``e``) as its first argument. Any other command —
+    ``claude mcp add``, ``codex login``, ``npx …``, ``timeout 600 claude`` —
+    launches none this reader reads.
+    """
+
+    words = _run_words(run)
+    if words is None:
+        return None
+    index = 0
+    while index < len(words) and _ASSIGNMENT_RE.match(words[index]):
+        index += 1
+    if index >= len(words):
+        return None
+    program, arguments = words[index].rsplit("/", 1)[-1], words[index + 1:]
+    options = arguments[:arguments.index("--")] if "--" in arguments else arguments
+    if program == "claude" and any(word in {"-p", "--print"} for word in options):
+        return "claude", arguments
+    if program == "codex" and arguments[:1] in (["exec"], ["e"]):
+        return "codex", arguments[1:]
+    return None
+
+
+def _declared_shell(step: dict[Any, Any], job: dict[Any, Any], workflow: dict[Any, Any]) -> Any:
+    """The ``shell:`` a step runs its ``run:`` with: its own, else its job's, else its workflow's default.
+
+    ``None`` when none is declared, which is the runner's default shell.
+    """
+
+    if step.get("shell") is not None:
+        return step["shell"]
+    for container in (job, workflow):
+        defaults = container.get("defaults")
+        run = defaults.get("run") if isinstance(defaults, dict) else None
+        if isinstance(run, dict) and run.get("shell") is not None:
+            return run["shell"]
+    return None
+
+
+#: An option word of a declared ``bash``/``sh`` template after which the shell
+#: still runs the script: a cluster of ``set`` flags and ``-l``, ``-i`` or
+#: ``-r``, or one of these long options. Never ``-c``, which runs a command
+#: string of its own, ``-s``, which reads commands from standard input, ``-n``,
+#: which runs none, ``--rcfile`` or anything else. A cluster ending in ``o``
+#: or ``O`` takes an option name next.
+_SHELL_OPTION_RE = re.compile(
+    r"[-+](?:[abefhiklmprtuvxBCEHPT]+[oO]?|[oO])"
+    r"|--(?:noprofile|norc|posix|login|restricted|noediting|verbose)"
+)
+_SHELL_OPTION_NAME_RE = re.compile(r"[a-z_]+")
+#: The option name that runs no command.
+_SHELL_NO_EXEC = "noexec"
+
+
+def _read_shell(shell: Any) -> bool:
+    """Whether a ``run:`` under this declared shell is read.
+
+    None declared, ``bash`` or ``sh`` (by any path), or a template that runs
+    one of them on the script alone: option words it still runs the script
+    under, then ``{0}`` last, as in ``bash --noprofile --norc -eo pipefail
+    {0}``. Any other template, such as ``bash -c '…' {0}``, may run a command
+    of its own or none, so the step is not read (#823 review cycle 7).
+    """
+
+    if shell is None:
+        return True
+    if not isinstance(shell, str):
+        return False
+    words = shell.split()
+    if not words or words[0].rsplit("/", 1)[-1] not in _READ_SHELLS:
+        return False
+    if len(words) == 1:
+        return True
+    if words[-1] != "{0}":
+        return False
+    index = 1
+    while index < len(words) - 1:
+        word = words[index]
+        if not _SHELL_OPTION_RE.fullmatch(word):
+            return False
+        index += 1
+        if not word.startswith("--") and word[-1] in "oO":
+            name = words[index] if index < len(words) - 1 else ""
+            if not _SHELL_OPTION_NAME_RE.fullmatch(name) or name == _SHELL_NO_EXEC:
+                return False
+            index += 1
+    return True
+
+
+def _read_flags(
+    words: list[str] | tuple[str, ...], table: dict[str, tuple[str, int | None]]
+) -> list[tuple[str, int | None, list[str] | None]]:
+    """The documented permission flags among ``words``: primary spelling, arity and value words.
+
+    A flag is read by name wherever it is a word of its own; every other word
+    — the prompt, ``--model`` and any undocumented flag — is not compared. A
+    flag that takes no value, or is given none, has ``None``. A long flag's
+    value may be attached as ``--name=value``, and a short one's as
+    ``-s<value>`` or ``-s=<value>``, which clap reads as ``-s <value>``
+    (#823 review cycle 3).
+    """
+
+    # A standalone terminator makes every following word positional prompt
+    # text, even when it spells a permission flag.
+    flags: list[tuple[str, int | None, list[str] | None]] = []
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if word == "--":
+            break
+        if word.startswith("--"):
+            name, equals, attached = word.partition("=")
+        elif len(word) > 2 and table.get(word[:2], ("", 0))[1] == 1:
+            name, equals, attached = word[:2], "=", word[2:].removeprefix("=")
+        else:
+            name, equals, attached = word, "", ""
+        spec = table.get(name)
+        index += 1
+        if spec is None:
+            continue
+        primary, arity = spec
+        if arity == 0:
+            flags.append((primary, arity, None))
+            continue
+        values = [attached] if equals else []
+        if arity == 1 and not equals and index < len(words):
+            values.append(words[index])
+            index += 1
+        elif arity is None:
+            while index < len(words) and not words[index].startswith("-"):
+                values.append(words[index])
+                index += 1
+        flags.append((primary, arity, values or None))
+    return flags
+
+
+#: One ``${{ … }}`` expression, or an unterminated ``${{`` to the end of the text.
+_EXPRESSION_SPAN_RE = re.compile(r"\$\{\{.*?(?:\}\}|\Z)", re.S)
+#: What an expression reads as while a user gate's entries are split: a
+#: private-use character, which is neither a comma nor a blank.
+_EXPRESSION_MARK = ""
+
+
+def holds_expression(text: str) -> bool:
+    """Whether declared text holds a ``${{ }}`` expression GitHub substitutes before the action reads it."""
+
+    return "${{" in text
+
+
+# --- what an agent setting publishes (#823, #802) --------------------------------------
+
+#: A codex ``--config`` override under one of these keys carries values the
+#: codex host reader never publishes, as ``.mcp.json`` ``env``/``headers`` do not.
+_CONFIG_WITHHELD_KEYS = frozenset({"env", "headers", "http_headers", "env_http_headers"})
+
+#: Keys whose value maps MCP server names to servers, anywhere in a structured
+#: value: Claude's ``mcpServers`` and codex's ``mcp_servers``. VS Code's
+#: ``servers`` counts only at the top, where `.vscode/mcp.json` puts it.
+_SERVER_MAP_KEYS = frozenset({"mcpServers", "mcp_servers"})
+_TOP_LEVEL_SERVER_MAP_KEYS = _SERVER_MAP_KEYS | {"servers"}
+#: Where, from the top of a Claude Code settings value, the settings reader
+#: publishes a string as it is: a ``permissions.allow``/``ask``/``deny`` rule,
+#: and the value of a documented setting, under ``permissions`` or at the top.
+_PUBLISHED_STRING_PATHS: frozenset[tuple[str, ...]] = frozenset({
+    *(("permissions", name) for name in ("allow", "ask", "deny", *CLAUDE_SCALAR_SETTINGS)),
+    *((name,) for name in (*CLAUDE_SCALAR_SETTINGS, *CLAUDE_LIST_SETTINGS)),
+})
+
+
+#: The permission rule lists among them, published as :func:`public_permission_rule` publishes a rule.
+_PUBLISHED_RULE_PATHS: frozenset[tuple[str, ...]] = frozenset(
+    ("permissions", name) for name in ("allow", "ask", "deny")
+)
+
+
+def _withheld_string(value: str, label: str | None = None) -> str:
+    """One string of a structured value as it is published (#823 review C2-F1).
+
+    ``<withheld:…>``: a short digest of what the host readers digest for it —
+    the sanitized text, and a URL's query as an MCP server's is (#723) — so
+    editing it is still a change while none of its text is published. Where a
+    host reader publishes a label for the string (``label``: an MCP server's
+    command name or URL, a permission rule, a documented setting's value), the
+    label is published, followed by the digest only when the label drops
+    something the digest reads, such as a command's arguments or a URL's query.
+    """
+
+    withheld = f"<withheld:{redacted_config_sha256(value)[:12]}>"
+    if label is None:
+        return withheld
+    if label == value or (
+        label == _sanitize_sensitive_string(value) and not _url_capability_parts(value)
+    ):
+        return label
+    return f"{label} {withheld}"
+
+
+def _server_command(command: str) -> str:
+    """An MCP server's ``command`` as the MCP reader names it: its first word's file name."""
+
+    first = command.strip().split(maxsplit=1)[0] if command.strip() else ""
+    return _withheld_string(command, _sanitize_sensitive_string(Path(first).name or first) or None)
+
+
+def _json_shape(value: Any, path: tuple[str, ...] = ()) -> Any:
+    """A structured value's shape: what a host reader would publish of it, and no free text.
+
+    Key names, numbers, booleans and ``null`` are kept. Secret-bearing values
+    are ``<redacted>`` exactly as the host readers redact them before any
+    digest: ``env`` and ``headers`` (and codex's ``http_headers`` and
+    ``env_http_headers``) keep their keys, a secret-named key's value
+    (``apiKeyHelper``) and the word after a secret-named argument are
+    replaced, and ``policyHelper`` is excluded. Every other string is
+    :func:`_withheld_string`, keeping only what a host reader publishes: a
+    ``permissions.allow``/``ask``/``deny`` rule and a documented Claude Code
+    setting's value (``defaultMode``, ``enabledMcpjsonServers`` entries) at the
+    top of the value, as the settings reader publishes them; and an MCP
+    server's command name and URL scheme and host, as the MCP reader publishes
+    them. So an MCP server's arguments and a hook's command publish nothing
+    of their text (#823 review C2-F1). ``path`` is the keys above ``value``.
+    """
+
+    parent = path[-1] if path else None
+    if isinstance(value, dict):
+        in_server = len(path) >= 2 and (
+            path[-2] in _SERVER_MAP_KEYS or (len(path) == 2 and path[0] in _TOP_LEVEL_SERVER_MAP_KEYS)
+        )
+        shaped: dict[str, Any] = {}
+        for key, inner in value.items():
+            key_text = str(key)
+            if key_text == "policyHelper":
+                shaped[key_text] = "<excluded-dynamic-helper>"
+            elif _is_secret_key(key_text) or parent in _CREDENTIAL_CONTAINER_KEYS:
+                shaped[key_text] = "<redacted>"
+            elif key_text in _CONFIG_WITHHELD_KEYS and isinstance(inner, dict):
+                shaped[key_text] = {str(name): "<redacted>" for name in inner}
+            elif in_server and key_text == "command" and isinstance(inner, str):
+                shaped[key_text] = _server_command(inner)
+            elif in_server and key_text in {"url", "serverUrl"} and isinstance(inner, str):
+                shaped[key_text] = _withheld_string(inner, _sanitize_url(inner))
+            else:
+                shaped[key_text] = _json_shape(inner, (*path, key_text))
+        return shaped
+    if isinstance(value, list):
+        items: list[Any] = []
+        redact_next = False
+        for item in value:
+            if redact_next:
+                items.append("<redacted>")
+                redact_next = False
+                continue
+            if isinstance(item, str) and not _SECRET_ARG_RE.fullmatch(item):
+                redact_next = item.lower().lstrip("-").replace("-", "_") in _SECRET_KEY_MARKERS
+            items.append(_json_shape(item, path))
+        return items
+    if isinstance(value, str):
+        if path in _PUBLISHED_RULE_PATHS:
+            return _withheld_string(value, public_permission_rule(value))
+        published = path in _PUBLISHED_STRING_PATHS
+        return _withheld_string(value, _sanitize_sensitive_string(value) if published else None)
+    return value
+
+
+def _withheld_json(value: Any) -> str | None:
+    """A structured value as it may be published: its :func:`_json_shape`, as canonical JSON.
+
+    Canonical, so reformatting or reordering keys changes nothing.
+    """
+
+    try:
+        return json.dumps(
+            _json_shape(value), sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, default=str,
+        )
+    except (RecursionError, TypeError, ValueError):
+        return None
+
+
+def _withheld_word(word: str) -> str | None:
+    """One word as it may be published: a JSON object by :func:`_withheld_json`, else as written.
+
+    ``None`` for a word that starts like a JSON object and does not parse: what
+    it holds cannot be told apart, so none of it may be published.
+    """
+
+    if not word.lstrip().startswith("{"):
+        return word
+    try:
+        loaded = json.loads(word)
+    except (ValueError, RecursionError):
+        return None
+    return _withheld_json(loaded)
+
+
+#: The action inputs that hold JSON or a file path (#823 review).
+_JSON_OR_PATH_INPUTS = frozenset({"mcp_config", "settings"})
+#: A file path as it may be published: plain path characters, and any
+#: ``${{ }}`` expression in it a plain context reference.
+_PLAIN_PATH_RE = re.compile(r"(?:[A-Za-z0-9_./~@+,:=%-]|\$\{\{[ A-Za-z0-9_.\-\[\]*]*\}\})*")
+
+
+def _withheld_json_or_path(text: str) -> str | None:
+    """A ``settings`` or ``mcp_config`` value as it may be published.
+
+    A JSON object by :func:`_withheld_word`, and a plain file path as
+    written. Any other text is neither, so the action rejects it, but it may
+    still hold what a host reader withholds, such as an ``env`` value after a
+    comment line: it publishes only ``<withheld:…>``, a digest, so an edit to
+    it is still a change (#823 review cycle 5).
+    """
+
+    if text.lstrip().startswith("{") or _PLAIN_PATH_RE.fullmatch(text):
+        return _withheld_word(text)
+    return _withheld_string(text)
+
+
+#: The codex ``--config`` keys whose value is published as written: the
+#: settings a documented widening rule reads (``sandbox_mode``,
+#: ``default_permissions``), the approval policy and the model. Any other
+#: key's value — an MCP server's command or URL, a shell environment value, a
+#: provider — publishes only its digest (#823 review cycle 4).
+_PUBLISHED_CONFIG_KEYS = frozenset({"sandbox_mode", "default_permissions", "approval_policy", "model"})
+
+
+def _withheld_config(text: str) -> str:
+    """A codex ``--config key=value`` override as it may be published.
+
+    The key is published. Under ``env``, ``headers`` or a secret-named key the
+    value is ``<redacted>``, as the host readers redact such values, so
+    rotating it is quiet; under one of :data:`_PUBLISHED_CONFIG_KEYS` it is
+    published as written; under any other key it is ``<withheld:…>``, a
+    digest, so editing it is still a change while none of its text is
+    published. Only a plain word reaches here, so the value is never a TOML
+    table or array.
+    """
+
+    key, equals, value = text.partition("=")
+    if not equals:
+        return text
+    segments = [segment.strip() for segment in key.split(".")]
+    if any(segment in _CONFIG_WITHHELD_KEYS or _is_secret_key(segment) for segment in segments):
+        return f"{key}=<redacted>"
+    if key.strip() in _PUBLISHED_CONFIG_KEYS:
+        return text
+    return f"{key}={_withheld_string(value)}"
+
+
+def _withheld_words(words: list[str] | tuple[str, ...], *, family: str) -> tuple[list[str], bool]:
+    """Each plain argument word as it may be published, and whether one was redacted as credential-shaped.
+
+    A codex ``--config`` override is withheld however it is attached to its
+    flag: a separate word after ``-c`` or ``--config``, ``--config=…``, and
+    ``-c<value>`` or ``-c=<value>``, which clap reads as ``-c <value>``. The
+    word after a secret-named word such as ``--token`` or ``password`` is
+    ``<redacted>``, as the host readers redact it in an MCP server's
+    arguments, and the value is then credential-shaped: an edit to that word
+    is not reported, so the caller names it as a limit. Every other word is
+    published as written, through the label redaction.
+    """
+
+    shown: list[str] = []
+    config = False
+    secret = False
+    redacted = False
+    for word in words:
+        if secret:
+            item = "<redacted>"
+            redacted = True
+        elif config:
+            item = _withheld_config(word)
+        elif family == "codex" and word.startswith("--config="):
+            item = "--config=" + _withheld_config(word.removeprefix("--config="))
+        elif family == "codex" and word.startswith("-c") and len(word) > 2:
+            prefix = "-c=" if word.startswith("-c=") else "-c"
+            item = prefix + _withheld_config(word.removeprefix(prefix))
+        else:
+            item = word
+        shown.append(item)
+        config = family == "codex" and word in {"-c", "--config"}
+        secret = not secret and word.lower().lstrip("-").replace("-", "_") in _SECRET_KEY_MARKERS
+    return shown, redacted
+
+
+def _url_withheld(url: str) -> str:
+    """A URL with its path and query withheld as the host sanitizer withholds them.
+
+    One holding userinfo is kept as written, so the label redaction still
+    finds the credential in it.
+    """
+
+    try:
+        netloc = urlsplit(url).netloc
+    except ValueError:
+        return url
+    return url if "@" in netloc else _sanitize_url(url)
+
+
+#: Private-use characters that stand for one expression each while a value is redacted.
+_EXPRESSION_SLOTS = range(0xE000, 0xF900)
+_EXPRESSION_SLOT_RE = re.compile("[\ue000-\uf8ff]")
+
+
+def _published_value(text: str) -> tuple[str, bool]:
+    """``text`` as it may be published, and whether credential-shaped text had to be redacted.
+
+    A URL's path and query are withheld the way the host sanitizer withholds
+    them from an MCP server URL (#723), and the rest of the text is published
+    and compared: a URL path is not a credential. Anything else the #802 label
+    redaction rewrites — a token shape, a credential assignment, a bearer or
+    header value, a URL's userinfo — is credential-shaped text, and the value
+    is published redacted. The caller decides what that refuses.
+
+    Each ``${{ }}`` expression is read as one word while this is decided, so an
+    expression inside a URL's userinfo is withheld with the userinfo rather
+    than splitting the URL (``https://x:${{ secrets.T }}@host/…`` publishes
+    ``https://host/<redacted-path>``), and every expression left in the value is
+    published through the same label redaction.
+    """
+
+    expressions = _EXPRESSION_SPAN_RE.findall(text)
+    if len(expressions) > len(_EXPRESSION_SLOTS) or _EXPRESSION_SLOT_RE.search(text):
+        # No free character to stand for each expression: read the text as written.
+        expressions = []
+    def url_withheld(match: re.Match[str]) -> str:
+        # A backslash the URL ends at is kept, so a JSON escape after it, as
+        # in a published permission rule, stays an escape (#823 review cycle 3).
+        url = match.group(0)
+        bare = url.rstrip("\\")
+        return _url_withheld(bare) + url[len(bare):]
+
+    def urls_withheld(value: str) -> str:
+        return _URL_RE.sub(url_withheld, value)
+
+    slots = iter(_EXPRESSION_SLOTS)
+    marked = _EXPRESSION_SPAN_RE.sub(lambda _match: chr(next(slots)), text) if expressions else text
+    withheld = urls_withheld(marked)
+    shown = published_workflow_label(withheld)
+    kept = [urls_withheld(expression) for expression in expressions]
+    labels = [published_workflow_label(expression) for expression in kept]
+    redacted = shown != withheld or labels != kept
+
+    if expressions:
+        shown = _EXPRESSION_SLOT_RE.sub(
+            lambda match: labels[ord(match.group()) - _EXPRESSION_SLOTS.start], shown
+        )
+    return shown, redacted
+
+
+def _setting_text(value: Any) -> str | None:
+    """A ``with:`` value as the text GitHub passes, or ``None`` when it is not a scalar."""
+
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return value.strip()
+    return None
+
+
+def _published_text(name: str, text: str | None, *, redacted: bool = False) -> dict[str, Any]:
+    """A setting's withheld text as it may be published; ``None`` text is ``unparsed_json``.
+
+    ``redacted`` says credential-shaped text was already withheld from it.
+    """
+
+    if text is None:
+        return {"name": name, "value": None, "unresolved_reason": "unparsed_json"}
+    shown, rewritten = _published_value(text)
+    return {"name": name, "value": shown, "unresolved_reason": "redacted" if redacted or rewritten else None}
+
+
+def _published_setting(name: str, value: Any, *, arguments: str | None = None) -> dict[str, Any]:
+    """One action input as it may be published: its text, or why it is not.
+
+    ``arguments`` names the family whose action splits this input
+    (``claude_args``, ``codex-args``). Such an input is read only when it is a
+    plain list of words (:func:`_argument_words`), published as those words;
+    otherwise it is ``unread_arguments`` and publishes only ``<withheld:…>``,
+    a digest, so an edit to it is still a change while none of its text is
+    published (#823 review cycle 4). Every other input is one value, a JSON
+    object published by :func:`_withheld_json`; a ``settings`` or
+    ``mcp_config`` value that is neither JSON nor a plain path publishes only
+    a digest (:func:`_withheld_json_or_path`).
+    """
+
+    text = _setting_text(value)
+    if text is None:
+        return {"name": name, "value": None, "unresolved_reason": "not_a_string"}
+    if arguments is not None:
+        words = _argument_words(text)
+        if words is None:
+            return {"name": name, "value": _withheld_string(text), "unresolved_reason": "unread_arguments"}
+        shown, redacted = _withheld_words(words, family=arguments)
+        return _published_text(name, " ".join(shown), redacted=redacted)
+    setting = _published_text(
+        name, _withheld_json_or_path(text) if name in _JSON_OR_PATH_INPUTS else _withheld_word(text)
+    )
+    # Read off the declared text: redaction may rewrite the expression away.
+    return {**setting, "holds_expression": True} if holds_expression(text) else setting
+
+
+def _published_flag(family: str, name: str, arity: int | None, values: list[str] | None) -> dict[str, Any]:
+    """One CLI flag of a plain ``run:`` as it may be published: its value words, a ``--config`` override withheld."""
+
+    if values is None:
+        return {"name": name, "value": None, "unresolved_reason": None}
+    if family == "codex" and name == "--config":
+        shown, redacted = [_withheld_config(value) for value in values], False
+    else:
+        shown, redacted = _withheld_words(values, family=family)
+    return _published_text(name, shown[0] if arity == 1 else " ".join(shown), redacted=redacted)
+
+
+def _setting_key(setting: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(setting["name"]),
+        str(setting.get("unresolved_reason") or ""),
+        "" if setting.get("value") is None else str(setting["value"]),
+    )
+
+
+def _job_secrets(job: dict[Any, Any], workflow_env: Any) -> list[str]:
+    """The secret names a job references in ``${{ }}``, and those the workflow ``env`` passes.
+
+    Context for the row that names an agent step in the job, never compared.
+    Each name is a published label (#802).
+    """
+
+    names: set[str] = set()
+    # Walked once per container, without recursion: a YAML alias can make a
+    # mapping hold itself, or fan one out many times over (#823 review cycle 5).
+    seen: set[int] = set()
+    pending: list[Any] = [job, workflow_env]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, str):
+            for expression, closed in _EXPRESSION_RE.findall(value):
+                if closed:
+                    names.update(_SECRET_REFERENCE_RE.findall(expression))
+        elif isinstance(value, (dict, list)) and id(value) not in seen:
+            seen.add(id(value))
+            pending.extend(value.values() if isinstance(value, dict) else value)
+    return sorted({published_workflow_label(name) for name in names})
+
+
+def _action_identity(uses: Any) -> str | None:
+    """A step's ``owner/repo`` in lower case when ``uses:`` is ``owner/repo@ref``."""
+
+    if not isinstance(uses, str):
+        return None
+    text = uses.strip()
+    if not _REMOTE_STEP_ACTION_RE.fullmatch(text):
+        return None
+    return text.rpartition("@")[0].casefold()
+
+
+def _action_launch(job: str, step_label: str, agent: str, step: dict[Any, Any]) -> dict[str, Any]:
+    """A documented agent action's launch: its documented inputs as published, and the rules they meet.
+
+    The rules are read from each input's declared text before any of it is
+    withheld for publication, so what redaction hides never hides a rule.
+    """
+
+    spec = _AGENT_ACTIONS[agent]
+    entry: dict[str, Any] = {
+        "job": job, "step": step_label, "agent": agent, "form": "read",
+        "unresolved_reason": None, "settings": [],
+    }
+    inputs = step.get("with")
+    if inputs is None:
+        return entry
+    if not isinstance(inputs, dict):
+        return {**entry, "form": "unresolved", "unresolved_reason": "inputs_not_a_mapping"}
+    wanted = {name.casefold(): name for name in spec.inputs}
+    declared = [
+        (wanted[str(key).casefold()], value)
+        for key, value in inputs.items()
+        if str(key).casefold() in wanted
+    ]
+    settings = [
+        _published_setting(name, value, arguments=spec.family if name == spec.args else None)
+        for name, value in declared
+    ]
+    return _with_rules(
+        {**entry, "settings": sorted(settings, key=_setting_key)}, _action_rules(spec, declared)
+    )
+
+
+def _run_launch(job: str, step_label: str, agent: str, arguments: list[str]) -> dict[str, Any]:
+    """A plain ``run:`` agent CLI command's launch: its documented permission flags, and the rules they meet."""
+
+    flags = _read_flags(arguments, _AGENT_FLAG_TABLES[agent])
+    settings = [_published_flag(agent, name, arity, values) for name, arity, values in flags]
+    return _with_rules(
+        {
+            "job": job, "step": step_label, "agent": agent, "form": "read",
+            "unresolved_reason": None, "settings": sorted(settings, key=_setting_key),
+        },
+        _flag_rules(agent, flags),
+    )
+
+
+def _step_agent_launches(
+    job: str, step: dict[Any, Any], index: int, shell: Any
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """The agent launches one step declares, and the unread ``run:`` agent steps it is.
+
+    A known agent action is a launch. A ``run:`` is a launch only when it is
+    one line of plain words (:func:`_run_command`) whose program is a known
+    agent CLI, run by ``bash`` or ``sh`` or no declared ``shell:`` (``shell``).
+    Any other ``run:`` that mentions ``claude`` or ``codex`` as a word of its
+    own is one unread step per agent CLI it mentions: a non-blocking limit
+    that publishes none of its text, is never compared and so gives no row,
+    and never says that the step starts or does not start an agent
+    (#823 review cycle 4).
+    """
+
+    if "uses" in step:
+        agent = _action_identity(step["uses"])
+        if agent is not None and agent in _AGENT_ACTIONS:
+            return [_action_launch(job, _step_label(step, index), agent, step)], []
+        return [], []
+    run = step.get("run")
+    if not isinstance(run, str):
+        return [], []
+    mentioned = sorted(set(_AGENT_CLI_MENTION_RE.findall(run)))
+    if not mentioned:
+        return [], []
+    label = _step_label(step, index)
+    command = _run_command(run) if _read_shell(shell) else None
+    if command is None:
+        return [], [{"job": job, "step": label, "agent": agent} for agent in mentioned]
+    agent, arguments = command
+    return [_run_launch(job, label, agent, arguments)], []
+
+
+def _checkout_ref(job: str, step: dict[Any, Any], index: int) -> dict[str, Any] | None:
+    """An ``actions/checkout`` step and the ``with.ref`` it declares, else ``None``."""
+
+    if _action_identity(step.get("uses")) != "actions/checkout":
+        return None
+    entry: dict[str, Any] = {
+        "job": job, "step": _step_label(step, index), "ref": None, "unresolved_reason": None,
+    }
+    inputs = step.get("with")
+    if inputs is None:
+        return entry
+    if not isinstance(inputs, dict):
+        return {**entry, "unresolved_reason": "inputs_not_a_mapping"}
+    if "ref" not in inputs:
+        return entry
+    text = _setting_text(inputs["ref"])
+    if text is None:
+        return {**entry, "unresolved_reason": "not_a_string"}
+    shown, redacted = _published_value(text)
+    # A redacted ref is published redacted, as a step reference is, and makes
+    # the workflow a blocking limit (#767): two refs may redact alike.
+    return {**entry, "ref": shown or None, "unresolved_reason": "redacted" if redacted else None}
+
+
+def agent_launch_key(entry: dict[str, Any]) -> tuple[Any, ...]:
+    """What an agent launch is compared by: its job, agent, form, settings and rules, not its step.
+
+    The widening rules are part of it: they are read from the declared text,
+    so a rule gained where redaction withholds the text is still a change.
+    """
+
+    return (
+        str(entry["job"]),
+        str(entry["agent"]),
+        str(entry["form"]),
+        str(entry.get("unresolved_reason") or ""),
+        tuple(sorted(_setting_key(setting) for setting in entry.get("settings", []))),
+        tuple(sorted(
+            (str(item["rule"]), str(item["setting"])) for item in entry.get("widening_rules", [])
+        )),
+    )
+
+
+def checkout_ref_key(entry: dict[str, Any]) -> tuple[str, str, str]:
+    """What a checkout ref is compared by: its job and the declared ref, not its step."""
+
+    return (
+        str(entry["job"]),
+        str(entry.get("unresolved_reason") or ""),
+        "" if entry.get("ref") is None else str(entry["ref"]),
+    )
+
+
+def _settings_bypass_permissions(text: str) -> bool:
+    """Whether Claude Code settings written as JSON set ``defaultMode: bypassPermissions`` (#823 review).
+
+    Read as the settings reader reads `.claude/settings.json`
+    (:func:`claude_setting_values`): under ``permissions``, else at the top.
+    A path, or text that does not parse, meets nothing: no file is read.
+    """
+
+    if not text.lstrip().startswith("{"):
+        return False
+    try:
+        loaded = json.loads(text)
+    except (ValueError, RecursionError):
+        return False
+    return any(
+        item.setting == "defaultMode" and item.value == "bypassPermissions"
+        for item in claude_setting_values(loaded)
+    )
+
+
+def _claude_action_rules(words: list[str]) -> set[str]:
+    """The widening rules the plain words of a Claude action's ``claude_args`` meet.
+
+    Read as ``parse-sdk-options.ts`` reads them: a word starting with ``--``
+    is always a flag and never another flag's value, so
+    ``--dangerously-skip-permissions`` counts wherever it stands, and
+    ``--permission-mode`` takes the next word unless that starts with ``--``,
+    the last one counting, as it and the CLI keep the last value of a
+    repeated option (#823 review cycle 5).
+    """
+
+    rules: set[str] = set()
+    mode: str | None = None
+    for index, word in enumerate(words):
+        name, equals, attached = word.partition("=")
+        following = words[index + 1] if index + 1 < len(words) else ""
+        value = attached if equals else ("" if following.startswith("--") else following)
+        if name == "--dangerously-skip-permissions":
+            rules.add("bypass_permissions")
+        elif name == "--permission-mode":
+            mode = value
+    if mode == "bypassPermissions":
+        rules.add("bypass_permissions")
+    return rules
+
+
+def _codex_override(text: str) -> tuple[str, Any] | None:
+    """A codex ``--config`` override's key and value, as the CLI's ``parse_overrides`` reads them.
+
+    The key is the text before the first ``=``, trimmed; the value is parsed
+    as TOML, and text that does not parse is a string with its surrounding
+    quotes trimmed, so ``sandbox_mode=danger-full-access`` and
+    ``sandbox_mode="danger-full-access"`` set one value.
+    """
+
+    key, equals, value = text.partition("=")
+    if not equals or not key.strip():
+        return None
+    raw = value.strip()
+    try:
+        loaded = tomllib.loads(f"value = {raw}").get("value")
+    except (ValueError, RecursionError):
+        # ``TOMLDecodeError`` is a ``ValueError``, and so is the error
+        # ``int()`` raises for an integer longer than Python's digit limit
+        # (#823 review cycle 6).
+        loaded = raw.strip("\"'")
+    return key.strip(), loaded
+
+
+def _codex_config_full_access(flags: list[tuple[str, int | None, list[str] | None]]) -> bool:
+    """Whether ``codex exec``'s ``--config`` overrides select its full-access sandbox (#823 review cycle 3).
+
+    ``sandbox_mode = "danger-full-access"`` is the setting ``--sandbox`` sets,
+    and ``default_permissions = ":danger-full-access"`` selects the built-in
+    full-access profile. As the CLI resolves them, the last override of a key
+    counts, a ``default_permissions`` override selects the permission
+    profile over a ``sandbox_mode`` one, and a ``--sandbox`` flag takes
+    precedence over both, so this reads none while one is passed.
+    """
+
+    if any(name == "--sandbox" for name, _arity, _values in flags):
+        return False
+    profile: Any = None
+    mode: Any = None
+    for name, _arity, values in flags:
+        if name != "--config":
+            continue
+        for value in values or []:
+            override = _codex_override(value)
+            if override is None:
+                continue
+            key, loaded = override
+            if key == "default_permissions":
+                profile = loaded
+            elif key == "sandbox_mode":
+                mode = loaded
+    if profile is not None:
+        return profile == ":danger-full-access"
+    return mode == "danger-full-access"
+
+
+def _flag_rules(
+    family: str,
+    flags: list[tuple[str, int | None, list[str] | None]],
+    *,
+    config_selects_sandbox: bool = True,
+) -> set[tuple[str, str]]:
+    """The widening rules a CLI's documented flags meet, each with the flag that met it.
+
+    ``config_selects_sandbox`` is false for the words `openai/codex-action`
+    passes on from ``codex-args``: after them the action appends its own
+    ``--sandbox <mode>``, or for a ``permission-profile`` its own
+    ``default_permissions`` override (``runCodexExec.ts``), and either takes
+    precedence over a sandbox ``--config`` override written before it, so
+    one there selects nothing.
+    """
+
+    rules: set[tuple[str, str]] = set()
+    if family == "codex" and config_selects_sandbox and _codex_config_full_access(flags):
+        rules.add(("danger_full_access", "--config"))
+    # The CLI keeps the last value of a repeated `--permission-mode` (#823 review cycle 5).
+    modes = [values[0] if values else None for name, _arity, values in flags if name == "--permission-mode"]
+    if family == "claude" and modes and modes[-1] == "bypassPermissions":
+        rules.add(("bypass_permissions", "--permission-mode"))
+    for name, _arity, values in flags:
+        value = values[0] if values else None
+        if family == "claude" and name == "--dangerously-skip-permissions":
+            rules.add(("bypass_permissions", name))
+        if family == "codex" and name == "--dangerously-bypass-approvals-and-sandbox":
+            rules.add(("bypass_approvals_and_sandbox", name))
+        if family == "codex" and name == "--sandbox" and value == "danger-full-access":
+            rules.add(("danger_full_access", name))
+    return rules
+
+
+def _action_rules(spec: _AgentAction, declared: list[tuple[str, Any]]) -> set[tuple[str, str]]:
+    """The documented widening rules an agent action's declared inputs meet, read from the raw text.
+
+    Read here, before anything is withheld for publication, so redaction never
+    hides a rule. Only from text this reader reads exactly: an argument input
+    only when it is a plain list of words (:func:`_argument_words`), which a
+    ``${{ }}`` expression never is; a user gate's entries that hold no
+    expression, since GitHub substitutes one before the action reads the
+    input and the substituted text may add entries but cannot remove a
+    literal one; and a mode or settings input only when it holds none. Each
+    rule names the input it was read from.
+    """
+
+    rules: set[tuple[str, str]] = set()
+    for name, value in declared:
+        text = _setting_text(value)
+        if text is None:
+            continue
+        if name in spec.gates:
+            entries = _EXPRESSION_SPAN_RE.sub(_EXPRESSION_MARK, text).split(",")
+            if "*" in {entry.strip() for entry in entries}:
+                rules.add(("open_gate", name))
+        for mode, widening, rule in spec.modes:
+            if name == mode and text == widening:
+                rules.add((rule, name))
+        if name == spec.settings and not holds_expression(text) and _settings_bypass_permissions(text):
+            rules.add(("bypass_permissions", name))
+        if name == spec.args:
+            words = _argument_words(text)
+            if words is None:
+                continue
+            if spec.family == "claude":
+                found = _claude_action_rules(words)
+            else:
+                found = {
+                    rule for rule, _flag in _flag_rules(
+                        "codex", _read_flags(words, _CODEX_FLAGS), config_selects_sandbox=False
+                    )
+                }
+            rules.update((rule, name) for rule in found)
+    return rules
+
+
+def _with_rules(entry: dict[str, Any], rules: set[tuple[str, str]]) -> dict[str, Any]:
+    """``entry`` with the rules it meets, omitted when none, as the schema omits them."""
+
+    if not rules:
+        return entry
+    return {**entry, "widening_rules": [{"rule": rule, "setting": setting} for rule, setting in sorted(rules)]}
+
+
+def agent_widening_rules(entry: dict[str, Any]) -> set[tuple[str, str]]:
+    """The documented widening rules one published agent launch meets (#823).
+
+    Each is ``(rule, detail)``: ``detail`` names the input for an opened gate
+    (``allowed_non_write_users``) and is empty otherwise, so one rule spelled
+    two ways, or moved between the CLI and an action, is one rule. Read from
+    ``widening_rules``, which the reader decided from the declared text before
+    any of it was withheld; an unresolved launch meets none.
+    """
+
+    if entry.get("form") != "read":
+        return set()
+    return {
+        (str(item["rule"]), str(item["setting"]) if item["rule"] == "open_gate" else "")
+        for item in entry.get("widening_rules", [])
+    }
+
+
+def agent_family(agent: str) -> str:
+    """``claude`` or ``codex``: which agent's rules a launch is read by."""
+
+    return _AGENT_ACTIONS[agent].family if agent in _AGENT_ACTIONS else agent
+
+
+AgentWidening = tuple[str, str, str, dict[str, Any]]
+#: A rule one job's launches of one agent family meet: ``(job, family, rule, detail)``.
+_RuleKey = tuple[str, str, str, str]
+
+#: The agent action inputs each documented rule is read from; a user gate's
+#: rule is read from the gate it names.
+_RULE_SETTINGS: dict[str, frozenset[str]] = {
+    "bypass_permissions": frozenset({"claude_args", "settings"}),
+    "bypass_approvals_and_sandbox": frozenset({"codex-args"}),
+    "danger_full_access": frozenset({"sandbox", "permission-profile", "codex-args"}),
+    "unsafe_safety_strategy": frozenset({"safety-strategy"}),
+}
+
+
+def _unread_setting(entry: dict[str, Any], rule: str, detail: str) -> tuple[str, str] | None:
+    """The input of ``entry`` whose text this reader did not read for ``rule``, and why.
+
+    ``expression``: it holds a ``${{ }}`` expression, whose substituted text
+    may meet the rule. ``unread``: it is an argument input that is not a
+    plain list of words (``unread_arguments``), so no rule was read from it.
+    """
+
+    names = frozenset({detail}) if rule == "open_gate" else _RULE_SETTINGS.get(rule, frozenset())
+    for setting in entry.get("settings", []):
+        if setting["name"] not in names:
+            continue
+        if setting.get("unresolved_reason") == "unread_arguments":
+            return str(setting["name"]), "unread"
+        if setting.get("holds_expression"):
+            return str(setting["name"]), "expression"
+    return None
+
+
+@dataclass(frozen=True)
+class AgentRuleGains:
+    """The documented rules a workflow's agent launches meet at ``after`` and not at ``before`` (#823).
+
+    Each widening is ``(job, rule, detail, entry)`` for the first launch at
+    ``after`` in that job that meets it. Only ``claimed`` is a widening:
+
+    - ``unread_before``: the job has fewer steps at ``after`` than at
+      ``before`` that may launch that agent in a form this reader does not
+      read — a ``run:`` that mentions the agent CLI and is not one plain
+      command (``unread_agent_runs``), or an agent action whose ``with:`` is
+      not a mapping — and more launches of it this reader reads. The launch
+      that meets the rule may be one of those steps, rewritten in a form this
+      reader reads, and it may have met the rule already, as a job whose
+      permissions were not explicit may already have held a write scope
+      (``unknown_before``). Each names a step that is gone. Such a step that
+      remains is a limit and nothing more, and one that goes while no read
+      launch is added takes no gain from a launch that was read before
+      (#823 review cycle 4).
+    - ``setting_before``: at ``before``, the job's launch of that agent held,
+      in an input the rule is read from, text this reader did not read for a
+      rule — a ``${{ }}`` expression (``expression``), whose substituted text
+      may already have met it, or an argument input that is not a plain list
+      of words (``unread``). Each names that input and which.
+    - ``moved``: the rule left another job whose launch that met it left that
+      job — the job no longer exists, or the same launch now runs here while
+      each launch of that agent this job had still runs here or in that job —
+      as when a job is renamed, an agent step moves to another job or two
+      jobs swap launches (#823 review). A job that remains may still run its
+      launch in a form this reader does not read, so a launch that only stops
+      being read has not left it, and one edited in place into the launch
+      that job had gains the rule (#823 review cycle 3). The launch has not
+      left while the job it met the rule in has any unread step of that
+      agent, wherever it stands, or a read launch of that agent whose input
+      the rule is read from it did not read (#823 review cycles 5 and 6);
+      nor while any other job but this one has more such steps and launches
+      than it had before, as a job new at the head holding one has, because
+      the launch may be one of them: the job it met the rule in may be that
+      job under a new name (#823 review cycle 7). So two jobs renamed at
+      once, one of them holding an unread step, claim the gain, in the safe
+      direction. Each names the launch it left, the way a step reference
+      moved between jobs adds no scope (#771).
+    """
+
+    claimed: list[AgentWidening]
+    unread_before: list[tuple[AgentWidening, dict[str, Any]]]
+    setting_before: list[tuple[AgentWidening, str, str]]
+    moved: list[tuple[AgentWidening, dict[str, Any]]]
+
+
+def agent_rule_gains(before: dict[str, Any] | None, after: dict[str, Any] | None) -> AgentRuleGains:
+    """Which documented rules the workflow's agent launches gain, and which of them are claimed.
+
+    Keyed by job, agent family and rule, so moving a launch between steps or
+    spellings (``--dangerously-skip-permissions`` and
+    ``--permission-mode bypassPermissions`` are one rule) gains nothing.
+    """
+
+    def met(grant: dict[str, Any] | None) -> dict[_RuleKey, list[dict[str, Any]]]:
+        found: dict[_RuleKey, list[dict[str, Any]]] = {}
+        for entry in (grant or {}).get("agent_launches", []):
+            for rule, detail in sorted(agent_widening_rules(entry)):
+                key = (str(entry["job"]), agent_family(str(entry["agent"])), rule, detail)
+                found.setdefault(key, []).append(entry)
+        return found
+
+    def by_job(entries: list[dict[str, Any]]) -> dict[tuple[str, str], list[dict[str, Any]]]:
+        found: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for entry in entries:
+            found.setdefault((str(entry["job"]), agent_family(str(entry["agent"]))), []).append(entry)
+        return found
+
+    def launches(grant: dict[str, Any] | None) -> dict[tuple[str, str], list[dict[str, Any]]]:
+        return by_job((grant or {}).get("agent_launches", []))
+
+    def unread_steps(grant: dict[str, Any] | None) -> dict[tuple[str, str], list[dict[str, Any]]]:
+        # The steps that may launch an agent in a form this reader does not read.
+        return by_job([
+            *(entry for entry in (grant or {}).get("agent_launches", []) if entry.get("form") != "read"),
+            *(grant or {}).get("unread_agent_runs", []),
+        ])
+
+    old, new = met(before), met(after)
+    launched_before, launched_after = launches(before), launches(after)
+    unread_before, unread_after = unread_steps(before), unread_steps(after)
+    lost = [key for key in old if key not in new]
+    gained = [key for key in new if key not in old]
+
+    def compared(entries: list[dict[str, Any]]) -> set[tuple[Any, ...]]:
+        # A launch as it is compared, less its job.
+        return {agent_launch_key(entry)[1:] for entry in entries}
+
+    def unread_forms(grant_unread: dict[tuple[str, str], list[dict[str, Any]]],
+                     grant_launched: dict[tuple[str, str], list[dict[str, Any]]],
+                     job: str, family: str, rule: str, detail: str) -> int:
+        # How many steps of the job may run a launch of that agent that this
+        # reader cannot tell meets the rule: its unread steps of that agent,
+        # and its read launches of it holding text in an input the rule is
+        # read from that this reader did not read.
+        return len(grant_unread.get((job, family), [])) + sum(
+            1 for entry in grant_launched.get((job, family), [])
+            if entry.get("form") == "read" and _unread_setting(entry, rule, detail)
+        )
+
+    def may_still_meet(source: _RuleKey, target: _RuleKey) -> bool:
+        # The launch that met the rule may still run, in a form this reader
+        # does not read, somewhere other than the job gaining the rule. Such a
+        # launch has not left for that job. An unread step carries no text to
+        # tell which launch it is, so:
+        # - in the losing job, any one counts, wherever it stands and whether
+        #   or not it was there before (#823 review cycles 5 and 6);
+        # - in any other job, one counts when that job has more of them than
+        #   it had before, as a job new at the head holding one has — so a
+        #   renamed losing job cannot hide the launch it kept, quoted, under
+        #   its new name (#823 review cycle 7).
+        job, family, rule, detail = source
+        if unread_forms(unread_after, launched_after, job, family, rule, detail):
+            return True
+        others = {name for name, agent in (*unread_after, *launched_after) if agent == family} - {job, target[0]}
+        return any(
+            unread_forms(unread_after, launched_after, other, family, rule, detail)
+            > unread_forms(unread_before, launched_before, other, family, rule, detail)
+            for other in others
+        )
+
+    def same_launch(source: _RuleKey, target: _RuleKey) -> bool:
+        # The launch that met the rule in the losing job now runs here, the
+        # losing job does not still run it in a form this reader does not
+        # read, and none of this job's own launches of that agent changed in
+        # place: each still runs here or now runs in the losing job, as when
+        # two jobs swap. A job whose launch was edited into the one the
+        # losing job had, while the losing job still exists, gained it (#823
+        # review cycle 3).
+        if not compared(old[source]) & compared(new[target]):
+            return False
+        if may_still_meet(source, target):
+            return False
+        family = target[1]
+        remaining = compared([
+            entry for job in (target[0], source[0]) for entry in launched_after.get((job, family), [])
+        ])
+        return compared(launched_before.get((target[0], family), [])) <= remaining
+
+    jobs_after = {str(context["job"]) for context in (after or {}).get("permission_contexts", [])}
+
+    def job_left(source: _RuleKey, target: _RuleKey) -> bool:
+        # The losing job no longer exists, as when it is renamed, and no
+        # other job may run its launch unread. A job that remains may still
+        # run its launch in a form this reader does not read, such as `npx`,
+        # so its launch is not taken to have left (#823 review cycle 3); a
+        # job renamed while it runs its launch unread is a new job holding
+        # an unread step (#823 review cycle 7).
+        return source[0] not in jobs_after and not may_still_meet(source, target)
+
+    # A rule moved when the launch that met it left the losing job. The same
+    # launch arriving is matched first, so which of two gaining jobs a rule
+    # moved to does not depend on the order the jobs are declared in (#823 review).
+    sources: dict[_RuleKey, _RuleKey] = {}
+    for left in (same_launch, job_left):
+        for key in gained:
+            if key in sources:
+                continue
+            source = next(
+                (other for other in lost if other[1:] == key[1:] and left(other, key)), None
+            )
+            if source is not None:
+                lost.remove(source)
+                sources[key] = source
+
+    def read(entries: list[dict[str, Any]]) -> int:
+        return sum(1 for entry in entries if entry.get("form") == "read")
+
+    gains = AgentRuleGains(claimed=[], unread_before=[], setting_before=[], moved=[])
+    for key in gained:
+        entries = new[key]
+        job, family, rule, detail = key
+        widening: AgentWidening = (job, rule, detail, entries[0])
+        if key in sources:
+            gains.moved.append((widening, old[sources[key]][0]))
+            continue
+        before_launches = launched_before.get((job, family), [])
+        was_unread = unread_before.get((job, family), [])
+        still_unread = unread_after.get((job, family), [])
+        if len(was_unread) > len(still_unread) and read(launched_after.get((job, family), [])) > read(
+            before_launches
+        ):
+            remaining = {str(entry["step"]) for entry in still_unread}
+            gone = next((entry for entry in was_unread if str(entry["step"]) not in remaining), was_unread[0])
+            gains.unread_before.append((widening, gone))
+            continue
+        setting = next(
+            (found for entry in before_launches if (found := _unread_setting(entry, rule, detail))), None
+        )
+        if setting is not None:
+            gains.setting_before.append((widening, *setting))
+            continue
+        gains.claimed.append(widening)
+    return gains
+
+
+def gained_agent_widenings(before: dict[str, Any] | None, after: dict[str, Any] | None) -> list[AgentWidening]:
+    """Documented widening rules the workflow's agent launches gain and claim (``AgentRuleGains.claimed``)."""
+
+    return agent_rule_gains(before, after).claimed
+
+
+def uncompared_agent_launch_texts(grant: dict[str, Any]) -> list[str]:
+    """One message per agent launch setting, unread agent step or checkout ref a workflow does not compare (#823).
+
+    Not blocking, like an unread secret value (#693). A launch's job, agent,
+    form and widening rules are still compared, so adding, removing or
+    re-forming one, or gaining a documented rule, is a row; only an edit
+    inside what is named here is not reported. A setting holding
+    credential-shaped text (#823 review) is compared by its redacted text and
+    its rules, so only an edit inside what is redacted is not reported. An
+    argument input that is not a plain list of words is compared by a digest
+    and read for no rule. An unread ``run:`` agent step is compared not at
+    all: it gives no row, whatever is edited (#823 review cycle 4). A
+    redacted checkout ref is not named here: :func:`_uncompared_workflow_text`
+    makes it a blocking limit, as a redacted step reference is (#767).
+    """
+
+    texts: list[str] = []
+    for entry in grant.get("agent_launches", []):
+        where = f"{entry['job']}/{entry['step']} ({entry['agent']})"
+        if entry.get("unresolved_reason") == "inputs_not_a_mapping":
+            texts.append(
+                f"the agent launch at {where} is a step whose `with:` is not a mapping; its "
+                "settings are neither published nor compared, so an edit to them is not reported"
+            )
+        for setting in entry.get("settings", []):
+            unread = setting.get("unresolved_reason")
+            if unread == "redacted":
+                texts.append(
+                    f"the {setting['name']} value of the agent launch at {where} contains "
+                    "credential-shaped text; it is published redacted and compared as published, "
+                    "so an edit inside what is redacted that gains no documented widening rule "
+                    "is not reported"
+                )
+                continue
+            if unread == "unread_arguments":
+                texts.append(
+                    f"the {setting['name']} value of the agent launch at {where} is not a plain list "
+                    "of words this audit reads: it holds a quote, a `${{ }}` expression, `$`, a "
+                    "backtick, a comment, a shell operator, JSON, `--settings` or `--mcp-config`, or "
+                    "another character outside the plain set; none of its text is published and no "
+                    "documented widening rule is read from it, and it is compared only by a digest, "
+                    "so an edit to it is a change, never a widening"
+                )
+                continue
+            what = {
+                "not_a_string": "is not a string",
+                "unparsed_json": (
+                    "holds text that starts like JSON and does not parse, so the values it may "
+                    "hold cannot be told apart from its key names"
+                ),
+            }.get(str(unread))
+            if what:
+                texts.append(
+                    f"the {setting['name']} value of the agent launch at {where} {what}; it is "
+                    "neither published nor compared, so an edit to it that gains no documented "
+                    "widening rule is not reported"
+                )
+    for entry in grant.get("unread_agent_runs", []):
+        texts.append(
+            f"the `run:` at {entry['job']}/{entry['step']} mentions {entry['agent']} and is not read "
+            "as an agent launch: only a single-line command of plain words run by bash or sh, whose "
+            "program is `claude -p` or `codex exec`, is read, so this step may start an agent that is "
+            "neither published nor compared, and adding, removing or editing it gives no row"
+        )
+    for entry in grant.get("checkout_refs", []):
+        unread = entry.get("unresolved_reason")
+        what = {
+            "not_a_string": "a ref that is not a string",
+            "inputs_not_a_mapping": "a `with:` that is not a mapping",
+        }.get(str(unread))
+        if what:
+            texts.append(
+                f"the checkout at {entry['job']}/{entry['step']} declares {what}; it is "
+                "neither published nor compared, so an edit to it is not reported"
+            )
+    # Two steps whose labels publish alike name one limit once.
+    return list(dict.fromkeys(texts))
+
+
+#: A whole ``secrets:`` value of this form names its source (#693). Only the
+#: property form is read; ``secrets['NAME']`` and every other expression stay
+#: unresolved rather than guessed. The ``secrets`` context name is matched as
+#: written: GitHub's expressions reference states case-insensitivity only for
+#: string comparison, never for a context name, so ``${{ SECRETS.X }}`` is not
+#: assumed to be the same reference.
+_SECRET_SOURCE_RE = re.compile(r"\$\{\{\s*secrets\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+
+#: GitHub's contexts reference calls ``github.token`` "functionally equivalent
+#: to the GITHUB_TOKEN secret", so both spellings name one source and moving
+#: between them is not a change (#693).
+_WORKFLOW_TOKEN_RE = re.compile(r"\$\{\{\s*github\.token\s*\}\}")
+_WORKFLOW_TOKEN_SOURCE = "GITHUB_TOKEN"
+
+
+def _secret_source_name(value: Any) -> str | None:
+    """The declared secret a whole ``secrets:`` value names, or ``None``."""
+
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    match = _SECRET_SOURCE_RE.fullmatch(text)
+    if match is not None:
+        return match.group(1)
+    return _WORKFLOW_TOKEN_SOURCE if _WORKFLOW_TOKEN_RE.fullmatch(text) else None
+
+
+def _secret_mapping(destination: object, value: Any) -> dict[str, Any]:
+    """One ``destination: value`` a reusable call passes, without its value.
+
+    Only a ``${{ secrets.NAME }}`` source name is published. A literal value
+    may be the credential itself and an expression may contain one, so for
+    anything else nothing of the value is kept — no text, no digest — and the
+    entry says only why it is unresolved.
+    """
+
+    shown, destination_redacted = _published(str(destination))
+    entry: dict[str, Any] = {
+        "destination": shown, "source": None, "form": "unresolved", "unresolved_reason": None,
+    }
+    name = _secret_source_name(value)
+    if name is not None:
+        source, source_redacted = _published(name)
+        if destination_redacted or source_redacted:
+            return {**entry, "source": source, "unresolved_reason": "redacted"}
+        return {**entry, "source": source, "form": "secret"}
+    if destination_redacted:
+        return {**entry, "unresolved_reason": "redacted"}
+    if not isinstance(value, str):
+        return {**entry, "unresolved_reason": "not_a_string"}
+    if "${{" in value:
+        return {**entry, "unresolved_reason": "expression"}
+    return {**entry, "unresolved_reason": "literal_value"}
+
+
+def secret_mapping_key(entry: dict[str, Any]) -> tuple[str, str, str, str]:
+    """What a named secret mapping is compared by: every published fact.
+
+    The source is folded: GitHub's secrets reference says names "are case
+    insensitive when referenced" and are stored uppercase, so ``staging_token``
+    and ``STAGING_TOKEN`` are one declared secret and renaming the case is not
+    a remap. The destination is the callee's ``workflow_call`` secret id, which
+    GitHub does not document as case-insensitive, so it stays as written and a
+    case-only edit there reads as a removal plus an addition.
+    """
+
+    return (
+        "" if entry.get("destination") is None else str(entry["destination"]),
+        str(entry["form"]),
+        str(entry.get("unresolved_reason") or ""),
+        "" if entry.get("source") is None else str(entry["source"]).casefold(),
+    )
+
+
+def _secret_mappings(value: Any) -> list[dict[str, Any]]:
+    """The named secrets a reusable call passes, in a canonical order.
+
+    Sorted, so reordering the ``secrets:`` keys changes nothing. A value that
+    is neither ``inherit`` nor a mapping is one unresolved entry with no
+    destination, so an absent list always means "read, none declared".
+    """
+
+    if not isinstance(value, dict):
+        return [{
+            "destination": None, "source": None, "form": "unresolved",
+            "unresolved_reason": "secrets_not_a_mapping",
+        }]
+    return sorted(
+        (_secret_mapping(destination, item) for destination, item in value.items()),
+        key=secret_mapping_key,
+    )
+
+
+def _reusable_call(job_name: str, job: dict[Any, Any]) -> dict[str, Any] | None:
+    """A job's reusable-workflow call: its target and what secrets it passes.
+
+    ``job_name`` is the job's published label (#802).
+    """
+
+    uses = job.get("uses")
+    if not (isinstance(uses, str) and uses.strip()):
+        return None
+    display, redacted = _published(uses.strip())
+    secrets = job.get("secrets")
+    call: dict[str, Any] = {"job": job_name, "uses": display, "secrets_inherit": secrets == "inherit"}
+    if redacted:
+        call["uses_redacted"] = True
+    if "secrets" in job and secrets != "inherit":
+        mappings = _secret_mappings(secrets)
+        if mappings:
+            call["secret_mappings"] = mappings
+    return call
+
+
+def _joined(items: list[str]) -> str:
+    return items[0] if len(items) == 1 else f"{', '.join(items[:-1])} and {items[-1]}"
+
+
+def _uncompared_workflow_text(
+    grant: dict[str, Any], collided: set[str] | frozenset[str] = frozenset()
+) -> str | None:
+    """Why part of a workflow grant is published but cannot be compared, or ``None``.
+
+    One rule for every compared workflow reference (#767, #693). A redacted
+    step reference, reusable target, secret name or checkout ref (#823) could
+    publish the same text as a different one, so comparing the display would
+    read a change to the code a job runs, or to where a secret goes, as equal.
+    That is a blocking limit: a changed workflow refuses, and an unchanged one
+    is named (#721).
+
+    A redacted agent launch setting is not counted here (#823 review). Its
+    documented widening rules are read from the declared text before it is
+    redacted, so comparing its published text and its rules loses no
+    direction, and ordinary prose such as "never print bearer tokens" in a
+    system prompt is as credential-shaped to the label redaction as a token
+    is. :func:`uncompared_agent_launch_texts` names it, not blocking, as a
+    redacted label is compared by what it publishes (#802).
+
+    A job id, trigger or permission scope name is compared by its published
+    label (#802). One redacted label is still a distinct label, so it refuses
+    nothing; ``collided`` names the kinds of which two distinct raw labels in
+    this workflow publish alike, which would merge two jobs, triggers or
+    scopes into one, and those refuse the same way.
+    """
+
+    calls = grant.get("reusable_calls", [])
+    mappings = [entry for call in calls for entry in call.get("secret_mappings", [])]
+    redacted = [
+        label for label, present in (
+            ("a step action reference", any(
+                item["unresolved_reason"] == "redacted" for item in grant.get("step_actions", [])
+            )),
+            ("a reusable workflow reference", any(call.get("uses_redacted") for call in calls)),
+            ("a reusable workflow secret name", any(
+                entry["unresolved_reason"] == "redacted" for entry in mappings
+            )),
+            # A checkout ref names the code a job runs, as a step reference does (#823).
+            ("a checkout ref", any(
+                item.get("unresolved_reason") == "redacted" for item in grant.get("checkout_refs", [])
+            )),
+        ) if present
+    ]
+    merged = [kind for kind in _LABEL_KINDS if kind in collided]
+    reasons = []
+    if len(redacted) == 1:
+        reasons.append(
+            f"{redacted[0]} contains credential-shaped text; it is published redacted and cannot be compared"
+        )
+    elif redacted:
+        reasons.append(
+            f"{_joined(redacted)} contain credential-shaped text; "
+            "they are published redacted and cannot be compared"
+        )
+    if merged:
+        reasons.append(
+            f"distinct {_joined(merged)} in this workflow publish alike once credential-shaped "
+            "text is redacted, so they cannot be compared apart; rename or remove one so "
+            "each publishes a distinct label"
+        )
+    return "; ".join(reasons) or None
+
+
+#: How an unresolved secret mapping reads in the limit that names it (#693).
+_UNRESOLVED_SECRET_PHRASES = {
+    "literal_value": "a literal value",
+    "expression": "an expression this static audit does not evaluate",
+    "not_a_string": "a value that is not a string",
+    "secrets_not_a_mapping": "neither `inherit` nor a mapping of secret names",
+}
+
+
+def uncompared_secret_mapping_texts(grant: dict[str, Any]) -> list[str]:
+    """One message per secret value a workflow publishes nothing of (#693).
+
+    Not blocking. The destination, the form and the reason are compared, so
+    adding an entry, removing one, or moving one between forms is still a row,
+    and the rest of the workflow — token permissions, triggers, targets, step
+    references, every other host — compares as it always did. Only an edit
+    between two values of the *same* unsupported form is invisible, and this
+    names where that is, the way an unread `envFile` does, rather than making
+    the surface blocking and refusing every row beside it (#789).
+    """
+
+    texts: list[str] = []
+    for call in grant.get("reusable_calls", []):
+        for entry in call.get("secret_mappings", []):
+            reason = str(entry.get("unresolved_reason") or "")
+            if entry["form"] != "unresolved" or reason == "redacted":
+                continue
+            where = (
+                f"{call['job']}/{entry['destination']}"
+                if entry.get("destination") is not None
+                else f"{call['job']}/secrets"
+            )
+            phrase = _UNRESOLVED_SECRET_PHRASES.get(reason, "an unsupported form")
+            texts.append(
+                f"the secret a reusable workflow call passes at {where} is {phrase}; its "
+                "value is neither published nor compared, so an edit between two such "
+                "values is not reported"
+            )
+    return texts
+
+
+def _workflow_grant(
+    data: Any, *, source: str, collided: set[str] | None = None
+) -> dict[str, Any] | None:
+    """One workflow's grant, every job id, trigger and scope name published once (#802).
+
+    Each label is published by :func:`published_workflow_label` before it is
+    used anywhere, so the job in ``permission_contexts``, ``reusable_calls``,
+    ``step_actions``, ``agent_launches``, ``unread_agent_runs``,
+    ``checkout_refs``, the ``write_scopes`` and ``effective_write_scopes``
+    prefixes, every row built
+    from them, and ``config_sha256`` all hold the same label, and none holds
+    the raw text. ``collided`` receives the kinds of label of which two
+    distinct raw values publish alike.
+    """
+
     if not isinstance(data, dict):
         return None
+    collided = set() if collided is None else collided
     data = _normalize_workflow_keys(data)
-    triggers = sorted(_trigger_names(data.get("on")))
+    trigger_labels = _published_labels(
+        _trigger_names(data.get("on")), kind=_TRIGGER_LABELS, collided=collided
+    )
+    # Not de-duplicated: two triggers that publish alike stay two entries.
+    triggers = sorted(trigger_labels.values())
     write_scopes: list[str] = []
-    write_all = False
+    effective_write_scopes: list[str] = []
+    permission_contexts: list[dict[str, Any]] = []
+    reusable_calls: list[dict[str, Any]] = []
+    step_actions: list[dict[str, Any]] = []
+    agent_launches: list[dict[str, Any]] = []
+    unread_agent_runs: list[dict[str, Any]] = []
+    checkout_refs: list[dict[str, Any]] = []
 
     def collect(perms: Any, where: str) -> None:
-        nonlocal write_all
         if perms == "write-all":
-            write_all = True
             write_scopes.append(f"{where}: write-all")
         elif isinstance(perms, dict):
-            for scope_name, value in sorted(perms.items()):
+            for scope_name, value in sorted(perms.items(), key=lambda item: str(item[0])):
                 if _is_write(value):
-                    write_scopes.append(f"{where}: {scope_name}: {value}")
+                    write_scopes.append(f"{where}: {published_workflow_label(str(scope_name))}: {value}")
 
     collect(data.get("permissions"), "<top-level>")
     jobs = data.get("jobs")
     if isinstance(jobs, dict):
-        for job_name, job in sorted(jobs.items()):
-            if isinstance(job, dict):
-                collect(job.get("permissions"), str(job_name))
+        declared = [(str(name), job) for name, job in jobs.items() if isinstance(job, dict)]
+        labels = _published_labels(
+            (name for name, _ in declared), kind=_JOB_LABELS, collided=collided
+        )
+        # Ordered by what is published, so a redacted job's place in the
+        # lists says nothing more about its raw id than its label does.
+        for job_name, job in sorted(declared, key=lambda item: (labels[item[0]], item[0])):
+            label = labels[job_name]
+            collect(job.get("permissions"), label)
+            value = job.get("permissions")
+            effective = _workflow_permissions(
+                data.get("permissions") if value is None else value, label, collided,
+            )
+            permission_contexts.append(effective)
+            effective_write_scopes.extend(
+                f"{label}: " + ("write-all" if scope == "*" else f"{scope}: write")
+                for scope, level in effective["permissions"].items() if level == "write"
+            )
+            call = _reusable_call(label, job)
+            if call is not None:
+                reusable_calls.append(call)
+            if "steps" in job:
+                steps = job["steps"]
+                if not isinstance(steps, list):
+                    step_actions.append(_unreadable_step(label, "steps", "steps_not_a_list"))
+                    steps = []
+                job_launches: list[dict[str, Any]] = []
+                for index, step in enumerate(steps):
+                    if not isinstance(step, dict):
+                        step_actions.append(
+                            _unreadable_step(label, f"steps[{index}]", "step_not_a_mapping")
+                        )
+                        continue
+                    action = _step_action(label, step, index)
+                    if action is not None:
+                        step_actions.append(action)
+                    launches, unread = _step_agent_launches(
+                        label, step, index, _declared_shell(step, job, data)
+                    )
+                    job_launches.extend(launches)
+                    unread_agent_runs.extend(unread)
+                    checkout = _checkout_ref(label, step, index)
+                    if checkout is not None:
+                        checkout_refs.append(checkout)
+                if job_launches:
+                    # Context for the note on the row, never compared (#823).
+                    secrets = _job_secrets(job, data.get("env"))
+                    agent_launches.extend(
+                        {**launch, "job_secrets": secrets} if secrets else launch
+                        for launch in job_launches
+                    )
     pull_target = "pull_request_target" in triggers
+    projection = {
+        "triggers": triggers,
+        "pull_request_target": pull_target,
+        "write_all": _has_write_all(effective_write_scopes),
+        "write_scopes": sorted(write_scopes),
+        "permission_contexts": permission_contexts,
+        "effective_write_scopes": sorted(effective_write_scopes),
+        "reusable_calls": reusable_calls,
+    }
+    if step_actions:
+        # Omitted when empty, as the schema omits it, so a workflow whose steps
+        # declare no listed reference keeps its earlier fingerprint.
+        projection["step_actions"] = step_actions
+    # Omitted when empty for the same reason (#823).
+    if agent_launches:
+        projection["agent_launches"] = agent_launches
+    if unread_agent_runs:
+        # Named as a limit, never compared (#823 review cycle 4).
+        projection["unread_agent_runs"] = unread_agent_runs
+    if checkout_refs:
+        projection["checkout_refs"] = checkout_refs
+    return _workflow_grant_from(projection, source=source)
+
+
+def _has_write_all(effective_write_scopes: list[str]) -> bool:
+    return any(entry.endswith(": write-all") for entry in effective_write_scopes)
+
+
+def _workflow_grant_from(projection: dict[str, Any], *, source: str) -> dict[str, Any]:
+    access, risk = _workflow_rating(projection)
     return {
         **_grant_base(
             host="github", scope="repository", source=source, kind="workflow",
-            identity=source, config=data,
-            access="admin" if write_all else ("write" if write_scopes or pull_target else "read"),
-            risk="critical" if write_all or pull_target else ("high" if write_scopes else "low"),
+            identity=source, config=_workflow_config(projection), access=access, risk=risk,
         ),
-        "triggers": triggers,
-        "pull_request_target": pull_target,
-        "write_all": write_all,
-        "write_scopes": sorted(write_scopes),
+        **projection,
     }
 
 
-def _instruction_grant(*, host: str, scope: HostScope, source: str, data: str) -> dict[str, Any]:
+def _workflow_config(projection: dict[str, Any]) -> dict[str, Any]:
+    """What a workflow grant's ``config_sha256`` is computed over: its projection, less ``write_scopes``."""
+
+    return {key: value for key, value in projection.items() if key != "write_scopes"}
+
+
+def _workflow_rating(projection: dict[str, Any]) -> tuple[str, str]:
+    """A workflow grant's ``access`` and ``risk``.
+
+    ``access`` describes the job tokens alone (#920). A privileged event is
+    not a token scope: ``pull_request_target`` raises ``risk`` to critical,
+    and makes ``access`` ``write`` only where a job declares no permissions,
+    since GitHub documents that event's token as read/write unless
+    permissions are declared. A workflow whose every job declares read-only
+    scopes reads ``read`` under any trigger.
+    """
+
+    contexts = projection["permission_contexts"]
+    effective = projection["effective_write_scopes"]
+    write_all = projection["write_all"]
+    pull_target = projection["pull_request_target"]
+    defaulted = any(context["state"] != "explicit" for context in contexts)
+    unknown = not contexts or defaulted
+    has_read = any(context["permissions"] for context in contexts)
+    inherits_secrets = any(call["secrets_inherit"] for call in projection["reusable_calls"])
+    access = "admin" if write_all else (
+        "write" if effective or (pull_target and defaulted) else (
+            "external" if inherits_secrets else (
+                "unknown" if unknown else ("read" if has_read else "none")
+            )
+        )
+    )
+    risk = "critical" if write_all or pull_target else (
+        "high" if effective or inherits_secrets else ("unknown" if unknown else "low")
+    )
+    return access, risk
+
+
+#: The two spellings GitHub documents for a reusable workflow in the same
+#: repository, both read from the caller's own commit and neither taking an
+#: ``@ref`` (#921).
+_LOCAL_REUSABLE_PREFIXES = ("./.github/workflows/", "$/.github/workflows/")
+#: GitHub connects at most ten levels of workflows: the caller and nine
+#: reusable workflows beneath it.
+_MAX_REUSABLE_LEVELS = 10
+#: Called workflows one inventory follows, however its calls are shaped. Past
+#: it every remaining call is ``too_deep``, so a pathological call graph costs
+#: a bounded read and never a guessed restriction.
+_MAX_REUSABLE_VISITS = 4096
+#: Fields a workflow grant holds beside its projection.
+_GRANT_BASE_KEYS = frozenset(
+    {"grant_id", "host", "scope", "source", "kind", "config_sha256", "access", "risk"}
+)
+
+CalleePermissions = Literal["read", "not_read", "limited", "cycle", "too_deep"]
+
+
+def local_reusable_target(uses: str, caller_source: str) -> str | None:
+    """The workflow file a same-repository reusable call names, ``""``, or ``None``.
+
+    ``None`` for any other call (``owner/repo/…@ref``), which is never read.
+    ``""`` for a same-repository spelling GitHub does not run, such as a
+    subdirectory or an ``@ref``: nothing is read for it. A workflow below the
+    repository root (a copy under ``samples/x/.github/workflows/``) resolves
+    within its own tree, as it would in the repository it was copied from.
+    """
+
+    prefix = next((item for item in _LOCAL_REUSABLE_PREFIXES if uses.startswith(item)), None)
+    if prefix is None:
+        return None
+    name = uses[len(prefix):]
+    if not name or "/" in name or "@" in name or not name.lower().endswith((".yml", ".yaml")):
+        return ""
+    root = caller_source.rpartition(".github/workflows/")[0]
+    return f"{root}.github/workflows/{name}"
+
+
+def _token_writes(permissions: dict[str, str]) -> frozenset[str]:
+    """The scopes one declaration grants ``write``; ``*`` is ``write-all``."""
+
+    return frozenset(scope for scope, level in permissions.items() if level == "write")
+
+
+def _writes_meet(ceiling: frozenset[str], declared: frozenset[str]) -> frozenset[str]:
+    """What a called job keeps: GitHub only maintains or reduces a passed token."""
+
+    if "*" in ceiling:
+        return declared
+    if "*" in declared:
+        return ceiling
+    return ceiling & declared
+
+
+def _writes_join(left: frozenset[str], right: frozenset[str]) -> frozenset[str]:
+    if "*" in left or "*" in right:
+        return frozenset({"*"})
+    return left | right
+
+
+def _write_entries(job: str, writes: frozenset[str]) -> list[str]:
+    return [f"{job}: " + ("write-all" if scope == "*" else f"{scope}: write") for scope in sorted(writes)]
+
+
+class _CalleeReader:
+    """Follows same-repository reusable calls through one side's workflow grants (#921).
+
+    Read, never run: a called workflow's declared ``permissions`` reduce what
+    the caller's ceiling grants its jobs, as GitHub documents — the caller's
+    token permissions "can be only downgraded (not elevated) by the called
+    workflow". A called job that declares nothing, or declares what this
+    audit could not read, keeps the whole ceiling, and so does a call this
+    audit does not follow (a remote one, a missing or limited file, a loop, a
+    chain past GitHub's ten levels): an unread restriction is never assumed.
+    """
+
+    def __init__(self, grants: list[dict[str, Any]], issues: list[dict[str, Any]]) -> None:
+        self.workflows = {
+            str(grant["source"]): grant
+            for grant in grants
+            if grant.get("kind") == "workflow" and "permission_contexts" in grant
+        }
+        self.limited = {
+            str(issue["source"]) for issue in issues
+            if issue.get("blocking") and issue.get("host") == "github"
+        }
+        self.visits = 0
+        self.settled: dict[tuple[str, frozenset[str]], tuple[int, frozenset[str]]] = {}
+
+    def reach(
+        self, target: str, ceiling: frozenset[str], *, level: int, chain: frozenset[str],
+    ) -> tuple[CalleePermissions, frozenset[str], bool]:
+        """What of ``ceiling`` any job ``target`` runs may hold, and how far it was read.
+
+        The third value says the answer depends on the chain that reached it
+        (a loop or a depth limit beneath), so it is not remembered.
+        """
+
+        grant = self.workflows.get(target) if target else None
+        if grant is None:
+            return "not_read", ceiling, False
+        if target in self.limited or any(
+            call.get("uses_redacted") for call in grant.get("reusable_calls", [])
+        ):
+            return "limited", ceiling, False
+        if target in chain:
+            return "cycle", ceiling, True
+        if level > _MAX_REUSABLE_LEVELS:
+            return "too_deep", ceiling, True
+        # An answer that met no loop and no depth limit holds at its level and
+        # any shallower one; a deeper call may meet the limit, so it reads again.
+        key = (target, ceiling)
+        settled = self.settled.get(key)
+        if settled is not None and level <= settled[0]:
+            return "read", settled[1], False
+        if self.visits >= _MAX_REUSABLE_VISITS:
+            return "too_deep", ceiling, True
+        self.visits += 1
+        calls = {str(call["job"]): call for call in grant.get("reusable_calls", [])}
+        reached: frozenset[str] = frozenset()
+        dependent = False
+        for context in grant["permission_contexts"]:
+            kept = (
+                _writes_meet(ceiling, _token_writes(context["permissions"]))
+                if context["state"] == "explicit"
+                else ceiling
+            )
+            call = calls.get(str(context["job"]))
+            if call is not None and kept:
+                nested = local_reusable_target(str(call["uses"]), target)
+                if nested is not None:
+                    _status, kept, beneath = self.reach(
+                        nested, kept, level=level + 1, chain=chain | {target},
+                    )
+                    dependent = dependent or beneath
+            reached = _writes_join(reached, kept)
+        if not dependent and (settled is None or level > settled[0]):
+            self.settled[key] = (level, reached)
+        return "read", reached, dependent
+
+
+def resolve_reusable_workflow_ceilings(
+    grants: list[dict[str, Any]], issues: list[dict[str, Any]],
+) -> None:
+    """Read a same-repository callee's restrictions into its caller's job token (#921).
+
+    A job that calls a reusable workflow runs no step itself: its
+    ``permissions`` are a ceiling on the called workflow's jobs. For a call
+    whose ceiling declares a ``write`` scope and whose target is a
+    same-repository workflow, the call gains ``callee_permissions`` (whether
+    the called workflow was read, or why not) and, when it was read,
+    ``callee_write_scopes`` (the ceiling's write scopes a called job may
+    hold). The caller's ``effective_write_scopes`` for that job then hold only
+    those. A remote call gains nothing and keeps its ceiling, and so does
+    every call this audit could not follow, so a restriction it did not read
+    never narrows a job. Grants are updated in place, with their digest,
+    access and risk.
+    """
+
+    reader = _CalleeReader(grants, issues)
+    for grant in reader.workflows.values():
+        contexts = {str(context["job"]): context for context in grant["permission_contexts"]}
+        resolved: dict[str, frozenset[str]] = {}
+        for call in grant.get("reusable_calls", []):
+            if call.get("uses_redacted"):
+                continue
+            target = local_reusable_target(str(call["uses"]), str(grant["source"]))
+            context = contexts.get(str(call["job"]))
+            if target is None or context is None or context["state"] != "explicit":
+                continue
+            ceiling = _token_writes(context["permissions"])
+            if not ceiling:
+                continue
+            status, reached, _dependent = reader.reach(
+                target, ceiling, level=2, chain=frozenset({str(grant["source"])}),
+            )
+            call["callee_permissions"] = status
+            if status == "read":
+                call["callee_write_scopes"] = sorted(reached)
+                resolved[str(call["job"])] = reached
+        if not resolved:
+            continue
+        effective: list[str] = []
+        for context in grant["permission_contexts"]:
+            job = str(context["job"])
+            writes = resolved.get(job)
+            if writes is None:
+                writes = _token_writes(context["permissions"])
+            effective.extend(_write_entries(job, writes))
+        grant["effective_write_scopes"] = sorted(effective)
+        grant["write_all"] = _has_write_all(grant["effective_write_scopes"])
+    for grant in reader.workflows.values():
+        if not any("callee_permissions" in call for call in grant.get("reusable_calls", [])):
+            continue
+        projection = {key: value for key, value in grant.items() if key not in _GRANT_BASE_KEYS}
+        grant["config_sha256"] = redacted_config_sha256(_workflow_config(projection))
+        grant["access"], grant["risk"] = _workflow_rating(projection)
+
+
+def _instruction_grant(*, host: str, scope: HostScope, source: str, data: str, structure: dict | None = None) -> dict[str, Any]:
     redacted_text = _sanitize_sensitive_string(data)
     return {
         **_grant_base(
             host=host, scope=scope, source=source, kind="instruction_trust_root",
             identity=source,
-            config={"content_sha256": hashlib.sha256(redacted_text.encode()).hexdigest()},
+            config=(structure if structure is not None else {"content_sha256": hashlib.sha256(redacted_text.encode()).hexdigest()}),
             access="execute", risk="medium",
         ),
-        "path": source,
+        "path": public_host_path(source),
     }
+
+
+def unresolved_structure_message(reason: str) -> str:
+    """What an unresolved instruction structure says to the author (#812 follow-up).
+
+    The inventory issue's message is what a reviewer reads in `audit --host`,
+    in `unchanged_limits[].detail` and in a refused comparison's coverage
+    ``detail``, so it is the sentence this engine stands behind about a file.
+
+    Only a file whose own text would not parse is one an author can repair,
+    and this profile refuses far more than that: a documented field written in
+    a shape it does not accept, a key it does not list, an anchor it will not
+    expand, a duplicate key it will not choose between, a role it does not
+    read, a header that parses to something other than a mapping, a value the
+    digest cannot encode. On one corpus repository
+    forty of forty-three refusals were of that kind, on files whose YAML is
+    legal, and every one of them told the author to repair the file. Where the
+    limit may be this entry's rather than the file's, the message states what
+    could not be established and stops there; correcting the profiles
+    themselves is #822.
+
+    The sentence holds on every route that prints it. `audit --host` compares
+    nothing, so it says no claim is made here rather than naming a comparison
+    that route never runs.
+    """
+
+    if unresolved_reason_is_invalid_syntax(reason):
+        return (
+            f"Instruction structure is unresolved ({reason}); the file's own text "
+            "could not be parsed. Repair or review this declared surface."
+        )
+    return (
+        f"Instruction structure is unresolved ({reason}); what this file declares "
+        "could not be established, so no claim is made here about it. The "
+        "limit may be this entry's rather than the file's, so no repair is prescribed."
+    )
+
+
+def _collect_openshell(
+    *, path: Path, source: str, root: Path, cache: HostStaticParseCache,
+    artifacts: list[dict[str, Any]], grants: list[dict[str, Any]],
+    issues: list[dict[str, Any]], budget: OpenShellCollectionBudget,
+    resolved_through: tuple[str, ...] = (),
+) -> None:
+    """Read registration and selected policies through the inventory's session."""
+
+    def read_document(
+        read_path: Path, label: str, kind: str, parser: Callable[[str], Any],
+        hops: tuple[str, ...] = (),
+    ) -> Any:
+        def record(artifact: dict[str, Any]) -> None:
+            if artifact["artifact_id"] not in budget.artifact_ids:
+                budget.artifact_ids.add(artifact["artifact_id"])
+                artifacts.append(artifact)
+
+        reader = cache.reader_for(root)
+        dependencies = (label, *hops)
+        cache.openshell_selected_paths.update(dependencies)
+        if any(public_host_path(dependency) != dependency for dependency in dependencies):
+            # A redacted path cannot identify exact bytes. Do not publish the
+            # original path or a digest of a credential-shaped link target.
+            shown = public_host_path(label)
+            cache.openshell_input_reads[shown] = {"limit": "redacted_input_path"}
+            from agents_shipgate.core.static_inputs import active_static_input_snapshot
+
+            snapshot = active_static_input_snapshot()
+            if snapshot is not None and snapshot.root == root:
+                snapshot.mark_unconfirmable_dependency(root / shown)
+            record(_artifact(
+                host="openshell", scope="repository", source=label, kind=kind,
+                status="unsupported", resolved_through=hops,
+            ))
+            issues.append(_inventory_issue(
+                kind="unsupported", host="openshell", source=label,
+                message="Selected OpenShell input paths cannot be bound after credential redaction",
+                blocking=True,
+            ))
+            return None
+        for dependency in dependencies:
+            if dependency not in cache.openshell_input_reads:
+                cache.openshell_input_reads[dependency] = capture_openshell_input(
+                    reader, dependency, absent_paths=cache.openshell_input_absences,
+                )
+
+        text, error = cache.read(read_path, containment_root=root)
+        if error:
+            record(_artifact(
+                host="openshell", scope="repository", source=label, kind=kind,
+                status="failed", resolved_through=hops,
+            ))
+            issues.append(cache.read_issue(
+                path=read_path, containment_root=root, source=label, host="openshell",
+                kind="unreadable", message=error,
+            ))
+            return None
+        assert text is not None
+        # Publish only a digest of structured public facts. Failed parsing
+        # leaves no digest: a hash of malformed, unredactable credential text
+        # could disclose a low-entropy value. Exact input identity is private.
+        evidence = None
+        try:
+            key = (*cache._key(read_path, root), kind)
+            if key not in cache._openshell_parses:
+                cache.parse_counts[str(read_path.absolute())] = (
+                    cache.parse_counts.get(str(read_path.absolute()), 0) + 1
+                )
+                try:
+                    cache._openshell_parses[key] = (parser(text), None, None)
+                except OpenShellReadError as exc:
+                    cache._openshell_parses[key] = (None, exc.kind, exc.message)
+            model, parse_kind, parse_message = cache._openshell_parses[key]
+            if parse_kind:
+                raise OpenShellReadError(parse_kind, parse_message or "OpenShell document was not read")
+            if isinstance(model, BaseModel):
+                raw = model.model_dump(mode="json")
+                public = _openshell_public_value(raw)
+                evidence = {"public_policy": public}
+                if public != raw:
+                    raise OpenShellReadError(
+                        "unsupported", "credential-shaped policy labels cannot be compared after redaction"
+                    )
+        except OpenShellReadError as exc:
+            record(_artifact(
+                host="openshell", scope="repository", source=label, kind=kind,
+                status="failed" if exc.kind == "parse_failed" else "unsupported",
+                data=evidence, resolved_through=hops,
+            ))
+            issues.append(_inventory_issue(
+                kind=exc.kind, host="openshell", source=label, message=exc.message, blocking=True,
+            ))
+            return None
+        record(_artifact(
+            host="openshell", scope="repository", source=label, kind=kind,
+            status="parsed", data=evidence, resolved_through=hops,
+        ))
+        return model
+
+    selection = read_document(path, source, "openshell_selection", parse_selection, resolved_through)
+    if selection is None:
+        return
+    def read_selected(selected_path: str, artifact_kind: str, parser):
+        if not budget.reserve():
+            raise OpenShellReadError("unsupported", "OpenShell selection exceeds the workspace limit of 64 policy references")
+        policy_path = root / selected_path
+        hops: tuple[str, ...] = ()
+        reader = cache.reader_for(root)
+        try:
+            kind = reader.directory_entry_kind(Path(selected_path))
+        except (OSError, ValueError):
+            kind = None
+        if kind == "symlink":
+            resolution = _resolve_in_tree_link(reader, Path(selected_path))
+            if resolution is not None and resolution[1] == "file":
+                policy_path, hops = root / resolution[0], resolution[2]
+        return read_document(policy_path, selected_path, artifact_kind, parser, hops)
+
+    for reference in sorted(selection.policies, key=lambda item: item.path):
+        try:
+            policy = read_selected(reference.path, "openshell_policy", parse_policy)
+        except OpenShellReadError as exc:
+            issues.append(_inventory_issue(kind=exc.kind, host="openshell", source=source,
+                message=exc.message, blocking=True))
+            break
+        if policy is None:
+            continue
+        fields, defaults = policy_field_paths(policy)
+        facts = {
+            "registration": public_host_path(source), "role": reference.role,
+            "runtime_version": selection.runtime_version, "policy_schema_version": policy.version,
+            "policy": policy.model_dump(mode="json"),
+            "defaulted_fields": defaults, "field_paths": fields,
+        }
+        if getattr(reference, "snapshot", None) is not None:
+            facts["snapshot"] = reference.snapshot.model_dump(mode="json")
+        grants.append({
+            **_grant_base(host="openshell", scope="repository", source=reference.path,
+                kind="openshell_policy", identity=source, config=facts, access="unknown", risk="unknown"),
+            "facts": facts,
+        })
+    for spec in getattr(selection, "compositions", []):
+        from agents_shipgate.core.openshell_composition import compose_local, composed_fields
+
+        try:
+            # Discover and capture the entire explicit closure before selecting
+            # a layer. The first archive intentionally lacks dependency bytes;
+            # one missing input must not conceal later catalog references.
+            from agents_shipgate.core.openshell_composition import parse_profile
+
+            inputs = {}
+            for role in ("global", "saved", "image"):
+                context = getattr(spec, role + "_policy")
+                if context.state == "selected":
+                    inputs[(context.path, "openshell_policy")] = read_selected(
+                        context.path, "openshell_policy", parse_policy,
+                    )
+            for reference in spec.profile_catalog:
+                inputs[(reference.path, "openshell_profile")] = read_selected(
+                    reference.path, "openshell_profile", parse_profile,
+                )
+            policy, provenance, credential_use = compose_local(
+                spec, lambda path, kind, parser, inputs=inputs: inputs[(path, kind)], parse_policy,
+            )
+            facts = {"registration": public_host_path(source), "role": "composed",
+                "runtime_version": selection.runtime_version, "policy_schema_version": policy.version,
+                "policy": policy.model_dump(mode="json"), "composition": provenance,
+                "credential_use": credential_use, "field_paths": composed_fields(policy)}
+            if _openshell_public_value(facts) != facts:
+                raise OpenShellReadError("unsupported", "Composition facts cannot be compared after credential redaction")
+            grants.append({**_grant_base(host="openshell", scope="repository", source=source,
+                kind="openshell_policy", identity="composition:" + spec.name,
+                config=facts, access="unknown", risk="unknown"), "facts": facts})
+        except OpenShellReadError as exc:
+            issues.append(_inventory_issue(kind=exc.kind, host="openshell", source=source,
+                message=exc.message, blocking=True))
+
+
+def _openshell_public_value(value: Any, *, parent_key: str = "") -> Any:
+    if isinstance(value, str):
+        return _sanitize_sensitive_string(redact_text(value) or "")
+    if isinstance(value, dict):
+        return {_openshell_public_value(key): (
+            "<redacted>" if parent_key in {"query", "params"} and _is_secret_key(key)
+            else _openshell_public_value(child, parent_key=key)
+        )
+                for key, child in value.items()}
+    if isinstance(value, list):
+        return [_openshell_public_value(child) for child in value]
+    return value
 
 
 def _collect_file(
     *, path: Path, source: str, host: str, scope: HostScope, kind: str,
     containment_root: Path, cache: HostStaticParseCache,
     artifacts: list[dict[str, Any]], grants: list[dict[str, Any]], issues: list[dict[str, Any]],
+    resolved_through: tuple[str, ...] = (),
+    hook_basis: HookLoadingBasis = "host_configuration",
+    plugin_root: str | None = None,
 ) -> Any:
+    first_grant = len(grants)
     if kind == "instructions":
         text, error = cache.read(path, containment_root=containment_root)
         if error:
-            issues.append(_inventory_issue(kind="unreadable", host=host, source=source, message=error, blocking=True))
-            artifacts.append(_artifact(host=host, scope=scope, source=source, kind=kind, status="failed"))
+            issues.append(cache.read_issue(
+                path=path, containment_root=containment_root,
+                kind="unreadable", host=host, source=source, message=error,
+            ))
+            artifacts.append(_artifact(
+                host=host, scope=scope, source=source, kind=kind, status="failed",
+                resolved_through=resolved_through,
+            ))
             return
         assert text is not None
         redacted_text = _sanitize_sensitive_string(text)
-        artifacts.append(_artifact(host=host, scope=scope, source=source, kind=kind, status="parsed", data={"sha256": hashlib.sha256(redacted_text.encode()).hexdigest()}))
-        grants.append(_instruction_grant(host=host, scope=scope, source=source, data=text))
+        artifact = _artifact(
+            host=host, scope=scope, source=source, kind=kind, status="parsed",
+            data={"sha256": hashlib.sha256(redacted_text.encode()).hexdigest()},
+            resolved_through=resolved_through,
+        )
+        structure = classify_instruction(source, text)
+        if structure is not None:
+            artifact["instruction_structure"] = structure.projection()
+            if structure.status == "unresolved":
+                artifact["parse_status"] = "unsupported"
+                issues.append(_inventory_issue(
+                    kind="unsupported", host=host, source=source,
+                    message=unresolved_structure_message(structure.reason),
+                    blocking=True,
+                ))
+        artifacts.append(artifact)
+        if structure is None or structure.status != "guidance":
+            grants.append(_instruction_grant(
+                host=host, scope=scope, source=source, data=text,
+                structure=structure.projection() if structure is not None else None,
+            ))
         return text
 
     data = _load_structured(
         path=path, source=source, host=host, kind=kind, scope=scope,
         containment_root=containment_root, cache=cache,
-        artifacts=artifacts, issues=issues,
+        artifacts=artifacts, issues=issues, resolved_through=resolved_through,
     )
     if data is None:
         return
@@ -845,12 +5062,64 @@ def _collect_file(
                 blocking=True,
             )
         )
+    if (
+        host == "claude-code" and kind == "config" and source in _CLAUDE_SETTINGS_RANK
+        and isinstance(data, dict) and artifacts and artifacts[-1]["path"] == public_host_path(source)
+    ):
+        # What no reader of this entry compares is named on the artifact, so
+        # a change confined to it is never read as no change (#1027), and one
+        # shaped as a command Claude Code runs keeps coverage partial, as
+        # policyHelper does.
+        unmodelled = _claude_unmodelled_keys(data)
+        if unmodelled:
+            artifacts[-1]["unmodelled_keys"] = unmodelled
+        issues.extend(
+            _inventory_issue(
+                kind="unsupported",
+                host="claude-code",
+                source=source,
+                message=(
+                    f"{key} is shaped as a command Claude Code runs (an object with a command, "
+                    "or a Helper string), and this entry does not model it; the static audit "
+                    "does not run it and cannot establish complete coverage"
+                ),
+                blocking=True,
+            )
+            for key in _claude_unmodelled_commands(data)
+        )
     if kind == "mcp":
         grants.extend(_mcp_grants(data, host=host, scope=scope, source=source))
+        if host == "vscode":
+            vscode_grants, vscode_issues = _vscode_mcp_extras(data, scope=scope, source=source)
+            grants.extend(vscode_grants)
+            issues.extend(vscode_issues)
     elif kind == "workflow":
-        grant = _workflow_grant(data, source=source)
+        collided: set[str] = set()
+        grant = _workflow_grant(data, source=source, collided=collided)
         if grant is not None:
             grants.append(grant)
+            uncompared = _uncompared_workflow_text(grant, collided)
+            if uncompared is not None:
+                # Refuse rather than let a distinct change compare as equal
+                # (#767), or two jobs, triggers or scopes compare as one (#802).
+                issues.append(_inventory_issue(
+                    kind="unsupported", host=host, source=source, message=uncompared, blocking=True,
+                ))
+            # An unread secret value narrows one entry, not the workflow, so it
+            # is named rather than blocking: coverage counts only blocking
+            # issues, and every other row on this file still reaches the
+            # reviewer (#693).
+            issues.extend(
+                _inventory_issue(
+                    kind="unsupported", host=host, source=source, message=text, blocking=False,
+                )
+                for text in (
+                    *uncompared_secret_mapping_texts(grant),
+                    # An agent launch or checkout ref this reader does not
+                    # compare narrows that entry, not the workflow (#823).
+                    *uncompared_agent_launch_texts(grant),
+                )
+            )
     elif host == "codex" and kind == "requirements":
         grants.extend(_codex_requirement_grants(data, scope=scope, source=source))
     elif host == "codex" and path.suffix == ".toml":
@@ -873,13 +5142,627 @@ def _collect_file(
                         blocking=True,
                     )
                 )
+    elif kind == "hooks":
+        # A hook file contributes hooks only. Claude Code reads `permissions`,
+        # `enabledPlugins` or `sandbox` from settings, never from a hook file,
+        # so reading one as settings published authority no host grants (#714).
+        grants.extend(_hooks_grants(data, host=host, scope=scope, source=source, basis=hook_basis))
     elif host == "claude-code":
         grants.extend(_claude_grants(data, scope=scope, source=source))
     elif host == "cursor":
         grants.extend(_cursor_grants(data, scope=scope, source=source))
-    elif kind == "hooks":
-        grants.extend(_hooks_grants(data, host=host, scope=scope, source=source))
+    _bind_hook_scripts(
+        data=data, grants=grants[first_grant:], root=containment_root,
+        cache=cache, issues=issues, artifacts=artifacts, plugin_root=plugin_root,
+    )
     return data
+
+
+def _bind_hook_scripts(
+    *, data: Any, grants: list[dict[str, Any]], root: Path,
+    cache: HostStaticParseCache, issues: list[dict[str, Any]],
+    artifacts: list[dict[str, Any]],
+    plugin_root: str | None = None,
+) -> None:
+    """Attach bounded direct dependencies to selected repository hook grants.
+
+    A limit on a selected dependency is a blocking ``unreadable`` issue on the
+    dependency's own path, once per host and path, so a comparison can prove
+    it unchanged or withhold that script alone (#702 review). A malformed
+    group is skipped with a non-blocking issue naming it: the groups after it
+    still select their handlers.
+    """
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    if not isinstance(hooks, dict):
+        return
+    for grant in grants:
+        if grant.get("kind") != "hook" or grant.get("scope") != "repository":
+            continue
+        event = grant["event"]
+        groups = hooks.get(event)
+        entries: list[dict[str, Any]] = []
+        grant["script_inputs"] = entries
+        selected = hook_loading_basis(grant) in LOADED_HOOK_BASES
+        malformed: list[str] = []
+        if not isinstance(groups, list):
+            entries.append({"handler": 0, "limit": "unsupported_hook_shape"})
+            malformed.append("value")
+            groups = []
+        index = 0
+        for position, group in enumerate(groups):
+            handlers = group.get("hooks") if isinstance(group, dict) else None
+            if not isinstance(handlers, list):
+                entries.append({"handler": index, "limit": "unsupported_hook_shape"})
+                malformed.append(f"group {position}")
+                continue
+            for handler in handlers:
+                if index >= MAX_HOOK_SCRIPT_HANDLERS:
+                    entries.append({"handler": index, "limit": "handler_bound_exceeded"})
+                    break
+                ordinal = index
+                index += 1
+                if not isinstance(handler, dict) or handler.get("type") != "command":
+                    continue
+                if not selected:
+                    entries.append({"handler": ordinal, "limit": "hook_selection_not_established"})
+                    continue
+                ref = hook_script_reference(
+                    handler, host=grant["host"],
+                    workspace_path=str(cache.reference_workspace or root), plugin_root=plugin_root,
+                )
+                entry: dict[str, Any] = {"handler": ordinal, "path": ref.path, "basis": ref.basis, "limit": ref.limit}
+                if ref.path is not None:
+                    shown = public_host_path(ref.path)
+                    if shown != ref.path:
+                        entry.update(path=shown, limit="redacted_dependency_path")
+                    else:
+                        if ref.path not in cache.hook_script_reads:
+                            cache.hook_script_reads[ref.path] = capture_hook_script(
+                                cache.reader_for(root), ref.path, absent_paths=cache.hook_script_absences,
+                            )
+                        entry.update(cache.hook_script_reads[ref.path])
+                    if entry.get("limit"):
+                        issue = _inventory_issue(
+                            kind="unreadable", host=grant["host"], source=shown,
+                            message=(
+                                f"Selected hook script {shown}: {entry['limit']}; its bytes were "
+                                f"not compared (hook {event} in {grant['source']})."
+                            ),
+                            blocking=True,
+                        )
+                        if not any(
+                            (item["kind"], item["host"], item["source"])
+                            == (issue["kind"], issue["host"], issue["source"])
+                            for item in issues
+                        ):
+                            issues.append(issue)
+                    if not any(item["host"] == grant["host"] and item["path"] == shown and item["kind"] == "hook_script" for item in artifacts):
+                        artifacts.append(_artifact(
+                            host=grant["host"], scope="repository", source=shown, kind="hook_script",
+                            status="failed" if entry.get("limit") else "parsed",
+                            data={"sha256": entry.get("sha256"), "size_bytes": entry.get("size_bytes")},
+                        ))
+                entries.append(entry)
+            if entries and entries[-1].get("limit") == "handler_bound_exceeded":
+                break
+        if selected and malformed:
+            issues.append(_inventory_issue(
+                kind="unsupported", host=grant["host"], source=grant["source"],
+                message=(
+                    f"Hook {event} {', '.join(malformed[:3])}"
+                    + (f" and {len(malformed) - 3} more" if len(malformed) > 3 else "")
+                    + " is not a matcher group holding a hooks list, so its handlers were "
+                    "not examined for script dependencies."
+                ),
+                blocking=False,
+            ))
+        if selected and any(entry.get("limit") == "handler_bound_exceeded" for entry in entries):
+            issues.append(_inventory_issue(
+                kind="unsupported", host=grant["host"], source=grant["source"],
+                message=f"Hook {event} executable dependencies were not fully examined: handler bound {MAX_HOOK_SCRIPT_HANDLERS} exceeded.",
+                blocking=True,
+            ))
+
+
+def _claude_plugin_hook_issue(*, source: str, message: str, blocking: bool) -> dict[str, Any]:
+    return _inventory_issue(
+        kind="unsupported", host="claude-code", source=source, message=message, blocking=blocking,
+    )
+
+
+@dataclass
+class _PluginHookSelection:
+    """What the plugin configuration in one repository selects (#714)."""
+
+    #: ``{hook file: the manifest or marketplace entry that selects it}``.
+    selected: dict[str, str] = field(default_factory=dict)
+    #: The selected hook files that a plugin this repository's project
+    #: settings enable selects, published as ``project_enabled_plugin``.
+    enabled: set[str] = field(default_factory=set)
+    #: The manifests and marketplaces whose inline hooks such a plugin loads,
+    #: by file (#809): an inline hook's `source` is the manifest, or
+    #: `<marketplace>#plugins.<name>`.
+    enabled_inline: set[str] = field(default_factory=set)
+    #: The hook files such a plugin selects that the reader refused to open,
+    #: by name or by a skipped directory (#809). Each is a named limit.
+    enabled_unread: set[str] = field(default_factory=set)
+    #: Every issue raised while resolving that selection.
+    reference_issue_ids: set[str] = field(default_factory=set)
+    #: ``{issue id: the plugin directories whose references raised it}`` (#808).
+    #: ``None`` stands for a reference that names a path outside its plugin,
+    #: which no directory bounds.
+    issue_roots: dict[str, set[str | None]] = field(default_factory=dict)
+    #: ``{hook file: every plugin directory that selects it}``, as spelled (#808).
+    roots: dict[str, set[str]] = field(default_factory=dict)
+    #: ``{inline hook selector: its plugin directory}``: a manifest, or a
+    #: marketplace entry ``<marketplace>#plugins.<name>`` (#808).
+    inline_roots: dict[str, str] = field(default_factory=dict)
+    #: Every Claude Code plugin directory this configuration recognises, from
+    #: a manifest that parsed or an in-repository marketplace entry (#936).
+    plugin_roots: set[str] = field(default_factory=set)
+    #: The files a manifest's or marketplace entry's `mcpServers` names by a
+    #: `./` path inside its plugin (#936). Each selects a `.mcp.json` for
+    #: Claude Code; no other file is read from it.
+    mcp_references: set[str] = field(default_factory=set)
+
+
+def _plugin_relative_path(reference: str, *, allow_root: bool = False) -> str | None:
+    """A `./` path inside a plugin directory, normalized; ``""`` for the root."""
+
+    if not reference.startswith("./") or "\\" in reference:
+        return None
+    relative = posixpath.normpath(reference[2:] or ".")
+    if relative == ".":
+        return "" if allow_root else None
+    if relative == ".." or relative.startswith("../") or posixpath.isabs(relative):
+        return None
+    return relative
+
+
+def _settings_marketplace_path(reference: str) -> str | None:
+    """A settings `directory`/`file` marketplace path inside the repository; ``""`` for the root.
+
+    Claude Code resolves a relative local marketplace path against the
+    repository's main checkout (plugin-marketplaces, "Configure team
+    marketplaces"). An absolute or home-relative path names a machine, not
+    this repository, and a backslash, a drive or a path leaving the checkout
+    cannot be proved to land inside it (#714).
+    """
+
+    if not reference or "\\" in reference or ":" in reference or reference.startswith(("/", "~")):
+        return None
+    relative = posixpath.normpath(reference)
+    if relative == ".":
+        return ""
+    if relative == ".." or relative.startswith("../"):
+        return None
+    return relative
+
+
+#: The project settings layers whose plugin enablement the repository holds,
+#: highest precedence first (#714). `.claude/settings.local.json` is usually
+#: uncommitted, but Claude Code reads it whenever it is present, so reading
+#: it errs toward showing a hook the host would load.
+_CLAUDE_PROJECT_SETTINGS_SOURCES = (".claude/settings.local.json", ".claude/settings.json")
+
+
+def _resolve_claude_plugin_hooks(
+    *, candidates: dict[str, tuple[Path, tuple[str, ...]]], root: Path,
+    cache: HostStaticParseCache, artifacts: list[dict[str, Any]],
+    grants: list[dict[str, Any]], issues: list[dict[str, Any]],
+    project_settings: tuple[Any, ...] = (),
+    unread_links: frozenset[str] = frozenset(),
+) -> _PluginHookSelection:
+    """Which hook files Claude Code plugin configuration selects, statically (#714).
+
+    Per the plugins reference, a plugin loads `hooks/hooks.json` relative to
+    its root. A `hooks` member adds a `./`-relative path, an array of such
+    paths, or an inline object, and custom paths add to the default rather
+    than replace it. That member may sit in the plugin's own
+    `.claude-plugin/plugin.json` or in its marketplace entry.
+
+    A plugin root is recognised in two ways. One is its manifest. The other
+    is a `.claude-plugin/marketplace.json` entry whose `source` is a `./` path,
+    or a bare name under `metadata.pluginRoot`. A remote source names nothing
+    in the repository. `strict` changes which file is authoritative, not what
+    is selected, so both are read and every selection is kept visible.
+
+    Selection is what the repository can prove. Whether the plugin is
+    installed or enabled is usually not in the repository, so a selected hook
+    is published as ``plugin_selected``, never as loaded.
+
+    The exception is a plugin the repository itself enables (settings
+    reference, `enabledPlugins` and `extraKnownMarketplaces`). When a project
+    settings layer sets `<plugin>@<marketplace>` to `true`, and a project
+    settings layer registers that marketplace as a `directory` or `file`
+    source resolving to a `.claude-plugin/marketplace.json` in this
+    repository, and that marketplace lists the plugin with a source inside the
+    repository, the plugin's selected hooks are ``project_enabled_plugin``.
+    Claude Code leaves only a plugin from an external source waiting for a
+    manual install (discover-plugins, "Configure team marketplaces"), so this
+    one loads once the folder is trusted. A remote or `settings` marketplace
+    source, an absolute path, a plugin the marketplace does not list, and a
+    value other than `true` establish nothing. A `true` in either layer
+    counts: a `false` in `.claude/settings.local.json` is one machine's
+    opt-out, not what the committed file enables for everyone else.
+
+    Limits:
+
+    * A manifest reference that cannot be followed blocks, because the hooks
+      it names are unread. The issue names the exact file when there is one,
+      so an unchanged-limit comparison checks that file's bytes.
+    * A marketplace limit never blocks. A marketplace lists plugins for many
+      repositories, and a refusal from it would stop comparisons that touch
+      no plugin.
+    * A reference to a missing file selects nothing a host could load, and a
+      reference into a directory the walk skips (`node_modules`, `.venv`) is
+      unread by design. Both are named without blocking.
+
+    Matching a reference to a file is case-insensitive when exactly one
+    file matches. A host on a case-sensitive filesystem would load nothing
+    from a miscased reference, one on macOS or Windows would, and reading it
+    errs toward showing the hook rather than hiding it.
+    """
+
+    result = _PluginHookSelection()
+    by_path = dict(candidates)
+    by_folded: dict[str, list[str]] = {}
+    for relative in by_path:
+        by_folded.setdefault(relative.casefold(), []).append(relative)
+    #: ``{hook file: the plugin roots that select it}``, folded, so a basis is
+    #: decided once every enabled root is known.
+    roots_by_file: dict[str, set[str]] = {}
+    #: Inline hook objects, kept until the same is known for their root.
+    inline: list[tuple[Any, str, str]] = []
+    #: ``{hook file the reader refused: the plugin roots that select it}``.
+    unread_roots_by_file: dict[str, set[str]] = {}
+    enabled_roots: set[str] = set()
+    folded_links = {link.casefold() for link in unread_links}
+
+    def existing(relative: str) -> str | None:
+        if relative in by_path:
+            return relative
+        matches = by_folded.get(relative.casefold(), [])
+        return matches[0] if len(matches) == 1 else None
+
+    def issue(*, source: str, message: str, blocking: bool, plugin_root: str | None) -> None:
+        """Raise a plugin-reference issue, bounded by ``plugin_root`` (#808).
+
+        ``None`` for a reference that names a path outside its plugin: what
+        it would select is not bounded by any directory.
+        """
+
+        item = _claude_plugin_hook_issue(source=source, message=message, blocking=blocking)
+        issues.append(item)
+        result.reference_issue_ids.add(item["issue_id"])
+        result.issue_roots.setdefault(item["issue_id"], set()).add(plugin_root)
+
+    def under(plugin_root: str, relative: str) -> str:
+        return posixpath.join(plugin_root, relative) if plugin_root else relative
+
+    def select(hook_file: str, *, plugin_root: str, selector: str) -> None:
+        result.selected.setdefault(hook_file, selector)
+        roots_by_file.setdefault(hook_file, set()).add(plugin_root.casefold())
+        result.roots.setdefault(hook_file, set()).add(plugin_root)
+
+    def select_default(plugin_root: str, selector: str) -> None:
+        result.plugin_roots.add(plugin_root)
+        default = existing(under(plugin_root, CLAUDE_PLUGIN_DEFAULT_HOOKS))
+        if default is not None:
+            select(default, plugin_root=plugin_root, selector=selector)
+
+    def in_repository_marketplace(config: Any) -> str | None:
+        source = config.get("source") if isinstance(config, dict) else None
+        if not isinstance(source, dict) or not isinstance(source.get("path"), str):
+            return None  # `github`, `git`, `url` and `settings` name nothing provable here.
+        relative = _settings_marketplace_path(source["path"])
+        if relative is None:
+            return None
+        if source.get("source") == "directory":
+            return existing(under(relative, CLAUDE_PLUGIN_MARKETPLACE))
+        if source.get("source") == "file" and is_claude_plugin_marketplace_path(relative):
+            return existing(relative)
+        return None
+
+    # `{marketplace name: plugin entry names}` the project settings enable, and
+    # `{marketplace file: the names the project settings register it under}`.
+    enabled_ids: set[str] = set()
+    registered: dict[str, set[str]] = {}
+    for layer in project_settings:
+        if not isinstance(layer, dict):
+            continue
+        plugins = layer.get("enabledPlugins")
+        if isinstance(plugins, dict):
+            enabled_ids.update(str(name) for name, value in plugins.items() if value is True)
+        for key in ("extraKnownMarketplaces", "additionalMarketplaces"):
+            marketplaces = layer.get(key)
+            if not isinstance(marketplaces, dict):
+                continue
+            for name, config in marketplaces.items():
+                located = in_repository_marketplace(config)
+                if located is not None:
+                    registered.setdefault(located, set()).add(str(name))
+    enabled_plugins: dict[str, set[str]] = {}
+    for plugin_id in sorted(enabled_ids):
+        plugin, separator, marketplace_name = plugin_id.rpartition("@")
+        if separator and plugin:
+            enabled_plugins.setdefault(marketplace_name, set()).add(plugin)
+
+    def enabled_entries(marketplace: str, data: Any) -> set[str]:
+        """The plugin entry names the project settings enable from this
+        marketplace file.
+
+        The marketplace must be registered in the project settings as an
+        in-repository source; an unregistered `marketplace.json` enables
+        nothing. It is then identified both by the `extraKnownMarketplaces`
+        key that registers it and by its own `name`. Claude Code's
+        `marketplace.json` schema calls that `name` the identifier users see
+        after the `@` (https://code.claude.com/docs/en/plugin-marketplaces),
+        and the settings documentation only ever shows a key equal to it, so
+        neither name is documented as the one `enabledPlugins` matches.
+        Reading both errs toward showing a hook the host would load.
+        """
+
+        names = registered.get(marketplace)
+        if not names:
+            return set()
+        own = data.get("name") if isinstance(data, dict) else None
+        if isinstance(own, str):
+            names = names | {own}
+        return {plugin for name in names for plugin in enabled_plugins.get(name, ())}
+
+    def through_unread_link(target: str) -> bool:
+        folded = target.casefold()
+        return any(folded.startswith(f"{link}/") for link in folded_links)
+
+    def follow(reference: str, *, plugin_root: str, selector: str, blocking: bool) -> None:
+        shown = _sanitize_sensitive_string(reference)
+        relative = _plugin_relative_path(reference)
+        if relative is None:
+            issue(
+                source=selector.split("#", 1)[0], blocking=blocking, plugin_root=None,
+                message=(
+                    f"{selector} names hooks at {shown!r}, which is not a `./` path inside the "
+                    "plugin directory; the hooks it names were not read"
+                ),
+            )
+            return
+        target = under(plugin_root, relative)
+        skipped = next(
+            (part for part in target.split("/") if part in _WALK_SKIPPED_DIRECTORIES), None
+        )
+        if skipped is not None:
+            unread_roots_by_file.setdefault(target, set()).add(plugin_root.casefold())
+            issue(
+                source=target, blocking=False, plugin_root=plugin_root,
+                message=(
+                    f"{selector} selects this hook file inside `{skipped}`, a directory the "
+                    "static reader does not walk; its hooks were not read"
+                ),
+            )
+            return
+        if not is_hook_declaration_file_name(target):
+            unread_roots_by_file.setdefault(target, set()).add(plugin_root.casefold())
+            issue(
+                source=target, blocking=blocking, plugin_root=plugin_root,
+                message=(
+                    f"{selector} selects this hook file, whose name is not `hooks.json` or "
+                    "`<name>-hooks.json`; the static reader follows only such names, so its "
+                    "hooks were not read"
+                ),
+            )
+            return
+        found = existing(target)
+        if found is None:
+            if through_unread_link(target):
+                # The walk reports that link as a blocking limit. A second,
+                # non-blocking "not in the repository" would contradict it.
+                return
+            issue(
+                source=target, blocking=False, plugin_root=plugin_root,
+                message=(
+                    f"{selector} selects this hook file, which is not in the repository; "
+                    "no hooks were read from it"
+                ),
+            )
+            return
+        select(found, plugin_root=plugin_root, selector=selector)
+
+    def note_mcp_references(declared: Any, *, plugin_root: str) -> None:
+        # Only what selects a `.mcp.json` for Claude Code (#936); the file is
+        # read as a registry surface, and nothing else is followed here.
+        for reference in declared_component_paths(declared):
+            target = plugin_reference(plugin_root, reference, require_dot_slash=True)
+            if target is not None:
+                result.mcp_references.add(target)
+
+    def follow_hooks(
+        declared: Any, *, plugin_root: str, selector: str, blocking: bool
+    ) -> None:
+        if isinstance(declared, dict):
+            inline.append((declared, plugin_root, selector))
+            result.inline_roots[selector] = plugin_root
+            return
+        if isinstance(declared, str):
+            references = [declared]
+        elif isinstance(declared, list) and all(isinstance(item, str) for item in declared):
+            references = list(declared)
+        else:
+            issue(
+                source=selector.split("#", 1)[0], blocking=blocking, plugin_root=plugin_root,
+                message=(
+                    f"{selector} `hooks` must be a `./` path, an array of such paths or an "
+                    "object of hook events; the hooks it names were not read"
+                ),
+            )
+            return
+        for reference in sorted(set(references)):
+            follow(reference, plugin_root=plugin_root, selector=selector, blocking=blocking)
+
+    for manifest in sorted(relative for relative in by_path if is_claude_plugin_manifest_path(relative)):
+        path, resolved_through = by_path[manifest]
+        plugin_root = posixpath.dirname(posixpath.dirname(manifest))
+        data, error_kind, error_message = cache.parse(path, containment_root=root)
+        if error_kind is not None:
+            assert error_message is not None
+            failure = cache.read_issue(
+                path=path, containment_root=root, kind=error_kind, host="claude-code",
+                source=manifest,
+                message=(
+                    f"{error_message}; the hook files this plugin manifest may select were not read"
+                ),
+            )
+            issues.append(failure)
+            result.reference_issue_ids.add(failure["issue_id"])
+            result.issue_roots.setdefault(failure["issue_id"], set()).add(plugin_root)
+            artifacts.append(_artifact(
+                host="claude-code", scope="repository", source=manifest, kind="config",
+                status="failed", resolved_through=resolved_through,
+            ))
+            continue
+        if not isinstance(data, dict):
+            issue(
+                source=manifest, blocking=True, plugin_root=plugin_root,
+                message=(
+                    "Cannot interpret a Claude Code plugin manifest that is not an object; "
+                    "the hook files it may select were not read."
+                ),
+            )
+            artifacts.append(_artifact(
+                host="claude-code", scope="repository", source=manifest, kind="config",
+                status="unsupported", resolved_through=resolved_through,
+            ))
+            continue
+        select_default(plugin_root, manifest)
+        note_mcp_references(data.get("mcpServers"), plugin_root=plugin_root)
+        if "hooks" not in data:
+            # Only the `hooks` member is published, so editing a plugin's
+            # version or description is not host-grant drift.
+            continue
+        artifacts.append(_artifact(
+            host="claude-code", scope="repository", source=manifest, kind="config",
+            status="parsed", data={"hooks": data["hooks"]}, resolved_through=resolved_through,
+        ))
+        follow_hooks(data["hooks"], plugin_root=plugin_root, selector=manifest, blocking=True)
+
+    for marketplace in sorted(
+        relative for relative in by_path if is_claude_plugin_marketplace_path(relative)
+    ):
+        path, resolved_through = by_path[marketplace]
+        marketplace_root = posixpath.dirname(posixpath.dirname(marketplace))
+        data, error_kind, _error_message = cache.parse(path, containment_root=root)
+        plugins = data.get("plugins") if isinstance(data, dict) else None
+        if error_kind is not None or not isinstance(plugins, list):
+            issue(
+                source=marketplace, blocking=False, plugin_root=marketplace_root,
+                message=(
+                    "Cannot read this Claude Code marketplace's `plugins` array; the hooks its "
+                    "plugin entries may select were not read"
+                ),
+            )
+            continue
+        enabled_here = enabled_entries(marketplace, data)
+        metadata = data.get("metadata")
+        root_reference = metadata.get("pluginRoot") if isinstance(metadata, dict) else None
+        plugin_base = (
+            _plugin_relative_path(root_reference, allow_root=True)
+            if isinstance(root_reference, str)
+            else None
+        )
+        if isinstance(root_reference, str) and plugin_base is None:
+            issue(
+                source=marketplace, blocking=False, plugin_root=marketplace_root,
+                message=(
+                    f"{marketplace} `metadata.pluginRoot` "
+                    f"{_sanitize_sensitive_string(root_reference)!r} is not a `./` path inside the "
+                    "marketplace directory; the hooks of plugins named by a bare source under it "
+                    "were not read"
+                ),
+            )
+        recorded: list[dict[str, Any]] = []
+        for index, entry in enumerate(plugins):
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name") if isinstance(entry.get("name"), str) else str(index)
+            selector = f"{marketplace}#plugins.{name}"
+            source = entry.get("source")
+            relative: str | None = None
+            if isinstance(source, str) and source.startswith("./"):
+                relative = _plugin_relative_path(source, allow_root=True)
+                if relative is None:
+                    issue(
+                        source=marketplace, blocking=False, plugin_root=marketplace_root,
+                        message=(
+                            f"{selector} source {_sanitize_sensitive_string(source)!r} leaves the "
+                            "marketplace directory; the hooks that plugin may select were not read"
+                        ),
+                    )
+                    continue
+            elif (
+                isinstance(source, str) and source and plugin_base is not None
+                # A bare name is one directory name: `team/demo` still needs `./`.
+                and "/" not in source and ":" not in source
+                and _plugin_relative_path(f"./{source}") is not None
+            ):
+                relative = under(plugin_base, posixpath.normpath(source))
+            else:
+                continue  # A remote source names nothing in this repository.
+            plugin_root = under(marketplace_root, relative) if relative else marketplace_root
+            if isinstance(entry.get("name"), str) and entry["name"] in enabled_here:
+                enabled_roots.add(plugin_root.casefold())
+            select_default(plugin_root, selector)
+            note_mcp_references(entry.get("mcpServers"), plugin_root=plugin_root)
+            if "hooks" not in entry:
+                continue
+            recorded.append({
+                "name": name, "source": source, "strict": entry.get("strict"),
+                "hooks": entry["hooks"],
+            })
+            follow_hooks(entry["hooks"], plugin_root=plugin_root, selector=selector, blocking=False)
+        if recorded:
+            artifacts.append(_artifact(
+                host="claude-code", scope="repository", source=marketplace, kind="config",
+                status="parsed", data={"plugins": recorded}, resolved_through=resolved_through,
+            ))
+
+    # Every enabled root is known only now: a manifest is read before the
+    # marketplace that enables its plugin.
+    for declared, plugin_root, selector in inline:
+        enabled_here = plugin_root.casefold() in enabled_roots
+        if enabled_here:
+            result.enabled_inline.add(selector.split("#", 1)[0])
+        inline_grants = _hooks_grants(
+            {"hooks": declared}, host="claude-code", scope="repository", source=selector,
+            basis="project_enabled_plugin" if enabled_here else "plugin_selected",
+        )
+        _bind_hook_scripts(
+            data={"hooks": declared}, grants=inline_grants, root=root,
+            cache=cache, issues=issues, artifacts=artifacts, plugin_root=plugin_root,
+        )
+        grants.extend(inline_grants)
+    result.enabled = {
+        hook_file for hook_file, roots in roots_by_file.items() if roots & enabled_roots
+    }
+    result.enabled_unread = {
+        hook_file for hook_file, roots in unread_roots_by_file.items() if roots & enabled_roots
+    }
+    return result
+
+
+#: Directory names the repository walk never enters. One definition, so a
+#: plugin reference into one is named as unread rather than missing (#714).
+_WALK_SKIPPED_DIRECTORIES = frozenset({
+    ".git", ".hg", ".svn", "node_modules", "site-packages", ".venv", "venv",
+    # Machine-written tool caches. No host reads configuration from one, so
+    # inventorying them buys no coverage — and it made an ordinary
+    # concurrent test run collapse the whole repository inventory, because
+    # a `.pyc` appearing between the scan and its revalidation is a
+    # directory that "changed while it was read" (#598). Excluded for the
+    # same reason `.venv` and `node_modules` already are, not to make an
+    # unreadable input pass.
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".tox", ".nox",
+})
 
 
 def _source_kind(path: str) -> str:
@@ -915,13 +5798,25 @@ def _repository_paths(
     root: Path,
     *,
     reader: IdentityBoundReadSession,
-) -> tuple[list[tuple[Path, str, str, str]], int]:
-    """Enumerate repository sources exclusively from the boundary registry."""
+    limits: tuple[tuple[str, int], ...] = (),
+    include_directory_candidates: bool = False,
+    plugin_candidates: dict[str, tuple[Path, tuple[str, ...]]] | None = None,
+    plugin_unread_links: set[str] | None = None,
+    plugin_manifests: dict[str, tuple[Path, tuple[str, ...]]] | None = None,
+) -> tuple[list[tuple[Path, str, str, str, tuple[str, ...]]], int]:
+    """Enumerate repository sources exclusively from the boundary registry.
 
-    indexed: dict[tuple[str, str], tuple[Path, str, str, str]] = {}
-    skipped = {".git", ".hg", ".svn", "node_modules", "site-packages", ".venv", "venv"}
+    Each row is ``(read path, source, host, kind, resolved_through)``. The two
+    paths differ only for a boundary path that is an in-tree link (#700, step
+    two): the source keeps the link's own spelling, which is what the host
+    reads, and the read path is the target the walk already enumerated.
+    """
+
+    indexed: dict[tuple[str, str], tuple[Path, str, str, str, tuple[str, ...]]] = {}
+    skipped = set(_WALK_SKIPPED_DIRECTORIES)
     candidates: list[tuple[Path, str]] = []
     symlink_directories: list[str] = []
+    link_resolutions: dict[str, tuple[Path, str, tuple[str, ...]] | None] = {}
     visited = 0
     pending = [Path()]
     while pending:
@@ -933,15 +5828,15 @@ def _repository_paths(
                 max_entries=MAX_HOST_REPOSITORY_ENTRIES - visited,
             )
         except IdentityReadBudgetExceeded as exc:
-            raise RuntimeError(
-                "repository host-boundary inventory exceeded its static "
-                "filesystem-entry bound"
-            ) from exc
+            raise HostInventoryReadError(HostInputFailure(
+                reason="resource_bound_exceeded", phase="inventory_enumeration",
+                source=relative_directory.as_posix(), limits=limits,
+            )) from exc
         except (OSError, NotImplementedError, ValueError) as exc:
-            raise RuntimeError(
-                "repository host-boundary inventory could not inspect the "
-                "workspace safely"
-            ) from exc
+            raise HostInventoryReadError(HostInputFailure(
+                reason="input_unreadable", phase="inventory_enumeration",
+                source=relative_directory.as_posix(),
+            )) from exc
         visited += len(names)
         child_directories: list[Path] = []
         for name in names:
@@ -952,19 +5847,49 @@ def _repository_paths(
                 if stat.S_ISLNK(metadata.st_mode):
                     if name not in skipped:
                         candidates.append((candidate, relative))
-                        symlink_directories.append(relative)
+                        resolution = _resolve_in_tree_link(reader, Path(relative))
+                        link_resolutions[relative] = resolution
+                        # A link to an in-tree regular file has no descendants
+                        # to conceal (#700, owner decision). Everything else,
+                        # including a target this session cannot type, still
+                        # may hide a recursive match unless it is read through
+                        # below.
+                        if resolution is None or resolution[1] != "file":
+                            symlink_directories.append(relative)
                     continue
                 if stat.S_ISDIR(metadata.st_mode):
                     if name not in skipped:
                         child_directories.append(Path(relative))
+                        if include_directory_candidates or is_explicit_boundary_file_path(relative):
+                            candidates.append((candidate, relative))
                     continue
             except (OSError, ValueError) as exc:
-                raise RuntimeError(
-                    "repository host-boundary inventory could not inspect a "
-                    "workspace entry safely"
-                ) from exc
+                raise HostInventoryReadError(HostInputFailure(
+                    reason="input_unreadable", phase="entry_inspection",
+                    source=relative,
+                )) from exc
             candidates.append((candidate, relative))
         pending.extend(reversed(child_directories))
+
+    # #700 step two: an in-tree directory link at a boundary location is read
+    # through. Every entry beneath its target was already enumerated by the walk
+    # above, at its real path, so each one is published again under the link.
+    read_through: list[tuple[Path, str, tuple[str, ...]]] = []
+    for link, resolution in sorted(link_resolutions.items()):
+        if resolution is None or resolution[1] != "directory":
+            continue
+        target, _kind, hops = resolution
+        if not _reads_through_directory_link(
+            link, target, skipped=skipped, links=link_resolutions
+        ):
+            continue
+        symlink_directories.remove(link)
+        prefix = f"{target.as_posix()}/"
+        for path, relative in candidates:
+            if relative.startswith(prefix):
+                read_through.append(
+                    (path, f"{link}/{relative[len(prefix):]}", (*hops[:-1], relative))
+                )
 
     for adapter in BOUNDARY_ADAPTERS:
         for expected in adapter.exact_paths:
@@ -974,7 +5899,34 @@ def _repository_paths(
             ):
                 candidates.append((root / expected, expected))
 
+    entries: list[tuple[Path, str, tuple[str, ...]]] = []
     for path, relative in candidates:
+        resolution = link_resolutions.get(relative)
+        if resolution is not None and resolution[1] == "file":
+            # #700 step two: a linked boundary file is read at its in-tree target.
+            entries.append((root / resolution[0], relative, resolution[2]))
+        elif resolution is not None and relative not in symlink_directories:
+            continue  # A directory link read through above names no source itself.
+        else:
+            entries.append((path, relative, ()))
+    entries.extend(read_through)
+
+    if plugin_candidates is not None:
+        # Not adapter surfaces: a plugin manifest, a marketplace and the
+        # hook-named files they may select are opened only to decide selection
+        # (#714). Taken from the same entries, so links and read-through
+        # resolve exactly as above.
+        for path, relative, resolved_through in entries:
+            if is_claude_plugin_reference_path(relative):
+                plugin_candidates[relative] = (path, resolved_through)
+    if plugin_manifests is not None:
+        # Every host's plugin manifest, which decides the host a `.mcp.json`
+        # is published under (#936). Only a Codex one is ever read.
+        for path, relative, resolved_through in entries:
+            if is_plugin_manifest_path(relative):
+                plugin_manifests[relative] = (path, resolved_through)
+
+    for path, relative, resolved_through in entries:
         for adapter in BOUNDARY_ADAPTERS:
             if not (
                 adapter.matches(relative)
@@ -993,8 +5945,106 @@ def _repository_paths(
                     relative,
                     host,
                     _source_kind(relative),
+                    resolved_through,
                 )
+    if plugin_unread_links is not None:
+        # Links the walk could not read through but still reports as a
+        # source, so reading them raises a blocking limit. A plugin reference
+        # beneath one is covered by that limit (#714).
+        reported = {relative for _host, relative in indexed}
+        plugin_unread_links.update(link for link in symlink_directories if link in reported)
     return [indexed[key] for key in sorted(indexed)], visited
+
+
+#: How many links one in-tree resolution may pass through.
+_MAX_IN_TREE_LINK_HOPS = 8
+
+
+def _resolve_in_tree_link(
+    reader: IdentityBoundReadSession, relative: Path
+) -> tuple[Path, str, tuple[str, ...]] | None:
+    """Where a link lands inside the tree: ``(target, kind, hops)``, or ``None`` (#700).
+
+    Bound to the identity-bound read rather than to a `stat()` at enumeration.
+    Each link's text comes from :meth:`IdentityBoundReadSession.link_target`,
+    and each component's kind from
+    :meth:`IdentityBoundReadSession.directory_entry_kind`, so :meth:`finish`
+    fails the snapshot if a link is re-pointed or a target is swapped.
+
+    ``kind`` is ``"file"`` or ``"directory"``, and ``hops`` are the in-tree
+    paths the resolution landed on, ending at the target. An absolute or
+    escaping target, a link as an intermediate component, a chain longer than
+    the hop bound, or anything the session cannot type is unresolved.
+    """
+
+    current = relative
+    hops: list[str] = []
+    try:
+        for _ in range(_MAX_IN_TREE_LINK_HOPS):
+            text = reader.link_target(current)
+            if not text or os.path.isabs(text) or text.startswith(("\\", "/")):
+                return None
+            joined = posixpath.normpath(posixpath.join(current.parent.as_posix(), text))
+            if joined in {".", ".."} or joined.startswith("../"):
+                return None
+            target = Path(joined)
+            for index in range(1, len(target.parts)):
+                if reader.directory_entry_kind(Path(*target.parts[:index])) != "directory":
+                    return None
+            kind = reader.directory_entry_kind(target)
+            hops.append(joined)
+            if kind in {"file", "directory"}:
+                return target, kind, tuple(hops)
+            if kind != "symlink":
+                return None
+            current = target
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _links_to_in_tree_file(reader: IdentityBoundReadSession, relative: Path) -> bool:
+    """Whether a link resolves, inside the tree, to a regular file (#700)."""
+
+    resolution = _resolve_in_tree_link(reader, relative)
+    return resolution is not None and resolution[1] == "file"
+
+
+def _reads_through_directory_link(
+    link: str,
+    target: Path,
+    *,
+    skipped: set[str],
+    links: dict[str, tuple[Path, str, tuple[str, ...]] | None],
+) -> bool:
+    """Whether an in-tree directory link is read through (#700, step two).
+
+    Only at a boundary location: a directory a registered adapter names by a
+    fixed prefix, such as `.claude/skills`, or an ancestor of an exact path.
+    A link that could only hide a `**/` match stays a limit. And only when the
+    walk already enumerated everything beneath the target: no skipped name on
+    the way, and no link inside it that would need a second resolution, which
+    also rules out a link into its own ancestor.
+    """
+
+    if any(part in skipped for part in target.parts):
+        return False
+    prefix = f"{target.as_posix()}/"
+    if any(other.startswith(prefix) or f"{other}/".startswith(prefix) for other in links):
+        return False
+    lowered = link.casefold()
+    for adapter in BOUNDARY_ADAPTERS:
+        if any(item.casefold().startswith(f"{lowered}/") for item in adapter.exact_paths):
+            return True
+        for pattern in adapter.globs:
+            fixed = pattern.casefold().split("*", 1)[0].rstrip("/")
+            if fixed and (
+                lowered == fixed
+                or lowered.startswith(f"{fixed}/")
+                or fixed.startswith(f"{lowered}/")
+            ):
+                return True
+    return False
 
 
 def _symlink_may_hide_boundary_glob(relative: str, pattern: str) -> bool:
@@ -1010,6 +6060,70 @@ def _symlink_may_hide_boundary_glob(relative: str, pattern: str) -> bool:
         or path.startswith(f"{fixed_prefix}/")
         or fixed_prefix.startswith(f"{path}/")
     )
+
+
+def _attribute_mcp_declarations(
+    repository_paths: list[tuple[Path, str, str, str, tuple[str, ...]]],
+    *,
+    manifests: dict[str, tuple[Path, tuple[str, ...]]],
+    selection: _PluginHookSelection,
+    root: Path,
+    cache: HostStaticParseCache,
+    issues: list[dict[str, Any]],
+) -> list[tuple[Path, str, str, str, tuple[str, ...]]]:
+    """Publish each `.mcp.json` under the hosts whose declarations select it (#936).
+
+    The registry finds the file by name and offers it as Claude Code's; the
+    rules in :mod:`agents_shipgate.core.mcp_host_selection` decide the hosts
+    from the plugin manifests and Claude Code plugin configuration around it.
+    The servers are read exactly as before, once per host. Only a Codex
+    manifest is read for this, through the same cache, and only when a
+    `.mcp.json` exists; a manifest of any other format is only noticed. A
+    declaration no host is established for carries a non-blocking issue naming
+    the manifests beside it, so `audit --host` says why.
+    """
+
+    sources = [
+        source for _path, source, host, kind, _resolved in repository_paths
+        if host == "claude-code" and kind == "mcp" and is_mcp_config_path(source)
+    ]
+    if not sources:
+        return repository_paths
+    parsed: dict[str, Any] = {}
+    for manifest, (path, _resolved_through) in sorted(manifests.items()):
+        located = plugin_manifest_root(manifest)
+        data: Any = None
+        if located is not None and located[1] == "codex":
+            data, error_kind, _message = cache.parse(path, containment_root=root)
+            if error_kind is not None or not isinstance(data, dict):
+                data = None
+        parsed[manifest] = data
+    selections = select_mcp_hosts(
+        sources=sources, manifests=parsed,
+        claude_roots=selection.plugin_roots, claude_references=selection.mcp_references,
+    )
+    rows: list[tuple[Path, str, str, str, tuple[str, ...]]] = []
+    for row in repository_paths:
+        path, source, host, kind, resolved_through = row
+        chosen = selections.get(source) if host == "claude-code" and kind == "mcp" else None
+        if chosen is None:
+            rows.append(row)
+            continue
+        rows.extend((path, source, each, kind, resolved_through) for each in chosen.hosts)
+        if chosen.unattributed_by:
+            beside = "; ".join(
+                f"{public_host_path(manifest)} ({reason})" for manifest, reason in chosen.unattributed_by
+            )
+            issues.append(_inventory_issue(
+                kind="unsupported", host=UNATTRIBUTED_MCP_HOST, source=source, blocking=False,
+                message=(
+                    "No plugin configuration this entry reads selects this MCP configuration, "
+                    f"and its directory holds {beside}. Which host loads its servers is not "
+                    "established, so they are published under host `unknown`, never as Claude "
+                    "Code's from the file name; nothing establishes that a plugin is installed."
+                ),
+            ))
+    return rows
 
 
 def _repository_sources_expected(host: str) -> list[str]:
@@ -1054,9 +6168,10 @@ def _collect_claude_project_state(
     data, error_kind, error = cache.parse(path, containment_root=home)
     if error_kind is not None:
         assert error is not None
-        issues.append(_inventory_issue(
+        issues.append(cache.read_issue(
+            path=path, containment_root=home,
             kind=error_kind, host="claude-code", source=source,
-            message=error, blocking=True,
+            message=error,
         ))
         artifacts.append(_artifact(
             host="claude-code", scope="local_static", source=source,
@@ -1111,12 +6226,13 @@ def _coverage(
     *, scope: HostScope, artifacts: list[dict[str, Any]], issues: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     coverage: list[dict[str, Any]] = []
-    for host in ("codex", "claude-code", "cursor", "vscode", "github"):
+    hosts = ["codex", "claude-code", "cursor", "vscode", "github"]
+    if any(item["host"] == "openshell" for item in (*artifacts, *issues)):
+        hosts.append("openshell")
+    for host in hosts:
         host_artifacts = [item for item in artifacts if item["host"] == host]
         host_issues = [item for item in issues if item["host"] == host and item["blocking"]]
         status = "partial" if host_issues else "complete"
-        if host == "vscode" and host_artifacts:
-            status = "experimental"
         expected = _repository_sources_expected(host)
         if scope == "local_static":
             expected.append("documented local static sources")
@@ -1131,14 +6247,185 @@ def _coverage(
     return coverage
 
 
+#: Claude Code's settings stack, highest first, as documented at
+#: code.claude.com/docs/en/settings § Settings precedence: managed settings,
+#: then `--settings` (a static audit never sees a session flag), then project
+#: local, shared project and user. A lower number wins.
+_CLAUDE_MANAGED_SOURCES = frozenset({
+    "/Library/Application Support/ClaudeCode/managed-settings.json",
+    "C:/Program Files/ClaudeCode/managed-settings.json",
+    "/etc/claude-code/managed-settings.json",
+})
+_CLAUDE_SETTINGS_RANK: dict[str, int] = {
+    **dict.fromkeys(_CLAUDE_MANAGED_SOURCES, 0),
+    ".claude/settings.local.json": 1,
+    ".claude/settings.json": 2,
+    "~/.claude/settings.json": 3,
+}
+#: One MCP server name defined in several scopes: "Claude Code connects to it
+#: once, using the definition from the highest-precedence source", whole
+#: entry, local over project (code.claude.com/docs/en/mcp).
+_CLAUDE_MCP_RANK: dict[str, int] = {
+    "~/.claude.json#current-workspace": 0,
+    ".mcp.json": 1,
+}
+#: Documented to take effect only from managed settings, where they restrict
+#: which permission rules or hooks any other source may contribute.
+_CLAUDE_MANAGED_ONLY_SETTINGS = {
+    "allowManagedPermissionRulesOnly": "permission_rule",
+    "allowManagedHooksOnly": "hook",
+}
+#: Kinds whose values the settings stack does not document how to combine
+#: when two layers disagree. Agreement is resolvable; disagreement fails
+#: closed and names both layers.
+_CLAUDE_UNDOCUMENTED_MERGE_KINDS = frozenset({"sandbox", "plugin_or_app"})
+
+
+def _claude_precedence_key(grant: dict[str, Any]) -> tuple[str, str] | None:
+    """The key two layers compete for, or ``None`` for a kind that merges.
+
+    Permission rules, additional directories and hooks merge across layers
+    ("Lists merge instead of overriding"; hook entries "merge across settings
+    levels rather than replacing each other"), so every layer's entry stays
+    effective and nothing competes.
+    """
+
+    kind = grant.get("kind")
+    if kind == "permission_mode" and grant.get("setting") in CLAUDE_LIST_SETTINGS:
+        # One grant per approved server (#827). Whether Claude Code merges the
+        # list across layers is not documented, so each entry is its own key:
+        # a server one layer approves is never hidden by another layer's list.
+        return (str(kind), f"{grant.get('setting')}:{grant.get('value')}")
+    if kind in {"permission_mode", "sandbox"}:
+        return (str(kind), str(grant.get("setting")))
+    if kind == "plugin_or_app":
+        return (str(kind), str(grant.get("name")))
+    if kind == "mcp_server":
+        return (str(kind), str(grant.get("server")))
+    return None
+
+
+def _claude_setting_ignored_in_source(grant: dict[str, Any]) -> bool:
+    """A value the documentation says this file cannot make take effect.
+
+    Such a grant never shadows a lower layer. It is still reported: the
+    restriction is recent (a project `bypassPermissions` took effect before
+    Claude Code v2.1.257) and a static audit cannot see the installed
+    version, so it over-reports rather than hide authority an older client
+    would grant.
+    """
+
+    if grant.get("kind") != "permission_mode":
+        return False
+    setting, value, source = grant.get("setting"), grant.get("value"), grant.get("source")
+    project_files = {".claude/settings.local.json", ".claude/settings.json"}
+    if setting == "defaultMode":
+        return value in {"auto", "bypassPermissions"} and source in project_files
+    if setting == "skipDangerousModePermissionPrompt":
+        return source == ".claude/settings.json"
+    return False
+
+
+def _project_claude_precedence(
+    grants: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Keep the Claude Code grants that take effect across local layers (#657).
+
+    Every layer used to raise a blocking ``unresolved_precedence`` issue as
+    soon as two existed, so the ordinary developer setup — user settings plus
+    a project's — could never record a local baseline. The projection follows
+    the documented stack instead: merged kinds keep every layer, a scalar key
+    keeps the highest layer that sets it, a same-named MCP server keeps the
+    highest scope's entry, and managed-only restrictions apply. What remains
+    names its effective layer in ``source``. Where the documentation does not
+    settle a disagreement, or a layer has no documented rank, every candidate
+    is kept and a blocking issue names the key and each layer.
+    """
+
+    claude = [grant for grant in grants if grant.get("host") == "claude-code"]
+    restricted_kinds = {
+        _CLAUDE_MANAGED_ONLY_SETTINGS[str(grant.get("setting"))]
+        for grant in claude
+        if grant.get("kind") == "permission_mode"
+        and grant.get("setting") in _CLAUDE_MANAGED_ONLY_SETTINGS
+        and grant.get("source") in _CLAUDE_MANAGED_SOURCES
+        and grant.get("value") == "True"
+    }
+    kept: list[dict[str, Any]] = []
+    contested: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for grant in grants:
+        if grant.get("host") != "claude-code":
+            kept.append(grant)
+            continue
+        managed = grant.get("source") in _CLAUDE_MANAGED_SOURCES
+        if (
+            grant.get("kind") == "permission_mode"
+            and grant.get("setting") in _CLAUDE_MANAGED_ONLY_SETTINGS
+            and not managed
+        ):
+            continue  # Documented as managed-only: no effect from any other file.
+        if grant.get("kind") in restricted_kinds and not managed:
+            continue  # A managed setting admits only managed rules or hooks.
+        key = _claude_precedence_key(grant)
+        if key is None:
+            kept.append(grant)
+        else:
+            contested.setdefault(key, []).append(grant)
+
+    issues: list[dict[str, Any]] = []
+    for (kind, name), group in sorted(contested.items()):
+        sources = sorted({str(grant.get("source")) for grant in group})
+        if len(sources) < 2:
+            kept.extend(group)
+            continue
+        rank = _CLAUDE_MCP_RANK if kind == "mcp_server" else _CLAUDE_SETTINGS_RANK
+        unranked = [source for source in sources if source not in rank]
+        disagreement = kind in _CLAUDE_UNDOCUMENTED_MERGE_KINDS and len({
+            str(grant.get("value") if kind == "sandbox" else grant.get("enabled"))
+            for grant in group
+        }) > 1
+        if unranked or disagreement:
+            reason = (
+                f"{', '.join(unranked)} has no documented place in Claude Code's precedence"
+                if unranked
+                else "Claude Code's documentation does not say which disagreeing value applies"
+            )
+            issues.append(
+                _inventory_issue(
+                    kind="unresolved_precedence",
+                    host="claude-code",
+                    source=f"claude-code:{kind}:{name}",
+                    message=(
+                        f"{kind} {name!r} is set in {', '.join(sources)}; {reason}, so its "
+                        "effective value is not statically projected."
+                    ),
+                    blocking=True,
+                )
+            )
+            kept.extend(group)
+            continue
+        shadowing = [grant for grant in group if not _claude_setting_ignored_in_source(grant)]
+        if not shadowing:
+            kept.extend(group)
+            continue
+        winner = min(rank[str(grant.get("source"))] for grant in shadowing)
+        # Anything ranked above the winner is a value its own file cannot make
+        # take effect; it stays, over-reported, for the reason given above.
+        kept.extend(grant for grant in group if rank[str(grant.get("source"))] <= winner)
+    return kept, issues
+
+
 def _local_precedence_issues(
     artifacts: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Fail closed where several static layers require an effective merge.
 
-    The inventory retains every redacted declaration, but it must not claim
-    effective-authority coverage until host-specific precedence is projected
-    at the individual setting/grant level.
+    Claude Code is projected by ``_project_claude_precedence``. For the other
+    hosts the inventory retains every redacted declaration, but it must not
+    claim effective-authority coverage while their layering is undocumented
+    or depends on state a static read cannot see (Codex loads a project
+    ``.codex/config.toml`` only for a trusted project; Cursor does not say
+    whether its user and project CLI files merge).
     """
 
     grouped: dict[tuple[str, str], list[str]] = {}
@@ -1159,8 +6446,9 @@ def _local_precedence_issues(
                 host=host,
                 source=f"{host}:{kind}",
                 message=(
-                    f"Multiple {host} {kind} layers were observed; their "
-                    "runtime-effective precedence is not statically projected."
+                    f"Multiple {host} {kind} layers were observed "
+                    f"({', '.join(unique_sources)}); their runtime-effective "
+                    "precedence is not statically projected."
                 ),
                 blocking=True,
             )
@@ -1179,26 +6467,140 @@ def build_host_boundary_snapshot(
     root = workspace.resolve()
     home = Path.home().resolve()
     cache = cache or HostStaticParseCache()
+    if cache.reference_workspace is None:
+        cache.reference_workspace = root
     artifacts: list[dict[str, Any]] = []
     grants: list[dict[str, Any]] = []
     issues: list[dict[str, Any]] = []
 
-    resource_bound_error: str | None = None
-    identity_snapshot_error: str | None = None
+    inventory_failures: list[HostInputFailure] = []
+    plugin_candidates: dict[str, tuple[Path, tuple[str, ...]]] = {}
+    plugin_unread_links: set[str] = set()
+    plugin_manifests: dict[str, tuple[Path, tuple[str, ...]]] = {}
     try:
-        repository_paths, _inventory_entries = _repository_paths(
-            root,
-            reader=cache.reader_for(root),
-        )
-    except (RuntimeError, IdentityReadBudgetExceeded) as exc:
+        with _perf.phase("host.inventory_walk"):
+            repository_paths, _inventory_entries = _repository_paths(
+                root,
+                reader=cache.reader_for(root),
+                limits=cache.configured_limits,
+                plugin_candidates=plugin_candidates,
+                plugin_unread_links=plugin_unread_links,
+                plugin_manifests=plugin_manifests,
+            )
+    except HostInventoryReadError as exc:
         repository_paths = []
-        resource_bound_error = str(exc)
-    for path, source, host, kind in repository_paths:
-        _collect_file(
-            path=path, source=source, host=host, scope="repository", kind=kind,
-            containment_root=root, cache=cache,
+        inventory_failures.append(exc.failure)
+    except IdentityReadBudgetExceeded:
+        repository_paths = []
+        inventory_failures.append(HostInputFailure(
+            reason="resource_bound_exceeded", phase="inventory_enumeration",
+            source="<repository>", limits=cache.configured_limits,
+        ))
+    except (OSError, NotImplementedError, ValueError):
+        repository_paths = []
+        inventory_failures.append(HostInputFailure(
+            reason="input_unreadable", phase="inventory_enumeration",
+            source="<repository>",
+        ))
+    # Parsed once through the cache: the collection below reuses the result
+    # and raises any issue these files have, so none is raised here.
+    project_settings = tuple(
+        cache.parse(path, containment_root=root)[0]
+        for path, source, host, _kind, _resolved_through in repository_paths
+        if host == "claude-code" and source in _CLAUDE_PROJECT_SETTINGS_SOURCES
+    )
+    selection = (
+        _PluginHookSelection()
+        if inventory_failures
+        else _resolve_claude_plugin_hooks(
+            candidates=plugin_candidates, root=root, cache=cache,
             artifacts=artifacts, grants=grants, issues=issues,
+            project_settings=project_settings,
+            unread_links=frozenset(plugin_unread_links),
         )
+    )
+    selected_hooks = selection.selected
+    plugin_reference_issue_ids = set(selection.reference_issue_ids)
+    if not inventory_failures:
+        repository_paths = _attribute_mcp_declarations(
+            repository_paths, manifests=plugin_manifests, selection=selection,
+            root=root, cache=cache, issues=issues,
+        )
+    issue_roots: dict[str, set[str | None]] = {
+        issue_id: set(roots) for issue_id, roots in selection.issue_roots.items()
+    }
+
+    def bound_by_selecting_roots(issue_id: str, source: str) -> None:
+        # A limit of a hook file only a plugin selects hides that file's
+        # hooks, and the file lies under every directory that selects it (#808).
+        issue_roots.setdefault(issue_id, set()).update(selection.roots.get(source, ()))
+
+    def note_unusable_selected_hooks(data: Any, *, source: str) -> None:
+        if isinstance(data, dict) and not isinstance(data.get("hooks"), dict):
+            item = _claude_plugin_hook_issue(
+                source=source, blocking=False,
+                message=(
+                    f"{selected_hooks[source]} selects this hook file, which has no `hooks` "
+                    "object of events; no hooks were read from it"
+                ),
+            )
+            issues.append(item)
+            plugin_reference_issue_ids.add(item["issue_id"])
+            bound_by_selecting_roots(item["issue_id"], source)
+
+    with _perf.phase("host.collect_sources"):
+        collected_claude_sources: set[str] = set()
+        openshell_budget = OpenShellCollectionBudget()
+        for path, source, host, kind, resolved_through in repository_paths:
+            if host == "openshell" and any(
+                adapter.id == "openshell" for adapter in boundary_adapters_for_path(source)
+            ):
+                _collect_openshell(
+                    path=path, source=source, root=root, cache=cache,
+                    artifacts=artifacts, grants=grants, issues=issues,
+                    budget=openshell_budget,
+                    resolved_through=resolved_through,
+                )
+                continue
+            hook_basis: HookLoadingBasis = "host_configuration"
+            if host == "claude-code" and kind == "hooks":
+                # Claude Code documents no project `.claude/hooks/hooks.json`
+                # location; only plugin configuration can select one (#714).
+                hook_basis = (
+                    "project_enabled_plugin" if source in selection.enabled
+                    else "plugin_selected" if source in selected_hooks
+                    else "declared_only"
+                )
+                collected_claude_sources.add(source)
+            data = _collect_file(
+                path=path, source=source, host=host, scope="repository", kind=kind,
+                containment_root=root, cache=cache,
+                artifacts=artifacts, grants=grants, issues=issues,
+                resolved_through=resolved_through, hook_basis=hook_basis,
+                plugin_root=(next(iter(selection.roots[source])) if len(selection.roots.get(source, ())) == 1 else None),
+            )
+            if hook_basis in {"plugin_selected", "project_enabled_plugin"}:
+                note_unusable_selected_hooks(data, source=source)
+        for source in sorted(set(selected_hooks) - collected_claude_sources):
+            path, resolved_through = plugin_candidates[source]
+            raised = len(issues)
+            data = _collect_file(
+                path=path, source=source, host="claude-code", scope="repository", kind="hooks",
+                containment_root=root, cache=cache,
+                artifacts=artifacts, grants=grants, issues=issues,
+                resolved_through=resolved_through,
+                hook_basis=(
+                    "project_enabled_plugin" if source in selection.enabled else "plugin_selected"
+                ),
+                plugin_root=(next(iter(selection.roots[source])) if len(selection.roots.get(source, ())) == 1 else None),
+            )
+            # Read only because a plugin selects it, so its read limits are
+            # plugin-reference limits. A registered hook path above keeps the
+            # limits 1.0.0 already gave it.
+            plugin_reference_issue_ids.update(item["issue_id"] for item in issues[raised:])
+            for item in issues[raised:]:
+                bound_by_selecting_roots(item["issue_id"], source)
+            note_unusable_selected_hooks(data, source=source)
 
     excluded = [
         "invocation flags and transient approvals",
@@ -1223,53 +6625,65 @@ def build_host_boundary_snapshot(
     else:  # pragma: no cover - CLI and typing constrain this; defensive API guard.
         raise ValueError(f"Unsupported host audit scope: {scope!r}")
 
+    if any(item["host"] == "openshell" for item in artifacts):
+        excluded.extend([
+            "OpenShell live gateway/provider catalog and inference-policy resolution",
+            "OpenShell driver defaults, runtime-added filesystem baseline paths and live policy freshness",
+            "OpenShell runtime validation, DNS resolution, executable identity and native policy proof",
+        ])
+
     if scope == "local_static":
-        issues.extend(_local_precedence_issues(artifacts))
+        grants, claude_precedence_issues = _project_claude_precedence(grants)
+        issues.extend(claude_precedence_issues)
+        issues.extend(_local_precedence_issues(
+            [item for item in artifacts if item.get("host") != "claude-code"]
+        ))
+
+    # Every workflow is read before any caller's ceiling is (#921): a called
+    # workflow's restrictions are read from this same side, never guessed.
+    with _perf.phase("host.resolve_workflow_ceilings"):
+        resolve_reusable_workflow_ceilings(grants, issues)
 
     try:
-        cache.finish()
-    except IdentityReadBudgetExceeded as exc:
-        resource_bound_error = cache.resource_bound_error or str(exc)
-    except (OSError, NotImplementedError, ValueError) as exc:
-        identity_snapshot_error = (
-            "static host-boundary inventory changed identity while its bounded "
-            f"snapshot was captured ({exc})"
-        )
-    if cache.resource_bound_error is not None:
-        resource_bound_error = cache.resource_bound_error
-    if resource_bound_error is not None:
-        # Aggregate exhaustion can prevent the final identity pass. Do not
-        # retain a partially validated projection as diagnostic grant data.
-        artifacts.clear()
-        grants.clear()
-        for host in ("codex", "claude-code", "cursor", "vscode", "github"):
-            issues.append(
-                _inventory_issue(
-                    kind="unreadable",
-                    host=host,
-                    source="<repository>",
-                    message=resource_bound_error,
-                    blocking=True,
-                )
-            )
-    if identity_snapshot_error is not None:
+        with _perf.phase("host.cache_finish"):
+            cache.finish()
+    except IdentityReadBudgetExceeded:
+        inventory_failures.append(cache.terminal_failure or HostInputFailure(
+            reason="resource_bound_exceeded", phase="snapshot_validation",
+            source="<repository>", limits=cache.configured_limits,
+        ))
+    except (OSError, NotImplementedError, ValueError):
+        inventory_failures.append(cache.terminal_failure or HostInputFailure(
+            reason="snapshot_validation_failed", phase="snapshot_validation",
+            source="<repository>",
+        ))
+    if inventory_failures:
         # No parsed projection is trustworthy when the final exact-name pass
-        # cannot bind it to the entries that were opened.
+        # or complete inventory cannot bind it to the entries that were opened.
         artifacts.clear()
         grants.clear()
-        for host in ("codex", "claude-code", "cursor", "vscode", "github"):
-            issues.append(
-                _inventory_issue(
-                    kind="unreadable",
-                    host=host,
-                    source="<repository>",
-                    message=identity_snapshot_error,
-                    blocking=True,
+        for failure in dict.fromkeys(inventory_failures):
+            # Use lexical spelling: a second resolve/read would inspect a
+            # different generation and could misattribute the original failure.
+            if Path(failure.source).is_absolute():
+                try:
+                    source = Path(failure.source).relative_to(root).as_posix()
+                except ValueError:
+                    source = failure.source
+                failure = replace(failure, source=source)
+            for host in ("codex", "claude-code", "cursor", "vscode", "github", "openshell"):
+                issue = _inventory_issue(
+                    kind="unreadable", host=host, source=failure.source,
+                    message=failure.summary() + " " + failure.recovery(), blocking=True,
                 )
-            )
+                issues.append(issue)
+                cache.input_failures[issue["issue_id"]] = failure
 
     artifacts.sort(key=lambda item: (item["host"], item["scope"], item["path"], item["kind"]))
     grants.sort(key=lambda item: item["grant_id"])
+    # A resource failure may first name a source and then invalidate all hosts.
+    # Keep one copy of that same source/host obligation in the inventory too.
+    issues = list({item["issue_id"]: item for item in issues}.values())
     issues.sort(key=lambda item: item["issue_id"])
     payload = {
         "host_grants_inventory_schema_version": HOST_GRANTS_INVENTORY_SCHEMA_VERSION,
@@ -1283,8 +6697,33 @@ def build_host_boundary_snapshot(
         "static_analysis_only": True,
         "runtime_session_verified": False,
     }
-    inventory = HostGrantsInventoryV2.model_validate(payload).model_dump(mode="json")
-    return HostBoundarySnapshot(inventory=inventory, cache=cache)
+    with _perf.phase("host.validate_inventory"):
+        inventory = HostGrantsInventoryV9.model_validate(payload).model_dump(mode="json")
+    return HostBoundarySnapshot(
+        inventory=inventory, cache=cache, input_failures=dict(cache.input_failures),
+        plugin_reference_issue_ids=frozenset(plugin_reference_issue_ids),
+        # Nothing parsed is trustworthy once the inventory failed, so no
+        # enablement is read from it either; its blocking issues stand.
+        enabled_plugin_hook_sources=(
+            frozenset()
+            if inventory_failures
+            else frozenset(selection.enabled | selection.enabled_inline)
+        ),
+        enabled_plugin_unread_hook_files=(
+            frozenset() if inventory_failures else frozenset(selection.enabled_unread)
+        ),
+        plugin_scopes=PluginScopeFacts(
+            issue_roots={
+                issue_id: frozenset(roots)
+                for issue_id, roots in issue_roots.items()
+                if issue_id in plugin_reference_issue_ids
+            },
+            inline_roots={
+                public_host_path(selector): root
+                for selector, root in selection.inline_roots.items()
+            },
+        ),
+    )
 
 
 def host_audit_inventory(
@@ -1298,7 +6737,7 @@ def host_audit_inventory(
 
     if snapshot is None:
         snapshot = build_host_boundary_snapshot(workspace, scope=scope, cache=cache)
-    inventory = HostGrantsInventoryV2.model_validate(snapshot.inventory)
+    inventory = HostGrantsInventoryV9.model_validate(snapshot.inventory)
     if inventory.scope != scope:
         raise ValueError(
             f"Host boundary snapshot scope {inventory.scope!r} does not match {scope!r}"
@@ -1312,6 +6751,161 @@ def inventory_is_complete(inventory: dict[str, Any]) -> bool:
     return not any(item.get("blocking") for item in inventory.get("issues", [])) and all(
         item.get("status") == "complete" for item in inventory.get("host_coverage", [])
     )
+
+
+def without_host_issues(
+    inventory: dict[str, Any], issue_ids: set[str] | frozenset[str]
+) -> dict[str, Any]:
+    """The inventory without these issues, with host coverage recomputed (#714).
+
+    For a caller that routes none of the sources those issues describe and
+    cannot name a limit (`check` and plugin references). Coverage is derived
+    from artifacts and blocking issues exactly as the reader derives it, so
+    dropping an issue changes nothing else.
+    """
+
+    kept = [item for item in inventory.get("issues", []) if item.get("issue_id") not in issue_ids]
+    if len(kept) == len(inventory.get("issues", [])):
+        return inventory
+    return {
+        **inventory,
+        "issues": kept,
+        "host_coverage": _coverage(
+            scope=inventory.get("scope", "repository"),
+            artifacts=list(inventory.get("artifacts") or []),
+            issues=kept,
+        ),
+    }
+
+
+def without_host_sources(
+    inventory: dict[str, Any],
+    *,
+    issue_ids: set[str] | frozenset[str],
+    withheld: Callable[[str], bool],
+) -> dict[str, Any]:
+    """The inventory without these issues and every source ``withheld`` names (#808).
+
+    For a comparison that leaves a plugin directory uncompared and compares
+    the rest. An artifact, a grant or a non-blocking issue is dropped when
+    ``withheld`` names its whole published source, and host coverage is
+    recomputed exactly as the reader derives it. A member (``<file>#...``)
+    only extends its file's path, so it is under a directory exactly when its
+    file is; cutting at the first ``#`` would instead read a sibling such as
+    ``plugins/demo#x/...`` as inside ``plugins/demo`` and drop it unnamed. A
+    blocking issue is dropped only by id: one the caller has not accounted
+    for stays, so what remains must still answer for it.
+    """
+
+    def kept(source: object) -> bool:
+        return not withheld(str(source))
+
+    issues = [
+        item
+        for item in inventory.get("issues", [])
+        if item.get("issue_id") not in issue_ids
+        and (item.get("blocking") or kept(item.get("source")))
+    ]
+    artifacts = [item for item in inventory.get("artifacts") or [] if kept(item.get("path"))]
+    return {
+        **inventory,
+        "artifacts": artifacts,
+        "grants": [item for item in inventory.get("grants") or [] if kept(item.get("source"))],
+        "issues": issues,
+        "host_coverage": _coverage(
+            scope=inventory.get("scope", "repository"), artifacts=artifacts, issues=issues
+        ),
+    }
+
+
+def hook_dependency_limits(inventory: dict[str, Any]) -> dict[tuple[str, str], str]:
+    """Each selected hook script whose bytes were not read, as ``{(host, path): limit}`` (#702).
+
+    Read from the ``script_inputs`` the grants publish: only an established
+    reference (a path and its basis) the reader then could not capture.
+    """
+
+    return {
+        (str(grant["host"]), str(entry["path"])): str(entry["limit"])
+        for grant in inventory.get("grants", [])
+        if grant.get("kind") == "hook"
+        for entry in grant.get("script_inputs") or []
+        if entry.get("path") and entry.get("basis") and entry.get("limit")
+    }
+
+
+def hook_dependency_issues(inventory: dict[str, Any]) -> dict[str, tuple[str, str]]:
+    """The blocking issues that are a selected hook script's limit, as ``{issue id: (host, path)}``.
+
+    An issue qualifies only when nothing else this inventory publishes at its
+    path could have raised it: a path that is also a declaration the reader
+    parses keeps its issue as that declaration's.
+    """
+
+    limits = hook_dependency_limits(inventory)
+    labels = {(host, _issue_source_label(path)): (host, path) for host, path in limits}
+    declared = {
+        (str(artifact["host"]), str(artifact["path"]))
+        for artifact in inventory.get("artifacts", [])
+        if artifact.get("kind") != "hook_script"
+    }
+    found: dict[str, tuple[str, str]] = {}
+    for issue in inventory.get("issues", []):
+        key = labels.get((str(issue.get("host")), str(issue.get("source"))))
+        if issue.get("blocking") and issue.get("kind") == "unreadable" and key and key not in declared:
+            found[str(issue["issue_id"])] = key
+    return found
+
+
+def without_hook_dependency_bytes(
+    inventory: dict[str, Any],
+    *,
+    issue_ids: set[str] | frozenset[str],
+    dependencies: set[tuple[str, str]] | frozenset[tuple[str, str]],
+) -> dict[str, Any]:
+    """The inventory with these hook scripts' bytes left uncompared (#702 review).
+
+    For a comparison that withholds one selected script rather than the whole
+    comparison: its limit issues and ``hook_script`` artifacts are dropped,
+    each hook entry naming it keeps its handler, path and basis but no digest,
+    size or limit, and host coverage is recomputed as the reader derives it.
+    The declaring hook is still compared, so a repointed reference is a row.
+    """
+
+    def withheld(host: object, path: object) -> bool:
+        return (str(host), str(path)) in dependencies
+
+    grants = []
+    for grant in inventory.get("grants") or []:
+        entries = grant.get("script_inputs")
+        if grant.get("kind") == "hook" and entries and any(
+            withheld(grant.get("host"), entry.get("path")) for entry in entries
+        ):
+            grant = {
+                **grant,
+                "script_inputs": [
+                    {**entry, "sha256": None, "size_bytes": None, "limit": None}
+                    if withheld(grant.get("host"), entry.get("path"))
+                    else entry
+                    for entry in entries
+                ],
+            }
+        grants.append(grant)
+    issues = [item for item in inventory.get("issues", []) if item.get("issue_id") not in issue_ids]
+    artifacts = [
+        item
+        for item in inventory.get("artifacts") or []
+        if not (item.get("kind") == "hook_script" and withheld(item.get("host"), item.get("path")))
+    ]
+    return {
+        **inventory,
+        "artifacts": artifacts,
+        "grants": grants,
+        "issues": issues,
+        "host_coverage": _coverage(
+            scope=inventory.get("scope", "repository"), artifacts=artifacts, issues=issues
+        ),
+    }
 
 
 def normalized_host_grants(inventory: dict[str, Any]) -> dict[str, Any]:
@@ -1333,10 +6927,37 @@ def normalized_host_grants(inventory: dict[str, Any]) -> dict[str, Any]:
 
 
 def host_grants_sha256(grants: dict[str, Any]) -> str:
-    return _sha(grants)
+    """The digest of a normalized inventory, read as comparisons read it (#819).
+
+    The display-only members :data:`DISPLAY_ONLY_GRANT_FIELDS` names are left
+    out, so a ``0.6`` inventory and its ``0.7`` reading of the same files have
+    one digest, and a ``0.6`` baseline's stored ``inventory_sha256`` still
+    verifies. Nothing they display is left unbound: each grant's
+    ``config_sha256``, which this digest covers, changes whenever they do.
+    """
+
+    if not isinstance(grants.get("grants"), list):
+        return _sha(grants)
+    compared = {**grants, "grants": [compared_grant(grant) for grant in grants["grants"]]}
+    if isinstance(grants.get("artifacts"), list):
+        compared["artifacts"] = [compared_artifact(artifact) for artifact in grants["artifacts"]]
+    return _sha(compared)
 
 
 def build_host_grants_baseline(inventory: dict[str, Any]) -> dict[str, Any]:
+    """The baseline ``audit --host --save-baseline`` writes for ``inventory``.
+
+    Each grant is saved as comparisons read it (:func:`compared_grant`), so a
+    saved baseline holds none of the display-only members
+    :data:`DISPLAY_ONLY_GRANT_FIELDS` names (#819). A baseline is committed,
+    and a hook's matcher, executable name and command digest, or an MCP
+    server's package and argument digest, read from a user or managed file
+    (``--scope local-static``) or a git-ignored ``.claude/settings.local.json``
+    would otherwise put facts about files that were never in the repository
+    into it. No comparison, row or digest reads a saved copy, so leaving them
+    out loses nothing: ``inventory_sha256`` is the same either way.
+    """
+
     if not inventory_is_complete(inventory):
         raise ValueError(
             "Host-grants inventory is incomplete or experimental; fix its coverage "
@@ -1347,9 +6968,28 @@ def build_host_grants_baseline(inventory: dict[str, Any]) -> dict[str, Any]:
         "host_grants_schema_version": HOST_GRANTS_BASELINE_SCHEMA_VERSION,
         "scope": inventory["scope"],
         "inventory_sha256": host_grants_sha256(normalized),
-        "inventory": normalized,
+        "inventory": {
+            **normalized,
+            "grants": [compared_grant(grant) for grant in normalized["grants"]],
+            "artifacts": [compared_artifact(artifact) for artifact in normalized["artifacts"]],
+        },
     }
-    return HostGrantsBaselineV2.model_validate(payload).model_dump(mode="json")
+    return HostGrantsBaselineV9.model_validate(payload).model_dump(mode="json")
+
+
+def host_comparison_baseline(inventory: dict[str, Any]) -> dict[str, Any]:
+    """The baseline one side of a comparison between two reads stands for (#819).
+
+    What :func:`build_host_grants_baseline` would save, refusals included,
+    with the full normalized inventory in place of the saved grants: a
+    comparison between two commits reads both sides fresh, and its rows render
+    the before side's hook handlers and MCP launch arguments. The display members are
+    left out of every comparison and digest, so what is compared is exactly
+    what the saved baseline would compare. It is never saved, loaded or
+    published as a baseline.
+    """
+
+    return {**build_host_grants_baseline(inventory), "inventory": normalized_host_grants(inventory)}
 
 
 def load_host_grants_baseline(path: Path) -> dict[str, Any]:
@@ -1393,18 +7033,22 @@ def load_host_grants_baseline_with_text(
                 "and repair or replace it deliberately."
             )
         return data, text
-    if version != HOST_GRANTS_BASELINE_SCHEMA_VERSION:
+    if version not in {"0.2", "0.3", "0.4", "0.5", "0.6", "0.7", "0.8", HOST_GRANTS_BASELINE_SCHEMA_VERSION}:
         raise ValueError(
             f"Host-grants baseline {path} has unsupported schema version "
             f"{version!r}. A human must review migration or replacement."
         )
     try:
-        parsed = HostGrantsBaselineV2.model_validate(data).model_dump(mode="json")
+        model = {"0.2": HostGrantsBaselineV2, "0.3": HostGrantsBaselineV3,
+                 "0.4": HostGrantsBaselineV4, "0.5": HostGrantsBaselineV5,
+                 "0.6": HostGrantsBaselineV6, "0.7": HostGrantsBaselineV7,
+                 "0.8": HostGrantsBaselineV8, "0.9": HostGrantsBaselineV9}[version]
+        parsed = model.model_validate(data).model_dump(mode="json")
     except ValidationError:
         return (
             {
-                "host_grants_schema_version": "0.2-invalid",
-                "_load_error": "malformed_v0.2_baseline",
+                "host_grants_schema_version": f"{version}-invalid",
+                "_load_error": f"malformed_v{version}_baseline",
             },
             text,
         )
@@ -1564,9 +7208,123 @@ def diff_host_grants(baseline: dict[str, Any], current: dict[str, Any]) -> list[
     for grant_id in sorted(set(base_by_id) | set(current_by_id)):
         before = base_by_id.get(grant_id)
         after = current_by_id.get(grant_id)
-        if before != after:
+        same_openshell = bool(
+            before and after and before.get("kind") == after.get("kind") == "openshell_policy"
+            and compare_openshell_grants(before, after).direction == "equivalent"
+        )
+        if compared_grant(before) != compared_grant(after) and not _same_workflow_grant(
+            before, after
+        ) and not same_openshell:
             changes.append({"grant_id": grant_id, "baseline": before, "current": after})
     return changes
+
+
+#: Members a grant publishes to display what its ``config_sha256`` already
+#: binds (#819): a hook's handlers and an MCP server's package and argument
+#: digest. Each is a function of the configuration as that digest's input
+#: holds it, and publishes no command or argument text but a plain-token
+#: executable name and a package specification, so it can change only when
+#: the digest does. Grant equality and the inventory digests leave them out:
+#: a change is still a row, through ``config_sha256``, and a ``0.6`` grant,
+#: which has none of them, compares equal to its ``0.7`` reading of the same
+#: configuration. #825's source pin classification is display-only too; its
+#: Git-ref fact may describe bytes omitted by URL-path redaction, and never
+#: creates a row by itself. A saved baseline holds none of them
+#: (:func:`build_host_grants_baseline`).
+DISPLAY_ONLY_GRANT_FIELDS: dict[str, frozenset[str]] = {
+    "hook": frozenset({"handlers", "omitted_handlers"}),
+    "mcp_server": frozenset({"package", "args_sha256", "launch_source", "env_var_names"}),
+    # A command setting's command, published as a hook handler's is (#1027).
+    "command_setting": frozenset({"command"}),
+}
+
+#: Members an artifact publishes beside what ``redacted_sha256`` already
+#: binds (#1027): a settings file's keys no reader compares, each with its
+#: digest. ``redacted_sha256`` moves whenever one of those does, so leaving
+#: them out of artifact equality, the inventory digests and a saved baseline
+#: loses no change, and a baseline saved before they were published still
+#: compares equal to a reading of the same files.
+DISPLAY_ONLY_ARTIFACT_FIELDS: frozenset[str] = frozenset({"unmodelled_keys"})
+
+
+def compared_grant(grant: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The grant as comparisons and digests read it: without its display-only members (#819)."""
+
+    if grant is None:
+        return None
+    hidden = DISPLAY_ONLY_GRANT_FIELDS.get(str(grant.get("kind")))
+    if not hidden or not hidden.intersection(grant):
+        return grant
+    return {key: value for key, value in grant.items() if key not in hidden}
+
+
+def compared_artifact(artifact: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The artifact as comparisons and digests read it: without its display-only members (#1027)."""
+
+    if artifact is None or not DISPLAY_ONLY_ARTIFACT_FIELDS.intersection(artifact):
+        return artifact
+    return {key: value for key, value in artifact.items() if key not in DISPLAY_ONLY_ARTIFACT_FIELDS}
+
+
+def hook_dependency_only_change(before: dict | None, after: dict | None) -> bool:
+    """Script bytes are compared evidence, never newly granted authority."""
+    if not before or not after or before.get("kind") != "hook" or after.get("kind") != "hook":
+        return False
+    return (
+        before.get("script_inputs") != after.get("script_inputs")
+        and {k: v for k, v in compared_grant(before).items() if k != "script_inputs"}
+        == {k: v for k, v in compared_grant(after).items() if k != "script_inputs"}
+    )
+
+
+def _same_workflow_grant(before: dict | None, after: dict | None) -> bool:
+    if any(
+        not grant or grant.get("kind") != "workflow" or "permission_contexts" not in grant
+        for grant in (before, after)
+    ):
+        return False
+    # Raw declaration placement is retained for inspection, but replacing
+    # inherited permissions by an identical explicit map changes no grant.
+    # Step references compare as each job's multiset of declared references:
+    # a reordered, renamed or re-id'd step that declares the same reference
+    # changes no modeled fact, and no execution-order dependency is evaluated.
+    # Agent launches and checkout refs compare the same way (#823): as each
+    # job's multiset of declared facts, never by step label, and a launch's
+    # `job_secrets` is context for the row, never compared.
+    # An unread `run:` agent step is a named limit and is never compared, so
+    # adding, removing or editing one gives no row (#823 review cycle 4).
+    ignored = {
+        "write_scopes", "config_sha256", "step_actions", "agent_launches", "checkout_refs",
+        "unread_agent_runs",
+    }
+
+    def comparable(grant: dict[str, Any]) -> dict[str, Any]:
+        # Both sides are v0.4+ shapes here, and a drift payload refuses a
+        # v0.4-v0.6 baseline holding a workflow, so a missing key is "none".
+        projection = {key: value for key, value in grant.items() if key not in ignored}
+        projection["step_actions"] = sorted(
+            step_action_key(item) for item in grant.get("step_actions", [])
+        )
+        projection["agent_launches"] = sorted(
+            agent_launch_key(item) for item in grant.get("agent_launches", [])
+        )
+        projection["checkout_refs"] = sorted(
+            checkout_ref_key(item) for item in grant.get("checkout_refs", [])
+        )
+        # Named secrets compare as each call's set of facts, whatever order a
+        # saved snapshot lists them in (#693).
+        projection["reusable_calls"] = [
+            {
+                **call,
+                "secret_mappings": sorted(
+                    secret_mapping_key(entry) for entry in call.get("secret_mappings", [])
+                ),
+            }
+            for call in grant.get("reusable_calls", [])
+        ]
+        return projection
+
+    return comparable(before) == comparable(after)
 
 
 def _diff_host_artifacts(
@@ -1580,11 +7338,33 @@ def _diff_host_artifacts(
     for artifact_id in sorted(set(base_by_id) | set(current_by_id)):
         before = base_by_id.get(artifact_id)
         after = current_by_id.get(artifact_id)
-        if before != after:
+        if compared_artifact(before) != compared_artifact(after) and not _same_instruction_artifact(
+            before, after
+        ):
             changes.append(
                 {"artifact_id": artifact_id, "baseline": before, "current": after}
             )
     return changes
+
+
+def _same_instruction_artifact(before: dict | None, after: dict | None) -> bool:
+    present = [item for item in (before, after) if item is not None]
+    if not present or any(
+        item.get("kind") != "instructions" or item.get("parse_status") != "parsed"
+        for item in present
+    ):
+        return False
+    projections = [item.get("instruction_structure") or {} for item in present]
+    if any(item.get("status") not in {"guidance", "structured"} for item in projections):
+        return False
+    if before is None or after is None:
+        return projections[0]["status"] == "guidance"
+    if projections[0] != projections[1]:
+        return False
+    return (
+        {key: value for key, value in before.items() if key != "redacted_sha256"}
+        == {key: value for key, value in after.items() if key != "redacted_sha256"}
+    )
 
 
 def _diff_host_coverage(
@@ -1595,37 +7375,834 @@ def _diff_host_coverage(
         item["host"]: item for item in current.get("host_coverage", [])
     }
     changes: list[dict[str, Any]] = []
+    guidance_paths = {
+        (artifact["host"], artifact["path"])
+        for inventory in (baseline, current)
+        for artifact in inventory.get("artifacts", [])
+        if artifact.get("parse_status") == "parsed"
+        and (artifact.get("instruction_structure") or {}).get("status") == "guidance"
+    }
     for host in sorted(set(base_by_host) | set(current_by_host)):
         before = base_by_host.get(host)
         after = current_by_host.get(host)
-        if before != after:
+        def comparison(item, host=host):
+            if item is None:
+                return None
+            return {**item, "sources_observed": [
+                path for path in item.get("sources_observed", []) if (host, path) not in guidance_paths
+            ]}
+        if comparison(before) != comparison(after):
             changes.append({"host": host, "baseline": before, "current": after})
     return changes
 
 
-def host_grant_expansion_signals(changes: list[dict[str, Any]]) -> list[str]:
-    signals: list[str] = []
+def _setting_predecessor(after: dict, changes: list[dict]) -> dict | None:
+    """The one same-source setting value an added value replaced, else ``None``.
+
+    A setting's grant identity includes its value, so an edit is a removal and
+    an addition. With no removed value, or several, what came before is not
+    established, and the addition is read as a new declaration (#820).
+    """
+
+    if after.get("host") == "claude-code" and after.get("setting") in CLAUDE_LIST_SETTINGS:
+        # Each named server is a separate grant, not a scalar replacement.
+        return None
+    candidates = [
+        old for change in changes
+        if (old := change.get("baseline")) is not None and change.get("current") is None
+        and all(old.get(key) == after.get(key) for key in ("host", "source", "kind", "setting"))
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+#: The Claude Code permission modes each documented mode can widen to
+#: (code.claude.com/docs/en/permissions#permission-modes). `auto` and
+#: `acceptEdits` are not ordered against each other.
+_CLAUDE_WIDER_MODES: dict[str, frozenset[str]] = {
+    "default": frozenset({"acceptEdits", "auto", "bypassPermissions"}),
+    "dontAsk": frozenset({"default", "acceptEdits", "auto", "bypassPermissions"}),
+    "plan": frozenset({"default", "acceptEdits", "auto", "bypassPermissions"}),
+    "acceptEdits": frozenset({"bypassPermissions"}),
+    "auto": frozenset({"bypassPermissions"}),
+    "bypassPermissions": frozenset(),
+}
+#: Documented switches and the value that permits more (#820). Claude Code's
+#: settings and sandboxing references: the project MCP and bypass-mode
+#: prompts, disabling the sandbox, its unsandboxed-command escape hatch,
+#: prompt-free sandboxed Bash, and the nested sandbox that "considerably
+#: weakens security". Codex's config reference: `workspace-write` networking,
+#: and keeping `/tmp` and `$TMPDIR` writable.
+_WIDENING_SWITCHES: dict[tuple[str, str], bool] = {
+    ("claude-code", "enableAllProjectMcpServers"): True,
+    ("claude-code", "skipDangerousModePermissionPrompt"): True,
+    ("claude-code", "sandbox.enabled"): False,
+    ("claude-code", "sandbox.allowUnsandboxedCommands"): True,
+    ("claude-code", "sandbox.autoAllowBashIfSandboxed"): True,
+    ("claude-code", "sandbox.enableWeakerNestedSandbox"): True,
+    ("codex", "sandbox_workspace_write.network_access"): True,
+    ("codex", "sandbox_workspace_write.exclude_slash_tmp"): False,
+    ("codex", "sandbox_workspace_write.exclude_tmpdir_env_var"): False,
+}
+#: Lists each entry of which permits something: a command run outside the
+#: Claude Code sandbox, or a directory Codex's `workspace-write` may write.
+_PERMITTING_LISTS = frozenset({
+    ("claude-code", "sandbox.excludedCommands"),
+    ("codex", "sandbox_workspace_write.writable_roots"),
+})
+_CODEX_SANDBOX_MODES = {"read-only": 0, "workspace-write": 1, "danger-full-access": 2}
+#: Codex `web_search`: `cached` has no external web access, `indexed` reaches
+#: it only through the search index, and `live` is unrestricted retrieval.
+_CODEX_WEB_SEARCH = {"disabled": 0, "cached": 1, "indexed": 2, "live": 3}
+
+
+def _setting_direction(before: dict | None, after: dict) -> bool | None:
+    """Whether a documented rule says this value widens: ``True``, ``False`` or ``None`` (#820).
+
+    ``None`` means no rule decides; the row says its direction is not
+    established, and nothing is ranked by severity. ``before`` is the value
+    this one replaced. When it is absent, ambiguous or not a documented value,
+    it is not a host default: only an explicitly permissive value widens, so a
+    typo or an unknown mode cannot hide `bypassPermissions` arriving.
+    """
+
+    host, setting = str(after.get("host")), str(after.get("setting"))
+    old = published_setting_value(before) if before is not None else None
+    new = published_setting_value(after)
+    switch = _WIDENING_SWITCHES.get((host, setting))
+    if switch is not None:
+        if new is switch:
+            return not (isinstance(old, bool) and old is switch)
+        return False if isinstance(new, bool) else None
+    if (host, setting) in _PERMITTING_LISTS:
+        if not isinstance(new, list):
+            return None
+        previous = old if isinstance(old, list) else []
+        return any(entry not in previous for entry in new)
+    if host in {"claude-code", "vscode"} and setting == "sandbox.network":
+        # Each `allowedDomains` entry is a domain sandboxed commands may reach;
+        # the object's other keys are not ordered here.
+        old_network = old if isinstance(old, dict) else {}
+        if not isinstance(new, dict):
+            return None
+        domains, previous = new.get("allowedDomains", []), old_network.get("allowedDomains", [])
+        if not isinstance(domains, list) or not isinstance(previous, list):
+            return None
+        if any(domain not in previous for domain in domains):
+            return True
+        new_rest, old_rest = ({**network, "allowedDomains": None} for network in (new, old_network))
+        return False if new_rest == old_rest else None
+    if host == "claude-code":
+        if setting == "defaultMode":
+            if not isinstance(new, str) or new not in _CLAUDE_WIDER_MODES:
+                return None
+            if not isinstance(old, str) or old not in _CLAUDE_WIDER_MODES:
+                return new in {"acceptEdits", "auto", "bypassPermissions"}
+            if new in _CLAUDE_WIDER_MODES[old]:
+                return True
+            return False if old in _CLAUDE_WIDER_MODES[new] else None
+        if setting == "enabledMcpjsonServers":
+            if before is not None:
+                return False  # The same named entry: nothing is approved anew.
+            return True if isinstance(new, str) and new.strip() else None
+        if setting == "disableBypassPermissionsMode":
+            return False if new == "disable" else None
+        if setting in {"allowManagedPermissionRulesOnly", "allowManagedHooksOnly"}:
+            # Restrictions, and only from managed settings: neither value grants.
+            return False if isinstance(new, bool) else None
+    elif host == "codex":
+        # learn.chatgpt.com/docs/config-file/config-reference. `never`
+        # auto-rejects escalations, so approval_policy is NOT ranked here.
+        for name, order, introduced in (
+            ("sandbox_mode", _CODEX_SANDBOX_MODES, {"danger-full-access": True, "read-only": False}),
+            ("web_search", _CODEX_WEB_SEARCH, {"live": True, "cached": False, "disabled": False}),
+        ):
+            if setting != name:
+                continue
+            if not isinstance(new, str) or new not in order:
+                return None
+            if isinstance(old, str) and old in order:
+                return order[new] > order[old]
+            return introduced.get(new)
+    elif host == "vscode" and setting.startswith("servers.") and setting.endswith(".sandboxEnabled"):
+        # VS Code documents this only for local stdio servers; the reader
+        # assigns admin access only when that transport is established.
+        if new is True:
+            return False
+        return True if new is False and after.get("access") == "admin" else None
+    return None
+
+
+def _setting_change_direction(change: dict, comparison_changes: list[dict]) -> bool | None:
+    """:func:`_setting_direction` of one added or changed setting grant, in its comparison."""
+
+    before, after = change.get("baseline"), change["current"]
+    previous = before if before is not None else _setting_predecessor(after, comparison_changes)
+    return _setting_direction(previous, after)
+
+
+def _hook_handler_count(grant: dict) -> int | None:
+    """How many handlers a hook grant declares (#819), or ``None`` where it does not say."""
+
+    handlers, omitted = grant.get("handlers"), grant.get("omitted_handlers")
+    if not isinstance(handlers, list) or isinstance(omitted, bool) or not isinstance(omitted, int):
+        return None
+    return len(handlers) + omitted
+
+
+def _hook_reachable_count(grant: dict) -> int | None:
+    """How many of a hook grant's handlers a tool call may run (#940), or ``None`` where it does not say.
+
+    A handler whose ``matcher_reach`` is ``no_tool_name`` runs for no tool
+    call, so it is not counted; every other handler is, and so is every
+    handler past the bound, whose matcher was not read. A Claude Code
+    tool event's handler without ``matcher_reach`` was not examined (a grant
+    a saved snapshot or an earlier reader holds), so that grant does not say;
+    another host's or event's handlers are all counted.
+    """
+
+    count = _hook_handler_count(grant)
+    if count is None:
+        return None
+    if grant.get("host") != "claude-code" or grant.get("event") not in CLAUDE_TOOL_NAME_EVENTS:
+        return count
+    handlers = grant["handlers"]
+    if not all(isinstance(handler, dict) and "matcher_reach" in handler for handler in handlers):
+        return None
+    unreachable = sum(1 for handler in handlers if handler["matcher_reach"] == NO_TOOL_NAME)
+    return count - unreachable
+
+
+def hook_runs_for_no_tool_call(grant: dict[str, Any] | None) -> bool:
+    """A Claude Code tool-event hook none of whose handlers any tool name can trigger (#940).
+
+    True only when the grant lists every handler it declares, at least one,
+    and each one's matcher is ``no_tool_name``.
+    """
+
+    return bool(grant) and grant.get("kind") == "hook" and (
+        _hook_handler_count(grant) or 0
+    ) > 0 and _hook_reachable_count(grant) == 0
+
+
+def _hook_handlers_grew(before: dict, after: dict) -> bool:
+    """One event declares more handlers a tool call may run than it did (#820, #940).
+
+    A hook was added to it, or a handler that no tool name could trigger now
+    has a matcher one may. Counted over the handlers a tool call may run when
+    both sides say, so a handler whose matcher matches no tool name adds
+    nothing; otherwise over every handler, as before #940.
+    """
+
+    old, new = _hook_reachable_count(before), _hook_reachable_count(after)
+    if old is None or new is None:
+        old, new = _hook_handler_count(before), _hook_handler_count(after)
+    return old is not None and new is not None and new > old
+
+
+def host_grant_direction_unknown(
+    change: dict[str, Any], *, comparison_changes: list[dict[str, Any]] | None = None,
+) -> bool:
+    """An edit that may widen authority, where no documented rule decides whether it does (#820).
+
+    Named, never silent: the row says its direction is unknown, and the Claude
+    Code Stop hook announces it beside the widenings. ``False`` for an
+    expansion, for a direction a rule settles (a disabled plugin, a more
+    restrictive mode), for a removal, for a re-read of the same
+    configuration, and for a hook nothing loads (#714). A hook or MCP edit is
+    never assumed to narrow.
+    """
+
+    before, after = change.get("baseline"), change.get("current")
+    if (after or before or {}).get("kind") == "openshell_policy":
+        return compare_openshell_grants(before, after).direction in {"unknown", "mixed"}
+    if after is None or (before is not None and before.get("config_sha256") == after.get("config_sha256")):
+        return False
+    if after.get("kind") == "permission_rule":
+        # The rule model decides every permission rule's direction or names
+        # it an expansion; none is unknown (and asking would rebuild it).
+        return False
+    if host_grant_expansion_signals([change], comparison_changes=comparison_changes):
+        return False
+    kind = after.get("kind")
+    if kind == "mcp_server":
+        return before is not None
+    if kind == "hook":
+        return before is not None and hook_loading_basis(after) in LOADED_HOOK_BASES
+    if kind == "plugin_or_app":
+        return after.get("enabled") is not False
+    if kind in {"permission_mode", "sandbox"}:
+        context = [change] if comparison_changes is None else comparison_changes
+        return _setting_change_direction(change, context) is None
+    if kind in {"command_setting", "env"}:
+        # Another command, or another value, establishes no direction (#1027).
+        return before is not None
+    return False
+
+
+def host_grant_expansion_signals(
+    changes: list[dict[str, Any]], *, comparison_changes: list[dict[str, Any]] | None = None,
+    current_grants: Sequence[dict[str, Any]] | None = None,
+    assessment: PermissionRuleAssessment | None = None,
+) -> list[str]:
+    """Expansion evidence for these changes, with setting replacement context.
+
+    Row projection asks about one change at a time; the full comparison is
+    needed because setting identities include values, making an edit two rows.
+    ``current_grants`` is the head inventory's grants, so a permission rule
+    the source still declares unchanged is known to have been there at the
+    base (#941); without it only the changed rules are. A caller asking
+    about many changes of one comparison passes the ``assessment`` it built
+    once from that comparison.
+    """
+
+    context = changes if comparison_changes is None else comparison_changes
+    if assessment is None:
+        assessment = permission_rule_assessment(context, current_grants)
+    widened, narrowed_rules = _permission_direction_signals(changes, assessment=assessment)
+    signals: list[str] = list(widened)
     for change in changes:
         before = change.get("baseline")
         after = change.get("current")
+        if (after or before or {}).get("kind") == "openshell_policy":
+            for reason in compare_openshell_grants(before, after).widened:
+                grant = after or before
+                signals.append(f"openshell_authority_expanded: {grant['source']}: {reason}")
+            continue
         if after is None:
-            if before and before.get("kind") == "permission_rule" and before.get("disposition") in {"deny", "ask"}:
+            if (
+                before and before.get("kind") == "permission_rule"
+                and before.get("disposition") in {"deny", "ask"}
+                and not assessment.restriction_kept(_permission_key(before))
+            ):
                 signals.append(f"{before['disposition']}_rule_removed: {before['host']}:{before['rule']}")
             continue
         kind = after.get("kind")
         prefix = "added" if before is None else "changed"
         if kind == "mcp_server":
-            signals.append(f"mcp_server_{prefix}: {after['host']}:{after['server']}")
+            # Launch fields (#819) describe the edit, not what arbitrary
+            # server code/arguments will do. Neither wider nor narrower.
+            if before is None:
+                signals.append(f"mcp_server_{prefix}: {after['host']}:{after['server']}")
+        elif kind == "permission_rule" and after.get("disposition") in {"deny", "ask"}:
+            if _permission_key(after) in assessment.carve_widened:
+                # A `!` rule now excepting paths from a restriction the base
+                # already had: part of a denial is gone (#974).
+                signals.append(
+                    f"{after['disposition']}_carve_out_{prefix}: {after['host']}:{after['rule']}"
+                )
         elif kind == "permission_rule" and after.get("disposition") == "allow":
+            if not assessment.grants_new(_permission_key(after)):
+                # Covered by an allow rule the source had at the base, the
+                # same grant spelled another way, or a path rule Claude Code
+                # never consults: the row stays, the expansion does not (#918,
+                # #941, #969, #938).
+                continue
+            if (after["host"], after.get("source", ""), str(after["rule"])) in narrowed_rules:
+                # The narrower half of a replacement. This list is an
+                # expansion channel — `preflight` prefixes it with
+                # "Expansion signals:" and the drift markdown prints every
+                # entry under "## Expansion signals" with a ⚠ — so an
+                # `allow_rule_added` here puts the warning on the change
+                # that *removed* authority. The narrowing is still visible:
+                # it is in `changes` as a removal and an addition (#657).
+                continue
+            if before is not None and before.get("wildcard") and not after.get("wildcard"):
+                # One grant id is one host, source, disposition and rule text,
+                # so the rule itself did not change: a baseline saved before
+                # #816 rated a one-tool MCP rule a whole-server grant. Reading
+                # it narrower now removes nothing and adds nothing; the row
+                # stays, as a change without an expansion signal.
+                continue
+            if (
+                before is not None
+                and exec_equivalent_argument(str(after.get("rule") or "")) is not None
+                and before.get("rule") == after.get("rule")
+                and before.get("config_sha256") is not None
+                and before.get("config_sha256") == after.get("config_sha256")
+            ):
+                # #824 re-rates a saved declaration; unchanged bytes do not
+                # grant new authority merely because this engine rates higher.
+                continue
             marker = "wildcard_allow" if after.get("wildcard") else "allow_rule"
             signals.append(f"{marker}_{prefix}: {after['host']}:{after['rule']}")
-        elif kind in {"permission_mode", "sandbox", "additional_path", "plugin_or_app", "hook"}:
+        elif kind == "hook":
+            # An expansion is claimed only for a hook the host loads for this
+            # project: one a settings layer declares, or one a plugin selects
+            # that this repository's project settings enable from an
+            # in-repository marketplace. A hook nothing selects, or one a
+            # plugin selects without that enablement, is still a row, never
+            # an expansion (#714). A loaded hook's command/matcher/timeout
+            # edit alone establishes no direction (#820). Its loading basis
+            # becoming established is still a gain in declared execution, and
+            # so is one more handler on an event that already had some: hook
+            # grants are one per event, so that added hook is a `changed` one.
+            # A hook whose every matcher matches no tool name runs for no
+            # tool call, so adding it, or establishing its basis, gains
+            # nothing (#940); it is still a row that names the mismatch.
+            if hook_loading_basis(after) in LOADED_HOOK_BASES and (
+                (
+                    (before is None or hook_loading_basis(before) in {"declared_only", "plugin_selected"})
+                    and not hook_runs_for_no_tool_call(after)
+                )
+                or (before is not None and _hook_handlers_grew(before, after))
+            ):
+                signals.append(f"{kind}_{prefix}: {after['host']}:{after['source']}")
+        elif kind in {"permission_mode", "sandbox"}:
+            if (
+                kind in {"permission_mode", "sandbox"}
+                and before is not None
+                and before.get("config_sha256") == after.get("config_sha256")
+            ):
+                # One grant id is one setting and value, and the digest says
+                # the value was read the same way: only the rating moved, as
+                # when a baseline saved before #827 rated `bypassPermissions`
+                # `medium`. The file permits nothing new, so the row stays as
+                # a change without an expansion signal, as #816 did for rules.
+                continue
+            if _setting_change_direction(change, context) is True:
+                signals.append(f"{kind}_{prefix}: {after['host']}:{after['source']}")
+        elif kind == "plugin_or_app":
+            if before is not None and before.get("config_sha256") == after.get("config_sha256"):
+                continue  # The same declaration, read again: nothing enabled anew.
+            # A marketplace added or re-pointed changes what the plugins
+            # enabled from it install and run (#720); it carries no `enabled`.
+            # Otherwise only enablement gains: a plugin or app enabled where
+            # it was absent, disabled, or not established as enabled.
+            marketplace = after.get("host") == "claude-code" and str(after.get("name", "")).startswith("marketplace:")
+            if marketplace or (
+                after.get("enabled") is True and (before is None or before.get("enabled") is not True)
+            ):
+                signals.append(f"{kind}_{prefix}: {after['host']}:{after['source']}")
+        elif kind == "additional_path" and before is None:
             signals.append(f"{kind}_{prefix}: {after['host']}:{after['source']}")
-        elif kind == "workflow" and (
-            after.get("write_all") or after.get("write_scopes") or after.get("pull_request_target")
-        ):
-            signals.append(f"workflow_write_{prefix}: {after['source']}")
+        elif kind in {"command_setting", "env"} and before is None:
+            # A command Claude Code now runs, or an env entry that now
+            # redirects its requests, changes its trust or loads code (#1027).
+            # An edit to one is a change of unknown direction, as a hook
+            # command's is.
+            label = after.get("setting") if kind == "command_setting" else after.get("name")
+            signals.append(f"{kind}_{prefix}: {after['host']}:{after['source']}:{label}")
+        elif kind == "workflow":
+            previous = before or {}
+            old_writes = set(previous.get("effective_write_scopes", previous.get("write_scopes", [])))
+            new_writes = set(after.get("effective_write_scopes", after.get("write_scopes", [])))
+            unknown_before = {
+                context["job"] for context in previous.get("permission_contexts", [])
+                if context["state"] != "explicit"
+            }
+            added_writes = {
+                entry for entry in new_writes - old_writes
+                if f"{entry.split(': ', 1)[0]}: write-all" not in old_writes
+                and entry.split(': ', 1)[0] not in unknown_before
+            }
+            # The privileged event and the token are separate facts (#920).
+            # Gaining `pull_request_target` widens the event context whatever
+            # the scopes; it widens the token only where a job may write: a
+            # write scope, or a job declaring none, which that event runs with
+            # a read/write token where a fork's `pull_request` would not.
+            privileged = bool(
+                after.get("pull_request_target") and not previous.get("pull_request_target")
+            )
+            may_write = bool(new_writes) or any(
+                context["state"] != "explicit" for context in after.get("permission_contexts", [])
+            )
+            if added_writes or (privileged and may_write):
+                signals.append(f"workflow_write_{prefix}: {after['source']}")
+            if privileged:
+                signals.append(f"workflow_pull_request_target_{prefix}: {after['source']}")
+            if inherited_recipients(after) - inherited_recipients(previous):
+                signals.append(f"workflow_secrets_inherited_{prefix}: {after['source']}")
+            # Only a documented rule gained by a job's agent launches widens
+            # (#823); every other agent-launch or checkout edit is a change.
+            if gained_agent_widenings(before, after):
+                signals.append(f"workflow_agent_widened_{prefix}: {after['source']}")
     return sorted(set(signals))
+
+
+#: One permission rule as a comparison identifies it: host, source, disposition, rule text.
+PermissionKey = tuple[str, str, str, str]
+
+
+def _permission_key(grant: dict[str, Any]) -> PermissionKey:
+    return (
+        str(grant["host"]), str(grant.get("source", "")),
+        str(grant.get("disposition")), str(grant["rule"]),
+    )
+
+
+@dataclass(frozen=True)
+class PermissionRuleAssessment:
+    """What Claude Code's rule model says about each changed permission rule (#918).
+
+    Built once per comparison by :func:`permission_rule_assessment` and read by
+    the drift signals, the replacement pairing and the rows, so the three
+    cannot disagree. Every key is one host, source and disposition: nothing
+    here reaches across settings sources, and nothing pairs rules by likeness.
+
+    * ``covered`` — an added allow rule, to the allow rule the same source
+      declared at the base that already matches all of it (#918, #941, #969).
+    * ``respelled`` — a removed or added rule, to the other side's rule that is
+      the same documented grant spelled another way (`:*` and ` *`).
+    * ``unconsulted`` — a path-scoped rule Claude Code accepts and never
+      consults (#938).
+    * ``carve_widened`` — a `!` deny or ask rule that now excepts paths from a
+      restriction the source already declared at the base (#974).
+    * ``narrowed_into`` — a removed allow rule, to the added allow rules it
+      covered: the readable half of a one-to-many narrowing (#918).
+    * ``respelled_pairs`` — removed and added rule spelling one grant, each the
+      only such rule on its side, which a reader may print as one change.
+    """
+
+    covered: dict[PermissionKey, str] = field(default_factory=dict)
+    respelled: dict[PermissionKey, str] = field(default_factory=dict)
+    unconsulted: frozenset[PermissionKey] = frozenset()
+    carve_widened: frozenset[PermissionKey] = frozenset()
+    narrowed_into: dict[PermissionKey, list[str]] = field(default_factory=dict)
+    respelled_pairs: tuple[tuple[PermissionKey, PermissionKey], ...] = ()
+
+    def grants_new(self, key: PermissionKey) -> bool:
+        """Whether an added or changed allow rule may allow something the base did not."""
+
+        return key not in self.covered and key not in self.unconsulted
+
+    def restriction_kept(self, key: PermissionKey) -> bool:
+        """Whether a removed deny or ask rule leaves every restriction it imposed in place.
+
+        A path rule Claude Code never consults imposed none; a carve-out only
+        excepted paths, so removing it restricts more; and a rule whose other
+        spelling the source still declares is still declared.
+        """
+
+        return (
+            key in self.unconsulted
+            or key in self.respelled
+            or (key[0] == "claude-code" and key[2] in {"deny", "ask"} and is_carve_out(key[3]))
+        )
+
+    def set_aside(self, key: PermissionKey) -> bool:
+        """Not a candidate for a replacement pair (see :func:`permission_rule_replacements`)."""
+
+        return key in self.unconsulted or key in self.respelled
+
+
+def permission_rule_assessment(
+    changes: Sequence[dict[str, Any]], current_grants: Sequence[dict[str, Any]] | None = None,
+) -> PermissionRuleAssessment:
+    """Read every changed Claude Code permission rule against its own source (#918).
+
+    The base side of a source is its current rules less those the comparison
+    added, plus those it removed: an unchanged rule is in neither, and was
+    there at the base. Without ``current_grants`` only changed rules are known,
+    so fewer additions are proven covered — never more.
+    """
+
+    removed: dict[tuple[str, str, str], dict[str, dict[str, Any]]] = {}
+    added: dict[tuple[str, str, str], dict[str, dict[str, Any]]] = {}
+    head: dict[tuple[str, str, str], set[str]] = {}
+    changed: dict[PermissionKey, tuple[dict[str, Any], dict[str, Any]]] = {}
+    for change in changes:
+        before, after = change.get("baseline"), change.get("current")
+        for grant in (before, after):
+            if grant and grant.get("kind") == "permission_rule" and grant.get("host") == "claude-code":
+                break
+        else:
+            continue
+        if before is not None and after is not None:
+            changed[_permission_key(after)] = (before, after)
+            head.setdefault(_permission_key(after)[:3], set()).add(str(after["rule"]))
+        elif after is not None:
+            added.setdefault(_permission_key(after)[:3], {})[str(after["rule"])] = after
+            head.setdefault(_permission_key(after)[:3], set()).add(str(after["rule"]))
+        elif before is not None:
+            removed.setdefault(_permission_key(before)[:3], {})[str(before["rule"])] = before
+    for grant in current_grants or ():
+        if grant.get("kind") == "permission_rule" and grant.get("host") == "claude-code":
+            head.setdefault(_permission_key(grant)[:3], set()).add(str(grant["rule"]))
+    lists = set(head) | set(removed)
+    base = {
+        key: (head.get(key, set()) - set(added.get(key, {}))) | set(removed.get(key, {}))
+        for key in lists
+    }
+
+    unconsulted = frozenset(
+        (*key, rule)
+        for key in lists
+        for rule in (*added.get(key, {}), *removed.get(key, {}), *head.get(key, set()))
+        if unconsulted_path_rule(rule)
+    )
+
+    respelled: dict[PermissionKey, str] = {}
+    pairs: list[tuple[PermissionKey, PermissionKey]] = []
+    for key in lists:
+        gone, new = removed.get(key, {}), added.get(key, {})
+        for rule in gone:
+            twins = sorted(other for other in head.get(key, set()) if same_spelling(rule, other))
+            if twins:
+                respelled[(*key, rule)] = twins[0]
+        for rule in new:
+            twins = sorted(other for other in base[key] if same_spelling(rule, other))
+            if twins:
+                respelled[(*key, rule)] = twins[0]
+        for rule in gone:
+            arrivals = [other for other in new if same_spelling(rule, other)]
+            if len(arrivals) == 1 and [
+                other for other in gone if same_spelling(other, arrivals[0])
+            ] == [rule]:
+                pairs.append(((*key, rule), (*key, arrivals[0])))
+
+    carve_widened: set[PermissionKey] = set()
+    for key in lists:
+        if key[2] not in {"deny", "ask"}:
+            continue
+        sides = [(rule, None, grant) for rule, grant in added.get(key, {}).items()] + [
+            (item_key[3], before, after)
+            for item_key, (before, after) in changed.items() if item_key[:3] == key
+        ]
+        for rule, before, after in sides:
+            if not is_carve_out(rule):
+                continue
+            head_from = after.get("carves_from")
+            if head_from is None:
+                # Not recorded: read as reaching every rule the base had.
+                head_from = sorted(base[key])
+            base_from = before.get("carves_from") if before is not None else None
+            if carve_out_widens(head_from, base_from, base[key]):
+                carve_widened.add((*key, rule))
+
+    covered: dict[PermissionKey, str] = {}
+    narrowed_into: dict[PermissionKey, list[str]] = {}
+    for key in lists:
+        if key[2] != "allow":
+            continue
+        host, source = key[0], key[1]
+        restrictions_base = {
+            canonical_rule(rule)
+            for disposition in ("deny", "ask")
+            for rule in base.get((host, source, disposition), set())
+        }
+        # A restriction this source no longer imposes may be what an added
+        # allow rule now reaches past, so its tool's additions stay new.
+        lifted = {
+            permission_pairing_group(rule).lower()
+            for disposition in ("deny", "ask")
+            for rule in removed.get((host, source, disposition), {})
+            if not (
+                (host, source, disposition, rule) in unconsulted
+                or (host, source, disposition, rule) in respelled
+                or is_carve_out(rule)
+            )
+        } | {
+            permission_pairing_group(item[3]).lower()
+            for item in carve_widened if item[:2] == (host, source)
+        }
+        for rule in added.get(key, {}):
+            if (*key, rule) in unconsulted or canonical_rule(rule) in restrictions_base:
+                # A deny or ask rule moved into `allow` was restricted at the
+                # base: never covered, whatever else allowed it (#816).
+                continue
+            if lifted & {permission_pairing_group(rule).lower(), "*"}:
+                continue
+            cover = covering_rule(rule, base[key])
+            if cover is None:
+                continue
+            covered[(*key, rule)] = cover
+            if cover in removed.get(key, {}):
+                narrowed_into.setdefault((*key, cover), []).append(rule)
+
+    return PermissionRuleAssessment(
+        covered=covered,
+        respelled=respelled,
+        unconsulted=unconsulted,
+        carve_widened=frozenset(carve_widened),
+        narrowed_into={key: sorted(value) for key, value in narrowed_into.items()},
+        respelled_pairs=tuple(sorted(pairs)),
+    )
+
+def reusable_call_target(uses: str) -> str:
+    """A reusable call's workflow without its ``@ref`` (#924).
+
+    ``owner/repo/path@main`` and ``owner/repo/path@<sha>`` name one called
+    workflow at two references. The reference is opaque text here: neither
+    what code it names nor whether two name the same code is established.
+    A same-repository call has no reference.
+    """
+
+    if local_reusable_target(uses, "") is not None:
+        return uses
+    target, at, _ref = uses.rpartition("@")
+    return target if at and target else uses
+
+
+def inherited_recipients(grant: dict[str, Any]) -> set[tuple[str, str]]:
+    """The jobs passing every caller secret, each with the workflow it calls (#685, #924).
+
+    Keyed by the called workflow, not its reference: re-pinning an inheriting
+    call from a branch to a commit SHA changes the code it names and passes
+    the same secrets to the same workflow, so it is not a new recipient. A new
+    inheriting job, another called workflow, or ``secrets: inherit`` added to
+    a call is.
+    """
+
+    return {
+        (str(call["job"]), reusable_call_target(str(call["uses"])))
+        for call in grant.get("reusable_calls", []) if call["secrets_inherit"]
+    }
+
+
+@dataclass(frozen=True)
+class PermissionRuleReplacement:
+    """One allow rule the lattice decided another replaced, in one host and source (#657, #816).
+
+    ``direction`` is ``widened`` when the arriving rule covers the one that
+    left, and ``narrowed`` when the rule that left covers the arrival. Rules
+    are the published rule text, exactly as the grants carry them.
+    """
+
+    host: str
+    source: str
+    before_rule: str
+    after_rule: str
+    direction: Literal["widened", "narrowed"]
+
+
+def _permission_direction_signals(
+    changes: list[dict[str, Any]], *, assessment: PermissionRuleAssessment | None = None,
+) -> tuple[list[str], set[tuple[str, str, str]]]:
+    """The expansion signals and narrowed rules of :func:`permission_rule_replacements`."""
+
+    assessment = assessment or permission_rule_assessment(changes)
+    replacements = permission_rule_replacements(changes, assessment=assessment)
+    signals = [
+        # Named as well as counted: `allow_rule_changed` says a rule
+        # moved, this says which way and by how much. The add signal
+        # stays too — it is not wrong, and readers already depend on it.
+        f"permission_widened: {item.host}:{item.before_rule} -> {item.after_rule}"
+        for item in replacements
+        if item.direction == "widened"
+        # Wider than the rule it replaced, yet inside another rule the source
+        # had at the base: nothing the base did not already allow (#941).
+        and assessment.grants_new((item.host, item.source, "allow", item.after_rule))
+    ]
+    # A narrowing earns no entry in an expansion list. What it earns
+    # is silence there, which is what the caller uses this set for.
+    narrowed = {
+        (item.host, item.source, item.after_rule)
+        for item in replacements if item.direction == "narrowed"
+    }
+    return signals, narrowed
+
+
+def permission_rule_replacements(
+    changes: list[dict[str, Any]], *, assessment: PermissionRuleAssessment | None = None,
+) -> list[PermissionRuleReplacement]:
+    """Name a replaced allow rule as widened or narrowed.
+
+    Grants are keyed by their rule text, so replacing `Bash(npm *)` with
+    `Bash(npm test:*)` arrives as one removal and one addition — the same
+    shape as replacing it with `Bash(*)`. Set arithmetic cannot tell those
+    apart; the lattice can, for the patterns it decides (#657).
+
+    Only pairs within one host, source and disposition are considered. After
+    setting aside moved rules, a single departure and arrival retain the
+    existing lattice comparison (including whole-server MCP narrowings).
+    Count within each exact tool or bare MCP server: an unrelated Read
+    arrival cannot obscure a Bash replacement (#858). Several departures or arrivals
+    for the same tool remain ambiguous; neither order nor likeness chooses a
+    pair. A pair the lattice cannot decide leaves the add/remove signals as
+    the whole answer.
+
+    A rule whose identical text only moved to another disposition in the
+    same host and source — `deny` to `allow`, say — replaced nothing, so a
+    rule that moved into `allow` is set aside before counting. It keeps its
+    own `allow_rule_added` and `deny_rule_removed`. Without this, moving
+    `Bash(git log *)` out of `deny` in the same edit that narrows
+    `Bash(git status *)` to `Bash(git status --short *)` counted as a second
+    arrival, and the narrower half was reported as a widening (#816). A rule
+    that moved out of `allow` is set aside only when another allow rule in
+    its group also left; when it is the only one, it is the rule the arrival replaced.
+    Identity is the exact rule text: nothing is paired by likeness.
+
+    A path rule Claude Code never consults, and a rule that is the same grant
+    as one on the other side spelled another way, is not a candidate (#918,
+    #938): neither replaced anything, and counting either would leave a real
+    replacement beside it unpaired.
+    """
+
+    assessment = assessment or permission_rule_assessment(changes)
+    removed: dict[tuple[str, str, str], list[str]] = {}
+    added: dict[tuple[str, str, str], list[str]] = {}
+    for change in changes:
+        before, after = change.get("baseline"), change.get("current")
+        for grant, sink in ((before, removed), (after, added)):
+            if grant and grant.get("kind") == "permission_rule":
+                if assessment.set_aside(_permission_key(grant)):
+                    continue
+                key = (grant["host"], grant.get("source", ""), str(grant.get("disposition")))
+                sink.setdefault(key, []).append(str(grant["rule"]))
+    moved = {
+        (host, source, rule)
+        for (host, source, gone_from), gone in removed.items()
+        for (other_host, other_source, arrived_in), arrived in added.items()
+        if (other_host, other_source) == (host, source) and arrived_in != gone_from
+        for rule in set(gone) & set(arrived)
+    }
+    # A rule present on both sides is unchanged and pairs with nothing.
+    replacements: list[PermissionRuleReplacement] = []
+    for key, gone in removed.items():
+        if key[2] != "allow":
+            continue
+        host, source = key[0], key[1]
+        arrived = added.get(key, [])
+        left = [rule for rule in gone if rule not in arrived]
+        # A rule that moved out of `allow` is set aside only when another
+        # allow rule also left: that one is then what the arrival replaced.
+        # When the moved rule is the only one that left, it is. It
+        # was granted at the base, so comparing the arrival with it is the
+        # same sound base-to-head comparison as any other replacement; setting
+        # it aside instead left the arrival unpaired, so tightening
+        # `Bash(npm *)` to `Bash(npm test *)` while denying `Bash(npm *)`
+        # gained a widening (#816).
+        only_gone = [rule for rule in left if (host, source, rule) not in moved] or left
+        # A rule that moved *into* `allow` is always set aside: it was denied
+        # or asked at the base, so it is never the narrower half of anything.
+        only_arrived = [
+            rule for rule in arrived if rule not in gone and (host, source, rule) not in moved
+        ]
+        gone_by_group: dict[str, list[str]] = {}
+        arrived_by_group: dict[str, list[str]] = {}
+        for rules, grouped in ((left, gone_by_group), (only_arrived, arrived_by_group)):
+            for rule in rules:
+                grouped.setdefault(permission_pairing_group(rule), []).append(rule)
+        pairs = []
+        for group, group_left in sorted(gone_by_group.items()):
+            # An unrelated tool leaving must not hide this group's moved rule.
+            group_gone = [r for r in group_left if (host, source, r) not in moved] or group_left
+            group_arrived = arrived_by_group.get(group, [])
+            if len(group_gone) == 1 and len(group_arrived) == 1:
+                pairs.append((group_gone[0], group_arrived[0]))
+        if not pairs and len(only_gone) == 1 and len(only_arrived) == 1:
+            # Preserve the single cross-group comparison, including `*`.
+            pairs = [(only_gone[0], only_arrived[0])]
+        for before_rule, after_rule in pairs:
+            if subsumes(after_rule, before_rule) is True:
+                direction: Literal["widened", "narrowed"] | None = "widened"
+            elif subsumes(before_rule, after_rule) is True and (
+                # Claude Code skips an unanchored allow glob such as `*` and
+                # matches tool names exactly, so only a rule its model says
+                # covers the arrival makes the arrival a narrowing.
+                host != "claude-code" or covering_rule(after_rule, [before_rule]) is not None
+            ):
+                direction = "narrowed"
+            else:
+                direction = None
+            if direction is not None:
+                replacements.append(
+                    PermissionRuleReplacement(
+                        host=host, source=source, before_rule=before_rule,
+                        after_rule=after_rule, direction=direction,
+                    )
+                )
+    return replacements
 
 
 def _incomparable_payload(
@@ -1653,30 +8230,118 @@ def _incomparable_payload(
         # and also route to a human before any first acknowledgement.
         "next_action": None,
     }
-    return HostGrantsDriftV2.model_validate(payload).model_dump(mode="json")
+    return HostGrantsDriftV9.model_validate(payload).model_dump(mode="json")
+
+
+#: Baseline versions a drift comparison reads as current. v0.5 only adds
+#: ``resolved_through`` on artifacts read through an in-tree link (#700). A
+#: v0.4 inventory refused such a link as unreadable, and an incomplete
+#: inventory can never be saved, so a v0.4 baseline holds no artifact that v0.5
+#: would describe differently. Accepting it keeps every saved baseline usable.
+#: v0.6 adds workflow step references (#771) and v0.7 agent launches and
+#: checkout refs (#823); the rules below narrow which older baselines that
+#: acceptance still covers.
+_COMPARABLE_BASELINE_SCHEMA_VERSIONS = frozenset(
+    {"0.4", "0.5", "0.6", "0.7", "0.8", HOST_GRANTS_BASELINE_SCHEMA_VERSION}
+)
+
+#: Baselines without workflow grants retain the v0.6 replacement route (#819).
+OVERWRITABLE_BASELINE_SCHEMA_VERSIONS = frozenset({"0.6", "0.7", "0.8", HOST_GRANTS_BASELINE_SCHEMA_VERSION})
+
+#: Baseline versions whose workflow grants never read step action references
+#: (#771). Such a grant's missing ``step_actions`` is not evidence that no
+#: step declared one, so a baseline holding a workflow grant is incomparable.
+#: A baseline with no workflow grant stays comparable: every workflow the
+#: current inventory holds is then an added grant, whose references no side
+#: claims were compared.
+_STEP_ACTIONS_UNREAD_BASELINE_SCHEMA_VERSIONS = frozenset({"0.4", "0.5"})
+
+#: Baseline versions whose workflow grants never read agent launches or
+#: checkout refs (#823), by the same rule: silence is not evidence of none.
+_AGENT_LAUNCHES_UNREAD_BASELINE_SCHEMA_VERSIONS = frozenset({"0.4", "0.5", "0.6"})
 
 
 def build_host_drift_payload(
     *, baseline: dict[str, Any], inventory: dict[str, Any], baseline_file: str
 ) -> dict[str, Any]:
     reasons: list[str] = []
+    # A baseline from before #702 never read script bytes. Only a hook whose
+    # current reading binds a script cannot be compared against it; for every
+    # other hook the current entries hold limits alone and are left out.
+    unread_scripts = {
+        str(grant.get("grant_id"))
+        for grant in (baseline.get("inventory") or {}).get("grants", [])
+        if grant.get("kind") == "hook" and grant.get("scope") == "repository"
+        and grant.get("script_inputs") is None
+    }
+    if any(
+        str(grant.get("grant_id")) in unread_scripts
+        and any(entry.get("path") and entry.get("basis") for entry in grant.get("script_inputs") or [])
+        for grant in inventory.get("grants", [])
+    ):
+        reasons.append("baseline_hook_script_inputs_unavailable")
     if baseline.get("host_grants_schema_version") == "0.1":
         reasons.append("baseline_schema_v0.1_lacks_typed_grants_and_scope")
-    elif baseline.get("host_grants_schema_version") != HOST_GRANTS_BASELINE_SCHEMA_VERSION:
+    elif baseline.get("host_grants_schema_version") not in _COMPARABLE_BASELINE_SCHEMA_VERSIONS:
         reasons.append(
             str(baseline.get("_load_error") or "unsupported_baseline_schema")
         )
+    elif baseline.get("host_grants_schema_version") in _AGENT_LAUNCHES_UNREAD_BASELINE_SCHEMA_VERSIONS:
+        version = baseline.get("host_grants_schema_version")
+        workflows = [
+            grant for grant in (baseline.get("inventory") or {}).get("grants", [])
+            if grant.get("kind") == "workflow"
+        ]
+        if workflows and version in _STEP_ACTIONS_UNREAD_BASELINE_SCHEMA_VERSIONS:
+            reasons.append("baseline_workflow_step_actions_unavailable")
+        if workflows:
+            reasons.append("baseline_workflow_agent_launches_unavailable")
+        if version in _STEP_ACTIONS_UNREAD_BASELINE_SCHEMA_VERSIONS and any(
+            grant.get("reusable_calls") for grant in workflows
+        ):
+            # Such a call's missing ``secret_mappings`` is not evidence that it
+            # passed no named secret: those snapshots never read them (#693).
+            reasons.append("baseline_reusable_workflow_secret_mappings_unavailable")
     if not inventory_is_complete(inventory):
         reasons.append("current_inventory_incomplete")
     baseline_scope = baseline.get("scope")
     if baseline_scope is not None and baseline_scope != inventory.get("scope"):
         reasons.append(f"scope_mismatch:{baseline_scope}->{inventory.get('scope')}")
+    if any(
+        artifact.get("kind") == "instructions"
+        and instruction_profile(str(artifact.get("path") or "")) is not None
+        and not artifact.get("instruction_structure")
+        for artifact in (baseline.get("inventory") or {}).get("artifacts", [])
+    ):
+        reasons.append("baseline_instruction_structure_unavailable")
     if reasons:
         return _incomparable_payload(inventory=inventory, baseline_file=baseline_file, reasons=reasons)
 
+    return _comparable_drift_payload(
+        baseline_inventory=baseline["inventory"],
+        inventory=inventory,
+        baseline_file=baseline_file,
+        unread_scripts=unread_scripts,
+    )
+
+
+def _comparable_drift_payload(
+    *, baseline_inventory: dict[str, Any], inventory: dict[str, Any], baseline_file: str,
+    unread_scripts: set[str] | frozenset[str] = frozenset(),
+) -> dict[str, Any]:
     current = normalized_host_grants(inventory)
-    baseline_inventory = baseline["inventory"]
-    changes = diff_host_grants(baseline_inventory, current)
+    # Limit-only entries against a baseline that never read scripts: neither
+    # side establishes a script, so there is nothing to compare (#702).
+    compared = {
+        **current,
+        "grants": [
+            {key: value for key, value in grant.items() if key != "script_inputs"}
+            if str(grant.get("grant_id")) in unread_scripts
+            else grant
+            for grant in current["grants"]
+        ],
+    } if unread_scripts else current
+    changes = diff_host_grants(baseline_inventory, compared)
     artifact_changes = _diff_host_artifacts(baseline_inventory, current)
     coverage_changes = _diff_host_coverage(baseline_inventory, current)
     payload = {
@@ -1690,15 +8355,45 @@ def build_host_drift_payload(
         "changes": changes,
         "artifact_changes": artifact_changes,
         "coverage_changes": coverage_changes,
-        "expansion_signals": host_grant_expansion_signals(changes),
+        "expansion_signals": host_grant_expansion_signals(
+            changes, current_grants=compared["grants"]
+        ),
         "issues": inventory.get("issues", []),
         "incomparable_reasons": [],
         "next_action": None,
     }
-    return HostGrantsDriftV2.model_validate(payload).model_dump(mode="json")
+    return HostGrantsDriftV9.model_validate(payload).model_dump(mode="json")
 
 
-def render_host_audit_markdown(inventory: dict[str, Any]) -> str:
+def build_host_comparison_payload(
+    *, before: dict[str, Any], after: dict[str, Any], baseline_file: str
+) -> dict[str, Any]:
+    """Drift between two freshly read inventories whose limits the caller proved unchanged.
+
+    For #721 only: the caller has established that every partial or
+    experimental source is byte-identical in both inventories, so what differs
+    between them was read on both sides. Nothing here saves or loads a
+    baseline. `build_host_grants_baseline` keeps refusing an incomplete
+    inventory, because a saved baseline acknowledges evidence and a comparison
+    between two commits does not.
+    """
+
+    if before.get("scope") != after.get("scope"):
+        return _incomparable_payload(
+            inventory=after,
+            baseline_file=baseline_file,
+            reasons=[f"scope_mismatch:{before.get('scope')}->{after.get('scope')}"],
+        )
+    return _comparable_drift_payload(
+        baseline_inventory=normalized_host_grants(before),
+        inventory=after,
+        baseline_file=baseline_file,
+    )
+
+
+def render_host_audit_markdown(
+    inventory: dict[str, Any], *, next_step: str | None = None
+) -> str:
     lines = ["# Host Capability Audit", ""]
     lines.append(
         f"Static `{inventory['scope']}` inventory. Runtime session behavior was not verified."
@@ -1721,30 +8416,79 @@ def render_host_audit_markdown(inventory: dict[str, Any]) -> str:
     else:
         for kind, grants in sorted(by_kind.items()):
             lines.append(f"- `{kind}`: {len(grants)}")
+        for grant in by_kind.get("openshell_policy", []):
+            facts = grant["facts"]
+            lines.extend([
+                "", "### OpenShell selected document", "",
+                "Policy facts include correlated binary/endpoint rules and default provenance; "
+                "they make no tool effect or deployed enforcement claim.",
+                "", "~~~~json",
+                json.dumps({"source": grant["source"], **facts}, indent=2, sort_keys=True),
+                "~~~~",
+            ])
         wildcard_rules = [
             grant
             for grant in by_kind.get("permission_rule", [])
             if grant.get("disposition") == "allow" and grant.get("wildcard")
         ]
-        if wildcard_rules:
+        # A `⚠` on `Read(**)` spends the reader's attention on the grant
+        # least worth it, and teaches them the marker means nothing. The
+        # warning names the wildcards whose tool class earned a severity;
+        # the low-risk ones are still listed above, just not shouted (#657).
+        notable = [grant for grant in wildcard_rules if grant.get("risk") != "low"]
+        # A launcher rule is not wildcard-shaped, but the check blocks it
+        # through the same rule, so the line that names that rule counts it
+        # (#824).
+        launchers = [
+            grant
+            for grant in by_kind.get("permission_rule", [])
+            if grant.get("disposition") == "allow"
+            and not grant.get("wildcard")
+            and exec_equivalent_argument(str(grant.get("rule") or "")) is not None
+        ]
+        if notable or launchers:
             lines.append("")
+            quiet = len(wildcard_rules) - len(notable)
             lines.append(
-                f"⚠ {len(wildcard_rules)} wildcard allow rule(s); verification "
-                "reports `SHIP-HOST-BOUNDARY-PERMISSION-WILDCARD-ALLOW`."
+                f"⚠ {len(notable) + len(launchers)} wildcard allow rule(s) above low risk; "
+                "verification reports "
+                "`SHIP-HOST-BOUNDARY-PERMISSION-WILDCARD-ALLOW`."
+                + (
+                    f" {len(launchers)} of them reach arbitrary code through a launcher."
+                    if launchers
+                    else ""
+                )
+                + (
+                    f" {quiet} further wildcard rule(s) are read-only and listed above."
+                    if quiet
+                    else ""
+                )
             )
     lines.append("")
     if inventory["issues"]:
         lines.append("## Coverage issues")
         lines.append("")
         for issue in inventory["issues"]:
-            marker = "blocking" if issue["blocking"] else "declared exclusion"
+            if issue["blocking"]:
+                marker = "blocking"
+            elif issue["kind"] in {"unsupported", "unreadable"}:
+                # Nothing was declared and nothing was excluded: this surface
+                # was read and one part of it could not be compared.
+                marker = "not compared"
+            else:
+                marker = "declared exclusion"
             lines.append(f"- `{issue['host']}` `{issue['source']}` ({marker}): {issue['message']}")
         lines.append("")
     lines.append("## Excluded scopes")
     lines.append("")
     for item in inventory["excluded_scopes"]:
         lines.append(f"- {item}")
-    lines.extend(["", "---", "Next: `agents-shipgate verify --preview --json` for release gating."])
+    lines.extend([
+        "",
+        "---",
+        next_step
+        or "Next: `agents-shipgate verify --preview --json` for release gating.",
+    ])
     return "\n".join(lines) + "\n"
 
 
@@ -1779,18 +8523,27 @@ __all__ = [
     "INCOMPARABLE_BASELINE_REVIEW",
     "HostBoundarySnapshot",
     "HostStaticParseCache",
+    "PermissionRuleReplacement",
+    "PluginScopeFacts",
     "build_host_boundary_snapshot",
     "build_host_drift_payload",
     "build_host_grants_baseline",
     "diff_host_grants",
+    "hook_loading_basis",
     "host_audit_inventory",
+    "host_comparison_baseline",
+    "host_grant_direction_unknown",
     "host_grant_expansion_signals",
     "host_grants_sha256",
     "inventory_is_complete",
     "load_host_grants_baseline",
     "load_host_grants_baseline_with_text",
     "normalized_host_grants",
+    "permission_rule_replacements",
+    "published_setting_value",
     "redacted_config_sha256",
     "render_host_audit_markdown",
     "render_host_drift_markdown",
+    "without_host_issues",
+    "without_host_sources",
 ]

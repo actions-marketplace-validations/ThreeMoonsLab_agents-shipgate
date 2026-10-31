@@ -7,13 +7,19 @@ partially succeeds.
 For the packaging surface and post-release fan-out checks, see
 [`distribution.md`](distribution.md).
 
+[MAINTAINERS.md](../MAINTAINERS.md) records the documented release/policy owners,
+the proposed support commitment and the outstanding responsibility confirmations.
+Before 1.x, complete the [operational ownership and access recovery](#operational-ownership-and-access-recovery)
+record below alongside qualification; workflow presence does not establish who
+can act when a required person or account is unavailable.
+
 ## The pipeline
 
-A release runs as five jobs with an explicit, content-addressed handoff.
+A release runs as five stages with an explicit, content-addressed handoff.
 
 | Job | Permissions | What it does |
 |---|---|---|
-| `verify` → `tests` | `contents: read` | Installs the locked closure, checks the locks against the declarations, lints, compiles, schema check, the correctness suite, dependency audit |
+| `verify` → `suite`, then `tests` | `contents: read` | `suite` runs the correctness suite in six parallel shards, `not perf` and including the `slow` tests, each installing the locked closure and checking the locks against the declarations. `tests` waits for every shard, requires each to have reported and to have tested this commit, enforces the 85% coverage floor over the combined shards, then lints, compiles, checks the schemas, runs the dependency audit and re-derives the qualification policy |
 | `verify` → `artifact` | `contents: read` | Requires a changelog section for the tag, builds from the tagged source, validates the signed qualification, binds wheel to source, produces the wheel-scoped SBOM, seals and uploads the candidate bundle |
 | `stage` | `contents: write`, `actions: read` | Re-peels the tag, requires a matching rehearsal, re-derives every digest, extracts the release notes, classifies the index, creates or repairs the **draft** release |
 | `publish` | `id-token: write`, `environment: pypi` | Signs and uploads to PyPI once |
@@ -27,14 +33,14 @@ than launching the environment's interpreter, because interpreter startup runs
 wheel itself is built with `--no-isolation` so the locked backend is the code
 that runs.
 
-Verification is two jobs for a specific reason: **the job that seals the handoff
-never runs the candidate's tests.** In a combined job the qualified wheel stayed
-writable on disk — with its path exported through `GITHUB_ENV` — while pytest,
-its plugins, and `conftest` code executed. A test could therefore replace the
-wheel *after* the source-to-wheel equality check and before the handoff was
-sealed, and the provenance report would still have claimed equality. The
-`artifact` job runs no suite and no dependency audit, and re-asserts the binding
-on the exact bytes it seals.
+Verification keeps the sealing apart from the suite for a specific reason:
+**the job that seals the handoff never runs the candidate's tests.** In a
+combined job the qualified wheel stayed writable on disk — with its path
+exported through `GITHUB_ENV` — while pytest, its plugins, and `conftest` code
+executed. A test could therefore replace the wheel *after* the source-to-wheel
+equality check and before the handoff was sealed, and the provenance report
+would still have claimed equality. The `artifact` job runs no suite and no
+dependency audit, and re-asserts the binding on the exact bytes it seals.
 
 The split is about which capabilities are ever held together. `publish` can
 mint a PyPI Trusted Publishing token, so it holds **no repository write**,
@@ -104,14 +110,24 @@ pipeline tested one artifact and published another.
 
 ### Which evidence bar the tag must meet
 
+This section governs a version `.github/release-channels.json` declares
+`qualified`. A version declared `advisory` carries no qualification artifact
+and is verified by `release-advisory-verify.yml` instead; see
+[§ The advisory release channel](#the-advisory-release-channel).
+
 Two named qualification policies exist, and the **version decides which one
 applies** — nothing in the artifact does:
 
 | Version | Accepted qualification | Cases |
 |---|---|---|
-| `0.x` (epoch 0, major 0) | `pre_1_0`, or the stronger `beta` | 56, or 100 |
-| `1.0` and later | `beta` only | 100 |
-| unparsable | `beta` only | 100 |
+| `0.x` (epoch 0, major 0) | `pre_1_0`, or the stronger `beta` | 38, or 80 |
+| `1.0` and later | `beta` only | 80 |
+| unparsable | `beta` only | 80 |
+
+Both policies have 21 strata and no expected `insufficient_evidence` class.
+The [current policy table](../benchmark/safety-qualification/README.md#current-policy-contract)
+records exact outcomes, 16/32 qualifying-origin floors, holdout and human-label
+requirements. It is checked against the typed policy and the stdlib gate.
 
 The `pre_1_0` policy was approved for issue #341 and is recorded, with its
 thresholds and rationale, in
@@ -126,7 +142,7 @@ Both gates apply the rule independently — the exhaustive
 standard-library `scripts/verify_qualification_binding.py` in the sealing job.
 The sealing gate cannot import the project, so it *restates* each tier's
 strata, exact-match floors, per-stratum holdout, and origin and κ floors, and
-re-derives them from the raw cases; a case count alone would let 56 identical
+re-derives them from the raw cases; a case count alone would let 38 identical
 rows through. An artifact naming a tier the version does not admit is rejected
 by both, and is then measured against the *production* policy, so a bad tier
 can never shrink what is checked.
@@ -135,7 +151,7 @@ can never shrink what is checked.
 is not a `0.x` version and gets the production bar.
 
 To produce the artifact, `scripts/run_safety_qualification.py` selects the same
-way. `--policy-tier production` opts up to the 100-case bar on a `0.x` wheel;
+way. `--policy-tier production` opts up to the 80-case `beta` bar on a `0.x` wheel;
 `--policy-tier pre-1.0` is refused for a `1.0`-or-later wheel, at the point of
 production rather than at the gate.
 
@@ -151,7 +167,10 @@ source.
 
 ```bash
 python -m pip install --require-hashes -r constraints/build-backend.txt
-python -m build --wheel --no-isolation
+candidate_sha="$(git rev-parse HEAD)"
+candidate_output="$(mktemp -d)"
+AGENTS_SHIPGATE_CANDIDATE_SOURCE_COMMIT="${candidate_sha}" \
+  python -m build --wheel --no-isolation --outdir "${candidate_output}"
 ```
 
 Install the backend closure, then build without isolation. Setting
@@ -159,6 +178,76 @@ Install the backend closure, then build without isolation. Setting
 constraints to an isolated build environment, so a constrained build still
 resolves whatever the index offers — verified by constraining hatchling to a
 version that does not exist and watching the build succeed.
+
+The candidate-only build hook requires a clean Git checkout, an exact full
+HEAD SHA and a final `X.Y.Z` package version. It compares tracked file bytes
+with HEAD blobs, enumerates Hatch's actual selected and force-included payload,
+and verifies that payload in the finished archive; ignored untracked inputs
+and `assume-unchanged` edits cannot acquire a source stamp. It refuses editable builds,
+previews, dirty/untracked source and non-Git copies. Keep the output outside
+the checkout until the build finishes. It writes a deterministic
+`agents_shipgate/_meta/release-source.json` into the wheel and revalidates the
+source after building; it never writes that record into the package tree.
+Ordinary and preview builds omit it. The release sealer uses the same opt-in
+build mode, and `--source-commit` requires the candidate and rebuild to carry
+the same valid record before comparing their bytes.
+
+That record makes `init --ci` in the frozen wheel use its immutable Action source
+SHA plus its `shipgate_version`. Once publication finishes, the unchanged
+generated workflow installs that published distribution instead of rebuilding
+unstamped source or selecting the previous release. The Action SHA resolves
+before the tag exists; the package version is intentionally a post-publication
+selector. Before publication replace that version input with the paired `shipgate_wheel` and
+`shipgate_wheel_sha256` Action inputs. They accept a local regular wheel inside
+`GITHUB_WORKSPACE`, check and privately capture the same bytes, and reinstall
+even an already-installed matching version. Install dependencies from the
+reviewed lock first; this candidate route uses `--no-deps`. It cannot be mixed
+with `shipgate_version`. Missing halves, bad hashes and conflicting wheel
+metadata fail before installation.
+
+The same record selects every other pin `init` renders from the wheel: the
+optional adoption kit's zero-install runners, its bundled CI recipes' `uses:` and
+`shipgate_version`, and the contract-floor statement beside them, which is judged
+against the contract the wheel itself emits (#781). The wheel is built before the
+published-release constants move, so judging it against those constants would tell
+adopters to install the previous release. The distribution smoke renders the kit
+from the installed candidate and refuses any other Action ref or package version.
+
+An explicit `AGENTS_SHIPGATE_WORKFLOW_REF` still selects the operator's requested
+Action source for the workflow `init --ci` writes and omits the candidate version
+selector there. It does not change the kit's runner pins, which cannot name an
+Action source. It cannot hide a malformed embedded source record. Ordinary and
+preview builds keep their published fallback.
+
+A malformed record refuses the things it decides — the pins `init --ci` and
+`init --agent-instructions` for the skill kits write — and nothing else. `init`
+refuses before writing any file, exits 2 and names the record, with an agent-mode
+`config_error` routing to a reinstall. `doctor`,
+`check` and `verify` keep running on that install, so the diagnostic that names
+the broken wheel is still available.
+
+### Distribution smoke before and after publication
+
+Run **Release Engine Smoke (unqualified)** on the committed candidate branch
+before freezing qualification inputs. Its read-only jobs build the stamped
+wheel, install it outside the source import path, generate the advisory CI pin,
+and exercise both the installed CLI and the Action from the same immutable
+checkout on the existing unsafe-refund PR fixture. Do not run
+`release_engine_smoke.py prepare` in your own checkout: it commits fixture
+history onto the current HEAD, which is why it refuses to run at all without
+`--disposable-checkout`. The evidence artifact names the wheel hash,
+source/Action SHA, installed version/contract, generated workflow and both
+capability results and engine identities. The two halves must agree and show
+the blocked result. This is synthetic distribution evidence; it grants no
+qualification or release authority.
+
+After publication the release owner must download the actual wheel from the
+published channel, compare its hash with the qualified wheel, and repeat the
+disposable downstream fixture using the unchanged generated workflow, then the
+real published Action tag. Record that resolved tag SHA, wheel hash,
+installed version/contract, engine identity and local/CI result together. The pre-publication
+smoke is not evidence that an unpublished tag or downloadable release exists;
+rollout remains incomplete until this second observation is attached to #570.
 
 If a backend bump lands between qualification and release, the provenance gate
 fails. The fix is to re-run qualification against a wheel built with the current
@@ -193,8 +282,8 @@ present. That is why the backend has a lock of its own.
 
 | Lock | Installed by | Contains |
 |---|---|---|
-| [`constraints/dev.txt`](../constraints/dev.txt) | CI and `verify` → `tests` | The development closure: runtime dependencies plus the `dev` extra |
-| [`constraints/build-backend.txt`](../constraints/build-backend.txt) | CI, `verify` → `tests`, qualification promotion | The build backend's closure, so builds need no isolation |
+| [`constraints/dev.txt`](../constraints/dev.txt) | CI and `verify` → `suite`, `tests` | The development closure: runtime dependencies plus the `dev` extra |
+| [`constraints/build-backend.txt`](../constraints/build-backend.txt) | CI, `verify` → `suite`, `tests`, qualification promotion | The build backend's closure, so builds need no isolation |
 | [`constraints/release-seal.txt`](../constraints/release-seal.txt) | `verify` → `artifact` | `build`, `hatchling`, `sigstore` |
 | [`constraints/release-publish.txt`](../constraints/release-publish.txt) | `stage`, `publish`, `finalize` | `uv`, `sigstore` |
 | [`constraints/release-build.txt`](../constraints/release-build.txt) | — | Not a lock: the one hand-maintained backend pin the closure above resolves |
@@ -322,34 +411,284 @@ timings rather than an estimate:
 
 | Job | Phase | Observed | Timeout |
 |---|---|---|---|
-| `tests` | correctness suite (`-n auto`, `not perf`) | 407s | 20 min |
-| `tests` | install, lint, compile, schema check, static lint, audit | ~40s | |
+| `suite` (six shards) | one shard of the correctness suite (`-n auto`, `not perf`), with checkout and install | slowest of CI's five shards 10.4 min of test on `main` (Test steps of 311, 405, 623, 508 and 538 s, 2026-10-08); Advisory Release Rehearsal run 37871044408 (2026-10-09): shard jobs 290–542 s with checkout and install, slowest 9.0 min; about 13 min projected with #964 | 35 min each |
+| `tests` | coverage combine, install, lint, compile, schema check, static lint, audit, qualification policy | 42 s for the whole job in Advisory Release Rehearsal run 37871044408; the qualified line's qualification download is estimated at under 2 min more | 10 min |
 | `artifact` | source build, downloads, signature + qualification + provenance | ~30s | 15 min |
 | `artifact` | isolated SBOM install | ~1–2 min | |
 
-Each leaves roughly 2.5–3.5x headroom. The suite dominates its job; the SBOM
-step dominates the other, because it installs the wheel's whole runtime closure
-into a fresh environment.
+Each leaves roughly 2.5–3.5x headroom. A shard dominates the first job; the
+SBOM step dominates the last, because it installs the wheel's whole runtime
+closure into a fresh environment. The shard and gate figures come from the
+first rehearsal of the sharded layout, which ran before #964; read them again
+from the first rehearsal after #964 lands.
 
-After any change that materially grows the suite, read the actual job duration
-from a rehearsal run and reset the timeout to roughly 2.5x it. Do not raise it
-in response to a single timeout without checking what got slower — a timeout
-that appears without a corresponding change in these phases is more likely a
-hung step than an undersized budget.
+After any change that materially grows the suite, read the actual duration of
+the *slowest shard* from a rehearsal run and reset that timeout to roughly 2.5x
+it. Do not raise a timeout in response to a single failure without checking what
+got slower — a timeout that appears without a corresponding change in these
+phases is more likely a hung step than an undersized budget. When the slowest
+shard nears half its timeout, add a shard rather than raising the number; the
+partition rebalances itself (`ci_sharding.py`, `tests/shard_seconds.json`).
+Adding one is a change to the matrix, `SHIPGATE_TEST_SHARDS` and the expected
+fragment or shard count in `ci.yml` and in **both** `release-verify.yml` and
+`release-advisory-verify.yml`; `tests/test_release_pipeline.py` fails until all
+of them agree.
+
+The suite is sharded here because a single runner could not keep its margin.
+The first check, on 2026-09-14, found the suite had grown from 3,099 test
+functions, when 407s was measured, to 6,137. CI had already split it into three
+shards, and an Advisory Release Rehearsal timed out 19.7 minutes into the suite.
+No rehearsal had finished, so the budget was reset from CI's sharded timings to
+60 minutes on one runner, about 2.4x the ~25 the suite needed.
+
+That derivation was stale by 2026-10-08. CI's five shards then took 311, 405,
+623, 508 and 538 seconds on `main`, about 40 minutes of test time: one runner
+had 1.5x headroom, not 2.4x. #964 adds roughly 45%, about 58 minutes, which is
+no margin at all, and a timeout in this job fails verification *after the tag
+exists*. Resetting the budget to 2.5x that would have meant a single job of
+about two and a half hours, whose hung-step signal is the same wait. Release
+verification instead shards the suite as CI does, with the same `conftest.py`
+partition. The only difference in selection is that release runs the `slow`
+tests, which pull-request CI leaves to the nightly Slow Tests workflow: the
+release gate is the complete one. The sealer's checks, its outputs and every
+integrity property of the `tests` job are unchanged; the gate now additionally
+proves that every shard reported and that each tested the commit it is gating.
+
+## Cadence
+
+**Approved 2026-09-02 for [#491](https://github.com/ThreeMoonsLab/agents-shipgate/issues/491).**
+
+Releases are cut **on a schedule, not on a feature**. The schedule is the
+policy; everything below is how it is kept and what happens when it is not.
+
+| | |
+|---|---|
+| Interval | **30 days** |
+| Defect threshold | **45 days** |
+| Who tags | The release owner — Pengfei Hu (`pengfei-threemoonslab`), the same owner as [`release-evidence-policy-decision.md`](release-evidence-policy-decision.md) |
+| Where the number is read | The **Release cadence** step in every CI run: a job-summary block, and a warning annotation once the interval lapses |
+
+Why a schedule at all: at the time this was written, 5,039 of `CHANGELOG.md`'s
+6,242 lines were under `## Unreleased` — 81% of the project's shipped work,
+installable by nobody, because releases were gated on a single expensive
+artifact and therefore happened when that artifact happened, which was never.
+The cost compounds: the longer the section grows, the larger and riskier the
+eventual release note, and the more migration notes land on adopters at once.
+It had already grown past GitHub's 125,000-character release-body limit, so the
+backlog had become a *blocker* on its own.
+
+### Keeping it
+
+```bash
+python scripts/release_cadence.py --json
+```
+
+Counts days since the newest **release tag** — `v` followed by a complete PEP
+440 version, so `preview-*`, `wip-sectiond` and `m3-pre-rebase` are correctly
+not releases. It reads the repository's own tags and needs no network, so an
+operator gets the same answer a runner does. Three states:
+
+| Status | Meaning | Action |
+|---|---|---|
+| `current` | under 30 days | none |
+| `due` | 30–45 days | cut a release, or record on the tracking issue why not |
+| `overdue` | over 45 days | **a defect to be triaged**, not a state to be tolerated |
+
+The CI step deliberately **warns and does not fail**. A red check here would
+fail whichever unrelated pull request happened to arrive after the interval
+lapsed, and that author is not the actor who can fix it. `--fail-when-overdue`
+gives the non-zero exit to an operator or a scheduled job that wants one;
+nothing in `ci.yml` passes it.
+
+### When the interval is missed
+
+1. **Name the blocker.** If the release cannot be cut, something is blocking
+   it, and it is an issue with a number. At the time of writing that is
+   [#456](https://github.com/ThreeMoonsLab/agents-shipgate/issues/456): no
+   signed qualification artifact exists, so the pipeline fails closed at
+   **Verify production qualification and exact wheel binding**.
+2. **Ship what can be shipped.** Publish an [unqualified
+   preview](#the-unqualified-preview-channel) so merged work is installable
+   while the blocker is worked. A preview is not a release and does not reset
+   this metric — deliberately.
+3. **Keep the note readable.** See below; this is the part that rots silently.
+
+### Release-note hygiene is continuous, not a release-day task
+
+`CHANGELOG.md`'s `## Unreleased` section **is** the next release body, and
+verification refuses a body over 125,000 characters. At 338,932 characters it
+was 2.7× that limit — a tag could not have been cut from it even with every
+other gate green.
+
+The shape that holds:
+
+- **`CHANGELOG.md` is the release note.** One line per change: the bold
+  headline sentence and its issue references. A section stays a section
+  somebody will read end to end.
+- **`docs/changelog/<version>.md` is the record.** The full reviewed prose for
+  every entry — design rationale, the trap each fix closed, the invariants —
+  moves there when the section is promoted. Nothing is deleted; the release
+  note links to it.
+- **Write the one-liner when the change lands**, not 165 entries later. The
+  headline sentence already exists in every entry; curation is only expensive
+  when it is deferred.
 
 ## Cutting the release
 
 1. Promote the `## Unreleased` heading in `CHANGELOG.md` to
-   `## <version> - <date>`. This is the release body; verification refuses a tag
-   with no matching section.
-2. Confirm `pyproject.toml` has the release version and a rehearsal is green.
-3. Push the tag: `git tag v0.16.0 && git push origin v0.16.0`.
-4. The `verify` job runs unattended.
-5. Approve the `pypi` environment gate on the `publish` job, using the readiness
+   `## <version> - <date>`, move the full prose to
+   `docs/changelog/<version>.md`, and leave a one-line-per-change section
+   behind. This is the release body; verification refuses a tag with no
+   matching section, and refuses one over 125,000 characters.
+   That record also states the application review count: run
+   [`benchmark/application-q2`](../benchmark/application-q2/README.md#every-release)
+   on both corpora with the release build, hand-score the rows that changed
+   since the previous ledger, commit the new ledger, and write
+   `Q2: n/49 development, m/≥30 holdout` with the change since the previous
+   release (#908). While the holdout has no pins, the line says so in place of
+   `m`. No success rate or market claim is made from either corpus.
+2. Stamp `<version>` on `STABILITY.md`'s title and on every
+   `## Migration Note: unreleased` heading.
+3. Confirm `pyproject.toml` has the release version,
+   `.github/release-channels.json` declares its channel, and that channel's
+   rehearsal is green: `release-rehearsal.yml` for a qualified release; for an
+   advisory one, Release Engine Smoke and then `release-advisory-rehearsal.yml`
+   on the same commit.
+4. Push the tag: `git tag v0.16.0 && git push origin v0.16.0`.
+5. The `verify` job runs unattended.
+6. Approve the `pypi` environment gate on the `publish` job, using the readiness
    summary as the evidence.
-6. Confirm the GitHub Release is published (not draft) with all assets and the
+7. Confirm the GitHub Release is published (not draft) with all assets and the
    changelog section as its body, then run the fan-out checks in
    [`distribution.md`](distribution.md).
+8. **Only now, move the published-release constants.**
+   `LATEST_PUBLISHED_VERSION` and `LATEST_PUBLISHED_CONTRACT_VERSION` in
+   [`src/agents_shipgate/published_release.py`](../src/agents_shipgate/published_release.py),
+   then `.well-known`'s `release_status.latest_release` and every other surface
+   that names the newest release — `tests/test_public_surface_contract.py`
+   fails once per file until each does, so the suite enumerates them for you.
+   That includes the `rev: v<version>` of every pre-commit example
+   (`.pre-commit-hooks.yaml`'s header, `docs/integrations.md`,
+   `examples/pre-commit/README.md`): `tests/test_distribution_surface_parity.py`
+   sweeps the whole repository for them, so a new one is enumerated the same way.
+   Two surfaces are measurements rather than pins, and are re-taken on the
+   published build installed from PyPI into a clean virtualenv outside any
+   checkout. The first is the README and quickstart `diff` answers: run that
+   build's `diff` on the fixtures `tests/test_host_diff_entry_docs.py` builds,
+   and record each normalized answer's digest in its `_PUBLISHED_ANSWERS` and
+   the release in `_PUBLISHED_ANSWERS_VERSION`, which the test holds to the
+   newest release. A page that calls its quotes published output may quote
+   only recorded answers. A page that calls them not yet released must name
+   the newest release it compares them with and quote at least one answer
+   that release does not print. The record, not the version string, is what
+   tells the two builds apart: until its next version bump this tree prints
+   the published version on its reference lines. The second is the pilot
+   ledger's route readiness dry run, which `tests/test_design_partner_pilot.py`
+   holds to the newest release on its `Published build measured` line.
+   The bundled prompts and CI recipes are re-rendered by the package's own
+   renderer, never hand-edited: their hashes move in
+   `tests/test_agent_instructions_renderers.py`, and the renders the new tag
+   carries are appended to `prior_render_sha256` in both
+   `adoption-kits/*/.agents-shipgate-kit-metadata.json` files, so an
+   unmodified install still upgrades. No test enumerates prose that calls the
+   new release or its contract unreleased — `unreleased`, `not yet released`,
+   `until <version> is published`, in docs and in `src/` comments that justify
+   extending a contract in place — so search for it; at `1.2.0` it was in
+   `docs/agent-contract-current.md`, `docs/application-comparison.md`, the
+   README and `schemas/contract.py`.
+
+   The two constants govern ordinary/source/preview adoption: the `uses:`
+   pin in the workflow it generates, the runner pins in the bundled adoption
+   prompts, the `shipgate_version` the bundled CI recipe installs. Moving them
+   *before* the tag exists is the failure they guard against (#506) — a
+   generated workflow that names a ref GitHub cannot resolve fails the
+   adopter's job before any step runs. A stamped candidate wheel generates its
+   own immutable source SHA independently; updating main later cannot and need
+   not repair that frozen wheel. Bundled prompt pins retain their explicit
+   published-contract-floor diagnostics until this post-publication update.
+
+   `LATEST_PUBLISHED_CONTRACT_VERSION` is the `CONTRACT_VERSION` the new tag
+   emits, not the tree's. When it lands below
+   `MINIMUM_CONTROL_CONTRACT_VERSION`, the adoption prompts say so in the same
+   breath as the pin rather than quietly promising a floor the pinned build
+   does not report.
+
+## The advisory release channel
+
+**Policy: `release-evidence-policy-decision.md`
+[§ Amendment 5](release-evidence-policy-decision.md#amendment-5--the-advisory-line-may-publish-a-v-release),
+decided 2026-09-13 (#648).** An advisory release is an ordinary `v*` tag and
+PyPI version that makes no qualified blocking claim. It shares every
+publication job with the qualified line; it differs in what verification
+proves and in what the release carries.
+
+| | Qualified release | Advisory release |
+|---|---|---|
+| Declared in `.github/release-channels.json` as | `qualified` | `advisory` |
+| Verification workflow | `release-verify.yml` | `release-advisory-verify.yml` |
+| Mandatory rehearsal | `release-rehearsal.yml` | `release-advisory-rehearsal.yml` |
+| Wheel published | the signed, qualified wheel | the wheel Release Engine Smoke exercised |
+| Bound to the tagged source by | `verify_wheel_provenance.py --qualified` | `verify_wheel_provenance.py --exercised` |
+| Assets besides the wheel and manifest | SBOM, provenance, `safety-qualification.json` and its bundle | SBOM, provenance, `advisory-statement.json` |
+| Signed by the release | wheel, SBOM | wheel, SBOM, advisory statement |
+
+To cut one:
+
+1. Land a reviewed change declaring the version `advisory`. Once a tag for a
+   version exists, its entry cannot change. The same change writes the
+   release record `docs/changelog/<version>.md`, which states the
+   application review count exactly as step 1 of
+   [§ Cutting the release](#cutting-the-release) describes (#908).
+2. Dispatch **Release Engine Smoke (unqualified)** on the release commit. Its
+   wheel is the one that will be published.
+3. Dispatch **Advisory Release Rehearsal** on the same commit.
+4. Tag, and continue from step 4 of [§ Cutting the release](#cutting-the-release).
+
+The advisory statement cites the newest successful Release Engine Smoke run for
+the commit. Re-running the smoke after the rehearsal therefore changes the
+tagged manifest, and `stage` refuses because it no longer matches the rehearsed
+one. Rehearse again.
+
+## The unqualified preview channel
+
+**Admissibility finding: `release-evidence-policy-decision.md`
+[§ Amendment 2](release-evidence-policy-decision.md#amendment-2--the-unqualified-preview-channel),
+approved 2026-09-02.** Read it before touching this: it records the five
+conditions the channel is admissible under, and the cases that would have made
+it inadmissible.
+
+A preview exists so merged work is installable while a release is blocked. It
+is **not a release**, and every property below is load-bearing rather than
+descriptive:
+
+| | |
+|---|---|
+| Workflow | `release-preview.yml`, `workflow_dispatch` only, with a mandatory `reason` |
+| Precondition | a successful `ci.yml` run for the exact `github.sha` |
+| Version | `<pyproject version>+preview.<date>.g<short sha>` — a PEP 440 **local** segment, which public indexes must refuse |
+| Ref | `preview-<version>`, outside the `v*` trigger namespace |
+| Assets | the wheel, and nothing else |
+| Marked | `--prerelease`, so it is never `Latest` |
+| Authority | `contents: write` in the job that runs no candidate code; `contents: read` in the job that builds. No `id-token` anywhere |
+
+To cut one, dispatch **Release Preview (unqualified)** against the commit and
+give the reason. It appears under the newest qualified release, labelled as not
+one.
+
+**It does not reset the cadence metric, and that is deliberate** —
+`release_cadence.py` counts `v*` release tags only. A channel that suppressed
+the signal which justified its existence would be worse than not having one.
+
+Three things a preview can never become:
+
+- **Release evidence.** `stage` locates the mandatory rehearsal by workflow
+  file (`release-rehearsal.yml`), so a preview run is invisible to it.
+- **A PyPI upload.** The local version segment is refused by the index at the
+  API, and no job in the file holds `id-token: write`.
+- **A qualified artifact.** It ships no `safety-qualification.json`, and
+  `verify_safety_qualification_release.py` rejects it on both the missing
+  artifact and `tag == v<version>`. The negative controls are in
+  `tests/test_release_pipeline.py` § #491.
 
 ## Recovery
 
@@ -404,12 +743,16 @@ identity. Asset *names* are not evidence: draft repair clobbers expected names
 but leaves unlisted ones behind, and an asset can be replaced during the
 approval window.
 
-If re-running is not possible, finalise by hand — the draft already has the
-authoritative assets:
+**Do not undraft by hand.** `gh release edit --draft=false` performs none of the
+checks above, and a draft that was checked once can change before the command
+runs. Re-running `finalize` is the only supported way to finish: it downloads
+the assets again, verifies them, the signatures, the notes and the tag against
+the verified candidate, and only then undrafts.
 
-```bash
-gh release edit v0.16.0 --draft=false --latest
-```
+If the run can no longer be re-run (GitHub keeps a run re-runnable for 30 days),
+or its candidate manifest is unavailable, stop. Leave the release a draft: PyPI
+already serves the version, so it stays installable. Then cut the next patch
+version through the full pipeline. Do not finish this one without verification.
 
 ### Publication failed
 
@@ -429,9 +772,16 @@ mistaken for the shipped ones.
 
 ### Verification failed
 
-Nothing outside the run changed: no tag deletion, no cleanup needed. Fix the
-cause on the branch, and either move the tag (only safe while nothing has been
-published for it) or cut a new version.
+Verification does not publish a release or upload a distribution. Inspect any
+earlier attempt before assuming that nothing was published. A transient failure
+with an unchanged candidate can be retried against the same tag and commit.
+
+If fixing the cause changes the source, fix it on the branch, cut a new version
+and use a new tag. Rebuild and refresh the qualification, signing and rehearsal
+evidence affected by the new candidate identity before tagging. Do not move or
+delete the failed tag, or weaken the tag ruleset to reuse it: the `v*` protection
+applies before publication as well as afterward. The failed run remains linked
+to the source it actually verified.
 
 ## Deployment prerequisites
 
@@ -447,6 +797,91 @@ the fact rather than prevention.
 | **Restricted release-write authority** (few actors, protected environment) | Concurrent mutation during finalisation | Remote verification and undrafting are two API calls. Another writer can replace an asset or add one in between, and the undraft publishes the changed server-side set |
 | Protected `.github/workflows/**` and `.github/release-trust-roots.json` (CODEOWNERS or ruleset) | Changes to the pipeline and its trust roots landing unreviewed | Workflow logic is candidate-controlled at the tag, so review is the control that makes it trustworthy |
 | `pypi` environment reviewers, independent of the release initiator | Unattended publication | Approval becomes a formality |
+
+### Effective configuration observed — 2026-09-09
+
+[#573](https://github.com/ThreeMoonsLab/agents-shipgate/issues/573) owns the
+effective platform controls. This dated, authenticated API observation is not
+an assertion that settings cannot change; read them back before release.
+
+| Surface | Observed setting | Remaining release obligation |
+| --- | --- | --- |
+| Repository immutable releases | Enabled under the repository owner's authorization; `GET /repos/ThreeMoonsLab/agents-shipgate/immutable-releases` returned `enabled: true`, `enforced_by_owner: false` after the enable request | Repository-level enablement is not organization-enforced policy, a retroactive lock on old releases or an exercised publication transaction. Verify draft/stage/finalize compatibility on the actual candidate. |
+| Release tags | Active repository ruleset [Protect release tags (22726019)](https://github.com/ThreeMoonsLab/agents-shipgate/rules/22726019): target `tag`, include `refs/tags/v*`, no exclusions, rules `update` and `deletion`, no bypass actors; authenticated read-back returned `current_user_can_bypass: "never"` | This establishes the configured pre-publication update/deletion boundary. It has no creation rule and does not establish restricted tag creators or release writers. Remote refusal testing, actual recovery ownership and final-candidate compatibility remain open. |
+| Main workflow/trust-root changes | The main ruleset requires a PR, but zero approving reviews, no code-owner review, no stale-review dismissal, no last-push approval and no required-status-check rule; its bypass-actor list is empty | These settings do not establish independent review of workflow or trust-root changes. Verify the effective policy, including any inherited rules, rather than inferring it from a PR existing. |
+| Publication environment | `pypi` has one required reviewer, `prevent_self_review: false` and `can_admins_bypass: true` | Confirm actually independent eligible reviewers and the named, reviewed recovery/bypass arrangement before changing this boundary or claiming it satisfied. |
+
+The repository immutable-release setting and release-tag ruleset were changed
+under the repository owner's authorization for this checkpoint.
+The [GitHub API](https://docs.github.com/en/rest/repos/repos#enable-immutable-releases)
+enable request completed, followed by the read-back above. GitHub documents
+that [immutability applies to future releases](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/establish-provenance-and-integrity/prevent-release-changes).
+Existing releases were not re-published, and no production tag/asset mutation
+or dummy publication was used as a test. The current pipeline's draft-first,
+validate-then-finalize order is consistent with that model; this source review
+does not replace an exercised candidate publication/recovery path.
+
+The tag ruleset was created and read back through the
+[repository ruleset API](https://docs.github.com/en/rest/repos/rules#create-a-repository-ruleset).
+The listing with `includes_parents=true` returned only `Protect main` (15704163)
+and `Protect release tags` (22726019), both active repository rulesets. The 13
+existing `v*` ref names, object types and object SHAs were identical before and
+after creation. No existing release tag was moved/deleted as a refusal probe.
+New version tags remain creatable under existing repository access; `preview-*`
+refs are outside this rule. Policy editors can still change the ruleset, so an
+empty bypass list is not proof that administration is immutable or independently
+reviewed. Re-read both the ruleset and its inherited-policy listing before
+release; a configured rule is not an exercised remote refusal or publication.
+
+#573 remains open for the missing protections and effective-policy/refusal
+evidence. #494 retains accepted operating/recovery duties and #509 retains the
+independent qualification signer. No reviewer, signer, writer, emergency actor
+or personal access claim is supplied by enabling these protections.
+
+### Main CI merge requirements — 2026-09-10 UTC
+
+The later #573 checkpoint adds required CI to the existing
+[Protect main ruleset (15704163)](https://github.com/ThreeMoonsLab/agents-shipgate/rules/15704163).
+The authenticated update and read-back retained its `refs/heads/main` scope,
+empty bypass list and all four existing rules, including every PR-review
+parameter. The only addition was `required_status_checks`:
+
+| Existing workflow | Required check contexts |
+| --- | --- |
+| CI | `test`, `suite (1)`, `suite (2)`, `suite (3)`, `coverage`, `windows-launcher`, `clean-checkout-launcher` |
+| Agents Shipgate | `verify` |
+| Agents Shipgate Self Dogfood | `verify-self` |
+
+All nine entries use `integration_id: 15368`, the `github-actions` App observed
+on the successful PR #624 check runs at
+`1c949f63724d9b5da53352f9cc028dcd4c5bafd8`. The three workflows run on PRs
+without path filters. `release-tag-consistency` is main-only and is not a PR
+requirement. Each shard is required separately, so a failed shard cannot hide
+behind a skipped dependent coverage job.
+
+`strict_required_status_checks_policy: true` requires testing against the
+current base; after main advances, refresh the PR branch and its checks.
+`do_not_enforce_on_create: false` adds no creation exception; the rule matches
+main, not contributor branches. The [effective branch-rule API](https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch)
+returned the same nine entries and flags for main under ruleset `15704163`.
+The inherited-policy listing still contained only Protect main and Protect
+release tags; tag protection and immutable-release enablement remained in place.
+
+This closes the missing required-check configuration recorded in the earlier
+checkpoint, **not independent workflow review**. App binding identifies the
+check producer, not a workflow path, event or trusted workflow contents.
+[GitHub accepts successful, skipped or neutral check conclusions](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging);
+a required name alone does not prove its test ran. Both Shipgate jobs retain
+their advisory human-review routing. Main still requires zero approving reviews,
+and publication reviewer independence remains unresolved. A policy editor can
+still change these settings. No failed merge, tag mutation or publication was
+attempted as a refusal test.
+
+Re-read the effective main rules and expected App/context names before release.
+A job rename needs a reviewed ruleset transition while the existing required
+contexts still report; otherwise the renamed job can leave PRs waiting forever.
+These settings do not supply a signer, recovery owner, qualified candidate or
+the remaining #573 release evidence.
 
 ### The limit worth stating plainly
 
@@ -482,8 +917,9 @@ vouches for it, in a single step with no diff to review. Source-to-wheel
 binding does not compensate: that attack reuses the legitimate wheel and forges
 only the safety claims about it.
 
-Both ship as `CHANGE_ME` until the promotion flow exists. The release **fails
-closed** while either is unset rather than defaulting to something permissive.
+The signer identity remains `CHANGE_ME`; the OIDC issuer is already
+`https://token.actions.githubusercontent.com`. The release **fails closed**
+while either value is unset rather than defaulting to something permissive.
 Changing either is a trust-root change and is reviewed as one.
 
 ### Artifact locations — repository variables
@@ -503,3 +939,59 @@ committed trust root or the source-to-wheel provenance gate.
 
 None of the four are currently set. Until they are, the release stops at
 **Require configured qualification artifact locations**.
+
+## Operational ownership and access recovery
+
+[#494](https://github.com/ThreeMoonsLab/agents-shipgate/issues/494) owns actual
+responsibility acceptance and a non-publishing tabletop. The inventory below
+names operative interfaces, not secret values or a claim that access works.
+Confirmed custodians and recovery evidence are still outstanding as recorded
+in [MAINTAINERS.md](../MAINTAINERS.md#responsibilities).
+
+| Interface | What the responsible person must confirm | Recovery boundary |
+| --- | --- | --- |
+| GitHub repository/organization access, `v*` tag rules and release-write actors | Actual administrator/release custodians, permitted writers, inherited rules and emergency-bypass responsibility | Recover through the provider's established account/organization process. No backup identity or bypass permission is granted by this document; #573 must verify effective controls after recovery. |
+| Protected GitHub `pypi` environment | Actual configuration custodian, eligible independent reviewers and absence coverage | An unavailable required reviewer holds publication. Self-review or an agent-created review cannot substitute for independent approval. |
+| PyPI Trusted Publisher mapping for `agents-shipgate` | The actual PyPI project custodian and mapping to this repository/workflow/environment | Verify provider-side ownership and restore/revoke the mapping through that custodian. This workflow uses OIDC; do not invent a long-lived PyPI upload token as a fallback. |
+| Ephemeral `GITHUB_TOKEN` / `${{ github.token }}` and the publication job's OIDC permission | Who can authorize workflow/settings changes and stop affected runs | Tokens are issued for jobs, not an undocumented shared recovery credential. Contain a compromised run/mapping with the authorized platform custodian, then re-establish reviewed access and evidence before rerunning. |
+| `.github/release-trust-roots.json`: `signer_identity`, `oidc_issuer` | The independent promotion owner, exact certificate identity and reviewed issuer; `signer_identity` is still unresolved | A missing/compromised signer holds publication. Recover the independent signing path and review any trust-root change; do not replace it with the release initiator or a mutable variable. No persistent Sigstore private-key custodian is assumed. |
+| `SAFETY_QUALIFICATION_WHEEL_URL`, `SAFETY_QUALIFICATION_WHEEL_FILENAME`, `SAFETY_QUALIFICATION_JSON_URL`, `SAFETY_QUALIFICATION_SIGSTORE_BUNDLE_URL` | Actual content-location custodian and the exact signed handoff from #509 | These are locations only. Relocation still needs signature, policy and exact-wheel validation. A new location does not authenticate replacement evidence. |
+| `security@threemoonslab.com` and account/contact recovery | Actual mailbox custodian, accepted acknowledgment capacity and available absence route | No alternate contact is confirmed. Keep reports private and hold any release decision that depends on unavailable security review. Record failed contact/access attempts honestly. |
+
+Record custodian acceptance and recovery references through the existing #494
+review. Keep private recovery links, codes, credential values and personal
+contact details outside GitHub issues and committed artifacts. The public record
+should establish which role can act and which evidence was checked; it need
+not expose account-recovery material. The existing [deployment prerequisites](#deployment-prerequisites)
+remain #573's effective-settings obligation, while #509 supplies the independently
+authenticated qualification identity and bytes.
+
+### Non-publishing tabletop
+
+The responsible people walk these cases with the existing runbook and read-only
+platform/evidence inspection. Do not mutate production tags, releases, uploads,
+trust roots or account permissions to prove that a stop works.
+
+| Case | Expected decision and evidence to inspect |
+| --- | --- |
+| Required reviewer or independent signer unavailable | Hold publication; identify the actually accepted alternate, if any, and prove its eligibility/independence. If none exists, record an unresolved dependency. |
+| Repository, PyPI or mailbox access lost | Identify the actual custodian and established provider recovery path. Record whether that person can initiate recovery without publishing codes or claiming an unexercised recovery succeeded. Recheck #573 controls before release resumes. |
+| Qualification signer or evidence integrity in doubt | Hold publication, contain the affected access through its real custodian, restore independently reviewed trust and obtain fresh trustworthy evidence for the affected inputs. Re-signing alone cannot rehabilitate untrusted measurements. |
+| PyPI upload completed; GitHub finalization did not | Use [the existing identical-publication recovery](#publication-succeeded-finalisation-failed). Inspect the exact index, candidate, signatures, asset set, notes and live tag before any finalization; unavailable validation holds publication. |
+| Candidate, workflow, policy or wheel changed | Invalidate the affected freeze, receipts, signatures and matching rehearsal. Repeat the owning steps against the new exact candidate; never restamp old evidence into current authority. |
+| Security contact unavailable | Record the unresolved intake/absence duty and private follow-up path under SECURITY.md. A missing reply cannot be recorded as acknowledgment or completed security review. |
+
+The legacy bare manual-undraft fallback in the recovery section is separately
+tracked in [#618](https://github.com/ThreeMoonsLab/agents-shipgate/issues/618).
+It is not validated 1.x recovery evidence. This tabletop requires the complete
+current validation and independent authority; when either is unavailable, stop.
+Repairing and exercising that fallback remains separate work.
+
+For each case, retain in #494 or a linked non-secret record the date, source and
+workflow revision, actual participants and accepted roles, scenario, inspected
+evidence, expected stop/resume condition, observed result and unresolved owner.
+Distinguish a document walkthrough from a successfully exercised recovery.
+No tabletop, access recovery, owner acceptance or effective protection is claimed
+by this procedure. Before closing #494, the owner must supply those results and
+accept the 1.x support/response commitment; #572 links that evidence alongside
+#509's signing and #573's platform controls.

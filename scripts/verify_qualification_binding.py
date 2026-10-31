@@ -12,7 +12,7 @@ This module exists so the sealing job can restate the claims that actually
 delegate publication authority, using nothing but the standard library:
 
 * the artifact is **qualified** under a policy the tag's version admits --
-  the 100-case ``beta`` policy, or, for a ``0.x`` tag only, the 56-case
+  the 80-case ``beta`` policy, or, for a ``0.x`` tag only, the 38-case
   ``pre_1_0`` policy approved in
   ``docs/release-evidence-policy-decision.md`` (issue #341);
 * it claims ``production_qualified`` exactly when it claims the ``beta`` tier;
@@ -109,7 +109,7 @@ def _requirements_errors(declared: Any, policy: Any) -> list[str]:
 
     The sealer re-derives the strata and floors from the cases, but the report
     schema version has no representation in the cases at all -- so without this
-    an artifact could restate the approved ``0.42`` as ``0.1`` and still seal.
+    an artifact could restate the approved ``0.43`` as ``0.1`` and still seal.
     """
 
     if not isinstance(declared, dict):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections import Counter, defaultdict
 from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import dataclass
@@ -10,7 +11,11 @@ from agents_shipgate.ci.exit_policy import (
     effective_fail_on,
     exit_code_for_report,
 )
-from agents_shipgate.core.agent_bindings import TOOL_SOURCE_BINDING_DECLARATION
+from agents_shipgate.core.agent_bindings import (
+    FRAMEWORK_CONSTRUCTOR_OWNERSHIP,
+    TOOL_SOURCE_BINDING_DECLARATION,
+)
+from agents_shipgate.core.binding_comparison import comparison_withholds_absence
 from agents_shipgate.core.control_packs import is_mandatory_current_control
 from agents_shipgate.core.declaration_questions import (
     ANSWERABLE_ISSUE_KINDS,
@@ -46,6 +51,7 @@ from agents_shipgate.core.semantic_assessment import (
     declared_effect_of,
     effect_readings,
     effect_repair,
+    extraction_is_complete,
     propose_effect_declaration,
     render_effect_readings,
     reviewed_risk_tag_constraints,
@@ -63,6 +69,7 @@ from agents_shipgate.schemas.bindings import (
     AgentBindingNode,
 )
 from agents_shipgate.schemas.common import Severity
+from agents_shipgate.schemas.coverage_recovery import CoverageRecovery, SourceRecoveryEvidence
 from agents_shipgate.schemas.report import (
     AGENT_AUTHORABLE_GAP_ACTION_KINDS,
     HUMAN_ONLY_GAP_KINDS,
@@ -90,6 +97,7 @@ from agents_shipgate.schemas.report import (
 from agents_shipgate.schemas.report import (
     REVIEW_REQUIRED_SENTINEL as _REVIEW_REQUIRED_SENTINEL,
 )
+from agents_shipgate.schemas.report_compatibility import report_schema_refusal_code
 
 # Thresholds for the `insufficient_evidence` decision state. Private
 # module-level constants so they're tunable in code without expanding
@@ -169,8 +177,20 @@ def build_release_decision(
     fail_on: list[Severity] | None,
     new_findings_only: bool,
     tool_catalog: Sequence[Tool] | None = None,
+    source_recovery_evidence: Sequence[SourceRecoveryEvidence] | None = None,
+    exit_fail_on_floor: Sequence[Severity] | None = None,
 ) -> ReleaseDecision:
     """Compute the release decision.
+
+    ``exit_fail_on_floor`` is a set of severities that fail CI in addition to
+    ``fail_on``, and nothing else (#1024). ``verify`` passes the base
+    manifest's declared ``ci.fail_on`` so the change under review cannot lower
+    its own exit code by loosening the list. It reaches the exit code (and so
+    ``fail_policy.exit_code`` / ``would_fail_ci``) only: the blocker
+    severities, the decision and ``fail_policy.fail_on`` keep the run's own
+    list, so a loosened list stays a human-review route, reported by
+    ``SHIP-VERIFY-POLICY-WEAKENED``, rather than a blocker under the list it
+    loosens.
 
     ``tools`` is the root-reachable surface — the population every count and
     every gate reads. ``tool_catalog`` is everything extraction found, reachable
@@ -186,10 +206,13 @@ def build_release_decision(
     # blockers/review_items consider the full findings set, NOT
     # new_findings_only: baseline-matched criticals must remain visible
     # as accepted debt in review_items. The new_findings_only filter
-    # only affects fail_policy.exit_code (via exit_code_for_report).
+    # only affects fail_policy.exit_code (via exit_code_for_report, which
+    # also reads these blockers, so a blocker no suppression can waive
+    # still fails a matching fail_on — #1029).
     # v0.17: iterate report.findings directly so the contribution_rules
     # audit row set is exhaustive (suppressed findings get an audit row
-    # too, classified as excluded/suppressed).
+    # too, classified as excluded/suppressed, or as a blocker when the
+    # suppression cannot waive a mandatory current-surface control).
     blockers: list[ReleaseDecisionItem] = []
     review_items: list[ReleaseDecisionItem] = []
     contribution_rules: list[ContributionRule] = []
@@ -321,8 +344,18 @@ def build_release_decision(
             )
         )
 
-    low_confidence_tool_count = sum(1 for tool in tools if tool.extraction_confidence != "high")
-    semantic_coverage, semantic_gaps = _semantic_coverage(tools)
+    low_confidence_tool_count = sum(
+        1 for tool in tools if not extraction_is_complete(tool)
+    )
+    declaration_paths = {
+        row.subject_id: row.manifest_path
+        for row in report.action_declaration_facts.rows
+        if row.resolution == "resolved" and row.subject_id is not None
+    }
+    semantic_coverage, semantic_gaps = _semantic_coverage(
+        tools,
+        declaration_paths=declaration_paths,
+    )
     identity_coverage = _identity_coverage(tools)
     binding_coverage, binding_gaps = _binding_coverage(report, catalog)
     evidence = EvidenceCoverageDecision(
@@ -336,7 +369,7 @@ def build_release_decision(
             *binding_gaps,
             *semantic_gaps,
             *report.policy_evidence_gaps,
-            *_evidence_gaps(report, tools),
+            *_evidence_gaps(report, tools, source_recovery_evidence=source_recovery_evidence),
         ],
         semantic_coverage=semantic_coverage,
         identity_coverage=identity_coverage,
@@ -410,10 +443,21 @@ def build_release_decision(
     # The canonical decision is computed before FailPolicy. Semantic gaps
     # remain strict-CI failures even when a higher-precedence named concern
     # labels the decision review_required instead of insufficient_evidence.
+    exit_fail_on: list[Severity] | None = fail_on
+    if exit_fail_on_floor:
+        exit_fail_on = [
+            *fail_on_resolved,
+            *(
+                severity
+                for severity in exit_fail_on_floor
+                if severity not in fail_on_resolved
+            ),
+        ]
     exit_code = exit_code_for_report(
         report,
         ci_mode,
-        fail_on=fail_on,
+        blockers=blockers,
+        fail_on=exit_fail_on,
         new_findings_only=new_findings_only,
         release_decision=decision,
         has_semantic_gaps=has_semantic_gaps or has_binding_gaps or has_policy_gaps,
@@ -483,15 +527,15 @@ REVIEW_REQUIRED_SENTINEL = _REVIEW_REQUIRED_SENTINEL
 def _inventory_remediation(
     manifest_key: str, source_id: str | None, *, rerun: str
 ) -> str:
-    """The prescribed repair for a source static extraction cannot enumerate.
+    """The inventory repair for an incomplete or unattested static extraction.
 
-    Two gap kinds prescribe the same repair (``incomplete_surface`` and
-    ``low_confidence_tool``), so the words live here once. ``source_id`` is not
-    decoration: an inventory referenced without it is an *independent* source
-    whose entries merely share names with the extracted ones, which grows the
-    catalog, leaves this gap open, and makes the action selectors that used to
-    resolve ambiguous (#386). Naming the source is what turns the file into a
-    completion of the surface that raised the gap.
+    Surface-enumeration, surface-attestation, and low-confidence rows can all
+    prescribe the same inventory binding, so the words live here once.
+    ``source_id`` is not decoration: an inventory referenced without it is an
+    *independent* source whose entries merely share names with the extracted
+    ones, which grows the catalog, leaves this gap open, and makes the action
+    selectors that used to resolve ambiguous (#386). Naming the source is what
+    turns the file into evidence about the surface that raised the gap.
     """
 
     binding = (
@@ -653,6 +697,9 @@ def _binding_declaration_template(
                 for source_id in source_ids
             ]
         }
+    if issue.source == FRAMEWORK_CONSTRUCTOR_OWNERSHIP:
+        # A declaration cannot establish the constructor or its dependencies.
+        return None
     if issue.source == TOOL_SOURCE_BINDING_DECLARATION:
         # A reviewed source binding that reached no tool. It is raised against
         # the surface node, which is the graph's root whenever it is the only
@@ -882,6 +929,16 @@ def _binding_coverage(
                 "tools, or remove the binding declaration, then rerun "
                 "verification."
             )
+        elif issue.source == FRAMEWORK_CONSTRUCTOR_OWNERSHIP:
+            action_kind = "provide_source"
+            path = issue.source_pointer
+            accepted_values = []
+            expects = (
+                "Provide readable supported source for the constructor's "
+                "unread ownership route, or remove that route, then rerun "
+                "verification. A tool inventory or binding declaration "
+                "cannot establish constructor ownership."
+            )
         elif issue.kind in {"missing_binding_evidence", "unresolved_bound_tool"}:
             action_kind = "declare_agent_bindings"
             path = "shipgate.yaml#agent_bindings.declarations"
@@ -891,7 +948,10 @@ def _binding_coverage(
             action_kind = "provide_complete_binding_graph"
             path = "shipgate.yaml#agent_bindings"
             accepted_values = ["literal_tools", "literal_handoffs", "complete:true"]
-            expects = "Provide static wiring or an exact reviewed declaration for every reachable edge."
+            expects = (
+                "Wire each tool to the agent that calls it in code, or declare "
+                "that link exactly."
+            )
         elif issue.kind == "conflicting_binding_evidence":
             action_kind = "resolve_binding_conflict"
             path = "shipgate.yaml#agent_bindings.declarations"
@@ -934,7 +994,12 @@ def _binding_coverage(
                     kind=action_kind,  # type: ignore[arg-type]
                     command=_SEMANTIC_RERUN_COMMAND,
                     path=path,
-                    why="A complete root-reachable static binding graph is required for passed.",
+                    why=(
+                        "The constructor and its ownership route must be established before this can pass."
+                        if issue.source == FRAMEWORK_CONSTRUCTOR_OWNERSHIP else
+                        "Every tool has to be traceable to an agent that can "
+                        "call it before this can pass."
+                    ),
                     expects=_with_scaffold_pointer(expects, template),
                     accepted_values=accepted_values,
                     declaration_template=template,
@@ -1111,6 +1176,18 @@ def _newly_excluded_tool_gaps(report: ReadinessReport) -> list[EvidenceGap]:
 
     diff = report.binding_surface_diff
     graph = report.binding_surface_facts
+    # Existing persisted coverage fields keep this route in the frozen 1.0
+    # report. A requested comparison with neither graph nor tool comparison
+    # established stays incomplete even when no tool id could be named.
+    # The tool comparison alone can be enabled and still withhold what depends
+    # on absence while a binding graph is incomplete; its notes say so, and so
+    # do the binding diff's. Either keeps the requested comparison unproven.
+    if diff.base_comparison_requested and not diff.enabled and (
+        not report.tool_surface_diff.enabled
+        or comparison_withholds_absence(report.tool_surface_diff.notes)
+        or comparison_withholds_absence(diff.notes)
+    ):
+        return [_incomplete_binding_comparison_gap(report)]
     if not diff.enabled:
         # A comparison was asked for and could not be performed, so "this tool
         # was already excluded before the change" is a claim about evidence
@@ -1174,6 +1251,29 @@ def _newly_excluded_tool_gaps(report: ReadinessReport) -> list[EvidenceGap]:
     return gaps
 
 
+def _incomplete_binding_comparison_gap(report: ReadinessReport) -> EvidenceGap:
+    return EvidenceGap(
+        kind="missing_binding_evidence",
+        subject=unavailable_base_subject(report),
+        source_ref="--diff-from",
+        why=(
+            "The requested capability comparison has incomplete binding evidence "
+            "on the head or base. It cannot establish removals, narrowings or "
+            "whether an excluded capability predates this change."
+        ),
+        next_action=EvidenceGapAction(
+            kind="provide_source",
+            path="--diff-from",
+            why="Both compared binding surfaces need readable evidence.",
+            expects=(
+                "Resolve the named head/base binding coverage gaps; regenerate "
+                "the base report in its source workspace and rerun the head "
+                "comparison with --diff-from. Keep the requested comparison."
+            ),
+        ),
+    )
+
+
 def _unavailable_base_gap(report: ReadinessReport) -> EvidenceGap:
     excluded = len(report.binding_surface_facts.unbound_tool_ids) + len(
         report.binding_surface_facts.possible_tool_ids
@@ -1218,6 +1318,8 @@ def _unavailable_base_gap(report: ReadinessReport) -> EvidenceGap:
 
 def _semantic_coverage(
     tools: list[Tool],
+    *,
+    declaration_paths: dict[str, str] | None = None,
 ) -> tuple[SemanticCoverageDecision, list[EvidenceGap]]:
     """Project normalized tool assessments into zero-tolerance gate evidence."""
 
@@ -1302,7 +1404,11 @@ def _semantic_coverage(
         # A review concern is exactly that tier: it cannot reach ``passed`` and
         # it cannot block, so the reviewer sees the exception and decides. The
         # count says how many; the row says what a reviewer has to judge.
-        for row in _acknowledged_overrides(tool, assessment):
+        for row in _acknowledged_overrides(
+            tool,
+            assessment,
+            manifest_path=(declaration_paths or {}).get(tool.id),
+        ):
             acknowledged_overrides.append(row)
             review_concern_count += 1
             _increment(reason_counts, "acknowledged_effect_override")
@@ -1495,6 +1601,8 @@ def _in_question_order(
 def _acknowledged_overrides(
     tool: Tool,
     assessment: ToolSemanticAssessment,
+    *,
+    manifest_path: str | None = None,
 ) -> list[AcknowledgedEffectOverride]:
     """Project each reviewed exception into the row a reviewer has to judge.
 
@@ -1529,7 +1637,12 @@ def _acknowledged_overrides(
                     evidence=str(evidence.get("evidence") or ""),
                     reason=str(evidence.get("reason") or ""),
                     manifest_path=(
-                        f"shipgate.yaml#action_surface.actions[tool={tool.name!r}].override"
+                        f"{manifest_path}.override"
+                        if manifest_path
+                        else (
+                            "shipgate.yaml#action_surface.actions"
+                            f"[tool={tool.name!r}].override"
+                        )
                     ),
                 )
             )
@@ -1696,6 +1809,16 @@ def _semantic_gap(
         ]
         action_why = "Free-form source labels are not evidence of policy eligibility."
         expects = "Use a typed first-party evidence producer and rerun verification."
+    elif kind == "partial_binding_evidence" and issue_source == FRAMEWORK_CONSTRUCTOR_OWNERSHIP:
+        action_kind = "provide_source"
+        accepted_values = []
+        action_why = "The constructor and its ownership route must be established before this can pass."
+        expects = (
+            "Provide readable supported source for the constructor's unread "
+            "ownership route, or remove that route, then rerun verification. "
+            "A tool inventory or binding declaration cannot establish "
+            "constructor ownership."
+        )
     elif kind in {
         "missing_binding_evidence",
         "partial_binding_evidence",
@@ -1717,16 +1840,23 @@ def _semantic_gap(
         accepted_values = ["match_structural_graph", "correct_source_wiring"]
         action_why = "Conflicting binding evidence cannot be auto-resolved."
         expects = "Reconcile positive structural evidence and reviewed declarations, then rerun verification."
-    elif kind == "incomplete_surface":
+    elif kind in {"incomplete_surface", "unattested_surface"}:
         manifest_key = inventory_manifest_key(tool.source_type)
         if manifest_key is not None:
             action_kind = "declare_tool_inventory"
             accepted_values = ["reviewed_explicit_inventory"]
-            action_why = (
-                f"{tool.source_type} extraction is static-only; an explicit "
-                "local tool inventory bound to this source is the supported "
-                "way to make the full surface enumerable."
-            )
+            if kind == "unattested_surface":
+                action_why = (
+                    f"{tool.source_type} extraction produced a static surface; "
+                    "an explicit local tool inventory bound to this source is "
+                    "the reviewed attestation the release evidence lacks."
+                )
+            else:
+                action_why = (
+                    f"{tool.source_type} extraction is static-only; an explicit "
+                    "local tool inventory bound to this source is the supported "
+                    "way to make the full surface enumerable."
+                )
             expects = _inventory_remediation(
                 manifest_key, tool.source_id, rerun="rerun verification."
             )
@@ -1741,10 +1871,14 @@ def _semantic_gap(
                 "openapi_spec",
                 "reviewed_explicit_inventory",
             ]
-            action_why = "The complete statically-bound tool surface must be enumerable."
+            action_why = (
+                "The statically-bound tool surface needs reviewed attestation."
+                if kind == "unattested_surface"
+                else "The complete statically-bound tool surface must be enumerable."
+            )
             expects = (
-                "Provide a complete MCP export, OpenAPI spec, or reviewed explicit "
-                "tool inventory, then rerun verification."
+                "Bind a complete MCP export, OpenAPI spec, or reviewed explicit "
+                "tool inventory to this source, then rerun verification."
             )
     elif kind in {
         "missing_effect_evidence",
@@ -2171,7 +2305,8 @@ def _semantic_gap(
         next_action=EvidenceGapAction(
             kind=action_kind,  # type: ignore[arg-type]
             command=_SEMANTIC_RERUN_COMMAND,
-            path=_semantic_gap_path(kind, tool, issue_source),
+            path=(source_ref if kind == "partial_binding_evidence" and issue_source == FRAMEWORK_CONSTRUCTOR_OWNERSHIP
+                  else _semantic_gap_path(kind, tool, issue_source)),
             why=action_why,
             # Decided by what the template says, never by which branch above
             # built it. The two are the same judgement — "did the scan fill
@@ -2299,7 +2434,7 @@ def _semantic_gap_path(kind: str, tool: Tool, issue_source: str | None = None) -
         # questionnaire counts by, so a row can never be excluded from the
         # counter as unanswerable while still publishing a manifest route.
         return _source_artifact_path(tool)
-    if kind == "incomplete_surface":
+    if kind in {"incomplete_surface", "unattested_surface"}:
         if inventory_manifest_key(tool.source_type) is not None:
             return SUGGESTED_INVENTORY_FILENAME
         return "shipgate.yaml#tool_sources"
@@ -2416,7 +2551,12 @@ def _surface_gap_note(tool: Tool) -> str:
     return f" Unresolved: {', '.join(reasons)}."
 
 
-def _evidence_gaps(report: ReadinessReport, tools: list[Tool]) -> list[EvidenceGap]:
+def _evidence_gaps(
+    report: ReadinessReport,
+    tools: list[Tool],
+    *,
+    source_recovery_evidence: Sequence[SourceRecoveryEvidence] | None = None,
+) -> list[EvidenceGap]:
     """v0.26: one actionable row per measurable evidence gap.
 
     Deterministic projection of the same inputs the counts use:
@@ -2549,12 +2689,17 @@ def _evidence_gaps(report: ReadinessReport, tools: list[Tool]) -> list[EvidenceG
                 ),
             )
         )
+    warning_counts = Counter(report.source_warnings)
+    recovery_by_warning: dict[str, list[SourceRecoveryEvidence]] = defaultdict(list)
+    for fact in source_recovery_evidence or ():
+        recovery_by_warning[fact.warning].append(fact)
     for warning in report.source_warnings:
-        if (
-            "predates report schema" in warning
-            and "semantic evidence" in warning
-            and "not comparable with --diff-from" in warning
-        ):
+        # Structural, not prose. The three-substring match this replaced keyed
+        # on the exact wording of one refusal, so rewording it dropped an
+        # incomparable base out of `insufficient_evidence` without failing
+        # anything that named the decision (#569). The refusal now carries its
+        # own reason code and this looks it up.
+        if report_schema_refusal_code(warning) is not None:
             action = EvidenceGapAction(
                 kind="provide_source",
                 # No command, for the same reason as the unavailable-base gap
@@ -2582,15 +2727,65 @@ def _evidence_gaps(report: ReadinessReport, tools: list[Tool]) -> list[EvidenceG
                     "stops warning, then rerun the scan."
                 ),
             )
-        gaps.append(
-            EvidenceGap(
-                kind="source_warning",
-                subject=warning,
-                why="A source loader degraded while reading declared inputs.",
-                next_action=action,
-            )
+        gap = EvidenceGap(
+            kind="source_warning",
+            subject=warning,
+            why="A source loader degraded while reading declared inputs.",
+            next_action=action,
         )
+        gaps.append(_with_source_recovery(
+            gap,
+            recovery_by_warning.get(warning, []),
+            warning_is_unique=warning_counts[warning] == 1,
+        ))
     return gaps
+
+
+def _with_source_recovery(
+    gap: EvidenceGap,
+    facts: list[SourceRecoveryEvidence],
+    *,
+    warning_is_unique: bool,
+) -> EvidenceGap:
+    """Explain a loader fact without changing any decision-bearing action kind.
+
+    `provide_source` is itself an IE threshold input. The existing action kind
+    and declaration permissions therefore stay exactly as they were; recovery
+    is an independent optional explanation, not another operational route.
+    """
+    if not facts:
+        return gap
+    if (
+        len(facts) != 1
+        or not warning_is_unique
+        or facts[0].recovery.reason == "ambiguous_warning_identity"
+    ):
+        return gap.model_copy(update={
+            "recovery": CoverageRecovery(kind="unresolved", reason="ambiguous_warning_identity"),
+            "next_action": gap.next_action.model_copy(update={
+                "path": None,
+                "why": "More than one input corresponds to this public warning.",
+                "expects": "Review the original inputs to identify the failing source before assigning a repair owner.",
+            }),
+        })
+    fact = facts[0]
+    if fact.recovery.kind == "input_unavailable":
+        why = "The configured OpenAI Agents SDK entrypoint was not found."
+        expects = "Restore the existing entrypoint, then rerun the scan. No declaration replaces the missing file."
+    elif fact.recovery.kind == "reader_limitation":
+        why = "The OpenAI Agents SDK binding reader does not support this literal tool-list concatenation."
+        expects = "Agents Shipgate needs a reader repair for literal tool-list concatenation; retain the source as a reproducer and rerun after the reader supports it."
+    else:
+        why = "The SDK tools expression could not be resolved; the evidence does not establish a repair owner."
+        expects = "Review the tools expression and establish its required static input or reader limitation before choosing a remedy."
+    return gap.model_copy(update={
+        "source_type": fact.source_type,
+        "source_ref": fact.source_ref,
+        "recovery": fact.recovery,
+        "next_action": gap.next_action.model_copy(update={
+            "path": fact.path, "why": why, "expects": expects,
+        }),
+    })
 
 
 # Symbols quoted in a gap's reason before it stops being a sentence.

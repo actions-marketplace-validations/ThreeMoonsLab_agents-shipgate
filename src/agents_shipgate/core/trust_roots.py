@@ -14,12 +14,14 @@ from __future__ import annotations
 import os
 import posixpath
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
 from agents_shipgate.core.boundary_registry import BOUNDARY_ADAPTERS
 from agents_shipgate.core.globbing import glob_match, glob_match_ci
+from agents_shipgate.invocation import render_command
+from agents_shipgate.schemas.instruction_structure import ConditionalInstructionEditRule
 
 # Ordered (class, glob) classification of a repo's release trust roots —
 # the surfaces that define the gate in any repo that has adopted
@@ -94,7 +96,9 @@ TRUST_ROOT_SURFACES: tuple[tuple[str, str], ...] = (
 # The deny-list of trust-root files a coding agent must never edit *to make a
 # verdict pass*, derived from ``TRUST_ROOT_SURFACES`` (single source of truth),
 # restricted to the classes whose trust boundary is the WHOLE FILE: the
-# Shipgate CI gate, the agent-instruction surfaces, and policy packs.
+# Shipgate CI gate, host boundaries, and policy packs. Instruction-directory
+# paths have a separate conditional rule: complete unchanged parsed structure
+# can clear a touch, while unknown structure and path-only plans still review.
 #
 # Deliberately EXCLUDES:
 #   * ``shipgate.yaml`` and ``.agents-shipgate/**`` — their boundary is
@@ -110,11 +114,32 @@ TRUST_ROOT_SURFACES: tuple[tuple[str, str], ...] = (
 # the IDENTICAL
 # standing deny-list — a passing/preview verdict never reads as "anything goes".
 _FORBIDDEN_EDIT_CLASSES = frozenset(
-    {"ci_gate", "agent_instructions", "policy", "host_boundary"}
+    {"ci_gate", "policy", "host_boundary"}
 )
 PROTECTED_FILE_EDITS: tuple[str, ...] = tuple(
     pattern for kind, pattern in TRUST_ROOT_SURFACES if kind in _FORBIDDEN_EDIT_CLASSES
 )
+
+
+CONDITIONAL_INSTRUCTION_PATTERNS: tuple[str, ...] = tuple(
+    pattern for kind, pattern in TRUST_ROOT_SURFACES
+    if kind == "agent_instructions" or pattern == "**/SKILL.md"
+)
+
+
+def conditional_instruction_edits(
+    *, workspace: Path, config: str, canonical: bool = False,
+) -> list[ConditionalInstructionEditRule]:
+    # Bind the actual subject; a default config could classify a custom
+    # manifest named AGENTS.md as prose. Durable verifier artifacts keep the
+    # canonical executable, while interactive preflight follows its launcher.
+    return [ConditionalInstructionEditRule(
+        patterns=list(CONDITIONAL_INSTRUCTION_PATTERNS),
+        preflight_command=render_command(
+            ["preflight", "--workspace", str(workspace), "--config", config, "--plan", "-", "--json"],
+            prefix=("agents-shipgate",) if canonical else None,
+        ),
+    )]
 
 
 def trust_root_class_for(path: str) -> str | None:
@@ -257,6 +282,7 @@ class IdentityReadBudget:
 class _DirectoryIdentitySnapshot:
     names: frozenset[str]
     observed: dict[str, os.stat_result]
+    entry_kinds: dict[str, str] = field(default_factory=dict)
 
 
 class IdentityBoundReadSession:
@@ -378,6 +404,10 @@ class IdentityBoundReadSession:
                 raise ValueError("inventory path is not a directory")
             directory = self.root / relative
         snapshot = self._snapshot(directory, max_entries=max_entries)
+        if max_entries is not None and len(snapshot.names) > max_entries:
+            raise IdentityReadBudgetExceeded(
+                "directory inventory exceeded its static filesystem entry bound"
+            )
         return tuple(sorted(snapshot.names))
 
     def finish(self) -> None:
@@ -395,6 +425,10 @@ class IdentityBoundReadSession:
                 raise ValueError(
                     "directory entries changed while identity-bound files were read"
                 )
+            for name, expected_kind in sorted(snapshot.entry_kinds.items()):
+                requested = directory / name
+                if _directory_member_kind(requested) != expected_kind:
+                    raise ValueError("directory entry kind changed while inputs were read")
             for name, expected in sorted(snapshot.observed.items()):
                 if name not in current_names:
                     raise ValueError("path changed lexical identity while it was read")
@@ -411,6 +445,55 @@ class IdentityBoundReadSession:
                 ):
                     raise ValueError("path changed identity while it was read")
         self._finished = True
+
+    def directory_entry_kind(self, relative: Path) -> str:
+        """Observe one enumerated name's no-follow kind, without reading bytes.
+
+        Unread siblings need a kind obligation, not a file-content obligation.
+        Files actually consumed still use read_bytes and its stronger identity
+        checks. Unsafe kinds are described without following or opening them.
+        """
+
+        if self._finished or relative.is_absolute() or ".." in relative.parts or not relative.name:
+            raise ValueError("invalid directory entry observation")
+        directory = self.root / relative.parent
+        if directory not in self._snapshots:
+            self.directory_entries(relative.parent)
+        snapshot = self._snapshots[directory]
+        if relative.name not in snapshot.names:
+            raise ValueError("directory entry changed lexical identity")
+        kind = _directory_member_kind(self.root / relative)
+        previous = snapshot.entry_kinds.get(relative.name)
+        if previous is not None and previous != kind:
+            raise ValueError("directory entry kind changed while inputs were read")
+        snapshot.entry_kinds[relative.name] = kind
+        return kind
+
+    def link_target(self, relative: Path) -> str:
+        """Read one enumerated symbolic link's target text, inside this session (#700).
+
+        The name must be in the directory inventory this session recorded, and
+        it must still be a link; nothing is followed or opened. Re-pointing a
+        link replaces a directory entry, which changes the containing
+        directory's own identity. That identity is recorded when the inventory
+        is taken and revalidated by :meth:`finish`, so a link re-pointed after
+        this read fails the snapshot there. A separate per-link record would
+        catch nothing that check does not.
+        """
+
+        if self._finished or relative.is_absolute() or ".." in relative.parts or not relative.name:
+            raise ValueError("invalid symbolic link observation")
+        directory = self.root / relative.parent
+        if directory not in self._snapshots:
+            self.directory_entries(relative.parent)
+        snapshot = self._snapshots[directory]
+        if relative.name not in snapshot.names:
+            raise ValueError("directory entry changed lexical identity")
+        path = self.root / relative
+        metadata = path.lstat()
+        if not stat.S_ISLNK(metadata.st_mode):
+            raise ValueError("entry is not a symbolic link")
+        return os.readlink(path)
 
     def _inspect_components(
         self,
@@ -837,6 +920,19 @@ def inspect_lexical_path_identity(
     return None
 
 
+def _directory_member_kind(path: Path) -> str:
+    """Classify an enumerated name without following or opening its target."""
+
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata) or _is_junction(path):
+        return "symlink"
+    if stat.S_ISDIR(metadata.st_mode):
+        return "directory"
+    if stat.S_ISREG(metadata.st_mode):
+        return "file"
+    return "special"
+
+
 def _is_reparse_point(metadata: os.stat_result) -> bool:
     """Whether Windows marked a lexical entry as a filesystem reparse point."""
 
@@ -871,6 +967,27 @@ def configured_manifest_identity(context: object) -> object | None:
     if logical:
         return logical
     return getattr(context, "config_path", None)
+
+
+def configured_input_trust_root(context: object, path: str) -> tuple[str, str] | None:
+    """Classify a changed path that is one of the run's command-line inputs.
+
+    ``VerificationContext.configured_trust_root_inputs`` names the in-repository
+    policy packs, baseline and comparison reference a verify run was pointed
+    at (#1024). Returns ``(trust_root_class, configured_path)`` for a match.
+    Both sides are normalized, and ASCII case variants match, for the reason
+    :func:`trust_root_class_for` gives.
+    """
+
+    verification = getattr(context, "verification", None)
+    inputs = getattr(verification, "configured_trust_root_inputs", None) or {}
+    candidate = _normalized(path).casefold()
+    if not candidate:
+        return None
+    for configured, trust_root_class in sorted(inputs.items()):
+        if _normalized(configured).casefold() == candidate:
+            return trust_root_class, configured
+    return None
 
 
 def is_context_configured_manifest(context: object, path: str) -> bool:
@@ -954,7 +1071,11 @@ def is_configured_manifest(
                 os.lstat(absolute_config),
                 os.lstat(absolute_candidate),
             )
-        except OSError:
+        except (OSError, ValueError):
+            # ``ValueError`` is a path no filesystem entry can have, such as
+            # the embedded NUL of a refused diff record. It is not the
+            # configured manifest, and the diff reader has already reported
+            # it as an invalid path; raising here crashed ``check`` (#581).
             return False
     if candidate == configured or exact:
         return candidate == configured
@@ -967,6 +1088,7 @@ __all__ = [
     "IdentityReadBudgetExceeded",
     "PROTECTED_FILE_EDITS",
     "PathIdentityIssue",
+    "configured_input_trust_root",
     "configured_manifest_identity",
     "inspect_lexical_path_identity",
     "is_context_configured_manifest",

@@ -953,7 +953,7 @@ def test_pr_comment_keeps_code_span_values_unescaped() -> None:
         merge_verdict="mergeable",
         applicability="not_applicable",
         can_merge_without_human=True,
-        control=derive_agent_control(reason="No applicable changes."),
+        control=derive_agent_control(reason="No applicable changes.", subject_evaluated=True),
         artifacts={
             "report_markdown": "agents-shipgate-reports/report.md",
             "verifier_json": "agents-shipgate-reports/verifier.json",
@@ -1094,6 +1094,29 @@ def test_capability_review_pr_comment_leads_with_top_changes_and_trust_root() ->
         '"verification_command": "agents-shipgate verify --base origin/main --head HEAD --json"'
         in comment
     )
+
+
+def test_capability_review_says_removed_and_narrowed_were_withheld_not_absent() -> None:
+    """Zero removed beside an enabled comparison would read as "none removed"."""
+    from agents_shipgate.core.binding_comparison import binding_comparison_limits
+    from agents_shipgate.schemas.bindings import AgentBindingGraphAssessment, AgentBindingIssue
+    from agents_shipgate.schemas.surfaces import ToolSurfaceDiff, ToolSurfaceToolChange
+
+    partial = AgentBindingGraphAssessment(status="partial", issues=[AgentBindingIssue(
+        kind="partial_binding_evidence", message="Unread constructor",
+        source="framework_constructor_ownership", source_pointer="agent.py:8",
+    )])
+    notes = binding_comparison_limits(partial, None, absence_only=True)
+    report = _report(decision="passed", exit_code=0)
+    report.tool_surface_diff = ToolSurfaceDiff(
+        enabled=True, tools=[ToolSurfaceToolChange(kind="added", name="fresh")], notes=["unrelated", *notes],
+    )
+    review = build_capability_review(report)
+    assert review.added == 1 and review.removed == 0
+    assert review.notes == notes
+
+    report.tool_surface_diff = ToolSurfaceDiff(enabled=True, tools=[ToolSurfaceToolChange(kind="added", name="fresh")])
+    assert build_capability_review(report).notes == []
 
 
 def test_capability_review_groups_one_bound_tool_without_changing_legacy_counts() -> None:
@@ -2606,7 +2629,7 @@ def test_verify_successful_base_scan_feeds_head_diff_from(
     assert calls[0]["ci_mode"] == "advisory"
     assert calls[0]["packet_enabled"] is False
     assert calls[1]["diff_from_path"] is not None
-    assert Path(calls[1]["diff_from_path"]).is_file()
+    assert calls[1]["diff_from_readable"]
 
 
 def test_verify_base_scan_cache_hit_skips_second_base_scan(
@@ -2630,6 +2653,9 @@ def test_verify_base_scan_cache_hit_skips_second_base_scan(
         "json",
     ]
 
+    # From the Git root, stdout spells artifact paths as verifier.json records
+    # them; from anywhere else they are spelled for the caller (#818).
+    monkeypatch.chdir(repo)
     first = runner.invoke(app, args)
     second = runner.invoke(app, args)
 
@@ -2742,6 +2768,10 @@ def test_verify_head_errors_preserve_exit_codes(
 def test_internal_control_consistency_failure_clears_stale_handoff(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from agents_shipgate.core.agent_control import AgentControlConsistencyError
+    from agents_shipgate.core.static_inputs import active_static_input_snapshot
+
+    prior_snapshot = active_static_input_snapshot()
     repo = _repo_with_manifest(tmp_path)
     reports = repo / "agents-shipgate-reports"
     reports.mkdir(exist_ok=True)
@@ -2750,7 +2780,8 @@ def test_internal_control_consistency_failure_clears_stale_handoff(
     _patch_run_scan(monkeypatch, [], head_exit=0)
 
     def fail_control_projection(**_kwargs: Any):
-        raise ValueError("agent control consistency failure")
+        assert active_static_input_snapshot() is not prior_snapshot
+        raise AgentControlConsistencyError("agent control consistency failure")
 
     monkeypatch.setattr(
         "agents_shipgate.cli.verify.orchestrator._build_verifier",
@@ -2764,6 +2795,44 @@ def test_internal_control_consistency_failure_clears_stale_handoff(
     assert result.exit_code == 4
     assert "agent control consistency failure" in result.output
     assert not stale.exists()
+    assert active_static_input_snapshot() is prior_snapshot
+
+
+def test_base_preparation_failure_restores_input_context_when_cleanup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import tempfile
+
+    from agents_shipgate.core.static_inputs import active_static_input_snapshot
+
+    prior_snapshot = active_static_input_snapshot()
+    repo = _repo_with_manifest(tmp_path)
+    (repo / "README.md").write_text("change\n", encoding="utf-8")
+    _commit_all(repo, "head")
+    _patch_run_scan(monkeypatch, [], head_exit=0)
+
+    def fail_base_preparation(**kwargs: Any):
+        assert active_static_input_snapshot() is not prior_snapshot
+        kwargs["run_report_dir"]()  # The run-private base directory now exists.
+        raise RuntimeError("base preparation failed")
+
+    real_cleanup = tempfile.TemporaryDirectory.cleanup
+
+    def fail_run_base_cleanup(self) -> None:
+        real_cleanup(self)
+        if Path(self.name).name.startswith("agents-shipgate-verify-base-"):
+            raise OSError("run-private base directory cleanup failed")
+
+    monkeypatch.setattr(verify_orchestrator, "_prepare_base_report", fail_base_preparation)
+    monkeypatch.setattr(tempfile.TemporaryDirectory, "cleanup", fail_run_base_cleanup)
+    result = runner.invoke(
+        app,
+        ["verify", "--workspace", str(repo), "--config", "shipgate.yaml", "--base", "HEAD~1"],
+    )
+
+    assert result.exit_code == 4
+    assert "run-private base directory cleanup failed" in result.output
+    assert active_static_input_snapshot() is prior_snapshot
 
 
 def test_advisory_and_strict_change_only_exit_policy_not_control(
@@ -3367,8 +3436,8 @@ def test_retained_manifest_probe_fails_closed_on_non_utf8_yaml(
 
 
 def test_prune_base_scan_cache_keeps_newest_entries(tmp_path: Path) -> None:
-    cache_root = tmp_path / "base-scans"
-    cache_root.mkdir()
+    cache_root = tmp_path / "agents-shipgate" / "base-scans"
+    cache_root.mkdir(parents=True)
     old = cache_root / "old"
     new = cache_root / "new"
     newest = cache_root / "newest"
@@ -3376,7 +3445,7 @@ def test_prune_base_scan_cache_keeps_newest_entries(tmp_path: Path) -> None:
         path.mkdir()
         os.utime(path, (index, index))
 
-    _prune_base_scan_cache(cache_root, keep=2)
+    _prune_base_scan_cache(tmp_path, keep=2)
 
     assert not old.exists()
     assert new.exists()
@@ -3408,12 +3477,15 @@ def test_non_git_preview_with_omitted_config_uses_workspace_default(
 
 def test_verify_preview_rejects_output_that_overlaps_its_config(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workspace = tmp_path / "fresh"
     workspace.mkdir()
     config = workspace / "verifier.json"
     original = '{"manifest": "must survive"}\n'
     config.write_text(original, encoding="utf-8")
+    # `--out .` is the current directory (#818); stand in the workspace.
+    monkeypatch.chdir(workspace)
 
     result = runner.invoke(
         app,
@@ -3563,6 +3635,110 @@ def test_verify_preview_docs_only_diff_does_not_recommend_init(tmp_path: Path) -
     assert payload["control"]["next_action"]["command"] == (
         f"shipgate init --workspace {repo} --write --json"
     )
+
+
+def test_verify_preview_consumes_the_trigger_route_before_publishing_control(
+    tmp_path: Path,
+) -> None:
+    """#414: one preview payload must not tell the caller to preview again."""
+
+    repo = _init_repo(tmp_path)
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    _commit_all(repo, "base")
+    _set_origin_main(repo)
+    (repo / "agent.py").write_text(
+        "from google.adk.agents import LlmAgent\n"
+        "root_agent = LlmAgent(name='closer', tools=[])\n",
+        encoding="utf-8",
+    )
+    _commit_all(repo, "add agent")
+
+    result = runner.invoke(
+        app,
+        [
+            "verify",
+            "--workspace",
+            str(repo),
+            "--preview",
+            "--base",
+            "origin/main",
+            "--head",
+            "HEAD",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["trigger"]["should_run"] is True
+    trigger_action = payload["trigger"]["next_action"]
+    assert trigger_action == {
+        "kind": "command",
+        "command": None,
+        "why": (
+            "The verifier consumed the trigger route; follow "
+            "control.next_action for the current operation."
+        ),
+        "authoritative": False,
+        "authoritative_path": "control.next_action",
+    }
+    assert all(
+        rule.get("command") is None for rule in payload["trigger"]["matched_rules"]
+    )
+    control_action = payload["control"]["next_action"]
+    assert control_action["kind"] == "initialize"
+    assert " init " in f" {control_action['command']} "
+    assert payload["control"]["allowed_next_commands"] == [control_action["command"]]
+
+
+def test_build_verifier_preserves_trigger_state_but_scrubs_embedded_commands(
+    tmp_path: Path,
+) -> None:
+    """#414: normal verifier construction embeds evidence, never a second route."""
+
+    repo = _init_repo(tmp_path)
+    out_dir = repo / "agents-shipgate-reports"
+    trigger = {
+        "should_run": True,
+        "rationale": "the diff input is incomplete",
+        "matched_rules": [
+            {
+                "rule_id": "changed-agent-source",
+                "action": "input_required",
+                "command": "agents-shipgate verify --preview --json",
+            }
+        ],
+        "next_action": {
+            "kind": "input_required",
+            "command": "agents-shipgate verify --preview --json",
+            "why": "Provide a complete diff.",
+        },
+    }
+
+    verifier = verify_orchestrator._build_verifier(
+        git_root=repo,
+        config_path=repo / "shipgate.yaml",
+        base=None,
+        head="HEAD",
+        changed_files=["agent.py"],
+        diff_text="",
+        trigger=trigger,
+        base_status="not_requested",
+        base_tree=None,
+        base_report=None,
+        base_notes=[],
+        report=None,
+        head_status="failed",
+        head_exit_code=2,
+        out_dir=out_dir,
+        manifest_provenance_value="unknown",
+    )
+
+    assert verifier.trigger["next_action"]["kind"] == "input_required"
+    assert verifier.trigger["next_action"]["command"] is None
+    assert verifier.trigger["next_action"]["authoritative"] is False
+    assert verifier.trigger["matched_rules"][0]["action"] == "input_required"
+    assert verifier.trigger["matched_rules"][0]["command"] is None
 
 
 def test_verify_preview_missing_base_without_manifest_reports_the_missing_ref(
@@ -3760,7 +3936,16 @@ def _patch_run_scan(
     decision: str = "passed",
 ) -> None:
     def fake_run_scan(**kwargs: Any):
-        calls.append(kwargs)
+        diff_from = kwargs.get("diff_from_path")
+        # A base report lives in a directory private to the run and is gone by
+        # the time the assertions run (#638), so record what the scan could see
+        # while it could still see it.
+        calls.append(
+            {
+                **kwargs,
+                "diff_from_readable": diff_from is not None and Path(diff_from).is_file(),
+            }
+        )
         report = _report(decision=decision, exit_code=head_exit)
         out_dir = Path(kwargs["output_dir"])
         out_dir.mkdir(parents=True, exist_ok=True)

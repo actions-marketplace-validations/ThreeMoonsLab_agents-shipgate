@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import os
+import posixpath
 import re
 import subprocess
 import tempfile
 import threading
 import unicodedata
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -14,8 +16,10 @@ from urllib.parse import urlsplit
 
 import yaml
 
+from agents_shipgate import _perf
 from agents_shipgate.core.boundary_registry import is_agent_boundary_path
 from agents_shipgate.core.errors import ConfigError
+from agents_shipgate.core.privacy import redact_text
 from agents_shipgate.core.trust_roots import trust_root_class_for
 from agents_shipgate.core.workspace_input import workspace_input_error
 from agents_shipgate.schemas.human_authorization import canonical_https_git_endpoint
@@ -24,6 +28,7 @@ _GIT_OBJECT_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _WORKTREE_FILTER_CONFIG_LIMIT = 1024 * 1024
 _WORKTREE_ATTRIBUTE_LIST_LIMIT = 8 * 1024 * 1024
 _DIFF_CONFIG_LIMIT = 1024 * 1024
+_PROMISOR_CONFIG_LIMIT = 1024 * 1024
 _DIFF_METADATA_LIMIT = 8 * 1024 * 1024
 _DIFF_BODY_LIMIT = 32 * 1024 * 1024
 _GIT_STDERR_LIMIT = 8 * 1024
@@ -88,6 +93,31 @@ _FETCHABLE_DIFF_REASONS: frozenset[str] = frozenset(
     {"refs_missing", "merge_base_missing", "objects_missing"}
 )
 
+#: The hydration example ``objects_missing`` names when no workspace is bound.
+DEFAULT_HYDRATE_COMMAND = "git fetch --refetch --no-filter origin"
+
+
+def objects_missing_remediation(hydrate: str = DEFAULT_HYDRATE_COMMAND) -> str:
+    """The one way ``objects_missing`` is repaired, worded once (#817).
+
+    ``verify``'s diff status and ``diff``'s refusal both say this, so the
+    repair cannot drift into two spellings. ``hydrate`` is the example command:
+    ``diff`` passes one bound to its workspace and the clone's promisor remote.
+
+    ``--no-filter`` is what makes the example work. A bare
+    ``git fetch --refetch origin`` applies the clone's configured
+    ``remote.<name>.partialclonefilter`` again, so it downloads every commit
+    and tree a second time and still no blob, and the same read fails after it.
+    """
+
+    return (
+        "This checkout is a partial clone and the objects the diff needs were "
+        "never fetched. Shipgate runs Git with GIT_NO_LAZY_FETCH=1 and will not "
+        f"fetch them implicitly. Hydrate them (for example `{hydrate}`, or "
+        "clone without `--filter`), then rerun."
+    )
+
+
 _DIFF_REASON_REMEDIATION: dict[str, str] = {
     "not_attempted": (
         "Verification stopped before it read any diff, so nothing is known "
@@ -108,13 +138,7 @@ _DIFF_REASON_REMEDIATION: dict[str, str] = {
         "comparison point — a force-push or a rewritten branch produces this — "
         "then rerun."
     ),
-    "objects_missing": (
-        "This checkout is a partial clone and the objects the diff needs were "
-        "never fetched. Verification runs with GIT_NO_LAZY_FETCH=1 and will "
-        "not fetch them implicitly. Hydrate them (for example "
-        "`git fetch --refetch origin`, or clone without `--filter`), then "
-        "rerun."
-    ),
+    "objects_missing": objects_missing_remediation(),
     "metadata_limit_exceeded": (
         "The change set exceeds Shipgate's static diff-metadata bound. Split "
         "the change, or exclude generated output from the compared range."
@@ -172,6 +196,19 @@ class DiffContext:
 
         if self.completeness == "complete":
             return ""
+        return f"{self.finding} {self.remediation}"
+
+    @property
+    def finding(self) -> str:
+        """:attr:`note` without its remediation: what failed, and nothing more.
+
+        For a reader whose own way out differs from the one the remediation
+        names: the currency check reads the working tree, where "split the
+        change" or "fetch the ref" may not be the step that clears it (#813).
+        """
+
+        if self.completeness == "complete":
+            return ""
         scope = (
             "Changed paths were collected but the diff body could not be read"
             if self.completeness == "partial"
@@ -183,7 +220,7 @@ class DiffContext:
             if terminated and terminated[-1] not in ".!?":
                 terminated += "."
             detail = f" Git reported: {terminated}"
-        return f"{scope} ({self.reason}).{detail} {self.remediation}"
+        return f"{scope} ({self.reason}).{detail}"
 
 
 class DiffInputError(ConfigError):
@@ -192,6 +229,29 @@ class DiffInputError(ConfigError):
     def __init__(self, context: DiffContext) -> None:
         self.context = context
         super().__init__(context.note.strip())
+
+
+class UnboundGitConfigurationError(ConfigError):
+    """Repository Git configuration a static worktree read refuses to run under.
+
+    Executable ``filter.*`` drivers, ``filter=`` attributes on tracked paths,
+    repository-local ``diff.*`` configuration and a non-empty
+    ``.git/info/attributes`` are not bound into any receipt, so a worktree read
+    refuses them rather than letting them rewrite what it reads. They describe
+    the repository, not the change: every worktree read of this repository
+    refuses the same way until the configuration itself changes, whatever is
+    re-run.
+
+    ``finding`` names what was refused — the configuration keys or the paths —
+    without the remediation the message appends. The currency check reads the
+    working tree for a committed-tree pointer too, so "verify refs" does not
+    clear it there, and repeating that advice sent a caller round the same
+    refusal (#813).
+    """
+
+    def __init__(self, finding: str, *, remediation: str | None = None) -> None:
+        self.finding = finding
+        super().__init__(f"{finding} {remediation}" if remediation else finding)
 
 
 class _UnavailableRevisionError(ConfigError):
@@ -414,7 +474,13 @@ def _normalized_sha_hint(value: str | None, *, label: str) -> str | None:
     return normalized
 
 
-def detect_default_base(workspace: Path, head: str = "HEAD") -> str | None:
+def detect_default_base(
+    workspace: Path,
+    head: str = "HEAD",
+    *,
+    allow_local_when_no_remote: bool = False,
+    allow_equal_head: bool = False,
+) -> str | None:
     """Best-effort default base ref for PR-style diff enrichment.
 
     Tries the remote default branch (``origin/HEAD``) first, then remote
@@ -425,12 +491,37 @@ def detect_default_base(workspace: Path, head: str = "HEAD") -> str | None:
     selected implicitly because they are often stale in CI and worktrees;
     pass ``--base main`` explicitly when that is intended. Never fetches;
     this only reads refs that already exist in the checkout.
+
+    ``allow_local_when_no_remote`` narrows that last rule to the case it
+    was written for. A local ``main`` is refused because a remote is the
+    authority it might be stale against; where the repository has **no
+    remote at all**, there is no such authority and the local branch is
+    the only base in existence. Refusing there would leave `check` with
+    nothing to compare on a repository that was simply never pushed
+    (#649). Off by default; `verify` reaches it through
+    :func:`resolve_verify_base` only after the remote-only detection found
+    nothing (#1023).
+
+    ``allow_equal_head`` keeps an authoritative default at ``head`` eligible
+    for callers comparing the working tree or an explicitly requested head.
+    This distinguishes a valid empty comparison from missing base evidence.
     """
 
-    return detect_default_base_with_notes(workspace, head).base
+    return detect_default_base_with_notes(
+        workspace,
+        head,
+        allow_local_when_no_remote=allow_local_when_no_remote,
+        allow_equal_head=allow_equal_head,
+    ).base
 
 
-def detect_default_base_with_notes(workspace: Path, head: str = "HEAD") -> DefaultBaseDetection:
+def detect_default_base_with_notes(
+    workspace: Path,
+    head: str = "HEAD",
+    *,
+    allow_local_when_no_remote: bool = False,
+    allow_equal_head: bool = False,
+) -> DefaultBaseDetection:
     """Return the implicit base plus warnings for skipped local defaults."""
 
     head_sha = commit_sha(workspace, head)
@@ -447,16 +538,80 @@ def detect_default_base_with_notes(workspace: Path, head: str = "HEAD") -> Defau
     selected_base_sha: str | None = None
     for candidate in candidates:
         sha = commit_sha(workspace, candidate)
-        if sha is not None and sha != head_sha:
+        if sha is not None and (allow_equal_head or sha != head_sha):
             selected_base = candidate
             selected_base_sha = sha
             break
+    if (
+        selected_base is None
+        and allow_local_when_no_remote
+        and not _has_configured_remote(workspace)
+    ):
+        for candidate in LOCAL_BASE_CANDIDATES:
+            sha = commit_sha(workspace, candidate)
+            if sha is not None and (allow_equal_head or sha != head_sha):
+                selected_base = candidate
+                selected_base_sha = sha
+                break
     notes = _skipped_local_base_notes(
         workspace,
         head_sha,
         selected_base_sha=selected_base_sha,
     )
     return DefaultBaseDetection(base=selected_base, notes=notes)
+
+
+@dataclass(frozen=True)
+class VerifyBaseResolution:
+    """What ``verify`` compares against when ``--base`` is omitted (#1023).
+
+    ``base`` is the ref to diff against. ``at_head`` names a default branch
+    that already points at the head: the comparison resolved, and there is
+    nothing committed to compare, so no base scan is spent on it. Both
+    ``None`` means no base exists to compare against at all, which ``verify``
+    refuses rather than publishing an empty diff as a complete one.
+    """
+
+    base: str | None
+    notes: list[str]
+    at_head: str | None = None
+
+    @property
+    def resolved(self) -> bool:
+        return self.base is not None or self.at_head is not None
+
+
+def resolve_verify_base(workspace: Path, head: str = "HEAD") -> VerifyBaseResolution:
+    """``check``'s base ladder (#649), keeping every base ``verify`` already chose.
+
+    The remote-only detection runs first and wins whenever it finds a base, so
+    a run that had one keeps exactly that one. Only when it finds none is the
+    ladder ``check`` uses consulted: a default branch at the head is a
+    resolved, empty comparison, and a repository with no remote at all falls
+    back to its local ``main`` or ``master``. Anything else is unresolved.
+    """
+
+    detection = detect_default_base_with_notes(workspace, head)
+    if detection.base is not None:
+        return VerifyBaseResolution(base=detection.base, notes=detection.notes)
+    ladder = detect_default_base_with_notes(
+        workspace,
+        head,
+        allow_local_when_no_remote=True,
+        allow_equal_head=True,
+    )
+    if ladder.base is None:
+        return VerifyBaseResolution(base=None, notes=ladder.notes)
+    if commit_sha(workspace, ladder.base) == commit_sha(workspace, head):
+        return VerifyBaseResolution(base=None, notes=detection.notes, at_head=ladder.base)
+    return VerifyBaseResolution(base=ladder.base, notes=ladder.notes)
+
+
+def _has_configured_remote(workspace: Path) -> bool:
+    """Whether this checkout has any remote to be stale against."""
+
+    result = _run_git(workspace, ["remote"], check=False)
+    return result.returncode == 0 and bool(result.stdout.strip())
 
 
 def _skipped_local_base_notes(
@@ -658,6 +813,20 @@ def git_path(workspace: Path, path: str) -> Path:
     if resolved.is_absolute():
         return resolved.resolve()
     return (workspace / resolved).resolve()
+
+
+def git_directories(workspace: Path) -> tuple[Path, Path]:
+    """Return the checkout-specific Git dir and the repository common dir."""
+
+    values: list[Path] = []
+    for flag in ("--git-dir", "--git-common-dir"):
+        result = _run_git(workspace, ["rev-parse", flag])
+        raw = result.stdout.strip()
+        if not raw:
+            raise ConfigError(f"Git did not report {flag} for {workspace}")
+        value = Path(raw)
+        values.append(value.resolve() if value.is_absolute() else (workspace / value).resolve())
+    return values[0], values[1]
 
 
 def diff_context(workspace: Path, base: str, head: str) -> tuple[list[str], str]:
@@ -939,6 +1108,768 @@ def path_present_at_ref(workspace: Path, ref: str, path: Path) -> bool | None:
         if fields[1] == b"blob":
             return True
     return False
+
+
+@dataclass(frozen=True)
+class FileAtRef:
+    """One repository file as a commit holds it (#1024).
+
+    ``state`` is ``present`` with ``data`` set, ``absent`` when the commit has
+    no entry at exactly this path, or ``unreadable`` with ``reason`` naming why
+    (not a regular file, past the read bound, or Git could not answer).
+    """
+
+    state: Literal["present", "absent", "unreadable"]
+    data: bytes | None = None
+    reason: str | None = None
+
+
+_REGULAR_FILE_MODES = frozenset({b"100644", b"100755"})
+
+
+def regular_file_at_ref(
+    workspace: Path, ref: str, path: Path, *, max_bytes: int
+) -> FileAtRef:
+    """Read exactly ``path`` at ``ref`` as a regular file, following nothing.
+
+    ``read_bytes_at_ref`` answers ``None`` alike for an absent path, an
+    oversize blob and a Git failure, and ``git show`` of a symbolic link
+    returns its target text as though it were the file. A comparison reference
+    has to tell those apart: an absent one can be replaced by a scan of the
+    same commit, while a link or an unreadable one cannot be read at all.
+    """
+
+    commit = commit_sha(workspace, ref)
+    if commit is None:
+        return FileAtRef("unreadable", reason=f"{ref!r} does not resolve to a commit")
+    wanted = path.as_posix()
+    listing = _run_git_bounded_output(
+        workspace,
+        ["--literal-pathspecs", "ls-tree", "-z", "--full-tree", commit, "--", wanted],
+        max_output_bytes=_MAX_MANIFEST_LISTING_BYTES,
+    )
+    if listing is None:
+        return FileAtRef("unreadable", reason="Git could not list the path")
+    for record in (item for item in listing.split(b"\0") if item):
+        header, separator, encoded_path = record.partition(b"\t")
+        if not separator or encoded_path != wanted.encode("utf-8"):
+            continue
+        fields = header.split()
+        if len(fields) != 3 or fields[1] != b"blob" or fields[0] not in _REGULAR_FILE_MODES:
+            return FileAtRef("unreadable", reason="it is not a regular file")
+        data = _run_git_bounded_output(
+            workspace,
+            ["cat-file", "blob", fields[2].decode("ascii")],
+            max_output_bytes=max_bytes,
+        )
+        if data is None:
+            return FileAtRef(
+                "unreadable",
+                reason=f"it could not be read within {max_bytes} bytes",
+            )
+        return FileAtRef("present", data=data)
+    return FileAtRef("absent")
+
+
+def path_ever_present_from(workspace: Path, ref: str, path: Path) -> bool | None:
+    """Whether any commit reachable from ``ref`` ever held exactly ``path``.
+
+    ``False`` only when complete history proves it never did. A shallow
+    checkout cannot see what came before its boundary: ``rev-list`` there
+    answers with empty output and exit 0, because the boundary is a root, so
+    the guard is what keeps that silence from reading as "never". A
+    ``$GIT_DIR/info/grafts`` file cuts history the same way while
+    ``--is-shallow-repository`` says ``false``, and Git honours it even with
+    replace objects disabled, so its presence answers ``None`` too, as does a
+    ref or a Git that cannot answer. Every commit that changed the path is
+    considered (``--full-history``), so a side branch that added and later
+    removed it is not simplified away behind a merge.
+    """
+
+    if _history_is_truncated(workspace) is not False:
+        return None
+    if _graft_file_present(workspace) is not False:
+        return None
+    commit = commit_sha(workspace, ref)
+    if commit is None:
+        return None
+    result = _run_git(
+        workspace,
+        [
+            "--literal-pathspecs",
+            "rev-list",
+            "-1",
+            "--full-history",
+            commit,
+            "--",
+            path.as_posix(),
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return bool(result.stdout.strip())
+
+
+def _graft_file_present(workspace: Path) -> bool | None:
+    """Whether the repository carries a ``$GIT_DIR/info/grafts`` file.
+
+    ``None`` when its location cannot be read, which no caller may take as
+    "absent". ``GIT_GRAFT_FILE`` cannot move it: every Git run here drops the
+    caller's ``GIT_*`` environment.
+    """
+
+    result = _run_git(workspace, ["rev-parse", "--git-path", "info/grafts"], check=False)
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    graft = Path(result.stdout.strip())
+    if not graft.is_absolute():
+        graft = workspace / graft
+    try:
+        graft.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+    return True
+
+
+#: The longest link text a tree entry is read for. No platform accepts a
+#: longer path, so a longer text is never followed.
+_MAX_LINK_TEXT_BYTES = 4096
+
+#: How the host reader reaches a file: each link it follows, with that link's
+#: own text, and the in-tree path of the regular file it opens (#822).
+_ReaderPath = tuple[tuple[tuple[str, str], ...], str]
+
+
+def _reader_path(
+    path: str,
+    kind: Callable[[str], str | None],
+    link_text: Callable[[str], str | None],
+) -> _ReaderPath | None:
+    """How the host reader reaches the file at ``path`` on one side, or ``None`` (#822).
+
+    ``kind`` names the entry at an in-tree path without following it:
+    ``"tree"``, ``"blob"`` (a regular file) or ``"link"``, and ``None`` for
+    anything else or nothing. ``link_text`` is a link entry's own text.
+
+    A link is followed only by rules the reader also applies (#700, the
+    reader's ``_resolve_in_tree_link``) and the archive would also resolve it
+    by (#711, :func:`_resolve_tree_link`): its text is relative and lands
+    inside the tree after normalization, every directory above where it lands
+    is a directory and not a link, and the chain ends at a directory or regular
+    file within :data:`_MAX_TREE_LINK_HOPS` links. A path holds links at one
+    component only, because a directory the reader reads through holds no
+    link, and every other component must be a directory. ``None`` means the
+    reader would not reach a regular file at ``path`` that way, so nothing
+    about it can be proven.
+
+    These are the rules for the links on the way to ``path``, not every
+    condition the reader puts on reading a whole linked directory (the
+    reader's ``_reads_through_directory_link``: no link anywhere beneath the
+    target, no skipped name on the way, a boundary location). So an answer
+    other than ``None`` is necessary for the reader to open the file there,
+    not sufficient: see :func:`blob_path_unchanged`.
+    """
+
+    parts = path.split("/")
+    real: list[str] = []
+    links: list[tuple[str, str]] = []
+    for index, part in enumerate(parts):
+        current = "/".join((*real, part))
+        current_kind = kind(current)
+        if current_kind == "link":
+            if links:
+                return None
+            for _ in range(_MAX_TREE_LINK_HOPS):
+                text = link_text(current)
+                if not text or "\0" in text or os.path.isabs(text) or text.startswith(("/", "\\")):
+                    return None
+                joined = posixpath.normpath(posixpath.join(posixpath.dirname(current), text))
+                if joined in {".", ".."} or joined.startswith("../"):
+                    return None
+                links.append((current, text))
+                landed = joined.split("/")
+                if any(kind("/".join(landed[:depth])) != "tree" for depth in range(1, len(landed))):
+                    return None
+                current, current_kind = joined, kind(joined)
+                if current_kind != "link":
+                    break
+            else:
+                return None
+            real = current.split("/")
+        else:
+            real.append(part)
+        if index == len(parts) - 1:
+            return (tuple(links), current) if current_kind == "blob" else None
+        if current_kind != "tree":
+            return None
+    return None
+
+
+class _CommitEntries:
+    """One commit's tree entries, each read exactly, by its own `ls-tree`."""
+
+    def __init__(self, workspace: Path, commit: str) -> None:
+        self._workspace = workspace
+        self._commit = commit
+        self._entries: dict[str, tuple[str, str, str] | None] = {}
+
+    def entry(self, path: str) -> tuple[str, str, str] | None:
+        """``(mode, type, oid)`` of exactly this path; ``None`` for none, or a Git failure."""
+
+        if path not in self._entries:
+            self._entries[path] = self._read(path)
+        return self._entries[path]
+
+    def _read(self, path: str) -> tuple[str, str, str] | None:
+        # One path per listing: a pathspec that names a directory another
+        # pathspec is under lists that directory's children, not the directory.
+        result = _run_git(
+            self._workspace,
+            ["--literal-pathspecs", "ls-tree", "-z", "--full-tree", self._commit, "--", path],
+            check=False,
+            text=False,
+        )
+        if result.returncode != 0:
+            return None
+        records = [record for record in result.stdout.split(b"\0") if record]
+        if len(records) != 1:
+            return None
+        header, separator, name = records[0].partition(b"\t")
+        fields = header.split()
+        if not separator or len(fields) != 3 or name != path.encode("utf-8"):
+            return None
+        mode, object_type, oid = (field.decode("ascii", errors="replace") for field in fields)
+        if not _GIT_OBJECT_RE.fullmatch(oid):
+            return None
+        return mode, object_type, oid
+
+    def kind(self, path: str) -> str | None:
+        entry = self.entry(path)
+        if entry is None:
+            return None
+        mode, object_type, _oid = entry
+        if object_type == "tree" and mode == "040000":
+            return "tree"
+        if object_type == "blob" and mode in {"100644", "100755"}:
+            return "blob"
+        if object_type == "blob" and mode == "120000":
+            return "link"
+        return None
+
+    def link_text(self, path: str) -> str | None:
+        entry = self.entry(path)
+        if entry is None or entry[:2] != ("120000", "blob"):
+            return None
+        data = _run_git_bounded_output(
+            self._workspace, ["cat-file", "blob", entry[2]], max_output_bytes=_MAX_LINK_TEXT_BYTES
+        )
+        if data is None:
+            return None
+        try:
+            return data.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return None
+
+    def reader_path(self, path: str) -> _ReaderPath | None:
+        # A regular blob listed under the path's own name has no link above
+        # it, because a listing never descends through one. That is the one
+        # listing a path with no link took before #822, and still takes.
+        if self.kind(path) == "blob":
+            return (), path
+        return _reader_path(path, self.kind, self.link_text)
+
+
+def _worktree_reader_path(workspace: Path, path: str) -> _ReaderPath | None:
+    """How the reader reaches ``path`` in the working tree, read without following a link."""
+
+    from agents_shipgate.core.trust_roots import _directory_member_kind
+
+    kinds = {"directory": "tree", "file": "blob", "symlink": "link"}
+
+    def kind(relative: str) -> str | None:
+        try:
+            return kinds.get(_directory_member_kind(workspace / relative))
+        except OSError:
+            return None
+
+    def link_text(relative: str) -> str | None:
+        try:
+            return os.readlink(workspace / relative)
+        except (OSError, ValueError):
+            return None
+
+    return _reader_path(path, kind, link_text)
+
+
+def blob_path_unchanged(workspace: Path, base: str, head: str | None, path: str) -> bool:
+    """Whether the file the host reader opens at ``path`` is the same at ``base`` and ``head``.
+
+    ``head=None`` means the working tree. Both sides must reach that file the
+    same way. With no link on the path, it is the same regular file at
+    ``path``, as before. Through an in-tree link (#822), such as
+    ``.claude/skills -> ../.agents/skills``, every link on the way must be a
+    link on both sides with the same text, every other component a
+    directory, and the file it lands on the same regular file at the same
+    in-tree path. Links are followed only by the rules :func:`_reader_path`
+    states, which the reader and the archive also apply to the links on the
+    way.
+
+    ``True`` is necessary for naming a limit on ``path`` as unchanged, not
+    sufficient: this does not model every condition the reader puts on reading
+    a whole linked directory, so it can answer ``True`` where one side's reader
+    does not read ``path`` at all, such as a head that adds a link inside
+    ``.agents/skills``. Its callers ask only about a limit both sides carry on
+    ``path``, and a side whose reader does not read ``path`` carries none
+    there: in that example it carries an ``unreadable`` limit on the link
+    instead, which is never named as unchanged, so the comparison still
+    refuses whatever this answers.
+
+    The answer is ``False`` whenever identity cannot be proven: a path absent
+    on either side, a link added, removed or given another text (even one that
+    lands on the same file), a link that leaves the repository, dangles, loops
+    or passes the hop bound, a tree or submodule, an unreadable file, or any
+    Git failure. The base is always read from its Git tree entries, and so is a
+    commit head. A working tree is read without following any link, each link
+    by its own text and the file by its unfiltered hash, against the base's
+    entries. Blob object IDs are compared rather than `git diff` output, so a
+    ``.gitattributes`` filter or textconv cannot make two different byte
+    sequences read as equal (#721).
+    """
+
+    from pathlib import PurePosixPath
+
+    relative = PurePosixPath(path)
+    if (
+        not path
+        or relative.is_absolute()
+        or relative.as_posix() != path
+        or ".." in relative.parts
+        or "\\" in path
+        or "\0" in path
+    ):
+        return False
+    try:
+        path.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+
+    base_commit = commit_sha(workspace, base)
+    if base_commit is None:
+        return False
+    base_tree = _CommitEntries(workspace, base_commit)
+    before = base_tree.reader_path(path)
+    base_entry = base_tree.entry(before[1]) if before is not None else None
+    if before is None or base_entry is None:
+        return False
+    if head is not None:
+        head_commit = commit_sha(workspace, head)
+        if head_commit is None:
+            return False
+        head_tree = _CommitEntries(workspace, head_commit)
+        return head_tree.reader_path(path) == before and head_tree.entry(before[1]) == base_entry
+    if _worktree_reader_path(workspace, path) != before:
+        return False
+    hashed = _run_git(workspace, ["hash-object", "--no-filters", "--", before[1]], check=False)
+    return hashed.returncode == 0 and hashed.stdout.strip() == base_entry[2]
+
+
+def tree_path_absent(workspace: Path, base: str, head: str | None, path: str) -> bool:
+    """Whether nothing is at ``path`` at ``base`` and at ``head`` (#702).
+
+    ``head=None`` means the working tree. On each side every component above
+    the first missing one must be a directory: a gitlink, link or file on the
+    way is not absence, since the file may live behind it, and neither is a
+    Git failure. In the working tree no component may be a link or other
+    non-directory either, and the index may stage nothing at the path or at
+    a component above it, such as a submodule not checked out. ``False``
+    whenever absence is not proven, so a selected hook script missing on both
+    sides is an unchanged limit only when this proves it (the #822 rule for
+    limits identical on both sides).
+    """
+
+    from pathlib import PurePosixPath
+
+    relative = PurePosixPath(path)
+    if (
+        not path
+        or relative.is_absolute()
+        or relative.as_posix() != path
+        or ".." in relative.parts
+        or "\\" in path
+        or "\0" in path
+    ):
+        return False
+    try:
+        encoded = path.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    prefixes = ["/".join(relative.parts[: index + 1]) for index in range(len(relative.parts))]
+
+    def commit_absent(ref: str) -> bool:
+        commit = commit_sha(workspace, ref)
+        if commit is None:
+            return False
+        for prefix in prefixes:
+            listed = _run_git(
+                workspace,
+                ["--literal-pathspecs", "ls-tree", "-z", "--full-tree", commit, "--", prefix],
+                check=False,
+                text=False,
+            )
+            if listed.returncode != 0:
+                return False
+            records = [record for record in listed.stdout.split(b"\0") if record]
+            if not records:
+                return True
+            header, separator, name = records[0].partition(b"\t")
+            if (
+                len(records) != 1
+                or not separator
+                or name != prefix.encode("utf-8")
+                or header.split()[:2] != [b"040000", b"tree"]
+            ):
+                return False
+        return False
+
+    if not commit_absent(base):
+        return False
+    if head is not None:
+        return commit_absent(head)
+    import stat
+
+    for prefix in prefixes:
+        try:
+            mode = os.lstat(workspace / prefix).st_mode
+        except FileNotFoundError:
+            break
+        except OSError:
+            return False
+        if not stat.S_ISDIR(mode):
+            return False
+    else:
+        return False
+    staged = _run_git(
+        workspace,
+        ["--literal-pathspecs", "ls-files", "--stage", "-z", "--", *prefixes],
+        check=False,
+        text=False,
+    )
+    if staged.returncode != 0:
+        return False
+    names = {prefix.encode("utf-8") for prefix in prefixes}
+    for record in staged.stdout.split(b"\0"):
+        if not record:
+            continue
+        _header, separator, name = record.partition(b"\t")
+        if not separator or name in names or name.startswith(encoded + b"/"):
+            return False
+    return True
+
+
+#: Bounds on what :func:`blob_path_identities` reads (#812): one tree listing,
+#: each base blob and working-tree file it compares (the host reader's own
+#: per-file bound), and those base blobs together.
+_IDENTITY_LISTING_BYTES = 8 * 1024 * 1024
+_IDENTITY_FILE_BYTES = 1024 * 1024
+_IDENTITY_BATCH_BYTES = 64 * 1024 * 1024
+#: The pathspec bytes one `ls-tree` command line carries, well inside the
+#: shortest platform command-line limit (Windows, 32,767 characters).
+_IDENTITY_ARGUMENT_BYTES = 8 * 1024
+#: Checkout conversions `.gitattributes` can apply besides line endings. A
+#: working-tree difference on a path that carries one is never called a
+#: change: it may be the conversion alone (#812).
+_CONVERSION_ATTRIBUTES = ("filter", "ident", "working-tree-encoding")
+
+
+@dataclass(frozen=True)
+class _TreeBlob:
+    mode: str
+    oid: str
+    size: int
+
+
+def _regular_tree_blobs(
+    workspace: Path, commit: str, paths: Sequence[str]
+) -> dict[str, _TreeBlob] | None:
+    """The regular-file blob at each path in one commit, from one listing.
+
+    A path that is absent, a symlink, a tree or a submodule has no entry, and
+    so does one whose listing is not exactly one record under its own name.
+    The paths are passed as literal pathspecs, split only so no command line
+    grows past a size every platform accepts. ``None`` means a listing failed.
+    """
+
+    wanted = {path.encode("utf-8"): path for path in paths}
+    records: dict[str, list[list[bytes]]] = {}
+    chunk: list[str] = []
+    length = 0
+    for index, path in enumerate(paths):
+        chunk.append(path)
+        length += len(path.encode("utf-8")) + 3
+        if index + 1 < len(paths) and length < _IDENTITY_ARGUMENT_BYTES:
+            continue
+        listing = _run_git_bounded_output(
+            workspace,
+            ["--literal-pathspecs", "ls-tree", "-l", "-z", "--full-tree", commit, "--", *chunk],
+            max_output_bytes=_IDENTITY_LISTING_BYTES,
+        )
+        if listing is None:
+            return None
+        for record in listing.split(b"\0"):
+            header, separator, name = record.partition(b"\t")
+            if separator and name in wanted:
+                records.setdefault(wanted[name], []).append(header.split())
+        chunk, length = [], 0
+    entries: dict[str, _TreeBlob] = {}
+    for path, found in records.items():
+        if len(found) != 1 or len(found[0]) != 4:
+            continue
+        mode, kind, oid, size = (field.decode("ascii", errors="replace") for field in found[0])
+        regular = kind == "blob" and mode in {"100644", "100755"}
+        if regular and _GIT_OBJECT_RE.fullmatch(oid) and size.isdigit():
+            entries[path] = _TreeBlob(mode=mode, oid=oid, size=int(size))
+    return entries
+
+
+def _c_quoted_path(path: str) -> bytes:
+    """One line of `hash-object --stdin-paths` input that Git unquotes to exactly ``path``."""
+
+    quoted = bytearray(b'"')
+    for byte in path.encode("utf-8"):
+        if byte in (0x22, 0x5C):
+            quoted += b"\\" + bytes([byte])
+        elif byte < 0x20 or byte == 0x7F:
+            quoted += b"\\%03o" % byte
+        else:
+            quoted.append(byte)
+    return bytes(quoted) + b'"\n'
+
+
+def _unfiltered_worktree_hashes(workspace: Path, paths: Sequence[str]) -> dict[str, str]:
+    """Each working-tree file's blob id as its bytes are, from one `hash-object`.
+
+    Empty when Git fails on any of them: its output then cannot be matched to
+    the paths with certainty.
+    """
+
+    if not paths:
+        return {}
+    output = _run_git_bounded_output(
+        workspace,
+        ["hash-object", "--no-filters", "--stdin-paths"],
+        max_output_bytes=(len(paths) + 1) * 72,
+        input=b"".join(_c_quoted_path(path) for path in paths),
+    )
+    if output is None:
+        return {}
+    hashes = output.decode("ascii", errors="replace").split()
+    if len(hashes) != len(paths) or not all(_GIT_OBJECT_RE.fullmatch(oid) for oid in hashes):
+        return {}
+    return dict(zip(paths, hashes, strict=True))
+
+
+def _paths_with_conversion_attributes(workspace: Path, paths: Sequence[str]) -> set[str] | None:
+    """The paths a `filter`, `ident` or `working-tree-encoding` attribute converts on checkout.
+
+    One `check-attr`. ``None`` when it could not be read.
+    """
+
+    output = _run_git_bounded_output(
+        workspace,
+        ["-c", "core.fsmonitor=false", "check-attr", "--stdin", "-z", *_CONVERSION_ATTRIBUTES],
+        max_output_bytes=_IDENTITY_LISTING_BYTES,
+        input=b"".join(path.encode("utf-8") + b"\0" for path in paths),
+    )
+    if output is None:
+        return None
+    fields = output.split(b"\0")
+    if fields and fields[-1] == b"":
+        fields.pop()
+    if len(fields) != 3 * len(_CONVERSION_ATTRIBUTES) * len(paths):
+        return None
+    wanted = {path.encode("utf-8"): path for path in paths}
+    converted: set[str] = set()
+    for index in range(0, len(fields), 3):
+        name, _attribute, value = fields[index : index + 3]
+        if name not in wanted:
+            return None
+        if value not in {b"unspecified", b"unset"}:
+            converted.add(wanted[name])
+    return converted
+
+
+def _blob_contents(workspace: Path, blobs: Sequence[_TreeBlob]) -> dict[str, bytes]:
+    """The bytes of each blob, from one bounded `cat-file --batch`; empty on any failure."""
+
+    if not blobs:
+        return {}
+    unique = list({blob.oid: blob for blob in blobs}.values())
+    output = _run_git_bounded_output(
+        workspace,
+        ["cat-file", "--batch"],
+        max_output_bytes=sum(blob.size + 128 for blob in unique),
+        input=b"".join(blob.oid.encode("ascii") + b"\n" for blob in unique),
+    )
+    if output is None:
+        return {}
+    contents: dict[str, bytes] = {}
+    offset = 0
+    for blob in unique:
+        header_end = output.find(b"\n", offset)
+        if header_end < 0:
+            return {}
+        header = output[offset:header_end].split()
+        start, end = header_end + 1, header_end + 1 + blob.size
+        if (
+            header != [blob.oid.encode("ascii"), b"blob", str(blob.size).encode("ascii")]
+            or output[end : end + 1] != b"\n"
+        ):
+            return {}
+        contents[blob.oid] = bytes(output[start:end])
+        offset = end + 1
+    return contents
+
+
+def _read_regular_file(target: Path) -> bytes | None:
+    """A working-tree file's bytes within the identity bound, never through a final link."""
+
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        descriptor = os.open(target, flags)
+    except OSError:
+        return None
+    try:
+        with os.fdopen(descriptor, "rb") as handle:
+            data = handle.read(_IDENTITY_FILE_BYTES + 1)
+    except OSError:
+        return None
+    return data if len(data) <= _IDENTITY_FILE_BYTES else None
+
+
+def blob_path_identities(
+    workspace: Path, base: str, head: str | None, paths: Iterable[str]
+) -> dict[str, bool | None]:
+    """Whether each path's bytes are the same at ``base`` and ``head``, three ways (#812).
+
+    ``head=None`` means the working tree. Every path requested has an answer:
+
+    - ``True``: identical. The same regular-file blob on both sides, exactly
+      as :func:`blob_path_unchanged` proves it for a path no link reaches.
+    - ``False``: differs. Between commits, two regular-file blobs with
+      different object IDs. In the working tree, a regular file whose
+      unfiltered hash differs from the base blob, on a path no `filter`,
+      `ident` or `working-tree-encoding` attribute converts, and whose bytes
+      still differ from the base blob's once `CRLF` is read as `LF` on both
+      sides.
+    - ``None``: neither is shown. A difference a checkout conversion can make
+      (`eol=crlf`, `core.autocrlf`, which Git itself reports as no change), a
+      mode-only change, a path absent or not a regular file on either side, a
+      symlink or a symlinked parent, a file past the read bound, or any Git
+      failure. Callers must never read it as either answer.
+
+    No clean or smudge filter runs: a configured filter driver is a command
+    line, so a converted path is answered ``None`` rather than converted.
+    ``blob_path_unchanged`` is left as it is for ``unchanged_limits``, where
+    anything short of identity refuses; only it follows an in-tree link
+    (#822), so a path through one is ``None`` here.
+
+    The cost is bounded per call, not per path: one tree listing per commit,
+    one `hash-object --stdin-paths` and, only for paths whose hashes differ,
+    one `check-attr` and one `cat-file --batch`.
+    """
+
+    from pathlib import PurePosixPath
+
+    answers: dict[str, bool | None] = {}
+    wanted: list[str] = []
+    for path in dict.fromkeys(paths):
+        answers[path] = None
+        relative = PurePosixPath(path)
+        if (
+            not path
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or "\\" in path
+            or "\0" in path
+        ):
+            continue
+        try:
+            path.encode("utf-8")
+        except UnicodeEncodeError:
+            continue
+        wanted.append(path)
+    if not wanted:
+        return answers
+    base_commit = commit_sha(workspace, base)
+    base_blobs = _regular_tree_blobs(workspace, base_commit, wanted) if base_commit else None
+    if base_blobs is None:
+        return answers
+    if head is not None:
+        head_commit = commit_sha(workspace, head)
+        head_blobs = _regular_tree_blobs(workspace, head_commit, wanted) if head_commit else None
+        if head_blobs is None:
+            return answers
+        for path in wanted:
+            before, after = base_blobs.get(path), head_blobs.get(path)
+            if before is None or after is None:
+                continue
+            if before == after:
+                answers[path] = True
+            elif before.oid != after.oid:
+                answers[path] = False
+        return answers
+
+    readable: list[str] = []
+    for path in wanted:
+        if path not in base_blobs:
+            continue
+        parts = PurePosixPath(path).parts
+        target = workspace / path
+        try:
+            parents = [workspace / Path(*parts[:index]) for index in range(1, len(parts))]
+            if (
+                any(parent.is_symlink() for parent in parents)
+                or target.is_symlink()
+                or not target.is_file()
+            ):
+                continue
+        except OSError:
+            continue
+        readable.append(path)
+    hashes = _unfiltered_worktree_hashes(workspace, readable)
+    differing: list[str] = []
+    for path in readable:
+        if path not in hashes:
+            continue
+        if hashes[path] == base_blobs[path].oid:
+            answers[path] = True
+        else:
+            differing.append(path)
+    if not differing:
+        return answers
+    converted = _paths_with_conversion_attributes(workspace, differing)
+    if converted is None:
+        return answers
+    compared: list[str] = []
+    total = 0
+    for path in differing:
+        size = base_blobs[path].size
+        if path in converted or size > _IDENTITY_FILE_BYTES or total + size > _IDENTITY_BATCH_BYTES:
+            continue
+        total += size
+        compared.append(path)
+    contents = _blob_contents(workspace, [base_blobs[path] for path in compared])
+    for path in compared:
+        before = contents.get(base_blobs[path].oid)
+        after = _read_regular_file(workspace / path)
+        if before is None or after is None:
+            continue
+        if before.replace(b"\r\n", b"\n") != after.replace(b"\r\n", b"\n"):
+            answers[path] = False
+    return answers
 
 
 def resolve_tree_path_identity(
@@ -1548,11 +2479,13 @@ def _reject_executable_worktree_filters(workspace: Path) -> None:
         if raw_value.strip():
             active.append(raw_key.decode("utf-8", errors="replace"))
     if active:
-        shown = ", ".join(sorted(active)[:3])
-        raise ConfigError(
-            "Static worktree collection refuses executable Git "
-            f"filters ({shown}). Commit the intended changes and verify refs, "
-            "or provide an explicit inert diff artifact."
+        shown = _named_in_refusal(active)
+        raise UnboundGitConfigurationError(
+            f"Static worktree collection refuses executable Git filters ({shown}).",
+            remediation=(
+                "Commit the intended changes and verify refs, or provide an "
+                "explicit inert diff artifact."
+            ),
         )
     attributed = _run_git_bounded_output(
         workspace,
@@ -1576,12 +2509,23 @@ def _reject_executable_worktree_filters(workspace: Path) -> None:
         os.fsdecode(raw) for raw in attributed.split(b"\0") if raw
     ]
     if attributed_paths:
-        shown = ", ".join(sorted(attributed_paths)[:3])
-        raise ConfigError(
+        shown = _named_in_refusal(attributed_paths)
+        raise UnboundGitConfigurationError(
             "Static worktree collection refuses Git filter attributes because "
-            f"their normalization driver is not receipt-bound ({shown}). "
-            "Commit the intended changes and verify refs instead."
+            f"their normalization driver is not receipt-bound ({shown}).",
+            remediation="Commit the intended changes and verify refs instead.",
         )
+
+
+def _named_in_refusal(names: list[str]) -> str:
+    """The first three configuration keys or paths a refusal names, redacted.
+
+    Both come from the repository, and either can be shaped like a credential
+    — a tracked ``assets/ghp_….bin`` — while the refusal is published in
+    ``verifier.json``, the PR comment and every currency refusal (#813).
+    """
+
+    return redact_text(", ".join(sorted(set(names))[:3])) or ""
 
 
 def _reject_unbound_diff_configuration(workspace: Path) -> None:
@@ -1604,10 +2548,17 @@ def _reject_unbound_diff_configuration(workspace: Path) -> None:
             "Could not establish whether repository-local Git diff drivers are "
             "safe for deterministic collection."
         )
-    if any(record.partition(b"\n")[2].strip() for record in configured.split(b"\0")):
-        raise ConfigError(
+    # The keys are named so the refusal says what it refused; values never
+    # are, because a driver's value is a command line.
+    keys = [
+        key.decode("utf-8", errors="replace")
+        for key, _, value in (record.partition(b"\n") for record in configured.split(b"\0"))
+        if value.strip()
+    ]
+    if keys:
+        raise UnboundGitConfigurationError(
             "Deterministic diff collection refuses repository-local diff.* "
-            "configuration because it is not receipt-bound."
+            f"configuration because it is not receipt-bound ({_named_in_refusal(keys)})."
         )
 
     raw_info_path = _run_git(
@@ -1629,14 +2580,53 @@ def _reject_unbound_diff_configuration(workspace: Path) -> None:
             "Could not inspect repository-local Git attributes safely."
         ) from exc
     if not info_path.is_file() or info_path.is_symlink() or metadata.st_size:
-        raise ConfigError(
+        raise UnboundGitConfigurationError(
             "Deterministic diff collection refuses non-empty or aliased "
             ".git/info/attributes because it is not receipt-bound."
         )
 
 
-def archive_tree(workspace: Path, ref: str, destination: Path) -> None:
-    """Materialize exact Git blobs without export-ignore or substitutions."""
+def archive_tree(
+    workspace: Path,
+    ref: str,
+    destination: Path,
+    *,
+    scope: Callable[[str], bool] | None = None,
+    record_gitlinks: bool = False,
+    rescope: Callable[[Path], tuple[Path, Callable[[str], bool]] | None] | None = None,
+    _allow_selected_openshell_links: bool = False,
+) -> dict[str, str]:
+    """Materialize exact Git blobs without export-ignore or substitutions.
+
+    ``rescope``, with a ``scope``, is called with the materialized tree and
+    may name a second, empty destination and a wider scope: the same
+    verified object store then materializes that one too, so a reader that
+    learns from the first tree which further paths it needs (#702) does not
+    copy and verify the object graph twice. The gitlinks returned are the
+    last tree's.
+
+    ``scope`` narrows the materialized tree to the paths a reader will
+    actually open, plus every symlink — a linked directory is what can
+    conceal a scoped path from the reader, so the two sides must see the
+    same links. Without a scope every blob is written; that once cost one
+    ``git cat-file`` per file, 1,168 subprocesses and 25 seconds on a 26 MB
+    repository whose host surface is four files (#686), and blobs are now
+    read in a few bounded ``cat-file --batch`` processes instead. Every
+    archive packs the tree rather than the commit, so no history is walked:
+    the commit's parents are not part of the snapshot, and a depth-1
+    checkout, which lacks them, archives its head like any other (#1023).
+
+    Scoping changes what is *materialized*, never what is *verified*: every
+    blob written is still checked against its object ID, and the isolated
+    store is still fsck'd, on the same terms as an unscoped archive.
+
+    A gitlink (a submodule's commit pointer) in scope is refused unless
+    ``record_gitlinks`` is set. Its content lives in another repository, so
+    no archive of this one can hold it. A caller whose reader treats an
+    unpopulated submodule as the empty directory a checkout leaves may opt in:
+    the gitlink is then materialized as that empty directory and returned
+    as ``{path: commit}``, so the caller can name what it did not read.
+    """
 
     destination.mkdir(parents=True, exist_ok=True)
     if any(destination.iterdir()):
@@ -1646,11 +2636,135 @@ def archive_tree(workspace: Path, ref: str, destination: Path) -> None:
         raise ConfigError(f"Git archive ref is unavailable: {ref}")
     with tempfile.TemporaryDirectory(prefix="agents-shipgate-git-snapshot-") as raw:
         git_dir = Path(raw) / "git"
-        _copy_verified_commit_graph(workspace, commit=commit, git_dir=git_dir)
-        _materialize_isolated_tree(git_dir, commit=commit, destination=destination)
+        # Peeled here, in the repository that certainly holds the commit: a
+        # tree pack does not carry it, so `<commit>^{tree}` cannot be
+        # resolved again inside the isolated store.
+        with _perf.phase("archive.rev_parse_tree"):
+            tree = _run_git(workspace, ["rev-parse", f"{commit}^{{tree}}"]).stdout.strip()
+        with _perf.phase("archive.copy_verified_graph"):
+            _copy_verified_commit_graph(
+                workspace,
+                commit=commit,
+                git_dir=git_dir,
+                tree=tree,
+            )
+        with _perf.phase("archive.materialize_scoped"):
+            gitlinks = _materialize_isolated_tree(
+                git_dir,
+                tree=tree,
+                destination=destination,
+                scope=scope,
+                record_gitlinks=record_gitlinks,
+                allow_selected_openshell_links=_allow_selected_openshell_links,
+            )
+        with _perf.phase("archive.rescope"):
+            wider = rescope(destination) if rescope is not None and scope is not None else None
+        if wider is None:
+            return gitlinks
+        again, wider_scope = wider
+        again.mkdir(parents=True, exist_ok=True)
+        if any(again.iterdir()):
+            raise ConfigError("Git archive destination must be empty")
+        with _perf.phase("archive.materialize_wider"):
+            return _materialize_isolated_tree(
+                git_dir,
+                tree=tree,
+                destination=again,
+                scope=wider_scope,
+                record_gitlinks=record_gitlinks,
+            )
 
 
-def _copy_verified_commit_graph(workspace: Path, *, commit: str, git_dir: Path) -> None:
+def archive_verification_tree(workspace: Path, ref: str, destination: Path) -> dict[str, str]:
+    """Full verification snapshot, allowing only selected contained policy links.
+
+    Selection is read from this immutable tree's verified object store; the
+    worktree cannot authorize a link. Generic archives retain their refusal.
+    """
+
+    return archive_tree(workspace, ref, destination, _allow_selected_openshell_links=True)
+
+
+def _selected_openshell_file_links(git_dir: Path, tree: str) -> set[str]:
+    from agents_shipgate.cli.verify.host_tree import materialize_host_tree
+    from agents_shipgate.core.host_grants import build_host_boundary_snapshot
+
+    # Reuse the host reader's bounded selection and dependency discovery, on
+    # the very same fsck'd store as the full archive. No checkout is read.
+    def from_store(_workspace, _commit, destination, *, scope, rescope):
+        _materialize_isolated_tree(git_dir, tree=tree, destination=destination, scope=scope)
+        wider = rescope(destination)
+        if wider is not None:
+            again, wider_scope = wider
+            again.mkdir(parents=True)
+            _materialize_isolated_tree(git_dir, tree=tree, destination=again, scope=wider_scope)
+
+    with tempfile.TemporaryDirectory(prefix="agents-shipgate-policy-selection-") as tmp:
+        root = Path(tmp)
+        destination = root / "selection"
+        destination.mkdir()
+        selected, snapshot = materialize_host_tree(root, tree, destination, archive=from_store)
+        snapshot = snapshot or build_host_boundary_snapshot(selected)
+        return {path for path, read in snapshot.cache.openshell_input_reads.items()
+                if read.get("source") == "generated" and read.get("limit") is None}
+
+
+def _admitted_selected_openshell_links(
+    git_dir: Path,
+    tree: str,
+    listed: list[tuple[str, str, str, str]],
+    tree_types: dict[str, str],
+) -> set[str]:
+    """Selected policy links a full verification archive may recreate.
+
+    Admission is the one exception to the generic link refusal, so it fails
+    closed: whatever it cannot establish admits nothing, and the refusal then
+    names a link exactly as it does without a selection. Discovery decodes and
+    recreates every link of a scoped tree, so a link it cannot represent there
+    (a target that is not UTF-8 or holds NUL, or a platform that cannot create
+    links) is a refusal here, never an internal error.
+    """
+
+    if not any(mode == "120000" for mode, _, _, _ in listed) or not any(
+        path.casefold() == ".shipgate/openshell.json"
+        or path.casefold().endswith("/.shipgate/openshell.json")
+        for _, _, _, path in listed
+    ):
+        return set()
+    try:
+        selected_links = _selected_openshell_file_links(git_dir, tree)
+    except Exception:  # noqa: BLE001 - admission fails closed to the refusal.
+        return set()
+    if not selected_links:
+        return set()
+    object_format = _run_git_dir(git_dir, ["rev-parse", "--show-object-format"]).stdout.strip()
+    link_texts: dict[str, str] = {}
+    wanted = [(oid, path) for mode, _, oid, path in listed if mode == "120000"]
+    for (oid, path), blob in zip(wanted, _isolated_blobs(git_dir, wanted), strict=True):
+        if _git_object_id("blob", blob, algorithm=object_format) != oid:
+            raise ConfigError(f"Git blob failed object-ID validation: {path}")
+        try:
+            text = blob.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            continue
+        if "\0" not in text:
+            link_texts[path] = text
+    # A captured link target alone is insufficient: independently require its
+    # bounded chain to open, as written, a regular Git blob.
+    directories = {path for path, kind in tree_types.items() if kind == "tree"}
+    for path in tree_types:
+        parts = path.split("/")
+        directories.update("/".join(parts[:index]) for index in range(1, len(parts)))
+    return {
+        path
+        for path in selected_links
+        if _physical_tree_link_target(path, link_texts, tree_types, directories) is not None
+    }
+
+
+def _copy_verified_commit_graph(
+    workspace: Path, *, commit: str, git_dir: Path, tree: str | None = None
+) -> None:
     """Copy one reachable object graph and verify it independently."""
 
     object_format = _run_git(workspace, ["rev-parse", "--show-object-format"]).stdout.strip()
@@ -1673,104 +2787,489 @@ def _copy_verified_commit_graph(workspace: Path, *, commit: str, git_dir: Path) 
         raise ConfigError(f"Could not initialize isolated Git store: {initialized.stderr.strip()}")
 
     pack_path = git_dir.parent / "reachable.pack"
-    with pack_path.open("wb") as output:
-        packed = _run_process(
-            [
-                "git",
-                "--no-replace-objects",
-                "-C",
-                str(workspace),
-                "pack-objects",
-                "--stdout",
-                "--revs",
-            ],
-            input=f"{commit}\n".encode("ascii"),
-            stdout=output,
-            stderr=subprocess.PIPE,
-            check=False,
-            env=env,
-            timeout=120,
-        )
+    with _perf.phase("archive.copy.pack_objects"):
+        with pack_path.open("wb") as output:
+            packed = _run_process(
+                [
+                    "git",
+                    "--no-replace-objects",
+                    "-C",
+                    str(workspace),
+                    "pack-objects",
+                    "--stdout",
+                    "--revs",
+                ],
+                input=f"{tree or commit}\n".encode("ascii"),
+                stdout=output,
+                stderr=subprocess.PIPE,
+                check=False,
+                env=env,
+                timeout=120,
+            )
     if packed.returncode != 0:
         detail = packed.stderr.decode("utf-8", errors="replace").strip()
         raise ConfigError(f"Could not copy verified Git objects: {detail}")
-    with pack_path.open("rb") as source:
-        indexed = _run_process(
-            [
-                "git",
-                "--no-replace-objects",
-                f"--git-dir={git_dir}",
-                "index-pack",
-                "--stdin",
-            ],
-            stdin=source,
-            capture_output=True,
-            check=False,
-            env=env,
-            timeout=120,
-        )
+    with _perf.phase("archive.copy.index_pack"):
+        with pack_path.open("rb") as source:
+            indexed = _run_process(
+                [
+                    "git",
+                    "--no-replace-objects",
+                    f"--git-dir={git_dir}",
+                    "index-pack",
+                    "--stdin",
+                ],
+                stdin=source,
+                capture_output=True,
+                check=False,
+                env=env,
+                timeout=120,
+            )
     if indexed.returncode != 0:
         detail = indexed.stderr.decode("utf-8", errors="replace").strip()
         raise ConfigError(f"Copied Git objects failed index validation: {detail}")
-    checked = _run_git_dir(
-        git_dir,
-        ["fsck", "--strict", "--no-reflogs", "--no-dangling", commit],
-        check=False,
-    )
+    # fsck the object the pack actually carries. A tree pack has no commit,
+    # and asking for one that is not there fails the check for the wrong
+    # reason; a tree also has no parents, which is why an archive works on a
+    # shallow clone where a commit walk crosses the graft (#683, #1023).
+    with _perf.phase("archive.copy.fsck"):
+        checked = _run_git_dir(
+            git_dir,
+            ["fsck", "--strict", "--no-reflogs", "--no-dangling", tree or commit],
+            check=False,
+        )
     if checked.returncode != 0:
         detail = checked.stderr.strip() or checked.stdout.strip()
         raise ConfigError(f"Copied Git object graph failed integrity validation: {detail}")
 
 
-def _materialize_isolated_tree(git_dir: Path, *, commit: str, destination: Path) -> None:
-    listing = _run_git_dir(git_dir, ["ls-tree", "-r", "-z", commit], text=False).stdout
+def _materialize_isolated_tree(
+    git_dir: Path,
+    *,
+    tree: str,
+    destination: Path,
+    scope: Callable[[str], bool] | None = None,
+    record_gitlinks: bool = False,
+    allow_selected_openshell_links: bool = False,
+) -> dict[str, str]:
+    listing_args = ["ls-tree", "-r", "-z"]
+    if scope is not None:
+        listing_args.append("-t")
+    with _perf.phase("archive.tree.list"):
+        listing = _run_git_dir(git_dir, [*listing_args, tree], text=False).stdout
     root = destination.resolve()
     entries: list[tuple[str, str, str]] = []
+    links: list[tuple[str, str]] = []
     portable_paths: dict[str, str] = {}
+    gitlinks: dict[str, str] = {}
+    #: Every entry's object type, in or out of scope, so a link's target type
+    #: can be read from the tree rather than from what was materialized.
+    tree_types: dict[str, str] = {}
+    listed: list[tuple[str, str, str, str]] = []
     for raw in listing.split(b"\0"):
         if not raw:
             continue
         metadata, raw_path = raw.split(b"\t", 1)
         mode, object_type, oid = metadata.decode("ascii").split(" ", 2)
         path_text = raw_path.decode("utf-8", errors="strict")
-        if "\\" in path_text:
-            raise ConfigError(f"Git tree path is not portable: {path_text}")
-        portable_key = _portable_tree_path_key(path_text)
-        prior = portable_paths.setdefault(portable_key, path_text)
-        if prior != path_text:
-            raise ConfigError(
-                "Git tree contains filesystem-colliding paths: "
-                f"{prior!r} and {path_text!r}"
-            )
-        if object_type != "blob" or mode in {"120000", "160000"}:
-            raise ConfigError(
-                f"Git tree contains unsupported external binding at {path_text} "
-                f"(mode {mode}, type {object_type})."
-            )
-        entries.append((mode, oid, path_text))
+        tree_types[path_text] = "link" if mode == "120000" else object_type
+        listed.append((mode, object_type, oid, path_text))
+    allowed_links = (
+        _admitted_selected_openshell_links(git_dir, tree, listed, tree_types)
+        if scope is None and allow_selected_openshell_links
+        else set()
+    )
+    with _perf.phase("archive.tree.scope_through_links"):
+        in_scope = (
+            _scope_through_boundary_links(git_dir, listed, tree_types, scope)
+            if scope is not None
+            else None
+        )
+    with _perf.phase("archive.tree.classify"):
+        for mode, object_type, oid, path_text in listed:
+            if in_scope is not None and mode != "120000" and not in_scope(path_text):
+                # Out of scope is not merely unmaterialized, it is unexamined:
+                # the portability and collision checks below describe the tree
+                # this archive writes, and a name that never lands on the
+                # filesystem cannot collide there. A repository whose
+                # `src/templates/` holds `.AwS__CrEdEnTiAlS.html` beside
+                # `.aws__credentials.html` is comparable for its host surface.
+                # Symlinks are always examined: they are what conceals a
+                # boundary path from the reader.
+                continue
+            if "\\" in path_text:
+                raise ConfigError(f"Git tree path is not portable: {path_text}")
+            portable_key = _portable_tree_path_key(path_text)
+            prior = portable_paths.setdefault(portable_key, path_text)
+            if prior != path_text:
+                raise ConfigError(
+                    "Git tree contains filesystem-colliding paths: "
+                    f"{prior!r} and {path_text!r}"
+                )
+            if object_type == "tree" and scope is not None:
+                # A directory at a recognized configuration path is an invalid
+                # input, not an absent file. Preserve its kind even when none of
+                # its children are in scope so both inventories can refuse it.
+                target = (root / path_text).resolve()
+                if target == root or root not in target.parents:
+                    raise ConfigError(f"Git tree path escapes destination: {path_text}")
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            if record_gitlinks and mode == "160000" and object_type == "commit":
+                # An unpopulated submodule: the directory a checkout leaves, with
+                # nothing written into it. What it would hold is not in this
+                # repository's object graph, and the caller names it as unread.
+                target = (root / path_text).resolve()
+                if target == root or root not in target.parents:
+                    raise ConfigError(f"Git tree path escapes destination: {path_text}")
+                target.mkdir(parents=True, exist_ok=True)
+                gitlinks[path_text] = oid
+                continue
+            if object_type != "blob" or mode == "160000" or (
+                mode == "120000" and scope is None and path_text not in allowed_links
+            ):
+                raise ConfigError(
+                    f"Git tree contains unsupported external binding at {path_text} "
+                    f"(mode {mode}, type {object_type})."
+                )
+            if mode == "120000":
+                # Recreated as a link rather than refused, so the base tree
+                # presents the reader the same object the worktree does: a link,
+                # opened with O_NOFOLLOW, recorded as unreadable if it is a
+                # boundary path. Refusing instead made a third of a
+                # 12-repository sample uncomparable, several of them for a
+                # symlink no reader would ever open (#688).
+                #
+                # Nothing is written *through* a link. The escape this refusal
+                # used to cover needs a blob under a symlinked ancestor, which a
+                # valid tree cannot express — the name would be both a blob and
+                # a tree, a duplicate entry `fsck --strict` rejects before
+                # anything is written. Blobs are materialized before links
+                # regardless, so no write passes through one even if that check
+                # ever loosens.
+                links.append((oid, path_text))
+                continue
+            entries.append((mode, oid, path_text))
 
     object_format = _run_git_dir(git_dir, ["rev-parse", "--show-object-format"]).stdout.strip()
     expected_digests: dict[str, str] = {}
-    for mode, oid, path_text in entries:
-        target = (root / path_text).resolve()
-        if target == root or root not in target.parents:
-            raise ConfigError(f"Git tree path escapes destination: {path_text}")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        blob = _run_git_dir(git_dir, ["cat-file", "blob", oid], text=False).stdout
-        if _git_object_id("blob", blob, algorithm=object_format) != oid:
-            raise ConfigError(f"Git blob failed object-ID validation: {path_text}")
-        target.write_bytes(blob)
-        expected_digests[path_text] = hashlib.sha256(blob).hexdigest()
-        if mode == "100755":
-            os.chmod(target, 0o755)
+    entry_blobs = _isolated_blobs(git_dir, [(oid, path_text) for _mode, oid, path_text in entries])
+    with _perf.phase("archive.tree.blobs_and_write"):
+        for (mode, oid, path_text), blob in zip(entries, entry_blobs, strict=True):
+            target = (root / path_text).resolve()
+            if target == root or root not in target.parents:
+                raise ConfigError(f"Git tree path escapes destination: {path_text}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if _git_object_id("blob", blob, algorithm=object_format) != oid:
+                raise ConfigError(f"Git blob failed object-ID validation: {path_text}")
+            target.write_bytes(blob)
+            expected_digests[path_text] = hashlib.sha256(blob).hexdigest()
+            if mode == "100755":
+                os.chmod(target, 0o755)
 
-    materialized = {
-        path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in root.rglob("*")
-        if path.is_file() and not path.is_symlink()
-    }
+    link_texts: dict[str, str] = {}
+    with _perf.phase("archive.tree.links"):
+        for (oid, path_text), blob in zip(links, _isolated_blobs(git_dir, links), strict=True):
+            target = root / path_text
+            if not _within(root, target.parent):
+                raise ConfigError(f"Git tree path escapes destination: {path_text}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if _git_object_id("blob", blob, algorithm=object_format) != oid:
+                raise ConfigError(f"Git blob failed object-ID validation: {path_text}")
+            # The link's own text is the blob. It may point anywhere, including
+            # out of the tree — the reader opens it with O_NOFOLLOW and records
+            # the failure, which is exactly what it does on the live worktree.
+            link_text = blob.decode("utf-8", errors="strict")
+            os.symlink(link_text, target)
+            link_texts[path_text] = link_text
+
+    with _perf.phase("archive.tree.link_target_types"):
+        placeholders = (
+            _materialize_link_target_types(root, link_texts, tree_types)
+            if scope is not None
+            else set()
+        )
+
+    with _perf.phase("archive.tree.verify_rglob"):
+        materialized = {
+            relative: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in root.rglob("*")
+            if path.is_file()
+            and not path.is_symlink()
+            and (relative := path.relative_to(root).as_posix()) not in placeholders
+        }
     if materialized != expected_digests:
         raise ConfigError("Materialized Git tree differs from the verified object graph")
+    return gitlinks
+
+
+#: The most blob bytes one `cat-file --batch` read of an isolated store holds.
+#: A batch is buffered whole, so this bounds memory, not the tree: a larger
+#: tree takes more batches, and a single larger blob is read alone, as it was
+#: when every blob had a process of its own.
+_MAX_ISOLATED_BATCH_BYTES = 64 * 1024 * 1024
+
+
+def _isolated_blobs(git_dir: Path, wanted: Sequence[tuple[str, str]]) -> Iterator[bytes]:
+    """Each ``(object ID, path)`` blob's bytes from ``git_dir``, in order (#686 cost class).
+
+    One `cat-file` process per blob made a whole-tree archive cost a process
+    per file: 3,485 of them and 181 seconds for one side of a 3,485-blob
+    repository. Here one `cat-file --batch-check` types and sizes every object
+    first, so a missing object, or one that is not a blob, refuses before any
+    content is read; the content then comes from as few `cat-file --batch`
+    reads as :data:`_MAX_ISOLATED_BATCH_BYTES` allows.
+
+    Only the framing is checked here: every record must name the requested
+    object, as a blob of the size the check reported. The caller still hashes
+    each blob against its tree entry's object ID before writing it. ``path``
+    only names the entry in a refusal.
+    """
+
+    if not wanted:
+        return
+    paths: dict[str, str] = {}
+    for oid, path_text in wanted:
+        # The batch protocol reads one object name per line and resolves any
+        # revision syntax in it, so only a full object ID may be sent.
+        if not _GIT_OBJECT_RE.fullmatch(oid):
+            raise ConfigError(f"Git tree entry has a malformed object ID: {path_text}")
+        paths.setdefault(oid, path_text)
+    checked = _run_git_dir(
+        git_dir,
+        ["cat-file", "--batch-check"],
+        text=False,
+        input=b"".join(f"{oid}\n".encode("ascii") for oid in paths),
+    ).stdout
+    records = checked.split(b"\n")
+    if records.pop() != b"" or len(records) != len(paths):
+        raise ConfigError("Git object check returned a malformed response")
+    sizes: dict[str, int] = {}
+    for (oid, path_text), record in zip(paths.items(), records, strict=True):
+        fields = record.split(b" ")
+        if fields == [oid.encode("ascii"), b"missing"]:
+            raise ConfigError(f"Git object is missing from the verified object graph: {path_text}")
+        if len(fields) != 3 or fields[0] != oid.encode("ascii") or not fields[2].isdigit():
+            raise ConfigError(f"Git object check returned a malformed record: {path_text}")
+        if fields[1] != b"blob":
+            raise ConfigError(
+                f"Git tree entry is not a blob: {path_text} "
+                f"(type {fields[1].decode('ascii', errors='replace')})."
+            )
+        sizes[oid] = int(fields[2])
+
+    # Consecutive runs of the requested order, each within the byte bound;
+    # an object repeated inside a run is read once.
+    runs: list[list[str]] = [[]]
+    distinct: set[str] = set()
+    run_bytes = 0
+    for oid, _path_text in wanted:
+        if oid not in distinct:
+            if distinct and run_bytes + sizes[oid] > _MAX_ISOLATED_BATCH_BYTES:
+                runs.append([])
+                distinct, run_bytes = set(), 0
+            distinct.add(oid)
+            run_bytes += sizes[oid]
+        runs[-1].append(oid)
+    for run in runs:
+        requested = list(dict.fromkeys(run))
+        output = _run_git_dir(
+            git_dir,
+            ["cat-file", "--batch"],
+            text=False,
+            input=b"".join(f"{oid}\n".encode("ascii") for oid in requested),
+        ).stdout
+        contents: dict[str, bytes] = {}
+        offset = 0
+        for oid in requested:
+            size = sizes[oid]
+            header_end = output.find(b"\n", offset)
+            start = header_end + 1
+            end = start + size
+            if (
+                header_end < 0
+                or output[offset:header_end] != f"{oid} blob {size}".encode("ascii")
+                or output[end : end + 1] != b"\n"
+            ):
+                raise ConfigError(f"Git object read returned a malformed record: {paths[oid]}")
+            contents[oid] = output[start:end]
+            offset = end + 1
+        if offset != len(output):
+            raise ConfigError("Git object read returned more than was requested")
+        for oid in run:
+            yield contents[oid]
+
+
+#: How many links one resolution may pass through before it counts as unresolved.
+_MAX_TREE_LINK_HOPS = 8
+
+
+def _scope_through_boundary_links(
+    git_dir: Path,
+    listed: list[tuple[str, str, str, str]],
+    tree_types: dict[str, str],
+    scope: Callable[[str], bool],
+) -> Callable[[str], bool]:
+    """Widen a scope to the in-tree targets of links at in-scope paths (#700).
+
+    The host reader reads a boundary path that is an in-tree link through to
+    its target. A base tree that held only a typed placeholder there would
+    compare the worktree's file against an empty one. So a link whose own path
+    is in scope brings its target's bytes, and a link to a directory brings
+    every blob beneath it whose path under the link is in scope.
+
+    Targets are resolved by the tree's own names, exactly as
+    :func:`_resolve_tree_link` does. Every link text read here comes from the
+    fsck'd isolated store and is checked against its object ID, and every blob
+    this adds is still validated when it is materialized.
+    """
+
+    object_format = _run_git_dir(git_dir, ["rev-parse", "--show-object-format"]).stdout.strip()
+    link_texts: dict[str, str] = {}
+    links = [(oid, path_text) for mode, _type, oid, path_text in listed if mode == "120000"]
+    for (oid, path_text), blob in zip(links, _isolated_blobs(git_dir, links), strict=True):
+        if _git_object_id("blob", blob, algorithm=object_format) != oid:
+            raise ConfigError(f"Git blob failed object-ID validation: {path_text}")
+        link_texts[path_text] = blob.decode("utf-8", errors="strict")
+    files: set[str] = set()
+    directories: list[tuple[str, str]] = []
+    for link in sorted(link_texts):
+        resolved = _resolve_tree_link(link, link_texts)
+        if resolved is None or resolved == link:
+            continue
+        target_type = tree_types.get(resolved)
+        if target_type == "blob" and scope(link):
+            files.add(resolved)
+        elif target_type == "tree":
+            directories.append((f"{resolved}/", f"{link}/"))
+    if not files and not directories:
+        return scope
+
+    def widened(path_text: str) -> bool:
+        if scope(path_text) or path_text in files:
+            return True
+        return any(
+            path_text.startswith(target) and scope(link + path_text[len(target):])
+            for target, link in directories
+        )
+
+    return widened
+
+
+def _resolve_tree_link(path_text: str, link_texts: dict[str, str]) -> str | None:
+    """Where an in-tree link lands, by the tree's own names, or ``None``.
+
+    Lexical only, and deliberately narrow: an absolute target, a target that
+    leaves the tree, a chain longer than the hop bound, or any path with a link
+    as an *intermediate* component is unresolved. Unresolved is the answer the
+    reader already gives such a link, so nothing below is ever written through
+    one.
+    """
+
+    current = path_text
+    for _ in range(_MAX_TREE_LINK_HOPS):
+        text = link_texts.get(current)
+        if text is None:
+            return current
+        if not text or text.startswith("/"):
+            return None
+        joined = posixpath.normpath(posixpath.join(posixpath.dirname(current), text))
+        if joined in {".", ".."} or joined.startswith("../"):
+            return None
+        parts = joined.split("/")
+        if any("/".join(parts[:index]) in link_texts for index in range(1, len(parts))):
+            return None
+        current = joined
+    return current if current not in link_texts else None
+
+
+def _physical_tree_link_target(
+    path_text: str,
+    link_texts: dict[str, str],
+    tree_types: dict[str, str],
+    directories: set[str],
+) -> str | None:
+    """The regular blob a link opens, walked as the filesystem walks it, or ``None``.
+
+    Only selected-link admission asks this. :func:`_resolve_tree_link`
+    normalizes lexically, and the filesystem does not: ``missing/../one``
+    fails at ``missing``, ``afile/../one`` at a file used as a directory and
+    ``one/`` by asking for a directory, although each normalizes to ``one``.
+    Here every hop is walked from its link's own directory, one component at a
+    time, against the tree's listing: no component may be empty, each
+    intermediate one must be a directory the tree holds (``directories``, so
+    never a link), ``..`` never rises above the root, and the last must be a
+    regular blob or another link, within :data:`_MAX_TREE_LINK_HOPS` links.
+    """
+
+    current = path_text
+    for _ in range(_MAX_TREE_LINK_HOPS):
+        text = link_texts.get(current)
+        if not text or text.startswith("/"):
+            return None
+        *intermediate, final = text.split("/")
+        parts = current.split("/")[:-1]
+        for component in intermediate:
+            if not component:
+                return None
+            if component == "..":
+                if not parts:
+                    return None
+                parts.pop()
+            elif component != ".":
+                parts.append(component)
+                if "/".join(parts) not in directories:
+                    return None
+        if final in {"", ".", ".."}:
+            return None
+        current = "/".join([*parts, final])
+        if tree_types.get(current) == "blob":
+            return current
+        if tree_types.get(current) != "link":
+            return None
+    return None
+
+
+def _materialize_link_target_types(
+    root: Path, link_texts: dict[str, str], tree_types: dict[str, str]
+) -> set[str]:
+    """Give each recreated link a target of the type the tree says it has (#700).
+
+    A scoped archive writes only the paths a reader opens, so a link to an
+    out-of-scope file dangled here while it resolved in the worktree. The reader
+    types a link's target to decide whether it may conceal a recursive match,
+    and a dangling link does, so `changelog.md -> README.md` made the base side
+    incomplete and every comparison in the repository refused.
+
+    The placeholder carries the target's type, never its content: an empty file
+    or an empty directory, at a path the scope already excluded because no
+    reader opens it. Returns the placeholder files, which the digest check must
+    not count as materialized blobs.
+    """
+
+    placeholders: set[str] = set()
+    for path_text in sorted(link_texts):
+        resolved = _resolve_tree_link(path_text, link_texts)
+        if resolved is None:
+            continue
+        object_type = tree_types.get(resolved)
+        target = root / resolved
+        if object_type not in {"blob", "tree"} or os.path.lexists(target):
+            continue
+        if not _within(root, target.parent):
+            continue
+        if object_type == "tree":
+            target.mkdir(parents=True, exist_ok=True)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"")
+            placeholders.add(resolved)
+    return placeholders
+
+
+def _within(root: Path, candidate: Path) -> bool:
+    resolved = candidate.resolve()
+    return resolved == root or root in resolved.parents
 
 
 def _portable_tree_path_key(path_text: str) -> str:
@@ -1875,12 +3374,14 @@ def _run_git_dir(
     *,
     check: bool = True,
     text: bool = True,
+    input: bytes | None = None,
 ) -> subprocess.CompletedProcess:
     return _run_process(
         ["git", "--no-replace-objects", f"--git-dir={git_dir}", *args],
         capture_output=True,
         check=check,
         env=_git_object_environment(),
+        input=input,
         text=text,
         timeout=120,
     )
@@ -2048,6 +3549,171 @@ def _decode_git_stderr(payload: bytes | bytearray) -> str:
     if len(collapsed) > _GIT_STDERR_EXCERPT_CHARS:
         collapsed = collapsed[:_GIT_STDERR_EXCERPT_CHARS].rstrip() + "…"
     return collapsed
+
+
+def promisor_remotes(workspace: Path) -> tuple[str, ...]:
+    """The remotes this partial clone was promised objects by, as a command can name them.
+
+    Read from repository configuration only, in the order Git lists it: every
+    ``remote.<name>.promisor`` Git reads as true, then the older
+    ``extensions.partialClone`` when it names another remote. A name is kept
+    only when ``git fetch <name>`` means that configured remote: it has a
+    ``remote.<name>.url``, Git accepts it as a remote name (the
+    ``refs/remotes/<name>/`` ref-format test ``git remote add`` applies, so
+    ``up/stream`` is kept), it is UTF-8, and it does not start with ``-``,
+    which ``git fetch`` would read as an option. Empty when none is left; no
+    other name, ``origin`` included, is supplied in its place. Nothing is
+    fetched (#817).
+    """
+
+    promisor_flags = _git_config_records(
+        workspace, r"^remote\..+\.promisor$", as_bool=True
+    )
+    other_keys = _git_config_records(
+        workspace, r"^(remote\..+\.url|extensions\.partialclone)$"
+    )
+    if promisor_flags is None or other_keys is None:
+        return ()
+    candidates = [
+        _remote_subsection(key, "promisor")
+        for key, value in promisor_flags
+        if value == "true"
+    ]
+    candidates.extend(
+        value for key, value in other_keys if key == "extensions.partialclone"
+    )
+    with_url = {
+        _remote_subsection(key, "url")
+        for key, _ in other_keys
+        if key != "extensions.partialclone"
+    }
+    names: list[str] = []
+    for name in dict.fromkeys(candidates):
+        if not name or name.startswith("-") or name not in with_url:
+            continue
+        accepted = _run_git(
+            workspace,
+            ["check-ref-format", f"refs/remotes/{name}/test"],
+            check=False,
+        )
+        if accepted.returncode == 0:
+            names.append(name)
+    return tuple(names)
+
+
+def _git_config_records(
+    workspace: Path, pattern: str, *, as_bool: bool = False
+) -> list[tuple[str, str]] | None:
+    """``git config -z --get-regexp`` as ``(key, value)`` pairs, in file order.
+
+    ``as_bool`` lets Git parse the values, so ``yes``, ``1`` and a bare key
+    read as ``true`` exactly as Git itself reads them. ``[]`` when nothing
+    matches, ``None`` when Git refuses the read (a value it cannot parse as a
+    boolean, say) or the output passes its bound. A record that is not UTF-8
+    is dropped rather than decoded into a name that differs from the
+    configured one.
+    """
+
+    payload = _run_git_bounded_output(
+        workspace,
+        [
+            "config",
+            "--includes",
+            "-z",
+            *(["--type=bool"] if as_bool else []),
+            "--get-regexp",
+            pattern,
+        ],
+        max_output_bytes=_PROMISOR_CONFIG_LIMIT,
+        allowed_returncodes=(0, 1),
+    )
+    if payload is None:
+        return None
+    records: list[tuple[str, str]] = []
+    for raw in payload.split(b"\0"):
+        if not raw:
+            continue
+        try:
+            record = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        key, _, value = record.partition("\n")
+        records.append((key, value))
+    return records
+
+
+def _remote_subsection(key: str, variable: str) -> str:
+    """``<name>`` from ``remote.<name>.<variable>``, as configured (Git lowercases only the outer parts)."""
+
+    return key[len("remote.") : -len(f".{variable}")]
+
+
+class PromisedObjectsMissingError(ConfigError):
+    """``commit``'s tree needs objects a partial clone never fetched (``objects_missing``)."""
+
+    def __init__(self, commit: str) -> None:
+        self.commit = commit
+        super().__init__(
+            f"Commit {commit} needs Git objects this partial clone never fetched."
+        )
+
+
+def archive_fetched_tree(
+    workspace: Path,
+    commit: str,
+    destination: Path,
+    *,
+    scope: Callable[[str], bool] | None = None,
+    record_gitlinks: bool = False,
+    rescope: Callable[[Path], tuple[Path, Callable[[str], bool]] | None] | None = None,
+) -> dict[str, str]:
+    """:func:`archive_tree`, naming a partial clone's unfetched objects as such.
+
+    A blobless clone fails the object copy with a :class:`ConfigError`, and a
+    treeless one fails the tree lookup before it with a
+    :class:`subprocess.CalledProcessError`. Both become
+    :class:`PromisedObjectsMissingError` when :func:`promised_objects_missing`
+    proves the clone lacks promised objects, so a caller can name the
+    hydration instead of a traceback (#817). Other Git
+    process failures are normalized to ConfigError at this subprocess boundary,
+    so CLI callers need no process-execution import just to catch an error.
+    """
+
+    try:
+        return archive_tree(
+            workspace, commit, destination, scope=scope, record_gitlinks=record_gitlinks,
+            rescope=rescope,
+        )
+    except (ConfigError, subprocess.CalledProcessError) as exc:
+        if promised_objects_missing(workspace, commit):
+            raise PromisedObjectsMissingError(commit) from exc
+        if isinstance(exc, subprocess.CalledProcessError):
+            raise ConfigError(f"Could not materialize Git tree for {commit}: {exc}") from exc
+        raise
+
+
+def promised_objects_missing(workspace: Path, commit: str) -> bool:
+    """Whether ``commit``'s tree needs objects a partial clone never fetched.
+
+    Asked of the repository rather than read from a failure's wording: a walk
+    of the commit's objects fails, and the same walk succeeds once objects a
+    promisor remote still owes are allowed to be missing. A shallow boundary
+    is not crossed (``--no-walk``), and an object missing without a promise,
+    as in a corrupt repository, is not reported as one. Lazy fetching is
+    disabled for both walks, so asking fetches nothing (#817).
+    """
+
+    walk = ["rev-list", "--objects", "--no-walk", "--quiet"]
+    try:
+        complete = _run_git(workspace, [*walk, commit], check=False)
+        if complete.returncode == 0:
+            return False
+        promised = _run_git(
+            workspace, [*walk, "--missing=allow-promisor", commit], check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return promised.returncode == 0
 
 
 def _history_is_truncated(workspace: Path) -> bool | None:
@@ -2267,8 +3933,114 @@ def path_committed_at_head(workspace: Path, path: Path) -> bool | None:
         return None
 
 
+@dataclass(frozen=True)
+class OutputDirectoryInventory:
+    """What Git holds beneath one directory, split by how Git holds it."""
+
+    #: Paths committed at ``HEAD``.
+    head: tuple[str, ...]
+    #: Paths committed in another compared commit and absent at ``HEAD``: the
+    #: change being evaluated removes them.
+    removed: tuple[str, ...]
+    #: Index entries not committed at ``HEAD``: staged additions.
+    staged: tuple[str, ...]
+    #: Paths committed at ``HEAD`` that the index no longer holds: staged
+    #: deletions.
+    unstaged: tuple[str, ...]
+    #: Untracked paths that survive the standard exclude rules.
+    untracked: tuple[str, ...]
+    #: Those of the caller's ``probe_ignored`` paths the standard exclude rules
+    #: ignore. A probed path need not exist: the rules match names, so this is
+    #: whether a file written there later would be ignored.
+    ignored: tuple[str, ...] = ()
+
+
+def output_directory_inventory(
+    workspace: Path,
+    directory: str,
+    *,
+    compared: Sequence[str] = (),
+    probe_ignored: Sequence[str] = (),
+) -> OutputDirectoryInventory:
+    """Every path Git could report beneath ``directory``, if it were not excluded.
+
+    ``directory`` is spelled relative to the repository root as Git stores it.
+    A change set leaves out everything beneath an excluded directory: content
+    committed at ``HEAD`` (and every later edit to it), content a compared
+    commit held that the change deletes, staged additions, and untracked files
+    the standard exclude rules keep. That is the question an output directory
+    is judged by — what leaving it out would hide (#804). ``compared`` names
+    the other commits the caller's change set is taken against, such as a
+    merge base; one that does not resolve contributes nothing, because no
+    change set is taken against it.
+
+    ``probe_ignored`` names root-relative paths, typically files a run has not
+    written yet, to test against the same exclude rules: whether a file a run
+    would write there is one Git reports at all.
+
+    Every read is bounded like every other metadata read here. A directory too
+    large to list, or a Git failure, raises rather than reading as empty.
+
+    Defined below ``_run_git`` so the line-pinned static-only allowlist entries
+    for this module's subprocess call sites stay stable.
+    """
+
+    pathspec = [f":(top,literal){directory}"]
+
+    def listed(args: list[str]) -> set[str]:
+        payload = _run_git_bounded_output(
+            workspace,
+            [*_SAFE_DIFF_CONFIG, *args, "-z", "--", *pathspec],
+            max_output_bytes=_DIFF_METADATA_LIMIT,
+        )
+        if payload is None:
+            raise ConfigError(
+                f"Git could not list the paths beneath {directory} within its "
+                "static output bounds."
+            )
+        return {os.fsdecode(raw) for raw in payload.split(b"\0") if raw}
+
+    def committed(ref: str) -> set[str]:
+        commit = commit_sha(workspace, ref)
+        if commit is None:
+            return set()
+        return listed(["ls-tree", "-r", "--name-only", commit])
+
+    at_head = committed("HEAD")
+    elsewhere: set[str] = set()
+    for ref in compared:
+        elsewhere |= committed(ref)
+    index = listed(["ls-files", "--cached"])
+    untracked = listed(["ls-files", "--others", "--exclude-standard"])
+    ignored: set[str] = set()
+    if probe_ignored:
+        # Exit 1 is "none of them is ignored", not a failure.
+        payload = _run_git_bounded_output(
+            workspace,
+            [*_SAFE_DIFF_CONFIG, "check-ignore", "--stdin", "-z"],
+            max_output_bytes=_DIFF_METADATA_LIMIT,
+            allowed_returncodes=(0, 1),
+            input=b"".join(os.fsencode(path) + b"\0" for path in probe_ignored),
+        )
+        if payload is None:
+            raise ConfigError(
+                f"Git could not read the ignore rules beneath {directory} within "
+                "its static output bounds."
+            )
+        ignored = {os.fsdecode(raw) for raw in payload.split(b"\0") if raw}
+    return OutputDirectoryInventory(
+        head=tuple(sorted(at_head)),
+        removed=tuple(sorted(elsewhere - at_head)),
+        staged=tuple(sorted(index - at_head)),
+        unstaged=tuple(sorted(at_head - index)),
+        untracked=tuple(sorted(untracked)),
+        ignored=tuple(sorted(ignored.intersection(probe_ignored))),
+    )
+
+
 __all__ = [
     "active_replace_refs",
+    "archive_fetched_tree",
     "archive_tree",
     "BinaryCapabilityDiffError",
     "collect_diff_context",
@@ -2283,11 +4055,18 @@ __all__ = [
     "diff_context",
     "diff_revspec_context",
     "ensure_git_workspace",
+    "git_directories",
     "git_path",
     "GitPushEndpoint",
     "merge_base_sha",
+    "objects_missing_remediation",
+    "output_directory_inventory",
+    "OutputDirectoryInventory",
     "path_committed_at_head",
     "path_present_at_ref",
+    "PromisedObjectsMissingError",
+    "promised_objects_missing",
+    "promisor_remotes",
     "read_bytes_at_ref",
     "read_file_at_ref",
     "removes_any_tracked_path",
@@ -2300,7 +4079,32 @@ __all__ = [
     "SourceHeadIdentity",
     "staged_paths_under",
     "tree_sha",
+    "UnboundGitConfigurationError",
     "validate_source_head_identity",
     "working_tree_context",
     "working_tree_paths",
 ]
+
+
+def shallow_merge_base_is_proven(workspace: Path, base: str, head: str, resolved: str) -> bool:
+    """Reject hidden better ancestors without requiring unrelated old history.
+
+    Inputs are resolved commit IDs. A returned common ancestor need not be the
+    best one when a merge exposes older ancestry around a shallow graft.
+    """
+    if resolved in {base, head}:
+        return True
+    shallow = _history_is_truncated(workspace)
+    if shallow is False:
+        return True
+    if shallow is None:
+        return False
+    roots = _run_git(
+        workspace,
+        ["rev-list", "--max-parents=0", "--max-count=1", base, head, "--not", resolved],
+        check=False,
+    )
+    # Removing the candidate's ancestry must leave no root (including grafts)
+    # reachable from either tip. Otherwise a hidden edge can conceal a newer
+    # common ancestor. This is conservative for unrelated shallow side branches.
+    return roots.returncode == 0 and not roots.stdout.strip()

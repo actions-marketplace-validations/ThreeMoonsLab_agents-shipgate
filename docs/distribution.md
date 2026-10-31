@@ -4,11 +4,47 @@ These items require release infrastructure, registry credentials, domains, or Gi
 
 ## Package Channels
 
+| Line | Carries | Install | Promises | Cadence |
+| --- | --- | --- | --- | --- |
+| **Advisory** | `diff`, `check`, `audit --host`, drift, advisory PR comments | a `v*` release declared `advisory` — `v1.2.0` is one, on PyPI — or an unqualified preview pre-release | plain-language capability rows; **no blocking authority** unless an adopter configures a blocking policy | 14 days |
+| **Qualified gate** | blocking verdicts backed by qualification evidence, receipts, attestations | a `v*` release on the qualified line | every bar in [`release-evidence-policy-decision.md`](release-evidence-policy-decision.md) | on evidence only |
+
+A `v*` tag's shape does not say which line it is on. Each release version is
+declared once, in `.github/release-channels.json`, as `advisory` or
+`qualified` (Amendment 5 of the policy decision); a tag whose own tree has no
+declaration predates advisory `v*` releases and is on the qualified line.
+
+The two cadences are measured separately by `scripts/release_cadence.py`,
+which reads each `v*` tag's declared channel: qualified tags count for the gate
+line, and advisory `v*` releases and `preview-*` pre-releases for the advisory
+line. Counting advisory releases in the gate metric would let the channel that
+exists *because* the release cadence slipped report that cadence as kept.
+
+For previews, the offline script uses the UTC build date stamped into the
+version, and labels it as a build-date proxy. Lightweight Git tags expose the
+source commit time, not publication time; GitHub publication records are
+still needed to prove the shipping cadence.
+
+
 - `agents-shipgate` is published on PyPI.
-- Pinned GitHub Action release tags are published, including `v0.15.0`.
-- GitHub Releases attach the independently qualified wheel, SBOM,
-  `safety-qualification.json`, and their Sigstore bundles. The tag workflow
-  does not rebuild or publish an unqualified sdist.
+- Pinned GitHub Action release tags are published, including `v1.2.0`.
+- A **qualified** `v*` GitHub Release attaches the independently qualified
+  wheel, SBOM, `safety-qualification.json`, and their Sigstore bundles.
+- An **advisory** `v*` GitHub Release attaches the wheel, a wheel-scoped SBOM,
+  `provenance.json`, `candidate-manifest.json` and a signed
+  `advisory-statement.json`, with Sigstore bundles for the wheel, SBOM and
+  statement, and no qualification artifact. `v1.0.0`, `v1.1.0` and `v1.2.0`
+  are published this way; each statement records advisory defaults, blocking
+  opt-in and no qualification claim.
+- The tag workflow does not rebuild or publish an unqualified sdist.
+- **Unqualified previews** are published as GitHub *pre-releases* at
+  `preview-<version>`, carrying one wheel and no qualification artifact. They
+  exist so merged work is installable while a tag is blocked, and they reach no
+  index: the version carries a PEP 440 local segment, which a public index must
+  refuse. See [`release-runbook.md`](release-runbook.md) § The unqualified
+  preview channel, and the admissibility finding in
+  [`release-evidence-policy-decision.md`](release-evidence-policy-decision.md)
+  § Amendment 2.
 - Evaluate a container image later only if it has an exercised build-and-test path.
 - Evaluate Homebrew once CLI usage warrants it.
 
@@ -26,7 +62,8 @@ to install a published PyPI version.
 - Pin the build backend in `constraints/release-build.txt` so release wheels are
   byte-reproducible.
 - Use Dependabot for Python and GitHub Actions updates.
-- Add a lockfile for release and dev dependency builds once packaging workflow is finalized.
+- Use the existing hash-locked development, build, sealing and publication
+  closures listed in the [release runbook](release-runbook.md#the-environment-is-locked-and-it-is-cis).
 
 PyPI Trusted Publishing is configured for this repository's tag-triggered
 release workflow and protected `pypi` environment.
@@ -57,8 +94,8 @@ against the exact wheel and signs `safety-qualification.json`:
 | `SAFETY_QUALIFICATION_SIGSTORE_BUNDLE_URL` | HTTPS URL for that JSON artifact's Sigstore bundle |
 
 The verification job checks the signature identity first, then validates the
-artifact against the policy the tag's version requires — the 100-case `beta`
-policy, or, for a `0.x` tag, the 56-case `pre_1_0` policy approved in
+artifact against the policy the tag's version requires — the 80-case `beta`
+policy, or, for a `0.x` tag, the 38-case `pre_1_0` policy approved in
 [`release-evidence-policy-decision.md`](release-evidence-policy-decision.md) —
 together with the tag/version and wheel SHA-256. Which policy governs is
 derived from the version, never read from the artifact, and a `0.x` tag may
@@ -82,9 +119,11 @@ This is a configured trust root, not proof of organizational independence.
 The promotion job trusts the signed qualification summary and does not replay
 its underlying verifier receipts. The four-week, three-design-partner rollout
 is likewise an external beta stop condition; the machine gate enforces only
-the qualification artifact's combined origin minimum — 40 real-history,
-rejected/reverted, or design-partner cases under the production policy and 23
+the qualification artifact's combined origin minimum — 32 real-history,
+rejected/reverted, or design-partner cases under the production policy and 16
 under the pre-1.0 one, the same 40% share of each corpus.
+The [current policy table](../benchmark/safety-qualification/README.md#current-policy-contract)
+keeps these machine floors separate from external rollout and pilot evidence.
 
 ## Marketplace And Site
 

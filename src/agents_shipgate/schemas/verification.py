@@ -19,7 +19,7 @@ orchestration fields additively.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -36,6 +36,12 @@ class VerificationContext(BaseModel):
     # so ``ScanContext.config_path`` alone cannot be compared with repository-
     # relative changed paths without leaking or depending on that temp path.
     configured_manifest_path: str | None = None
+    # How the configured manifest may be used. ``local_review`` is the
+    # reserved ephemeral setup path: checks must route it through the ordinary
+    # release decision as review-required, never as an authoritative pass.
+    manifest_provenance: Literal[
+        "repository", "local_review", "uncommitted", "absent", "unknown"
+    ] = "unknown"
     # True only when the comparison base carries no Shipgate manifest at all —
     # this diff *introduces* the gate rather than modifying one. Checks that
     # fail safe on a missing base use it to say so honestly; it never relaxes a
@@ -43,6 +49,12 @@ class VerificationContext(BaseModel):
     # ``cli/verify/orchestrator._manifest_introduced``), so a renamed manifest
     # cannot pass itself off as a first adoption.
     manifest_introduced: bool = False
+    # True when the configured manifest itself is new in the comparison and
+    # the gate introduction is unshared. Unlike ``manifest_introduced``, this
+    # remains knowable when the bounded whole-tree manifest probe abstains.
+    # Declaration review uses it only to compare the new rows with an empty
+    # base; it never relaxes release routing.
+    configured_gate_introduced: bool = False
     # True when verify resolved a base ref and could not produce a usable base
     # report for it (ref missing, archive failed, base scan failed, base
     # manifest absent). The head scan cannot see that from ``--diff-from``,
@@ -50,3 +62,21 @@ class VerificationContext(BaseModel):
     # compare. It never relaxes a verdict; it only stops the head from
     # claiming a comparison it did not get.
     base_comparison_unavailable: bool = False
+    # Repository-relative paths of the in-repository inputs the verifier was
+    # pointed at on its command line (``--policy-pack``, ``--baseline``,
+    # ``--diff-from``), each with the trust-root class it governs the gate as.
+    # Like ``configured_manifest_path``, they exist only in the invocation, so
+    # the trust-root glob table cannot see them; a change that edits one
+    # touches a trust root (#1024).
+    configured_trust_root_inputs: dict[str, str] = Field(default_factory=dict)
+    # The files that hold hooks of a plugin the repository's project settings
+    # enable, read from both compared sides (an ``EnabledPluginHookFiles``),
+    # and the input issues from reading them (``BoundaryInputIssue``s), as
+    # `check` reads them (#809). ``None`` reads the scanned tree only, which
+    # cannot see a hook file the change deleted. Run-private: excluded from
+    # serialization and never published.
+    enabled_plugin_hooks: Any = Field(default=None, exclude=True, repr=False)
+    enabled_plugin_hook_issues: tuple[Any, ...] = Field(default=(), exclude=True, repr=False)
+
+    # Produced only by the opt-in trusted local execution, never by JSON import.
+    openshell_native: Any = Field(default=None, exclude=True, repr=False)

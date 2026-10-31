@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
+import os
+import re
 import shutil
 import subprocess
 import sys
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from email import message_from_bytes
 from pathlib import Path
 
@@ -42,11 +46,7 @@ def built_wheel(tmp_path_factory: pytest.TempPathFactory) -> Path:
         ),
     )
     stale_report = (
-        source_root
-        / "samples"
-        / "support_refund_agent"
-        / "agents-shipgate-reports"
-        / "report.json"
+        source_root / "samples" / "support_refund_agent" / "agents-shipgate-reports" / "report.json"
     )
     stale_report.parent.mkdir(parents=True)
     stale_report.write_text('{"stale": true}\n', encoding="utf-8")
@@ -62,6 +62,34 @@ def built_wheel(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return wheels[0]
 
 
+@pytest.fixture(scope="session")
+def installed_wheel_site(
+    built_wheel: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Path:
+    """Install the built wheel into an isolated target without network access."""
+
+    root = tmp_path_factory.mktemp("installed-wheel")
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--no-deps",
+            "--force-reinstall",
+            "--target",
+            str(root),
+            str(built_wheel),
+        ],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return root
+
+
 def test_wheel_includes_adoption_kits(built_wheel: Path) -> None:
     with zipfile.ZipFile(built_wheel) as archive:
         names = set(archive.namelist())
@@ -69,6 +97,26 @@ def test_wheel_includes_adoption_kits(built_wheel: Path) -> None:
     assert "agents_shipgate/_adoption_kits/claude-code-skill/SKILL.md" in names
     assert "agents_shipgate/_adoption_kits/codex-skill/.agents-shipgate-kit-metadata.json" in names
     assert "agents_shipgate/_meta/claude-command/shipgate.md" in names
+
+
+def test_wheel_description_leads_with_the_host_diff_entry(built_wheel: Path) -> None:
+    """#779: the description a next release publishes carries the current entry.
+
+    The description inside the published `1.0.0` metadata is immutable and
+    still opens on a constructed fixture under a pre-1.0 status. Editing
+    `README.md` on main cannot change those bytes, so this reads the wheel this
+    tree builds, which is what the next release's PyPI page will show.
+    """
+    with zipfile.ZipFile(built_wheel) as archive:
+        metadata = next(
+            name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+        )
+        body = message_from_bytes(archive.read(metadata)).get_payload()
+    assert body.index("## What did this PR change?") < body.index(
+        "## One capability change, one verdict"
+    )
+    assert "agents-shipgate diff" in body
+    assert "Status: pre-1.0" not in body
 
 
 def test_wheel_includes_nested_sample_fixtures(built_wheel: Path) -> None:
@@ -81,6 +129,255 @@ def test_wheel_includes_nested_sample_fixtures(built_wheel: Path) -> None:
         "agents_shipgate/_fixtures/support_refund_agent/shipgate.yaml",
     ):
         assert path in names
+
+
+def test_installed_wheel_replays_incident_fixtures(
+    installed_wheel_site: Path,
+    tmp_path: Path,
+) -> None:
+    """The three demos run from an installed artifact, not the source tree."""
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(installed_wheel_site)
+    env["PYTHONNOUSERSITE"] = "1"
+    fixtures = (
+        (
+            "agent_weakens_gate",
+            "Merge verdict: blocked",
+            "blocked",
+            "blocked",
+            ("SHIP-VERIFY-CI-GATE-REMOVED",),
+            (),
+        ),
+        (
+            "governed_edits_governance",
+            "Fixture expectation: expected-fail",
+            "mergeable",
+            "passed",
+            (),
+            ("SHIP-VERIFY-TRUST-ROOT-TOUCHED",),
+        ),
+        (
+            "prompt_change_rides_release",
+            "Merge verdict: human_review_required",
+            "human_review_required",
+            "review_required",
+            (
+                "SHIP-AGENT-BOUNDARY-PROTECTED-SURFACE-UNCLASSIFIED",
+                "SHIP-VERIFY-TRUST-ROOT-TOUCHED",
+            ),
+            (),
+        ),
+    )
+
+    def replay(
+        expectation: tuple[str, str, str, str, tuple[str, ...], tuple[str, ...]],
+    ) -> tuple[
+        tuple[str, str, str, str, tuple[str, ...], tuple[str, ...]],
+        Path,
+        subprocess.CompletedProcess[str],
+    ]:
+        name = expectation[0]
+        out = tmp_path / name
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "agents_shipgate",
+                "fixture",
+                "run",
+                name,
+                "--out",
+                str(out),
+            ],
+            cwd=tmp_path,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return expectation, out, result
+
+    with ThreadPoolExecutor(max_workers=len(fixtures)) as executor:
+        results = list(executor.map(replay, fixtures))
+
+    for expectation, out, result in results:
+        name, expected_output, merge_verdict, decision, required_checks, absent_checks = expectation
+        assert result.returncode == 0, f"{name}: {result.stdout}{result.stderr}"
+        assert expected_output in result.stdout
+        verifier = json.loads((out / "verifier.json").read_text(encoding="utf-8"))
+        report = json.loads((out / "report.json").read_text(encoding="utf-8"))
+        assert verifier["merge_verdict"] == merge_verdict
+        assert report["release_decision"]["decision"] == decision
+        check_ids = {finding["check_id"] for finding in report["findings"]}
+        assert set(required_checks) <= check_ids
+        assert not (set(absent_checks) & check_ids)
+
+
+def test_a_stamped_installed_wheel_kit_does_not_downgrade_or_stop_at_the_floor(
+    installed_wheel_site: Path,
+    tmp_path: Path,
+) -> None:
+    """#781, on installed bytes and the real `init` route, outside any checkout.
+
+    A final wheel is built before the published-release constants move, so it
+    carries the *previous* release in them — `1.0.0` carried `0.15.0` and
+    contract `10`. Its adoption kit rendered those constants and told adopters
+    to install `0.15.0` and stop at a contract floor the running build met.
+    This rewrites the installed copy's constants to that pre-publication state
+    and adds the release-source record the candidate build stamps, then reads
+    what the installed CLI emits. The unstamped run is the control: it must
+    still show the published fallback, or the substitution did not take.
+    """
+
+    from agents_shipgate import __version__
+
+    site = tmp_path / "site"
+    shutil.copytree(installed_wheel_site, site, symlinks=True)
+    package = site / "agents_shipgate"
+    constants = package / "published_release.py"
+    text = constants.read_text(encoding="utf-8")
+    for name, stale in (
+        ("LATEST_PUBLISHED_VERSION", "0.15.0"),
+        ("LATEST_PUBLISHED_CONTRACT_VERSION", "10"),
+    ):
+        text, count = re.subn(rf'^{name} = "[^"]*"$', f'{name} = "{stale}"', text, flags=re.M)
+        assert count == 1, name
+    constants.write_text(text, encoding="utf-8")
+    shutil.rmtree(package / "__pycache__", ignore_errors=True)
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(site)
+    env["PYTHONNOUSERSITE"] = "1"
+    env.pop("AGENTS_SHIPGATE_WORKFLOW_REF", None)
+    located = subprocess.run(
+        [sys.executable, "-c", "import agents_shipgate; print(agents_shipgate.__file__)"],
+        cwd=tmp_path, env=env, check=True, capture_output=True, text=True,
+    )
+    assert Path(located.stdout.strip()).resolve().is_relative_to(site.resolve())
+
+    def kit(name: str) -> str:
+        workspace = tmp_path / name
+        workspace.mkdir()
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "agents_shipgate", "init",
+                "--workspace", str(workspace), "--minimal",
+                "--agent-instructions=claude-code-skill,codex-skill", "--json",
+            ],
+            cwd=tmp_path, env=env, check=False, capture_output=True, text=True,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert not any(workspace.iterdir()), "the dry run wrote into the workspace"
+        payload = json.loads(result.stdout)
+        files = [
+            entry
+            for target in payload["agent_instructions"]["targets"]
+            for entry in target["files"]
+        ]
+        assert any(entry["path"].endswith("ci-recipes/advisory-pr-comment.yml") for entry in files)
+        assert any(entry["path"].endswith("assets/advisory-pr-comment.yml") for entry in files)
+        return "\n".join(entry["content"] for entry in files)
+
+    control = kit("unstamped")
+    assert "ThreeMoonsLab/agents-shipgate@v0.15.0" in control
+    assert "No published release reports that contract yet" in control
+
+    sha = "c" * 40
+    record = package / "_meta" / "release-source.json"
+    record.parent.mkdir(exist_ok=True)
+    record.write_text(json.dumps({
+        "schema_version": "shipgate.release_source/v1",
+        "source_commit": sha,
+        "package_version": __version__,
+    }), encoding="utf-8")
+    stamped = kit("stamped")
+    actions = set(re.findall(r"ThreeMoonsLab/agents-shipgate@([^\s\"'`)\],;{}]+)", stamped))
+    assert actions - {"v<NEW>"} == {sha}
+    assert set(re.findall(r"shipgate_version:\s*'([^']+)'", stamped)) - {"<NEW>"} == {__version__}
+    assert set(re.findall(r"agents-shipgate(?:@|==)(\d+\.\d+\.\d+)", stamped)) == {__version__}
+    assert "0.15.0" not in stamped
+    assert "No published release reports that contract" not in stamped
+
+
+def test_wheel_emits_a_capability_delta_attestation(
+    built_wheel: Path, tmp_path: Path
+) -> None:
+    """#470: the attestation must reach a packaged release, not only a checkout.
+
+    Run against the wheel's own bytes alone, with the working directory outside
+    the repository, so a hidden read of ``docs/`` or ``samples/`` — neither of
+    which a release has at those paths — fails rather than silently succeeding
+    from the developer's tree. The wheel carries the shipped samples at
+    ``agents_shipgate/_fixtures``, so the projection has real capability facts
+    to work from without the repository.
+
+    Extracted rather than pip-installed on purpose. ``built_wheel`` is already
+    required by every other test in this module, while ``installed_wheel_site``
+    is required by one — and session fixtures are per *worker* under xdist, so
+    a second consumer of the install fixture can add a whole wheel build and
+    install to another worker's run. This test needs the packaged file tree,
+    not a resolved distribution, and the ``test`` job has no time to spare.
+    """
+
+    site = tmp_path / "site"
+    with zipfile.ZipFile(built_wheel) as archive:
+        archive.extractall(site)
+    workdir = tmp_path / "elsewhere"
+    workdir.mkdir()
+    script = workdir / "emit.py"
+    script.write_text(
+        """
+import shutil, sys
+from pathlib import Path
+
+import agents_shipgate
+from agents_shipgate.cli.capability import build_capability_lock_from_config
+from agents_shipgate.core.capability_attestation import (
+    project_capability_delta_attestation,
+)
+from agents_shipgate.schemas.capability_attestation import render_attestation_json
+
+assert Path(agents_shipgate.__file__).parent.parent == Path(sys.argv[1]), (
+    "the script must run against the packaged wheel, not the source tree"
+)
+sample = Path(agents_shipgate.__file__).parent / "_fixtures" / "ai_generated_refund_pr"
+base = build_capability_lock_from_config(
+    config=sample / "shipgate.yaml", no_plugins=True, verbose=False
+)
+head_root = Path("head")
+shutil.copytree(sample, head_root)
+shutil.copyfile(head_root / "_head" / "tools.json", head_root / "tools.json")
+head = build_capability_lock_from_config(
+    config=head_root / "shipgate.yaml", no_plugins=True, verbose=False
+)
+attestation = project_capability_delta_attestation(
+    base.capabilities,
+    head.capabilities,
+    subject_name="wheel-check",
+    base_tree_sha="a" * 40,
+    head_tree_sha="b" * 40,
+    head_commit_sha=None,
+)
+sys.stdout.write(render_attestation_json(attestation))
+""",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(site)
+    env["PYTHONNOUSERSITE"] = "1"
+    result = subprocess.run(
+        [sys.executable, str(script), str(site)],
+        cwd=workdir,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    document = json.loads(result.stdout)
+    assert document["predicateType"].endswith("/capability-delta/v1")
+    assert document["predicate"]["delta"]["summary"]["subjects"] >= 1
 
 
 def test_wheel_excludes_generated_shipgate_reports(built_wheel: Path) -> None:

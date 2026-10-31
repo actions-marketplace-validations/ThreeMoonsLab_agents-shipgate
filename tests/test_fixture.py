@@ -4,12 +4,32 @@
 from __future__ import annotations
 
 import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tarfile
+from dataclasses import replace
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
+from agents_shipgate import fixtures as fixtures_module
+from agents_shipgate.cli.fixture import _report_replay_expectation
 from agents_shipgate.cli.main import app
-from agents_shipgate.fixtures import fixture_path, fixtures_root, list_fixtures
+from agents_shipgate.fixtures import (
+    fixture_path,
+    fixtures_root,
+    list_fixtures,
+    replay_fixture,
+)
+from agents_shipgate.published_release import LATEST_PUBLISHED_VERSION
+from agents_shipgate.schemas.report import Finding, ReadinessReport, ReleaseDecision
+from agents_shipgate.schemas.verifier import VerifierArtifact
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 runner = CliRunner()
 
@@ -23,11 +43,14 @@ def test_fixtures_root_finds_samples_in_editable_install():
 
 def test_list_fixtures_excludes_anti_patterns_and_dotfiles():
     fixtures = list_fixtures()
-    names = {entry["name"] for entry in fixtures}
+    listed_names = [entry["name"] for entry in fixtures]
+    names = set(listed_names)
     assert "support_refund_agent" in names
-    assert "_anti_patterns" not in names, (
-        "anti-patterns directory must not surface as a fixture"
-    )
+    assert "agent_weakens_gate" in names
+    assert "governed_edits_governance" in names
+    assert "prompt_change_rides_release" in names
+    assert len(listed_names) == len(names), "fixture names must be unique"
+    assert "_anti_patterns" not in names, "anti-patterns directory must not surface as a fixture"
     for entry in fixtures:
         assert not entry["name"].startswith("_")
         assert not entry["name"].startswith(".")
@@ -39,12 +62,19 @@ def test_fixture_path_returns_existing_directory():
 
 
 def test_fixture_path_raises_for_unknown_fixture():
-    import pytest
-
     from agents_shipgate.fixtures import FixtureNotFoundError
 
     with pytest.raises(FixtureNotFoundError):
         fixture_path("does-not-exist")
+
+
+def test_replay_name_cannot_shadow_a_different_bundled_sample(tmp_path: Path):
+    collision = tmp_path / "governed_edits_governance"
+    collision.mkdir()
+    (collision / "shipgate.yaml").write_text("version: 1\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="governed_edits_governance"):
+        fixtures_module._validate_replay_fixture_names(tmp_path)
 
 
 def test_cli_fixture_list_text():
@@ -60,6 +90,10 @@ def test_cli_fixture_list_json():
     assert isinstance(payload, list)
     names = {entry["name"] for entry in payload}
     assert "support_refund_agent" in names
+    replay = next(entry for entry in payload if entry["name"] == "governed_edits_governance")
+    assert replay["kind"] == "replay"
+    assert replay["path"] == "replay:governed_edits_governance"
+    assert replay["backing_path"].endswith("/agent_weakens_gate")
 
 
 def test_cli_fixture_run(tmp_path: Path):
@@ -86,6 +120,21 @@ def test_cli_fixture_run(tmp_path: Path):
         "review_concern_count": 0,
         "reason_counts": {},
         "acknowledged_overrides": [],
+        "declaration_review": {
+            "enabled": False,
+            "base_comparison_requested": False,
+            "base_kind": "none",
+            "changed_count": 0,
+            "summary": {
+                "evidence_consistent": 0,
+                "unverified": 0,
+                "acknowledged_override": 0,
+            },
+            "rows": [],
+            "notes": [
+                "No trustworthy base declaration snapshot was available; declaration review disabled."
+            ],
+        },
         # Nothing was ever asked: ``readOnlyHint`` establishes the effect and
         # the MCP auth block establishes the authority, so the manifest's
         # declarations restate what the scan already proved.
@@ -97,6 +146,311 @@ def test_cli_fixture_run(tmp_path: Path):
             "open_questions": [],
         },
     }
+
+
+#: The human entry path (#498). Both files quote this fixture's PR comment, and
+#: both are registered distribution surfaces in `docs/distribution-surfaces.md`.
+_ENTRY_PATH_SURFACES = ("README.md", "docs/quickstart.md")
+
+#: A fenced or quoted block, and the prose immediately before it. A block is
+#: read as a quotation of the PR comment when that prose names the artifact.
+_QUOTED_BLOCK = re.compile(r"(?P<lead>(?:[^\n]*\n){0,4})```[a-z]*\n(?P<body>.*?)\n```", re.DOTALL)
+_BLOCKQUOTE = re.compile(r"(?P<lead>(?:[^\n]*\n){0,4})(?P<body>(?:^>[^\n]*\n)+)", re.M)
+
+
+def _unescaped(text: str) -> str:
+    """Markdown escaping removed and whitespace collapsed.
+
+    The comment writes ``high\\-risk`` because it renders into a Markdown
+    surface; a document quoting it as ``high-risk`` is quoting the same content,
+    and where a paragraph wraps is not part of the claim either.
+    """
+
+    return re.sub(r"\s+", " ", re.sub(r"\\([^A-Za-z0-9\s])", r"\1", text)).strip()
+
+
+def _logical_lines(body: str) -> list[str]:
+    """One entry per rendered line, with hard-wrapped continuations rejoined.
+
+    A quoted excerpt wraps the comment's long lines to fit the page and skips
+    the rows it is not making a point about. Neither is a difference in what it
+    claims, so the comparison is per rendered line: a bullet or heading starts
+    one, anything else continues the previous.
+    """
+
+    lines: list[str] = []
+    for raw in body.splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(("-", "#", "|")) or not lines:
+            lines.append(stripped)
+        else:
+            lines[-1] = f"{lines[-1]} {stripped}"
+    return [_unescaped(line) for line in lines]
+
+
+#: How a step says an excerpt belongs to one channel: it names the published
+#: release. Rendered from the constant, so it moves with the release rather than
+#: being a literal two files can disagree about.
+#:
+#: Deliberately the *version*, not a fixed sentence. The failure this catches is
+#: a step that never mentions the channel at all; pinning one phrasing would
+#: make authors write prose to satisfy a test, and the first draft already
+#: rejected "The published `v0.15.0` build names the same four check IDs" —
+#: which says exactly what the guard wants said.
+_RELEASE_MARKER = f"`v{LATEST_PUBLISHED_VERSION}`"
+
+#: The artifacts a quoted block can be bound to. A block is bound when the
+#: prose immediately before it names the file; anything else is not a quotation
+#: of an artifact and is left alone.
+_QUOTED_ARTIFACTS = ("pr-comment.md", "report.md")
+
+
+def _run_refund_fixture(out: Path, *, source_root: Path | None = None) -> dict[str, str]:
+    """Render the fixture's artifacts, from this tree or from an extracted tag."""
+
+    if source_root is None:
+        result = runner.invoke(app, ["fixture", "run", "ai_generated_refund_pr", "--out", str(out)])
+        assert result.exit_code == 0, result.output
+    else:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "agents_shipgate",
+                "fixture",
+                "run",
+                "ai_generated_refund_pr",
+                "--out",
+                str(out),
+            ],
+            cwd=source_root,
+            env={**os.environ, "PYTHONPATH": str(source_root / "src")},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:  # pragma: no cover - dependency drift
+            pytest.skip(
+                f"the released engine at {source_root} did not run here: "
+                f"{completed.stderr.strip()[:400]}. Its dependencies must be "
+                "satisfiable by this interpreter for the channel comparison."
+            )
+    return {
+        name: _unescaped((out / name).read_text(encoding="utf-8")) for name in _QUOTED_ARTIFACTS
+    }
+
+
+def _released_source(tmp_path: Path) -> Path:
+    """This repository at the newest published tag, extracted."""
+
+    root = tmp_path / "released"
+    root.mkdir()
+    archive = tmp_path / "released.tar"
+    with archive.open("wb") as handle:
+        completed = subprocess.run(
+            ["git", "archive", f"v{LATEST_PUBLISHED_VERSION}"],
+            cwd=REPO_ROOT,
+            stdout=handle,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    if completed.returncode != 0:  # pragma: no cover - shallow or tagless
+        pytest.skip(
+            f"could not extract v{LATEST_PUBLISHED_VERSION}: "
+            f"{completed.stderr.decode(errors='replace').strip()}. The job "
+            "needs `fetch-depth: 0` and `fetch-tags: true`."
+        )
+    with tarfile.open(archive) as tar:
+        tar.extractall(root, filter="data")
+    return root
+
+
+def _enclosing_section(text: str, offset: int) -> str:
+    """The `##`/`###` section containing ``offset``, heading included.
+
+    Fenced regions are masked first. The PR-comment excerpt quotes the comment's
+    own `## Agents Shipgate` / `### Human summary` headings, so a scan that read
+    them as document structure decided the enclosing section *began inside the
+    block it was trying to place* — and every note before the block fell
+    outside it.
+    """
+
+    masked = re.sub(r"```.*?```", lambda m: " " * len(m.group(0)), text, flags=re.DOTALL)
+    heads = [match.start() for match in re.finditer(r"^#{2,6} ", masked, re.M)]
+    start = max((head for head in heads if head <= offset), default=0)
+    stop = min((head for head in heads if head > offset), default=len(text))
+    return text[start:stop]
+
+
+def _quoted_artifact_segments(text: str):
+    """Every ``(artifact, segment, section)`` a surface quotes from an artifact."""
+
+    for pattern in (_QUOTED_BLOCK, _BLOCKQUOTE):
+        for match in pattern.finditer(text):
+            lead = match.group("lead")
+            named = [name for name in _QUOTED_ARTIFACTS if name in lead]
+            if len(named) != 1:
+                # Zero: not a quotation of an artifact. Two: ambiguous, and a
+                # guard that guessed would bind half these lines to the wrong
+                # file — say so instead.
+                assert not named or len(named) == 1, (
+                    f"a quoted block names {named} in its lead; bind it to one "
+                    "artifact so the comparison has a subject."
+                )
+                continue
+            body = match.group("body").replace("\n>", "\n").lstrip(">")
+            section = _enclosing_section(text, match.start())
+            for logical in _logical_lines(body):
+                # `…` is the abridgement marker: each side of one is a claim,
+                # what it elides is not. An excerpt also *skips* rows, so each
+                # line is checked on its own rather than the block being
+                # required to appear contiguously.
+                for segment in logical.split("…"):
+                    segment = segment.strip(" ;-")
+                    if len(segment) >= 12:
+                        yield named[0], segment, section
+
+
+def test_the_entry_path_quotes_lines_the_pr_comment_actually_renders(tmp_path: Path):
+    """Every artifact line the entry path quotes is rendered by a named channel.
+
+    Two failures produced this test, and one rule covers both.
+
+    The README used to show a `### Agents Shipgate result: block` heading, an
+    `Impact | Change | Subject | Why` table and a numbered *Required before
+    merge* list, and said the fixture wrote that "verbatim". No code path
+    rendered any of it, and `block` is not a value `merge_verdict` or
+    `release_decision.decision` ever takes.
+
+    Then the first fix of that introduced the other half: the quickstart said
+    its walkthrough ran on the published release and quoted *this tree's*
+    output at it. `v0.15.0` groups the capability delta by change rather than
+    subject and prints `Evidence coverage: static (human review recommended)`
+    with no counts, so a reader on the recommended install could not find the
+    evidence steps 3 and 5 asked them to interpret. Checking against one engine
+    could not see that, which is why both are rendered here.
+
+    So: a quoted line must be rendered by *some* channel, and a line only one
+    channel renders must sit in a step that names the published release.
+
+    ``v1.0.0`` renders every line the entry path shows, so its per-step release
+    notes were dropped together with the assertion that at least one quoted
+    line differs between the two channels; the rule above still fires on the
+    first line a later tree renders that the published release does not.
+    """
+
+    source = _run_refund_fixture(tmp_path / "source")
+    released = _run_refund_fixture(
+        tmp_path / "released-out", source_root=_released_source(tmp_path)
+    )
+
+    checked = 0
+    for relpath in _ENTRY_PATH_SURFACES:
+        text = (REPO_ROOT / relpath).read_text(encoding="utf-8")
+        for artifact, segment, section in _quoted_artifact_segments(text):
+            checked += 1
+            in_source = segment in source[artifact]
+            in_released = segment in released[artifact]
+            assert in_source or in_released, (
+                f"{relpath} shows this as part of `{artifact}`, and neither the "
+                f"source tree nor v{LATEST_PUBLISHED_VERSION} renders it:\n"
+                f"  {segment!r}\n"
+                "Quote what an engine writes, or stop calling the block an "
+                "artifact excerpt."
+            )
+            if in_source and in_released:
+                continue
+            assert _RELEASE_MARKER in section, (
+                f"{relpath} quotes a `{artifact}` line that only the "
+                f"{'source tree' if in_source else f'v{LATEST_PUBLISHED_VERSION} release'} "
+                f"renders, in a section that never says so:\n  {segment!r}\n"
+                f"Name {_RELEASE_MARKER} in that step and show what the other "
+                "channel prints — a reader on the recommended install cannot "
+                "find what this asks them to read."
+            )
+    assert checked >= 8, (
+        f"only {checked} quoted artifact segments found across "
+        f"{list(_ENTRY_PATH_SURFACES)}; this guard is checking nothing. Either "
+        "the entry path stopped showing the artifacts, or its blocks are no "
+        "longer introduced by prose naming one of them."
+    )
+
+
+#: The walkthrough's own control command, as `docs/quickstart.md` prints it.
+_AGENT_CONTROL_LINE = re.compile(r"^agents-shipgate agent control (?P<flags>.+)$", re.M)
+
+
+def test_the_walkthrough_control_command_runs_in_the_walkthrough(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Step 7's command has to work where step 2 left the reader.
+
+    It did not. `fixture run` writes into a temporary copy of the sample and
+    reports under `<copy>/reports`, so the `--workspace .` the step printed
+    looked for `./agents-shipgate-reports` in the caller's directory and exited
+    3 with `Current control is unavailable (missing)` — or, worse, validated an
+    unrelated run the caller happened to have there. Prose said "validate the
+    pointer first" while the command shown could not (#498 review).
+
+    The flags are read out of the page rather than restated, so a step that
+    drops `--reports-dir` fails here rather than on a reader's terminal.
+    """
+
+    # No `--out`: step 2 does not pass one, and that is the whole point — the
+    # default puts the artifacts under the fixture *copy*, not the caller's
+    # directory. Passing one here would test a situation the reader is not in.
+    result = runner.invoke(app, ["fixture", "run", "ai_generated_refund_pr"])
+    assert result.exit_code == 0, result.output
+    copied = re.search(r"Fixture copy left at (?P<path>.+?)\.\s*$", result.output, re.M)
+    assert copied, (
+        "`fixture run` no longer prints `Fixture copy left at <path>.`, which "
+        "is the line docs/quickstart.md step 7 tells the reader to use."
+    )
+    workspace = Path(copied.group("path"))
+
+    quickstart = (REPO_ROOT / "docs" / "quickstart.md").read_text(encoding="utf-8")
+    section = quickstart.split("## One review, end to end", 1)[1].split("## Two kinds of fix", 1)[0]
+    printed = _AGENT_CONTROL_LINE.search(section)
+    assert printed, (
+        "docs/quickstart.md's walkthrough no longer prints an "
+        "`agents-shipgate agent control` command, so this guard is checking "
+        "nothing. Restore it or drop the test with the step."
+    )
+
+    # This change of directory must be taught by the page, not supplied only
+    # by the test. Otherwise deleting its `cd` line leaves the guard green
+    # while restoring the caller-directory failure it is meant to prevent.
+    preceding = section[:printed.start()].rstrip().splitlines()[-1]
+    change_directory = shlex.split(preceding)
+    assert change_directory == [
+        "cd", "/tmp/shipgate-fixture-ai_generated_refund_pr-<random>/ai_generated_refund_pr",
+    ], "step 7 must change to the fixture copy before reading its control"
+
+    # The page prints `cd <fixture copy>` on the line above, and the flags are
+    # relative to it — `--reports-dir reports` resolves against the working
+    # directory, which is exactly what made the first draft of this guard
+    # disagree with a hand-run terminal. So take the `cd` literally.
+    monkeypatch.chdir(workspace)
+    argv = ["agent", "control", *shlex.split(printed.group("flags"))]
+
+    control = runner.invoke(app, argv)
+    assert control.exit_code == 0, (
+        "the command docs/quickstart.md prints in step 7 does not succeed where "
+        f"step 2 leaves the reader:\n  argv: {argv}\n  exit: "
+        f"{control.exit_code}\n{control.output}"
+    )
+    payload = json.loads(control.output)
+    assert payload["control_state"] == "human_review_required", (
+        "step 7 tells the reader this run is held for human review; "
+        f"`agent control` reports {payload['control_state']!r}."
+    )
+    for field in ("control_state", "next_actor", "decision", "permissions"):
+        assert field in payload, (
+            f"step 7 names `{field}` as a top-level field of the "
+            f"`shipgate.agent_control/v1` envelope; the command does not emit it."
+        )
 
 
 def test_cli_fixture_run_ai_generated_refund_pr_writes_verifier_artifacts(tmp_path: Path):
@@ -121,9 +475,7 @@ def test_cli_fixture_run_ai_generated_refund_pr_writes_verifier_artifacts(tmp_pa
     assert payload["merge_verdict"] == "blocked"
     assert payload["can_merge_without_human"] is False
     report = json.loads((out / "report.json").read_text(encoding="utf-8"))
-    blocker_checks = {
-        item["check_id"] for item in report["release_decision"]["blockers"]
-    }
+    blocker_checks = {item["check_id"] for item in report["release_decision"]["blockers"]}
     assert "SHIP-ACTION-DESTRUCTIVE-ROLLBACK-MISSING" in blocker_checks
     semantic = report["release_decision"]["evidence_coverage"]["semantic_coverage"]
     assert semantic["gap_count"] == 0
@@ -144,6 +496,27 @@ def test_cli_fixture_copy(tmp_path: Path):
     )
     assert result.exit_code == 0, result.output
     assert (target / "clean_read_only_agent" / "shipgate.yaml").is_file()
+
+
+def test_cli_fixture_copy_labels_replay_as_the_requested_incident(tmp_path: Path):
+    target = tmp_path / "copies"
+    result = runner.invoke(
+        app,
+        [
+            "fixture",
+            "copy",
+            "governed_edits_governance",
+            "--to",
+            str(target),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    copied = target / "governed_edits_governance"
+    readme = (copied / "README.md").read_text(encoding="utf-8")
+    assert readme.startswith("# governed_edits_governance\n")
+    assert "reviewed `agent_weakens_gate` sample" in readme
+    assert not readme.startswith("# agent_weakens_gate")
+    assert (copied / "INCIDENT-FIXTURE.md").is_file()
 
 
 def test_cli_fixture_unknown_returns_2():
@@ -172,7 +545,111 @@ def test_cli_fixture_run_agent_weakens_gate_blocks_on_gate_removal(tmp_path: Pat
     assert payload["merge_verdict"] == "blocked"
     assert payload["can_merge_without_human"] is False
     report = json.loads((out / "report.json").read_text(encoding="utf-8"))
-    blocker_checks = {
-        item["check_id"] for item in report["release_decision"]["blockers"]
-    }
+    blocker_checks = {item["check_id"] for item in report["release_decision"]["blockers"]}
     assert "SHIP-VERIFY-CI-GATE-REMOVED" in blocker_checks
+
+
+def test_incident_replay_contracts_pin_current_and_desired_outcomes() -> None:
+    """Lightweight registry checks complement the installed-wheel replays."""
+
+    gap = replay_fixture("governed_edits_governance")
+    assert gap is not None
+    assert gap.observed_merge_verdict == "mergeable"
+    assert gap.desired_merge_verdict == "human_review_required"
+    assert gap.absent_check_ids == ("SHIP-VERIFY-TRUST-ROOT-TOUCHED",)
+    assert gap.known_gap is not None and gap.known_gap.endswith("/issues/474")
+    assert gap.gap_paths == (".github/agents/release-reviewer.agent.md",)
+
+    routed = replay_fixture("prompt_change_rides_release")
+    assert routed is not None
+    assert routed.observed_merge_verdict == "human_review_required"
+    assert routed.observed_decision == "review_required"
+    assert routed.required_check_ids == (
+        "SHIP-AGENT-BOUNDARY-PROTECTED-SURFACE-UNCLASSIFIED",
+        "SHIP-VERIFY-TRUST-ROOT-TOUCHED",
+    )
+
+    gate_removal = replay_fixture("agent_weakens_gate")
+    assert gate_removal is not None
+    assert gate_removal.head_files == ((".github/workflows/agents-shipgate.yml", None),)
+
+
+def _verifier(merge_verdict: str, decision: str) -> VerifierArtifact:
+    return VerifierArtifact.model_construct(
+        merge_verdict=merge_verdict,
+        release_decision=ReleaseDecision.model_construct(decision=decision),
+    )
+
+
+def _report(*findings: tuple[str, dict[str, object]]) -> ReadinessReport:
+    return ReadinessReport.model_construct(
+        findings=[
+            Finding.model_construct(check_id=check_id, evidence=evidence)
+            for check_id, evidence in findings
+        ]
+    )
+
+
+def test_expected_fail_is_not_resolved_by_an_unrelated_review_route(capsys) -> None:
+    """The desired verdict alone cannot prove the named path gap closed."""
+
+    replay = replay_fixture("governed_edits_governance")
+    assert replay is not None
+    verifier = _verifier("human_review_required", "review_required")
+    report = _report(("SHIP-SOME-UNRELATED-REVIEW", {"path": "somewhere-else"}))
+
+    assert _report_replay_expectation(replay, verifier=verifier, report=report) == 20
+    captured = capsys.readouterr()
+    assert "Fixture expectation diverged" in captured.err
+    assert f"Known gap: {replay.known_gap}" in captured.err
+    assert "review finding names the gap path" in captured.err
+    assert "Expected-fail resolved" not in captured.err
+
+
+def test_expected_fail_resolution_accepts_a_new_check_that_names_the_gap(capsys) -> None:
+    replay = replay_fixture("governed_edits_governance")
+    assert replay is not None
+    path = replay.gap_paths[0]
+    new_check = "SHIP-NEW-GOVERNANCE-PATH-TOUCHED"
+    verifier = _verifier("human_review_required", "review_required")
+    report = _report((new_check, {"changed_path": path}))
+
+    assert _report_replay_expectation(replay, verifier=verifier, report=report) == 20
+    captured = capsys.readouterr()
+    assert "Expected-fail resolved" in captured.err
+    assert new_check in captured.err
+    assert path in captured.err
+
+
+def test_expected_fail_refuses_to_pass_without_a_report(capsys) -> None:
+    replay = replay_fixture("governed_edits_governance")
+    assert replay is not None
+
+    assert (
+        _report_replay_expectation(
+            replay,
+            verifier=_verifier("mergeable", "passed"),
+            report=None,
+        )
+        == 20
+    )
+    assert "refusing to treat missing findings as expected absence" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"known_gap": None}, "must be set together"),
+        ({"desired_merge_verdict": None}, "must be set together"),
+        ({"absent_check_ids": ()}, "require absent_check_ids and gap_paths"),
+        ({"gap_paths": ()}, "require absent_check_ids and gap_paths"),
+    ],
+)
+def test_expected_fail_replay_metadata_invariants(
+    changes: dict[str, object],
+    message: str,
+) -> None:
+    replay = replay_fixture("governed_edits_governance")
+    assert replay is not None
+    with pytest.raises(ValueError, match=message):
+        replace(replay, **changes)

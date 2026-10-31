@@ -147,6 +147,12 @@ def test_frozen_v028_report_schema_does_not_backport_v029_semantic_evidence() ->
     assert "suggested_patch_kind" in v29_gap_action
 
 
+def test_current_report_schema_keeps_policy_identity_out_of_gap_prose() -> None:
+    current_gap = _report_schema_definition_properties("0.42", "EvidenceGap")
+
+    assert "policy_id" in current_gap
+
+
 def test_frozen_v07_packet_schema_does_not_backport_v08_static_boundary() -> None:
     v7 = _packet_schema_definition_properties("0.7", "ReleaseDecisionSection")
     v8 = _packet_schema_definition_properties("0.8", "ReleaseDecisionSection")
@@ -256,7 +262,7 @@ def test_representative_schema_payloads_keep_wire_fields() -> None:
         tool_surface=ToolSurfaceSummary(total_tools=0, high_risk_tools=0),
     )
     report_payload = report_json_payload(report)
-    assert report_payload["report_schema_version"] == "0.42"
+    assert report_payload["report_schema_version"] == "1.0"
     assert list(report_payload) == [
         "schema_version",
         "report_schema_version",
@@ -282,6 +288,7 @@ def test_representative_schema_payloads_keep_wire_fields() -> None:
         "tool_surface_diff",
         "action_surface_facts",
         "action_surface_diff",
+        "action_declaration_facts",
         "binding_surface_facts",
         "binding_surface_diff",
         "capability_runtime_evidence",
@@ -345,7 +352,7 @@ def test_representative_schema_payloads_keep_wire_fields() -> None:
         not_proven=NotProvenSection(headline="not proven"),
     )
     packet_payload = serialize_packet_json(packet)
-    assert packet_payload["packet_schema_version"] == "0.17"
+    assert packet_payload["packet_schema_version"] == "0.18"
     assert "generated_at" not in packet_payload
     assert "action_surface_diff" in packet_payload
     assert report_payload["capability_runtime_evidence"]["enabled"] is False
@@ -422,14 +429,34 @@ def test_representative_schema_payloads_keep_wire_fields() -> None:
             "~/.config/agents-shipgate/human-authorization-trust-policy.json"
         ),
         human_authorization_schema_path="docs/human-authorization-schema.v1.json",
+        human_review_request_schema_version="shipgate.human_review_request/v1",
+        human_review_request_schema_path="docs/human-review-request-schema.v1.json",
+        human_review_request_artifact="agents-shipgate-reports/human-review-request.json",
+        human_review_decision_schema_version="shipgate.human_review_decision/v1",
+        human_review_evaluation_schema_version="shipgate.human_review_evaluation/v1",
+        human_review_decision_schema_path="docs/human-review-decision-schema.v1.json",
         agent_handoff_schema_version="shipgate.agent_handoff/v2",
         agent_handoff_schema_path="docs/agent-handoff-schema.v2.json",
         agent_handoff_artifact="agents-shipgate-reports/agent-handoff.json",
         codex_boundary_result_schema_version="shipgate.codex_boundary_result/v1",
-        agent_boundary_result_schema_version="shipgate.agent_boundary_result/v2",
-        agent_boundary_result_schema_path="docs/agent-boundary-result-schema.v2.json",
+        agent_boundary_result_schema_version="shipgate.agent_boundary_result/v3",
+        agent_boundary_result_schema_path="docs/agent-boundary-result-schema.v3.json",
         capability_lock_schema_version="0.4",
         capability_lock_diff_schema_version="0.5",
+        capability_payload_schema_version="shipgate.capability_payload/v1",
+        capability_payload_schema_path="docs/capability-payload-schema.v1.json",
+        capability_delta_attestation_schema_version=(
+            "shipgate.capability_delta_attestation/v1"
+        ),
+        capability_delta_attestation_schema_path=(
+            "docs/capability-delta-attestation-schema.v1.json"
+        ),
+        capability_delta_predicate_type=(
+            "https://threemoonslab.com/agents-shipgate/capability-delta/v1"
+        ),
+        capability_delta_attestation_artifact=(
+            "agents-shipgate-reports/capability-delta-attestation.json"
+        ),
         preflight_schema_version="0.2",
         capability_standard_version="0.3",
         governance_benchmark_catalog_schema_version="0.2",
@@ -509,14 +536,34 @@ def test_representative_schema_payloads_keep_wire_fields() -> None:
             "~/.config/agents-shipgate/human-authorization-trust-policy.json"
         ),
         "human_authorization_schema_path": "docs/human-authorization-schema.v1.json",
+        "human_review_request_schema_version": "shipgate.human_review_request/v1",
+        "human_review_request_schema_path": "docs/human-review-request-schema.v1.json",
+        "human_review_request_artifact": "agents-shipgate-reports/human-review-request.json",
+        "human_review_decision_schema_version": "shipgate.human_review_decision/v1",
+        "human_review_evaluation_schema_version": "shipgate.human_review_evaluation/v1",
+        "human_review_decision_schema_path": "docs/human-review-decision-schema.v1.json",
         "agent_handoff_schema_version": "shipgate.agent_handoff/v2",
         "agent_handoff_schema_path": "docs/agent-handoff-schema.v2.json",
         "agent_handoff_artifact": "agents-shipgate-reports/agent-handoff.json",
         "codex_boundary_result_schema_version": "shipgate.codex_boundary_result/v1",
-        "agent_boundary_result_schema_version": "shipgate.agent_boundary_result/v2",
-        "agent_boundary_result_schema_path": "docs/agent-boundary-result-schema.v2.json",
+        "agent_boundary_result_schema_version": "shipgate.agent_boundary_result/v3",
+        "agent_boundary_result_schema_path": "docs/agent-boundary-result-schema.v3.json",
         "capability_lock_schema_version": "0.4",
         "capability_lock_diff_schema_version": "0.5",
+        "capability_payload_schema_version": "shipgate.capability_payload/v1",
+        "capability_payload_schema_path": "docs/capability-payload-schema.v1.json",
+        "capability_delta_attestation_schema_version": (
+            "shipgate.capability_delta_attestation/v1"
+        ),
+        "capability_delta_attestation_schema_path": (
+            "docs/capability-delta-attestation-schema.v1.json"
+        ),
+        "capability_delta_predicate_type": (
+            "https://threemoonslab.com/agents-shipgate/capability-delta/v1"
+        ),
+        "capability_delta_attestation_artifact": (
+            "agents-shipgate-reports/capability-delta-attestation.json"
+        ),
         "preflight_schema_version": "0.2",
         "capability_standard_version": "0.3",
         "governance_benchmark_catalog_schema_version": "0.2",
@@ -574,6 +621,8 @@ def test_representative_schema_payloads_keep_wire_fields() -> None:
         "suggested_sources": [],
         "excluded_sources": [],
         "codex_plugin_candidates": [],
+        "host_boundary_candidates": [],
+        "host_discovery_incomplete_paths": [],
         "next_action": "",
         "workspace_signals": {
             "python_file_count": 0,

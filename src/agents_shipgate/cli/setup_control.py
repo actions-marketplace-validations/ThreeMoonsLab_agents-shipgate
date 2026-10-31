@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Literal
 
 from agents_shipgate.cli.diagnostics import ranked_diagnostics
+from agents_shipgate.cli.discovery.identity_recovery import AgentNameRecovery
 from agents_shipgate.cli.discovery.placeholders import human_owned_placeholders
 from agents_shipgate.core.agent_control import derive_agent_control
 from agents_shipgate.core.agent_control_envelope import envelope_from_setup
@@ -209,6 +210,8 @@ def setup_control_envelope(
     recheck_command: str | None = None,
     placeholders: Sequence[Mapping[str, object]] | None = None,
     manifest_display_path: str | None = None,
+    human_review_suffix: str | None = None,
+    name_recovery: AgentNameRecovery | None = None,
     execution: AgentControlExecution = "succeeded",
     exit_code: int | None = None,
 ) -> SetupRouting:
@@ -255,6 +258,13 @@ def setup_control_envelope(
 
     ordered = ranked_diagnostics(list(diagnostics))
     pending_human = human_owned_placeholders(placeholders)
+    identity_reason = None
+    if name_recovery is not None and name_recovery.human_reason:
+        pending_human = [
+            entry for entry in (placeholders or [])
+            if entry in pending_human or entry.get("path") == "agent.name"
+        ]
+        identity_reason = name_recovery.human_reason
     alternatives = [diag.next_actions[0] for diag in ordered]
 
     blocking = next((diag for diag in ordered if diag.severity == "block"), None)
@@ -270,9 +280,18 @@ def setup_control_envelope(
         # run, so the next one surfaces it.
         selected, kind, decision = advance, advance_kind, advance_decision
     elif pending_human:
+        placeholder_why = _placeholder_review_why(
+            pending_human,
+            manifest_display_path,
+            reserved_suffix=human_review_suffix,
+            review_tail=(
+                f" require a human decision. {identity_reason}"
+                if identity_reason else _PLACEHOLDER_REVIEW_TAIL
+            ),
+        )
         selected = NextAction(
             kind="review",
-            why=_placeholder_review_why(pending_human, manifest_display_path),
+            why=placeholder_why,
             expects="Every human-owned field above holds a value a person supplied.",
         )
         kind, decision = "configure", SETUP_INCOMPLETE
@@ -374,6 +393,7 @@ def setup_failure_routing(
     manifest_display_path: str | None = None,
     recheck_command: str | None = None,
     routing_facts: object = None,
+    name_recovery: AgentNameRecovery | None = None,
 ) -> SetupRouting:
     """The shared envelope for a setup command that could not finish.
 
@@ -444,6 +464,7 @@ def setup_failure_routing(
                 action_kind,
                 [item.model_dump(mode="json") for item in ranked_diagnostics(list(diagnostics))],
                 routing_facts,
+                name_recovery.identity_facts if name_recovery else None,
             ),
         ),
         reason=reason,
@@ -457,6 +478,7 @@ def setup_failure_routing(
         recheck_command=recheck_command,
         execution="failed",
         exit_code=exit_code,
+        name_recovery=name_recovery,
     )
 
 
@@ -577,6 +599,9 @@ _PLACEHOLDER_REVIEW_TAIL = (
 def _placeholder_review_why(
     entries: Sequence[Mapping[str, object]],
     manifest_display_path: str | None,
+    *,
+    reserved_suffix: str | None = None,
+    review_tail: str = _PLACEHOLDER_REVIEW_TAIL,
 ) -> str:
     """Name the exact fields and lines a person has to fill in.
 
@@ -601,7 +626,8 @@ def _placeholder_review_why(
     def size(text: str) -> int:
         return len(text.encode("utf-8"))
 
-    budget = MAX_ENVELOPE_PROSE_BYTES - size(_PLACEHOLDER_REVIEW_TAIL)
+    suffix = f" {reserved_suffix}" if reserved_suffix else ""
+    budget = MAX_ENVELOPE_PROSE_BYTES - size(review_tail) - size(suffix)
     manifest = manifest_display_path or "shipgate.yaml"
     # The manifest is named once and the lines refer to it, rather than repeated
     # per entry. Repeating it spent the whole budget on a deep absolute path
@@ -653,7 +679,7 @@ def _placeholder_review_why(
             break
         used += (2 if shown else 0) + size(candidate)
         shown.append(candidate)
-    return prefix + ", ".join(shown) + _PLACEHOLDER_REVIEW_TAIL
+    return prefix + ", ".join(shown) + review_tail + suffix
 
 
 def _basename(path: str) -> str:

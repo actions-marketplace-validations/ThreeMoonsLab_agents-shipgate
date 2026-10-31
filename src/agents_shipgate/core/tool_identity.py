@@ -17,12 +17,14 @@ from agents_shipgate.core.adopter_text import (
     overlapping_binding_message,
 )
 from agents_shipgate.core.domain import (
+    ANNOTATION_HINT_KEYS,
     SURFACE_PARTIAL,
     LoadedToolSource,
     SemanticClaim,
     SemanticIssue,
     Tool,
     ToolIdentityAssessment,
+    annotation_hints_are_effect_evidence,
 )
 from agents_shipgate.core.errors import InputParseError
 from agents_shipgate.core.source_warnings import (
@@ -836,14 +838,7 @@ def _observations(
                     },
                 )
             seen[key] = (read_index, _source_file(tool))
-            observation_id = _stable_id(
-                "obs_v1",
-                {
-                    "source_type": tool.source_type,
-                    "source_id": source_id,
-                    "native_locator": locator,
-                },
-            )
+            observation_id = source_observation_id(tool, source_id)
             tool.native_locator = locator
             tool.observation_id = observation_id
             tool.observation_ids = [observation_id]
@@ -856,6 +851,16 @@ def _observations(
             tool.provider = source_id
             observations.append(tool)
     return observations
+
+
+def source_observation_id(tool: Tool, source_id: str) -> str:
+    """Identity shared by a source reader and the canonical catalog join."""
+
+    return _stable_id("obs_v1", {
+        "source_type": tool.source_type,
+        "source_id": source_id,
+        "native_locator": _native_locator(tool),
+    })
 
 
 def _source_file(tool: Tool) -> str | None:
@@ -941,6 +946,15 @@ def _merge_bound_observations(primary: Tool, members: list[Tool]) -> tuple[Tool,
                         member.source_pointer or member.source_ref,
                     )
                 )
+                continue
+            if (
+                key in ANNOTATION_HINT_KEYS
+                and not annotation_hints_are_effect_evidence(member)
+                and annotation_hints_are_effect_evidence(merged)
+            ):
+                # A hint the server's own source claims stays on its own
+                # observation (#658). Merged under a primary whose hints are
+                # evidence, it would count as the primary's published hint.
                 continue
             merged.annotations[key] = value
         existing_hints = {

@@ -41,11 +41,11 @@ surface before production-like permissions are granted.
 
 ## Core references
 
-- [Quickstart](quickstart.md)
+- [Quickstart](quickstart.md) — the human entry path: one review end to end
 - [Concepts](concepts.md)
 - [Manifest v0.1](manifest-v0.1.md)
 - [Check catalog](checks.md)
-- [Report schema v0.42](report-schema.v0.42.json) (current; v0.41 frozen at [report-schema.v0.41.json](report-schema.v0.41.json), with older references in the [index](INDEX.md#reference))
+- [Report schema v1.0](report-schema.v1.0.json) (current, frozen; v0.43 — the last pre-freeze version — frozen at [report-schema.v0.43.json](report-schema.v0.43.json), with older references in the [index](INDEX.md#reference))
 - [Evidence-backed `passed` contract](passed-verdict-contract.md)
 - [Trust model](trust-model.md)
 - [Agent instructions](../AGENTS.md)

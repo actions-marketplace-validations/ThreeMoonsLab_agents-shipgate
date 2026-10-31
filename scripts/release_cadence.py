@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""Report how long shipped work has been waiting for a tag.
+
+Issue #491 measured the failure this exists to make visible: 81% of
+``CHANGELOG.md`` had never reached a user, because releases were gated on a
+single expensive artifact rather than on a schedule. A cadence nobody counts is
+a cadence nobody keeps, so the interval is stated in
+``docs/release-runbook.md`` and the number is printed where it will be read.
+
+The metric is deliberately *not* a CI failure. A red check on an unrelated pull
+request punishes the wrong change for a release the maintainer has not cut;
+``--fail-when-overdue`` exists for an operator or a scheduled job that wants the
+non-zero exit, and nothing in ``ci.yml`` passes it.
+
+Standard library only, and no network. It reads the repository's own tags, so
+it answers the same way on a laptop as it does on a runner -- and an operator
+can run it before deciding whether to cut a release.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+
+if __package__:
+    from scripts._release_support import is_release_version
+    from scripts.release_channel import (
+        ADVISORY,
+        DECLARATION_PATH,
+        QUALIFIED,
+        ChannelError,
+        parse_declaration,
+    )
+else:  # ``python scripts/release_cadence.py``
+    from _release_support import is_release_version
+    from release_channel import (
+        ADVISORY,
+        DECLARATION_PATH,
+        QUALIFIED,
+        ChannelError,
+        parse_declaration,
+    )
+
+# The approved cadence, recorded in `docs/release-runbook.md` § Cadence. These
+# two numbers are the policy; every surface below renders them rather than
+# restating them.
+INTERVAL_DAYS = 30
+OVERDUE_DAYS = 45
+
+# The advisory line's own interval (#648). It is a separate measurement, not
+# a softer reading of the same one: the qualified line answers "when did we
+# last publish something that may block a merge", and the advisory line
+# answers "when could an outsider last install the engine this repository
+# documents". Those went out of step by two months, and one number could not
+# have shown it.
+ADVISORY_PREFIX = "preview-"
+ADVISORY_INTERVAL_DAYS = 14
+ADVISORY_OVERDUE_DAYS = 21
+
+_STATUS_NOTE = {
+    "current": "within the {interval}-day interval",
+    "due": "past the {interval}-day interval; cut a release or record why not",
+    "overdue": "past {overdue} days; triage as a release defect (#491)",
+    "unknown": "no release tag found; tags may not be fetched in this checkout",
+}
+
+
+@dataclass(frozen=True)
+class Cadence:
+    """The cadence answer, as one value every surface renders from."""
+
+    latest_release_tag: str | None
+    tagged_at: str | None
+    days_since_release: int | None
+    interval_days: int
+    overdue_days: int
+    status: str
+    #: Which line this measures. Carried on the value so the one renderer
+    #: can serve both without either surface restating the other's name.
+    label: str = "Release cadence"
+    date_basis: str = "tag_creator"
+
+    @property
+    def note(self) -> str:
+        note = _STATUS_NOTE[self.status].format(
+            interval=self.interval_days, overdue=self.overdue_days
+        )
+        if self.date_basis == "preview_build" and self.status != "unknown":
+            note += "; based on the preview build date, not GitHub publication time"
+        return note
+
+    def as_dict(self) -> dict[str, object]:
+        date_key = "built_at" if self.date_basis == "preview_build" else "tagged_at"
+        result: dict[str, object] = {
+            "latest_release_tag": self.latest_release_tag,
+            date_key: self.tagged_at,
+            "days_since_release": self.days_since_release,
+            "interval_days": self.interval_days,
+            "overdue_days": self.overdue_days,
+            "status": self.status,
+            "note": self.note,
+        }
+        if self.date_basis == "preview_build":
+            result["date_basis"] = self.date_basis
+        return result
+
+    def as_line(self) -> str:
+        if self.status == "unknown":
+            return f"{self.label}: unknown -- {self.note}."
+        return (
+            f"{self.label}: {self.days_since_release} days since "
+            f"{self.latest_release_tag} ({self.tagged_at}) -- {self.note}."
+        )
+
+    def as_markdown(self) -> str:
+        """The step-summary block. One renderer, so no surface can disagree."""
+
+        days = "unknown" if self.days_since_release is None else str(self.days_since_release)
+        date_label = "Preview build date" if self.date_basis == "preview_build" else "Tagged"
+        return "\n".join(
+            [
+                f"## {self.label}",
+                "",
+                "| | |",
+                "| --- | --- |",
+                f"| Latest release tag | `{self.latest_release_tag or 'none'}` |",
+                f"| {date_label} | {self.tagged_at or 'n/a'} |",
+                f"| Days since | **{days}** |",
+                f"| Interval | {self.interval_days} days |",
+                f"| Status | **{self.status}** -- {self.note} |",
+                "",
+            ]
+        )
+
+
+def is_advisory_tag(ref: str) -> bool:
+    """True for an advisory preview ref.
+
+    The preview channel publishes outside the ``v*`` namespace so it can
+    never be read as a qualified release. That separation is what makes a
+    second cadence measurable at all: counting previews in the release
+    metric would let the channel that exists *because* the release cadence
+    slipped report that cadence as kept.
+    """
+
+    if not ref.startswith(ADVISORY_PREFIX):
+        return False
+    version, separator, local = ref[len(ADVISORY_PREFIX):].partition("+")
+    if not separator or not is_release_version(version):
+        return False
+    match = re.fullmatch(r"preview\.(\d{8})\.g[0-9a-f]{7}", local)
+    if match is None:
+        return False
+    try:
+        datetime.strptime(match[1], "%Y%m%d")
+    except ValueError:
+        return False
+    return True
+
+
+def is_release_tag(ref: str) -> bool:
+    """True for ``v`` followed by a complete PEP 440 version.
+
+    This is what separates a shipped artifact from the repository's other
+    refs. ``wip-sectiond`` and ``m3-pre-rebase`` are not releases, and neither
+    is a ``preview/*`` ref: the unqualified preview channel publishes outside
+    the ``v*`` namespace precisely so that it cannot be read as one (see
+    ``docs/release-evidence-policy-decision.md`` § Amendment 2), and counting a
+    preview here would let the channel that exists *because* the cadence
+    slipped report the cadence as kept.
+    """
+
+    return ref.startswith("v") and is_release_version(ref[1:])
+
+
+def read_release_tags(
+    repo: Path, *, predicate: Callable[[str], bool] = is_release_tag
+) -> list[tuple[str, int]]:
+    """Every tag matching ``predicate``, with its creation time, newest first."""
+
+    result = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        ["git", "for-each-ref", "--format=%(refname:strip=2)\t%(creatordate:unix)", "refs/tags"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    tags: list[tuple[str, int]] = []
+    for line in result.stdout.splitlines():
+        ref, _, when = line.partition("\t")
+        if not predicate(ref):
+            continue
+        try:
+            tags.append((ref, int(when)))
+        except ValueError:
+            continue
+    return sorted(tags, key=lambda item: item[1], reverse=True)
+
+
+
+def tag_channel(repo: Path, ref: str) -> str | None:
+    """The channel ``ref``'s own committed tree declares for its version.
+
+    Read from the tag's tree, never the working checkout: the declaration
+    grows over time, and a tag's channel is what was reviewed when it was cut.
+    ``None`` means that tree has no declaration at all — every tag before
+    advisory ``v*`` releases existed — which makes it a gate-line release by
+    construction. A declaration that is present but unparseable, or that does
+    not name the version, yields ``"undeclared"``: the release workflow
+    refuses such a tag, so it was never published on either line (#648).
+    """
+
+    shown = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        ["git", "show", f"{ref}:{DECLARATION_PATH.as_posix()}"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if shown.returncode != 0:
+        return None
+    try:
+        channels = parse_declaration(shown.stdout)
+    except ChannelError:
+        return "undeclared"
+    return channels.get(ref[1:], "undeclared")
+
+
+def read_gate_line_tags(repo: Path) -> list[tuple[str, int]]:
+    """``v*`` tags on the qualified gate line.
+
+    An advisory ``v*`` release (#648) has the same tag shape, so shape alone
+    no longer separates the lines. Counting one here would let an advisory
+    release report the gate line's cadence as kept — the dishonesty the
+    preview namespace was created to prevent (Amendment 4).
+    """
+
+    return [
+        (ref, when)
+        for ref, when in read_release_tags(repo)
+        if tag_channel(repo, ref) in (None, QUALIFIED)
+    ]
+
+
+def read_advisory_tags(repo: Path) -> list[tuple[str, int]]:
+    """Use the preview version's UTC build date as the offline cadence proxy.
+
+    The preview publisher creates lightweight tags. Git's creatordate for
+    those tags is the source commit time, not when the preview was built or
+    published. Publication timestamps require release metadata unavailable
+    in local Git, so expose the embedded build date and name that boundary.
+    """
+    tags = []
+    # An advisory ``v*`` release (#648) is on this line too; its date is the
+    # tag's own creator date, as for the gate line.
+    for ref, when in read_release_tags(repo):
+        if tag_channel(repo, ref) == ADVISORY:
+            tags.append((ref, when))
+    for ref, _commit_time in read_release_tags(repo, predicate=is_advisory_tag):
+        stamp = ref.partition("+preview.")[2].partition(".g")[0]
+        built = datetime.strptime(stamp, "%Y%m%d").replace(tzinfo=UTC)
+        tags.append((ref, int(built.timestamp())))
+    return sorted(tags, key=lambda item: item[1], reverse=True)
+
+
+def assess(
+    tags: list[tuple[str, int]],
+    *,
+    now: int,
+    interval_days: int = INTERVAL_DAYS,
+    overdue_days: int = OVERDUE_DAYS,
+    label: str = "Release cadence",
+    date_basis: str = "tag_creator",
+) -> Cadence:
+    """Classify the newest release tag against the approved interval.
+
+    ``tags`` is deliberately an argument rather than something this reads: the
+    classification is the part worth testing, and it must not depend on the
+    clock or on what happens to be tagged in the working checkout.
+    """
+
+    if not tags:
+        return Cadence(None, None, None, interval_days, overdue_days, "unknown", label, date_basis)
+    ref, when = max(tags, key=lambda item: item[1])
+    # Truncated, not rounded: "56 days since" must never report 57 because the
+    # tag was cut in the afternoon.
+    days = max(0, (now - when) // 86_400)
+    if days > overdue_days:
+        status = "overdue"
+    elif days >= interval_days:
+        status = "due"
+    else:
+        status = "current"
+    tagged_at = datetime.fromtimestamp(when, tz=UTC).date().isoformat()
+    return Cadence(ref, tagged_at, days, interval_days, overdue_days, status, label, date_basis)
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument("--json", action="store_true", help="emit the machine-readable form")
+    parser.add_argument(
+        "--github",
+        action="store_true",
+        help="append the summary block to $GITHUB_STEP_SUMMARY and warn when not current",
+    )
+    parser.add_argument(
+        "--fail-when-overdue",
+        action="store_true",
+        help="exit non-zero past the overdue threshold (never set by ci.yml)",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    now = int(datetime.now(tz=UTC).timestamp())
+    cadence = assess(read_gate_line_tags(args.repo), now=now)
+    advisory_tags = read_advisory_tags(args.repo)
+    newest_advisory = max(advisory_tags, key=lambda item: item[1])[0] if advisory_tags else ""
+    advisory = assess(
+        advisory_tags,
+        now=now,
+        interval_days=ADVISORY_INTERVAL_DAYS,
+        overdue_days=ADVISORY_OVERDUE_DAYS,
+        label="Advisory cadence",
+        # A preview is dated by its embedded build stamp; an advisory v*
+        # release by its tag, so say which one produced the number.
+        date_basis="tag_creator" if newest_advisory.startswith("v") else "preview_build",
+    )
+
+    lines = (cadence, advisory)
+    if args.json:
+        sys.stdout.write(
+            json.dumps(
+                {**cadence.as_dict(), "advisory": advisory.as_dict()},
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+    else:
+        for measured in lines:
+            sys.stdout.write(measured.as_line() + "\n")
+
+    if args.github:
+        summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary:
+            with open(summary, "a", encoding="utf-8") as handle:
+                for measured in lines:
+                    handle.write(measured.as_markdown())
+        for measured in lines:
+            if measured.status != "current":
+                # A warning annotation, never a failure: see the module
+                # docstring. The reasoning covers the advisory line too —
+                # whichever pull request happens to arrive after the interval
+                # lapses is not the one that can cut a release.
+                sys.stdout.write(
+                    f"::warning title={measured.label}::{measured.as_line()}\n"
+                )
+
+    overdue = [measured for measured in lines if measured.status == "overdue"]
+    if args.fail_when_overdue and overdue:
+        for measured in overdue:
+            sys.stderr.write(f"{measured.label} defect: {measured.as_line()}\n")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

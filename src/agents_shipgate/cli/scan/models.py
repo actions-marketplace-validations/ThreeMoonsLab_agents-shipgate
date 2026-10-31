@@ -17,14 +17,21 @@ from agents_shipgate.core.artifact_models import (
 )
 from agents_shipgate.core.artifacts import ArtifactBag
 from agents_shipgate.core.context import ScanContext
-from agents_shipgate.core.domain import Agent, LoadedToolSource, Tool, ToolkitScopeBound
+from agents_shipgate.core.domain import (
+    Agent,
+    AgentRemoteBinding,
+    LoadedToolSource,
+    Tool,
+    ToolkitScopeBound,
+)
 from agents_shipgate.core.lenses.tool_surface import ToolSurfaceDiffReference
 from agents_shipgate.core.privacy import RedactionStats
 from agents_shipgate.schemas.bindings import AgentBindingGraphAssessment, BindingSurfaceDiff
 from agents_shipgate.schemas.codex_plugin import CodexPluginSurface
+from agents_shipgate.schemas.guard_dependencies import GuardDependencyEvidence
 from agents_shipgate.schemas.manifest import AgentsShipgateManifest, CiConfig
 from agents_shipgate.schemas.report import PolicyAudit
-from agents_shipgate.schemas.surfaces import ActionSurfaceFacts
+from agents_shipgate.schemas.surfaces import ActionDeclarationFacts, ActionSurfaceFacts
 
 
 @dataclass(frozen=True)
@@ -96,6 +103,10 @@ class _ToolsAndAgent:
     # toolkits, aggregated across all loaded sources. Empty for the common
     # case (no recognized agent-toolkit constructor).
     toolkit_bounds: list[ToolkitScopeBound] = field(default_factory=list)
+    # Agent -> remote tool-surface bindings, aggregated across all loaded
+    # sources. Empty for every workspace with no recognized remote binding.
+    remote_bindings: list[AgentRemoteBinding] = field(default_factory=list)
+    guard_dependencies: list[GuardDependencyEvidence] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -159,6 +170,9 @@ class _SanitizedSurfaces:
 
     manifest: AgentsShipgateManifest
     manifest_dir: str
+    #: Sanitized workspace-relative manifest spelling when verify supplied
+    #: one; filename-only for plain scans that have no workspace identity.
+    manifest_path: str
     project: Any
     environment: Any
     agent: Agent
@@ -180,6 +194,10 @@ class _SanitizedSurfaces:
     loaded_plugins: Any
     loaded_adapters: Any  # v0.20: list[dict[str, Any]]; sanitized via redact_data
     diff_reference: ToolSurfaceDiffReference | None
+    base_comparison_requested: bool
+    manifest_introduced: bool
+    configured_gate_introduced: bool
+    action_declaration_facts: ActionDeclarationFacts
     base_action_surface_facts: ActionSurfaceFacts | None
     action_surface_facts: ActionSurfaceFacts
     action_surface_diff: Any
@@ -194,3 +212,4 @@ class _SanitizedSurfaces:
     # load order. Carried separately from ``source_warnings`` because only
     # these are proven omissions — see ``core.surface_exclusions``.
     source_omissions: list[Any]
+    source_recovery_evidence: list[Any]

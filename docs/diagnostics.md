@@ -61,7 +61,7 @@ recovery loop stays runnable in the environment that produced it:
 | ------------------------------------- | ----------------------------------------------- |
 | `AGENTS_SHIPGATE_CLI` set             | That value, split with `shlex` — highest precedence. The same override the Claude Code hook installer honours. An explicit entry point is always spliced in, including `AGENTS_SHIPGATE_CLI=/private/venv/bin/agents-shipgate`: the program *name* matches a console script, but the operator named that wrapper, not whichever one `PATH` resolves. |
 | `agents-shipgate …` / `shipgate …`    | The same console script the command was written with — unchanged. |
-| `python -m agents_shipgate …`         | `<sys.executable> -m agents_shipgate …`. The interpreter is spelled by path, not as a bare `python`, because a bare name resolves through `PATH` and can land on a different interpreter. |
+| `python -m agents_shipgate …`         | `<sys.executable> -P -m agents_shipgate …`. The interpreter is spelled by path, not as a bare `python`, because a bare name resolves through `PATH` and can land on a different interpreter. `-P` keeps the working directory off `sys.path`: the command is run from the repository under review, where plain `python -m` would import a committed `yaml/` or `agents_shipgate/` package first. |
 | Anything else                         | The canonical `agents-shipgate`. An unrecognised argv is not evidence of a better spelling. |
 
 `command` never contains `__main__.py`.
@@ -178,7 +178,7 @@ point either.
 | ----------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `SHIP-DIAG-MISSING-MANIFEST`        | block    | The manifest file does not exist on disk. Rank-1 action: `agents-shipgate verify --workspace <dir> --preview --json`.                             |
 | `SHIP-DIAG-INVALID-MANIFEST`        | block    | The manifest file exists but the loader rejected it (invalid YAML, schema validation failure, unsupported version). Rank-1 action: `edit <path>`. |
-| `SHIP-DIAG-NO-AGENT-SURFACE`        | info     | `is_agent_project=false` AND `suggested_sources=[]` AND `codex_plugin_candidates=[]` AND `python_parse_truncated=false` AND no manifest. Catch-all negative control. |
+| `SHIP-DIAG-NO-AGENT-SURFACE`        | info     | `is_agent_project=false` AND `suggested_sources=[]` AND `codex_plugin_candidates=[]` AND `host_boundary_candidates=[]` AND `host_discovery_incomplete_paths=[]` AND `python_parse_truncated=false` AND no manifest. Catch-all negative control. |
 | `SHIP-DIAG-NON-AGENT-LIBRARY`       | info     | Python project (≥1 .py file + pyproject/requirements) with no agent framework, prompts, or tool surface.                                         |
 | `SHIP-DIAG-PURE-PROMPT-EXPERIMENT`  | info     | Only `prompts/` is present; no Python framework, no tool sources.                                                                                |
 | `SHIP-DIAG-MCP-OPENAPI-ARTIFACT-ONLY` | info   | `is_agent_project=false` BUT `suggested_sources` has MCP/OpenAPI entries. Artifact-only repos are valid Shipgate targets.                        |
@@ -268,6 +268,22 @@ interactive users.
 or escaped required sources regardless of `--json`, because once an
 agent moves past doctor, those are real scan failures.
 
+That refusal is **one precondition applied before any adapter runs**,
+reading the same resolver this diagnostic uses, so scan and doctor agree
+by construction rather than by each reader deciding for itself. Before
+#585 they did decide for themselves: the shared loaders and
+`mcp_server_source` raised, while `openai_agents_sdk` returned a source
+warning and let a required, absent entrypoint finish as an advisory
+exit-0 scan. The message names each offending source id, its declared
+path and whether it is missing or escapes the manifest directory.
+
+`optional: true` sources are outside this rule by design — they keep
+their source warning and `coverage_recovery` evidence, and the scan
+completes. `verify` applies the precondition to every tree it scans; a
+base commit whose manifest declares a path absent from that tree gives
+`base_status: "scan_failed"` with the reason in `base_notes`, no
+capability delta, and an unchanged head gate.
+
 ## Adoption rung
 
 Every `doctor --json` payload also carries `adoption`, a projection of where
@@ -344,6 +360,25 @@ unchanged). Per-finding remediation already has its own v0.7 fields
 `docs_url`); diagnostics are pre-scan recovery hints, not post-scan
 remediation.
 
+### `agent control` refusals name their cause
+
+When `agent control` refuses because the workspace could not be read
+(`workspace_unverifiable`, or `workspace_unverified` for a `complete`
+pointer), `message` starts with the cause: a bounded, redacted sentence naming
+the Git configuration key or path, never a value or file content. `next_actions[0]` is chosen by the cause, so following it can change
+the answer:
+
+| Cause | `kind` | Action |
+| --- | --- | --- |
+| Git configuration the worktree readers refuse (`filter.*` drivers, `filter=` attributes, repository-local `diff.*`, `.git/info/attributes`) | `review` | A human decides; re-running `verify`, with or without `--head`, does not change the answer. `agents-shipgate diff` is named as the read-only route. |
+| The reports directory holds repository content | `command` or `review` | Publish elsewhere (see [the output-directory rule](agent-contract-current.md#two-read-entry-points)). |
+| An uncommitted change beyond a read bound, or a Git timeout | `command` | Commit or shrink the change, then run the named `verify`. |
+| Anything else | `command` | The producing `verify` command, as before. |
+
+No field, error kind, refusal code or exit code is added for this; the cause
+travels in the existing `message` and `why` text. See
+[`docs/agent-contract-current.md`](agent-contract-current.md#two-read-entry-points).
+
 ## Projection onto the control envelope
 
 Contract v24 adds a `control` field to `detect --json`, `init --json`, and each
@@ -393,6 +428,28 @@ person having decided something. A value a coding agent supplied is not a guess
 to be corrected later — it is a declaration nobody made, and Shipgate treats it
 as evidence. Every other placeholder (a tool-source path, a project name) is
 ordinary repository reading and stays coding-agent work.
+
+`agent.name` has one contextual exception (#543). When fresh discovery has
+resolved the manifest scope, read the complete Python inventory and found names
+only in test/template code, `init` and `doctor` ask a person to choose the product
+identity or supply product code that establishes it. The route names the field
+and line even after purpose has been supplied; an arbitrary nonempty replacement
+is not evidence. Doctor's placeholder diagnostic carries the same review route.
+A selectable product declaration remains a coding-agent edit and names its
+source file. No setup permission changes.
+
+Init reuses its current discovery result when its workspace is the loaded
+manifest's directory; an existing manifest reached through a link to another
+directory gets fresh discovery at the resolved target. Doctor also recomputes
+there, only for an actual unresolved `agent.name`, rather than using a wider
+workspace or a sibling project. Edit locations retain the caller's manifest
+spelling; product-name guidance names the actual source file. The recovery
+facts participate in `input_id`;
+saved discovery JSON is never a routing input. Capped, ambiguous or partly
+unparsed discovery cannot establish test/template-only evidence. Broader
+unresolved-name recovery remains unchanged, and doctor does not offer a
+higher-cap retry it has no flag to consume. These facts describe the current
+invocation; they do not provide a verifier snapshot or release authority.
 
 Matching is on every segment, not the leaf, because `collect_placeholders` names
 a list item by its own text: a `CHANGE_ME` under `declared_purpose: [...]` is

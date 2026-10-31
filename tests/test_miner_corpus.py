@@ -10,6 +10,7 @@ wrong number. Network-free — reads only the committed files.
 from __future__ import annotations
 
 import csv
+import json
 from pathlib import Path
 
 import pytest
@@ -17,11 +18,13 @@ import pytest
 from benchmark.miner.labels import WORKSHEET_COLUMNS, build_worksheet
 from benchmark.miner.rows import (
     CSV_COLUMNS,
+    MINER_SCHEMA_VERSION,
     STATUS_ERROR,
     STATUS_EVALUATED,
     STATUS_INIT_SKIP,
     STATUS_SCAN_FAILED,
     STATUS_TRIGGER_SKIP,
+    MinedRow,
     read_jsonl,
     summarize,
 )
@@ -44,14 +47,38 @@ VALID_VERDICTS = {
 
 
 def _mined_jsonl_files() -> list[Path]:
+    """The unselected latest-N sweeps, which are what the KPI numbers aggregate."""
+
     return sorted(RESULTS_DIR.glob("*-mined.jsonl"))
+
+
+def _all_run_jsonl_files() -> list[Path]:
+    """Every committed run, whatever it was for.
+
+    Integrity is not a property of the KPI runs alone. ``*-reeval``,
+    ``*-cutb``, ``*-closeout`` and ``constructed`` sit outside the ``*-mined``
+    glob on purpose -- they are selected samples and would move a noise bound
+    that is only meaningful over unselected ones -- but their rows are load
+    bearing all the same: ``tests/test_strata_inventory.py`` re-reads every
+    committed CSV as the authority for a corpus candidate's pins. A
+    half-regenerated pair outside this enumeration would leave stale pins
+    certifying the inventory with nothing in CI to notice.
+    """
+
+    return sorted(RESULTS_DIR.glob("*.jsonl"))
 
 
 def test_at_least_one_committed_run_exists() -> None:
     assert _mined_jsonl_files(), "no committed mined corpus under benchmark/miner/results/"
+    # The two enumerations must not silently converge: if every run became a
+    # `*-mined` one, the split above would be doing nothing and the next
+    # selected sweep would land outside a guard that looks like it covers it.
+    assert set(_mined_jsonl_files()) < set(_all_run_jsonl_files()), (
+        "every committed run matches *-mined; the integrity/KPI split is vacuous"
+    )
 
 
-@pytest.mark.parametrize("jsonl_path", _mined_jsonl_files(), ids=lambda p: p.name)
+@pytest.mark.parametrize("jsonl_path", _all_run_jsonl_files(), ids=lambda p: p.name)
 def test_committed_corpus_is_well_formed(jsonl_path: Path) -> None:
     rows = read_jsonl(jsonl_path)
     assert rows, f"{jsonl_path.name} is empty"
@@ -70,23 +97,54 @@ def test_committed_corpus_is_well_formed(jsonl_path: Path) -> None:
             )
 
 
-def _csv_shape(row) -> dict[str, str]:
-    """How write_csv serializes a row: None → "", everything else → str."""
+# Frozen history keeps the header its miner actually emitted. Spell the old
+# schema out: deriving it from the live fields would let a future addition
+# silently redefine the evidence we claim to preserve.
+_V02_COLUMNS = (
+    "repo", "pr_number", "pr_url", "title", "merged_at", "base_sha", "head_sha",
+    "files_changed", "trigger_run", "trigger_rationale", "check_decision",
+    "check_rule_ids", "init_status", "head_decision", "head_blockers",
+    "head_review_items", "evidence_gaps", "tools_scanned", "cap_added",
+    "cap_removed", "cap_changed", "cap_broadened", "verify_verdict",
+    "verify_decision", "verify_can_merge", "verify_trust_root_touched",
+    "verify_policy_weakened", "verify_cap_added", "verify_cap_modified",
+    "verify_cap_removed", "status", "notes", "schema_version",
+)
 
-    return {key: ("" if value is None else str(value)) for key, value in row.to_json().items()}
+
+def _artifact_columns(rows: list[MinedRow]) -> tuple[str, ...]:
+    versions = {row.schema_version for row in rows}
+    assert len(versions) == 1, f"empty or mixed miner schemas: {versions}"
+    version = versions.pop()
+    known = {"0.2": _V02_COLUMNS, MINER_SCHEMA_VERSION: CSV_COLUMNS}
+    assert version in known, f"unrecognized committed miner schema: {version}"
+    return known[version]
 
 
-@pytest.mark.parametrize("jsonl_path", _mined_jsonl_files(), ids=lambda p: p.name)
+def _csv_shape(row: MinedRow, columns: tuple[str, ...]) -> dict[str, str]:
+    """Check every field of the artifact's declared schema, including JSON cells."""
+
+    return {
+        key: (
+            "" if value is None else
+            json.dumps(value, sort_keys=True) if isinstance(value, dict) else str(value)
+        )
+        for key, value in row.to_json().items() if key in columns
+    }
+
+
+@pytest.mark.parametrize("jsonl_path", _all_run_jsonl_files(), ids=lambda p: p.name)
 def test_csv_and_jsonl_agree(jsonl_path: Path) -> None:
     csv_path = jsonl_path.with_suffix(".csv")
     assert csv_path.is_file(), f"missing CSV sibling for {jsonl_path.name}"
     jsonl_rows = read_jsonl(jsonl_path)
-    expected = {row.pr_url: _csv_shape(row) for row in jsonl_rows}
+    columns = _artifact_columns(jsonl_rows)
+    expected = {row.pr_url: _csv_shape(row, columns) for row in jsonl_rows}
     assert len(expected) == len(jsonl_rows), f"{jsonl_path.name}: duplicate pr_url"
 
     with csv_path.open(encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
-        assert tuple(reader.fieldnames or ()) == CSV_COLUMNS, (
+        assert tuple(reader.fieldnames or ()) == columns, (
             f"{csv_path.name} header drifted from the row schema"
         )
         csv_rows = list(reader)
@@ -100,18 +158,33 @@ def test_csv_and_jsonl_agree(jsonl_path: Path) -> None:
     for csv_row in csv_rows:
         url = csv_row["pr_url"]
         assert url in expected, f"{csv_path.name}: pr_url {url} absent from {jsonl_path.name}"
-        normalized = {key: csv_row.get(key, "") for key in CSV_COLUMNS}
+        normalized = {key: csv_row.get(key, "") for key in columns}
         assert normalized == expected[url], (
             f"{csv_path.stem}: row {url} differs between CSV and JSONL\n"
             f"  csv:   {normalized}\n  jsonl: {expected[url]}"
         )
 
 
-@pytest.mark.parametrize("jsonl_path", _mined_jsonl_files(), ids=lambda p: p.name)
+@pytest.mark.parametrize("jsonl_path", _all_run_jsonl_files(), ids=lambda p: p.name)
 def test_committed_corpus_files_are_lf_only(jsonl_path: Path) -> None:
     assert b"\r" not in jsonl_path.read_bytes(), f"{jsonl_path.name} has CRLF (git diff --check)"
     csv_path = jsonl_path.with_suffix(".csv")
     assert b"\r" not in csv_path.read_bytes(), f"{csv_path.name} has CRLF (git diff --check)"
+
+
+def test_every_committed_results_csv_has_a_jsonl_to_be_checked_against() -> None:
+    """The enumeration above is driven by the JSONL side, so a run CSV without
+    one would be read by ``tests/test_strata_inventory.py`` as pin authority
+    and validated by nothing at all. Label files are not runs and are checked
+    by their own guards.
+    """
+
+    orphans = [
+        path.name
+        for path in sorted(RESULTS_DIR.glob("*.csv"))
+        if ".labels" not in path.name and not path.with_suffix(".jsonl").is_file()
+    ]
+    assert orphans == [], f"results CSVs with no JSONL sibling: {orphans}"
 
 
 _TEMPLATE_SUFFIX = ".labels.template.csv"
@@ -359,14 +432,15 @@ def test_w27_reeval_csv_and_jsonl_agree_and_are_lf_only() -> None:
     assert b"\r" not in REEVAL_JSONL.read_bytes(), "reeval jsonl has CRLF"
     assert b"\r" not in csv_path.read_bytes(), "reeval csv has CRLF"
     jsonl_rows = read_jsonl(REEVAL_JSONL)
-    expected = {row.pr_url: _csv_shape(row) for row in jsonl_rows}
+    columns = _artifact_columns(jsonl_rows)
+    expected = {row.pr_url: _csv_shape(row, columns) for row in jsonl_rows}
     with csv_path.open(encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
-        assert tuple(reader.fieldnames or ()) == CSV_COLUMNS
+        assert tuple(reader.fieldnames or ()) == columns
         csv_rows = list(reader)
     assert len(csv_rows) == len(jsonl_rows)
     for csv_row in csv_rows:
-        normalized = {key: csv_row.get(key, "") for key in CSV_COLUMNS}
+        normalized = {key: csv_row.get(key, "") for key in columns}
         assert normalized == expected[csv_row["pr_url"]]
 
 

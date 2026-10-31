@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""Exercise the installed candidate and Action on one disposable refund PR.
+
+`prepare` commits synthetic fixture history into the checkout it is given, so
+it refuses to run without `--disposable-checkout`. Use only in the disposable
+release-engine-smoke job or a temporary clone.
+The output is distribution evidence, not human labels or release qualification.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+def _git(root: Path, *args: str) -> str:
+    return subprocess.check_output(
+        ["git", "-C", str(root), *args], text=True, stderr=subprocess.PIPE,
+    ).strip()
+
+
+def _cli(root: Path, *args: str) -> dict:
+    env = {k: v for k, v in os.environ.items() if k not in {"PYTHONPATH", "PYTHONHOME"}}
+    result = subprocess.run(
+        [sys.executable, "-I", "-m", "agents_shipgate", *args],
+        cwd=root, env=env, text=True, capture_output=True, check=False,
+    )
+    if result.returncode:
+        raise ValueError(f"Installed CLI failed ({result.returncode}): {result.stderr}")
+    return json.loads(result.stdout)
+
+
+def _commit(root: Path, message: str) -> None:
+    """Commit as the smoke identity without writing it into ``.git/config``.
+
+    ``git config user.email …`` would outlive the run and silently re-author
+    whatever the operator committed next, which is not a cost a read-only
+    evidence script gets to impose on a checkout.
+    """
+    _git(root, "-c", "user.name=Agents Shipgate distribution smoke",
+         "-c", "user.email=distribution-smoke@example.invalid",
+         "-c", "commit.gpgsign=false", "commit", "-qm", message)
+
+
+def prepare(root: Path, source_commit: str, wheel: Path, *, disposable: bool = False) -> dict:
+    if not disposable:
+        # Being at the candidate commit is exactly what a maintainer's own
+        # checkout looks like while a release is being cut, so it cannot be the
+        # thing that distinguishes a disposable runner from one. Only the
+        # caller knows, and it has to say so.
+        raise ValueError(
+            "prepare rewrites the checkout it is given: two commits on the current HEAD "
+            "and an info/exclude entry. Pass --disposable-checkout to confirm this one "
+            "is a runner or throwaway clone."
+        )
+    if _git(root, "rev-parse", "HEAD") != source_commit:
+        raise ValueError("Disposable checkout must still be at the candidate source commit")
+    fixture = root / ".shipgate-smoke/fixture"
+    if fixture.exists():
+        raise ValueError("Smoke fixture must not pre-exist")
+    sample = root / "samples/ai_generated_refund_pr"
+    fixture.mkdir(parents=True)
+    for name in ("shipgate.yaml", "tools.json"):
+        shutil.copyfile(sample / name, fixture / name)
+    exclude = Path(_git(root, "rev-parse", "--git-path", "info/exclude"))
+    if not exclude.is_absolute():
+        exclude = root / exclude
+    with exclude.open("a", encoding="utf-8") as handle:
+        handle.write("\n/.shipgate-smoke/\n")
+    _git(root, "add", "-f", ".shipgate-smoke/fixture/shipgate.yaml",
+         ".shipgate-smoke/fixture/tools.json")
+    _commit(root, "smoke: base support tools")
+    base = _git(root, "rev-parse", "HEAD")
+    shutil.copyfile(sample / "_head/tools.json", fixture / "tools.json")
+    _git(root, "add", "-f", ".shipgate-smoke/fixture/tools.json")
+    _commit(root, "smoke: add refund capability")
+    contract = _cli(root, "contract", "--json")
+    # Init runs in a separate disposable adopter directory so its generated
+    # workflow is not a trust-root change in the reviewed fixture.
+    with tempfile.TemporaryDirectory(prefix="shipgate-distribution-adopter-") as directory:
+        adopter = Path(directory)
+        shutil.copyfile(fixture / "shipgate.yaml", adopter / "shipgate.yaml")
+        shutil.copyfile(fixture / "tools.json", adopter / "tools.json")
+        _cli(adopter, "init", "--workspace", str(adopter), "--ci", "--json")
+        generated_text = (adopter / ".github/workflows/agents-shipgate.yml").read_text()
+    if f"ThreeMoonsLab/agents-shipgate@{source_commit}" not in generated_text:
+        raise ValueError("Installed candidate generated a different Action source")
+    if f'shipgate_version: "{contract["cli_version"]}"' not in generated_text:
+        raise ValueError("Installed candidate did not pin its package version")
+    kit_pins = _kit_pins(source_commit, contract["cli_version"])
+    _cli(root, "verify", "--workspace", str(root), "--config", str(fixture / "shipgate.yaml"),
+         "--base", base, "--head", "HEAD", "--ci-mode", "advisory",
+         "--out", str(root / ".shipgate-smoke/local"), "--format", "json")
+    result = {
+        "source_commit": source_commit, "action_ref": source_commit,
+        "wheel_sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+        "contract": contract, "base_ref": base, "head_ref": _git(root, "rev-parse", "HEAD"),
+        "generated_workflow": generated_text, "generated_kit_pins": kit_pins, "qualified": False,
+    }
+    (root / ".shipgate-smoke/prepared.json").write_text(json.dumps(result, indent=2) + "\n")
+    return result
+
+
+_KIT_ACTION_REF = re.compile(r"ThreeMoonsLab/agents-shipgate@([^\s\"'`)\],;{}]+)")
+_KIT_PACKAGE_PIN = re.compile(
+    r"(?:agents-shipgate(?:@|==)|shipgate_version:\s*['\"])(\d+\.\d+\.\d+)"
+)
+#: The one blank `upgrade-shipgate-version.md` prints for a reader to fill in.
+_KIT_READER_BLANKS = frozenset({"v<NEW>"})
+
+
+def _kit_pins(source_commit: str, version: str) -> dict:
+    """The optional adoption kit must select the candidate's own engine (#781).
+
+    Rendered by the installed CLI in an empty directory, as an adopter's dry
+    run would be. A kit that names the previous release, or states that no
+    release reports the contract floor this candidate reports, fails here
+    rather than after publication.
+    """
+    with tempfile.TemporaryDirectory(prefix="shipgate-distribution-kit-") as directory:
+        payload = _cli(Path(directory), "init", "--workspace", directory, "--minimal",
+                       "--agent-instructions=claude-code-skill,codex-skill", "--json")
+    text = "\n".join(entry["content"] for target in payload["agent_instructions"]["targets"]
+                     for entry in target.get("files") or ())
+    actions = sorted(set(_KIT_ACTION_REF.findall(text)) - _KIT_READER_BLANKS)
+    packages = sorted(set(_KIT_PACKAGE_PIN.findall(text)))
+    if actions != [source_commit]:
+        raise ValueError(f"Installed candidate adoption kit names Action refs {actions}")
+    if packages != [version]:
+        raise ValueError(f"Installed candidate adoption kit names package versions {packages}")
+    if "No published release reports that contract" in text:
+        raise ValueError("Installed candidate adoption kit denies the contract it reports")
+    if "{{" in text.replace("${{", ""):
+        raise ValueError("Installed candidate adoption kit left an unrendered template placeholder")
+    return {"action_refs": actions, "package_versions": packages}
+
+
+def _cli_refusal(root: Path, *args: str) -> str:
+    """Run the installed CLI expecting it to refuse, and return what it said.
+
+    ``_cli`` raises on a non-zero exit because every other caller wants the
+    parsed stdout. The migration replay wants the opposite: the refusal *is*
+    the result, and a zero exit is the failure.
+    """
+
+    env = {k: v for k, v in os.environ.items() if k not in {"PYTHONPATH", "PYTHONHOME"}}
+    result = subprocess.run(
+        [sys.executable, "-I", "-m", "agents_shipgate", *args],
+        cwd=root, env=env, text=True, capture_output=True, check=False,
+    )
+    if result.returncode == 0:
+        raise ValueError(
+            f"Installed CLI accepted an artifact it must refuse: {' '.join(args)}"
+        )
+    return result.stdout + result.stderr
+
+
+def report_schema_exercise(root: Path, prepared: dict) -> dict:
+    """The recorded report-contract exercise for this candidate (#569).
+
+    ``STABILITY.md`` says a ``1.0`` line begins only once the report schema
+    reaches ``1.0`` and *holds*. "Holds" cannot be established by the source
+    tree asserting things about itself, so it is established here, against the
+    installed candidate wheel, on the same disposable run that already proves
+    the CLI and its generated Action agree.
+
+    Two claims, and the second is the one worth the machinery:
+
+    1. **The freeze is real in the distribution.** The reports this build emits
+       carry the frozen major, and it is the same version the build advertises
+       in ``contract --json``. A build whose emitted and advertised schema
+       disagree sends consumers to the wrong document and makes the
+       qualification gate reject every receipt.
+
+    2. **The migration boundary behaves, on the installed build.** A pre-freeze
+       report is refused by name with a route, and this build's own report is
+       accepted. The pre-freeze input is this run's own report with *only* its
+       version rewritten -- a single-variable experiment, and exactly the
+       mistake the freeze forbids: relabelling an artifact rather than
+       regenerating it. If a relabelled artifact were accepted, an old signed
+       receipt could acquire current authority by a one-field edit.
+    """
+
+    # Which side each fact comes from, stated because this file otherwise
+    # reads everything out of the installed wheel via ``_cli``:
+    #
+    #   * the *observed* values -- advertised contract, emitted report, the
+    #     refusal text -- come from the installed candidate;
+    #   * ``REPORT_CONTRACT_MAJOR`` and ``report_schema_refusal_code`` are the
+    #     *reviewed claim* being checked, and come from the source tree.
+    #
+    # They are the same build by construction: ``prepare`` is given
+    # ``--source-commit`` and refuses unless the generated workflow names it,
+    # so the checkout under review is the commit the wheel was built from.
+    from agents_shipgate.schemas.report_compatibility import (
+        REPORT_CONTRACT_MAJOR,
+        parse_report_schema_version,
+        report_schema_refusal_code,
+    )
+
+    advertised = prepared["contract"]["report_schema_version"]
+    parsed = parse_report_schema_version(advertised)
+    if parsed is None or parsed[0] != REPORT_CONTRACT_MAJOR:
+        raise ValueError(
+            f"Installed candidate advertises report schema {advertised!r}, which is "
+            f"not in the frozen {REPORT_CONTRACT_MAJOR}.x major"
+        )
+
+    local = root / ".shipgate-smoke/local"
+    emitted = json.loads((local / "report.json").read_text())["report_schema_version"]
+    if emitted != advertised:
+        raise ValueError(
+            f"Installed candidate emits report schema {emitted!r} but advertises "
+            f"{advertised!r}; consumers and the qualification gate read the second"
+        )
+
+    replay = root / ".shipgate-smoke/migration-replay"
+    replay.mkdir(parents=True, exist_ok=True)
+    relabelled = replay / "pre-freeze-report.json"
+    payload = json.loads((local / "report.json").read_text())
+    payload["report_schema_version"] = "0.43"
+    relabelled.write_text(json.dumps(payload, indent=2) + "\n")
+
+    refusal = _cli_refusal(root, "findings", "--from", str(relabelled), "--json")
+    code = report_schema_refusal_code(refusal)
+    if code != "report_schema_pre_freeze":
+        raise ValueError(
+            "Installed candidate did not refuse a relabelled pre-freeze report "
+            f"with a recognizable reason code (got {code!r})"
+        )
+    if "agents-shipgate scan" not in refusal:
+        raise ValueError("The installed candidate's refusal names no regeneration route")
+
+    # The other half: a gate nothing passes is indistinguishable from a broken
+    # one, and that is how a fail-closed change actually ships broken.
+    _cli(root, "findings", "--from", str(local / "report.json"), "--json")
+
+    return {
+        "advertised_report_schema_version": advertised,
+        "emitted_report_schema_version": emitted,
+        "frozen_major": REPORT_CONTRACT_MAJOR,
+        "relabelled_input_version": "0.43",
+        "relabelled_input_refused_with": code,
+        "refusal_names_regeneration_route": True,
+        "current_report_accepted": True,
+        "conversion_offered": False,
+    }
+
+
+def compare(root: Path) -> dict:
+    prepared = json.loads((root / ".shipgate-smoke/prepared.json").read_text())
+    results = []
+    for name in ("local", "ci"):
+        directory = root / ".shipgate-smoke" / name
+        report = json.loads((directory / "report.json").read_text())
+        verifier = json.loads((directory / "verifier.json").read_text())
+        plan = json.loads((directory / "verification-plan.json").read_text())
+        results.append({
+            "decision": report["release_decision"]["decision"],
+            "merge_verdict": verifier["merge_verdict"],
+            "findings": sorted((f["check_id"], f["severity"]) for f in report["findings"]),
+            "engine": plan["engine"],
+            "report_schema_version": report.get("report_schema_version"),
+        })
+    if results[0] != results[1] or results[0]["decision"] != "blocked":
+        raise ValueError("Installed CLI and Action disagree, or the unsafe refund was not blocked")
+    current_contract = _cli(root, "contract", "--json")
+    if current_contract != prepared["contract"]:
+        raise ValueError("Installed runtime contract changed between local and Action execution")
+    return {**prepared, "local_and_action_agree": True, "result": results[0],
+            "report_schema_exercise": report_schema_exercise(root, prepared),
+            "qualification_claim": "none: synthetic distribution smoke only"}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("operation", choices=("prepare", "compare"))
+    parser.add_argument("--workspace", type=Path, default=Path.cwd())
+    parser.add_argument("--source-commit")
+    parser.add_argument("--wheel", type=Path)
+    parser.add_argument(
+        "--disposable-checkout", action="store_true",
+        help="confirm the workspace is a runner or throwaway clone that prepare may rewrite",
+    )
+    args = parser.parse_args()
+    try:
+        if args.operation == "prepare":
+            if not args.source_commit or args.wheel is None:
+                raise ValueError("prepare requires --source-commit and --wheel")
+            result = prepare(
+                args.workspace.resolve(), args.source_commit, args.wheel,
+                disposable=args.disposable_checkout,
+            )
+            if os.environ.get("GITHUB_OUTPUT"):
+                with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+                    handle.write(f"base_ref={result['base_ref']}\nhead_ref={result['head_ref']}\n")
+        else:
+            result = compare(args.workspace.resolve())
+        print(json.dumps(result, indent=2, sort_keys=True))
+    except (ValueError, OSError, subprocess.CalledProcessError) as exc:
+        print(f"Release engine smoke failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

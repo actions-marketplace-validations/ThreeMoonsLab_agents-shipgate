@@ -27,12 +27,18 @@ from typing import get_args
 import pytest
 
 from agents_shipgate import __version__
+from agents_shipgate.cli.discovery import detect_workspace
 from agents_shipgate.core.boundary_registry import BOUNDARY_ADAPTERS
 from agents_shipgate.core.dependency_manifests import (
     DEPENDENCY_MANIFEST_GLOBS,
     is_dependency_manifest,
 )
 from agents_shipgate.packet.disclaimer import PACKET_NON_PROOF_HEADLINE
+from agents_shipgate.published_release import (
+    LATEST_PUBLISHED_CONTRACT_VERSION,
+    LATEST_PUBLISHED_VERSION,
+    contract_floor_prose,
+)
 from agents_shipgate.report.markdown import DISCLAIMER
 from agents_shipgate.schemas.attestation import ATTESTATION_SCHEMA_VERSION
 from agents_shipgate.schemas.capabilities import (
@@ -44,6 +50,7 @@ from agents_shipgate.schemas.contract import (
     CONTRACT_VERSION,
     GATING_SIGNAL,
     MANUAL_REVIEW_SIGNALS,
+    MINIMUM_CONTROL_CONTRACT_VERSION,
     SUPPORTED_INPUTS,
     build_contract_payload,
 )
@@ -58,6 +65,10 @@ from agents_shipgate.schemas.org_evidence_bundle import ORG_EVIDENCE_BUNDLE_SCHE
 from agents_shipgate.schemas.packet import EvidencePacket
 from agents_shipgate.schemas.registry import REGISTRY_SCHEMA_VERSION
 from agents_shipgate.schemas.report import ReadinessReport
+from agents_shipgate.schemas.safety_qualification import (
+    pre_release_safety_requirements,
+    production_safety_requirements,
+)
 from agents_shipgate.schemas.verifier import VerifierArtifact
 from agents_shipgate.triggers import (
     VALID_SURFACE_CLASSES,
@@ -72,9 +83,11 @@ CURRENT_REPORT_SCHEMA_VERSION = str(ReadinessReport.model_fields["report_schema_
 CURRENT_REPORT_SCHEMA = f"report-schema.v{CURRENT_REPORT_SCHEMA_VERSION}.json"
 CURRENT_PACKET_SCHEMA_VERSION = str(EvidencePacket.model_fields["packet_schema_version"].default)
 CURRENT_PACKET_SCHEMA = f"packet-schema.v{CURRENT_PACKET_SCHEMA_VERSION}.json"
-# The source tree is on the 0.16 beta line while install snippets and Action
-# examples must continue to name the latest tag that actually exists.
-LATEST_PUBLISHED_VERSION = "0.15.0"
+# The source tree runs ahead of the newest tag between releases, while install
+# snippets and Action examples must continue to name the latest tag that
+# actually exists. Imported rather than restated: the same constant is what
+# `init` writes into an adopter's repository, and a second copy here is how the
+# two conventions diverged in the first place (#506).
 # Frozen report schemas that still appear in public surfaces must be labeled as
 # frozen/legacy/older instead of being mistaken for the current schema.
 LEGACY_REPORT_SCHEMA_PATTERN = re.compile(
@@ -122,7 +135,7 @@ VERSION_LITERAL_TARGETS = (
     ),
     (
         "docs/faq.md",
-        re.compile(rf"v({VERSION_RE}) is the latest published pre-1\.0 beta"),
+        re.compile(rf"v({VERSION_RE}) is the latest published release"),
     ),
     (
         "ROADMAP.md",
@@ -212,10 +225,12 @@ PUBLIC_SURFACES = (
 # launch copy is allowed to reference historic releases (e.g. v0.5.1).
 # Schema files (`docs/{report,packet}-schema.v0.X.json`) are excluded
 # because their `$id` necessarily names their own frozen version.
-# Prompts the adoption kits render. Their runner pin and contract floor come
-# from the same build, so they track that build rather than the latest
-# published release — a CI example, which installs from PyPI, still tracks the
-# release.
+# Prompts the adoption kits render. They are *not* excluded from the pin sweep
+# below any more: they used to track the emitting build rather than the latest
+# published release, which is what made the exclusion necessary and what made
+# the pins unfetchable for 56 days (#506). One rule now covers every surface;
+# this tuple survives only to name the files whose contract-floor prose is
+# separately checked for honesty.
 RENDERED_PROMPT_PIN_FILES = (
     "prompts/add-shipgate-to-repo.md",
     "prompts/decide-shipgate-relevance.md",
@@ -225,7 +240,7 @@ RENDERED_PROMPT_PIN_FILES = (
     "plugins/claude-code/skills/agents-shipgate/prompts/decide-shipgate-relevance.md",
 )
 ACTION_PIN_FILES = (
-    *(s for s in PUBLIC_SURFACES if s not in RENDERED_PROMPT_PIN_FILES),
+    *PUBLIC_SURFACES,
     "docs/integrations.md",
     "docs/quickstart.md",
     "docs/target-repo-agent-snippets.md",
@@ -236,6 +251,7 @@ ACTION_PIN_FILES = (
     "examples/github-actions/05-sarif-to-code-scanning.yml",
     "examples/github-actions/07-block-on-blocked-verdict.yml",
     "examples/github-actions/08-require-mergeable.yml",
+    "examples/github-actions/14-host-only-advisory-pr.yml",
     "examples/circleci/01-advisory.yml",
     "examples/circleci/02-strict-with-baseline.yml",
     "examples/circleci/03-sarif-artifact-retention.yml",
@@ -552,7 +568,7 @@ def test_well_known_metadata_lists_packet_outputs():
     assert "verification-receipt-schema.v1.json" in schemas["verification_receipt"]
     assert "human_authorization" in schemas
     assert "human-authorization-schema.v1.json" in schemas["human_authorization"]
-    assert "agent_handoff" in schemas and "agent-handoff-schema.v8.json" in schemas["agent_handoff"]
+    assert "agent_handoff" in schemas and "agent-handoff-schema.v9.json" in schemas["agent_handoff"]
     assert (
         "codex_boundary_result" in schemas
         and "codex-boundary-result-schema.v2.json" in schemas["codex_boundary_result"]
@@ -616,6 +632,91 @@ def test_agent_contract_current_doc_is_canonical():
         "docs/agent-contract-current.md must reference the current packet "
         f"schema (v{CURRENT_PACKET_SCHEMA_VERSION}) so coding agents know "
         "about the Release Evidence Packet."
+    )
+
+
+def test_keystone_and_stability_agree_on_whether_the_contract_shipped():
+    """STABILITY.md and docs/agent-contract-current.md carry the same
+    mirror sentences about the current contract, and release prep restates
+    them — "new in <version>" in place of "unreleased". Only STABILITY.md's
+    copies were restated for 1.1.0, so at the tag the keystone doc, and the
+    generated llms-full.txt that inlines it, would have told readers four
+    times that the contract the release publishes is unreleased.
+
+    Two claims, both decidable from the tree:
+
+    * the two documents must not disagree — either both describe the
+      current contract as unreleased, or neither does;
+    * once STABILITY.md is stamped for the version this tree emits, which
+      is the release-prep step that says these schemas ship, the keystone
+      doc may not still call that contract unreleased.
+
+    The ``<a id="migration-note-unreleased-…">`` anchors are stable link
+    targets, not claims about the current contract, and do not carry this
+    phrase.
+    """
+    keystone = _read("docs/agent-contract-current.md")
+    stability = _read("STABILITY.md")
+    keystone_count = keystone.count("unreleased contract")
+    stability_count = stability.count("unreleased contract")
+    assert bool(keystone_count) == bool(stability_count), (
+        "STABILITY.md and docs/agent-contract-current.md disagree about "
+        "whether the current contract has shipped: 'unreleased contract' "
+        f"appears {keystone_count} time(s) in the keystone doc and "
+        f"{stability_count} time(s) in STABILITY.md. Restate both together "
+        "— the keystone doc's own rule is to update STABILITY.md first, "
+        "then it."
+    )
+    if _stability_is_stamped_for_this_tree():
+        assert keystone_count == 0, (
+            f"STABILITY.md is stamped {__version__}, the version this tree "
+            "emits, so the contract it describes ships in that release; "
+            "docs/agent-contract-current.md must not still call it an "
+            "'unreleased contract'. scripts/build-llms-full.py inlines that "
+            "file, so llms-full.txt would repeat it at the tag."
+        )
+
+
+def _stability_is_stamped_for_this_tree() -> bool:
+    """True once STABILITY.md's title names the version this tree emits.
+
+    Stamping the title is the release-prep step that turns "this is coming"
+    into "this ships", so it is the point after which no surface may defer a
+    claim to an unnamed future release.
+    """
+    stability = _read("STABILITY.md")
+    stamp = re.match(r"# Stability Contract · (?P<version>\S+)", stability)
+    assert stamp, "STABILITY.md must open with '# Stability Contract · <version>'."
+    return stamp.group("version") == __version__
+
+
+def test_no_deprecation_is_dated_to_an_unnamed_cycle_at_release():
+    """A deprecation has to name the release it started in.
+
+    STABILITY.md § Versioning counts the deprecation clock in shipped
+    releases, never in time on unreleased ``main``, so "deprecated in the
+    unreleased minor cycle" tells a reader nothing they can count a removal
+    from once that cycle has a number. The 1.1.0 prep restated the phrase in
+    STABILITY.md and docs/checks.md and left it in the check registry, whose
+    ``description`` is published in docs/checks.json — the machine-readable
+    catalog a coding agent fetches by URL — and in ``list-checks``, report
+    metadata and SARIF beside it.
+    """
+    if not _stability_is_stamped_for_this_tree():
+        return
+    surfaces = ["STABILITY.md", "docs/checks.md", "docs/checks.json", "llms-full.txt"]
+    surfaces += sorted(
+        str(path.relative_to(REPO_ROOT)) for path in (REPO_ROOT / "docs" / "checks").glob("*.yaml")
+    )
+    offenders = {path: _read(path).count("unreleased minor cycle") for path in surfaces}
+    offenders = {path: count for path, count in offenders.items() if count}
+    assert not offenders, (
+        f"STABILITY.md is stamped {__version__}, the version this tree emits, "
+        "so a deprecation in this cycle is deprecated in that release and the "
+        "removal clock can be counted from it. These surfaces still date it to "
+        f"'the unreleased minor cycle': {offenders}. Restate the check "
+        "registry under docs/checks/ and re-run "
+        "`python scripts/generate_schemas.py`, which rewrites docs/checks.json."
     )
 
 
@@ -722,6 +823,87 @@ def test_constants_match_contract_doc():
     )
 
 
+def test_the_prose_that_states_the_current_report_schema_states_the_current_one():
+    """Two more places name the schema version in a sentence, and both drifted.
+
+    The contract doc and `docs/architecture.md` were already bound above; these
+    two were not, so a bump left them behind. ``README.md`` ended up
+    contradicting itself -- one section said `0.43` while Limitations still said
+    `0.42` -- and the qualification runbook stated a pin the policy no longer
+    used. Both are current-state claims, not frozen-reference mentions, so each
+    is matched by the sentence that makes the claim rather than by searching the
+    file for a number.
+    """
+
+    readme = re.search(
+        r'Current reports carry `report_schema_version: "(\d+\.\d+)"`', _read("README.md")
+    )
+    assert readme, "README.md must state 'Current reports carry `report_schema_version: \"X.Y\"`'."
+    assert readme.group(1) == CURRENT_REPORT_SCHEMA_VERSION, (
+        f"README.md Limitations says reports carry {readme.group(1)!r}; "
+        f"the engine emits {CURRENT_REPORT_SCHEMA_VERSION!r}."
+    )
+
+    # The runbook's claim is about the *policy's* pin, which a separate test
+    # already holds equal to what the engine emits. Checking it against the
+    # policy keeps this guard about the sentence rather than duplicating that
+    # equality.
+    #
+    # It reads the *production* policy because the two policies stopped being
+    # identical at the 1.0 freeze (#569): production follows the engine to
+    # `1.0`, while the retired `pre_1_0` tier keeps the `0.43` its artifacts
+    # actually carry. The runbook has to say which is which, so both halves of
+    # that sentence are bound here.
+    runbook_text = _read("benchmark/safety-qualification/README.md")
+    pinned = production_safety_requirements().required_report_schema_version
+    runbook = re.search(
+        r"`required_report_schema_version` pins \(`(\d+\.\d+)` today",
+        runbook_text,
+    )
+    assert runbook, (
+        "benchmark/safety-qualification/README.md must state which version "
+        "`required_report_schema_version` pins."
+    )
+    assert runbook.group(1) == pinned, (
+        f"the qualification runbook says the policy pins {runbook.group(1)!r}; "
+        f"production_safety_requirements() pins {pinned!r}."
+    )
+
+    retired = pre_release_safety_requirements().required_report_schema_version
+    historical = re.search(
+        r"historical `(\d+\.\d+)` pin", runbook_text
+    )
+    assert historical, (
+        "benchmark/safety-qualification/README.md must state the retired "
+        "`pre_1_0` policy's historical pin, or a reader cannot tell why the "
+        "two policies name different schemas."
+    )
+    assert historical.group(1) == retired, (
+        f"the qualification runbook says the retired policy keeps "
+        f"{historical.group(1)!r}; pre_release_safety_requirements() keeps "
+        f"{retired!r}."
+    )
+
+
+def test_discovery_integration_surfaces_match_the_same_build_runtime():
+    """Main-tree discovery names exactly what this source contract supports.
+
+    The site's released copy belongs to its tag; it is intentionally not an
+    input to this same-build comparison. Ordering is presentation, not a
+    second capability or compatibility promise.
+    """
+    published = json.loads(_read(".well-known/agents-shipgate.json"))
+    runtime = build_contract_payload().external_integration_surfaces
+    discovered = published["external_integration_surfaces"]
+    assert len(discovered) == len(set(discovered)), "duplicate discovery integration surfaces"
+    missing = sorted(set(runtime) - set(discovered))
+    unexpected = sorted(set(discovered) - set(runtime))
+    assert not missing and not unexpected, (
+        "same-build external_integration_surfaces drift: "
+        f"missing from discovery={missing}; not supported by runtime={unexpected}"
+    )
+
+
 def test_runtime_and_published_versions_propagate_to_metadata_surfaces():
     """Keep the in-tree runtime and latest published tag distinct.
 
@@ -784,6 +966,150 @@ def test_runtime_and_published_versions_propagate_to_metadata_surfaces():
         f"published tag `v{LATEST_PUBLISHED_VERSION}`."
     )
     assert f"In-tree runtime: `{expected}`" in contract_text
+
+
+#: "contract 40" and "contract v40" both name a runtime contract.
+_CONTRACT_MENTION = re.compile(r"\bcontract v?(\d+)\b")
+#: Wording that places the source tree ahead of the newest published build.
+_AHEAD_OF_RELEASE = re.compile(r"\bunreleased\b|\bahead of\b", re.IGNORECASE)
+
+
+def _single_line(text: str, prefix: str, relpath: str) -> str:
+    lines = [line for line in text.splitlines() if line.startswith(prefix)]
+    assert len(lines) == 1, f"{relpath} must carry exactly one {prefix!r} line; found {len(lines)}."
+    return lines[0]
+
+
+def _prose_sentences(text: str) -> list[str]:
+    """Sentences of hard-wrapped Markdown prose, each joined onto one line."""
+    return re.split(r"(?<=[.!?])\s+", _normalize_ws(text))
+
+
+def _single_statement(statements: list[str], needle: str, relpath: str) -> str:
+    found = [s for s in statements if needle in s.lower() and _CONTRACT_MENTION.search(s)]
+    assert len(found) == 1, (
+        f"{relpath} must state exactly one {needle!r} contract; found {len(found)}: {found!r}"
+    )
+    return found[0]
+
+
+def _assert_contract_statements_apart(
+    relpath: str, statements: list[str], release: str, source: str
+) -> None:
+    assert _CONTRACT_MENTION.findall(release) == [LATEST_PUBLISHED_CONTRACT_VERSION], (
+        f"{relpath}: the latest public release must name the contract v{LATEST_PUBLISHED_VERSION} "
+        f"emits, {LATEST_PUBLISHED_CONTRACT_VERSION}, and no other: {release!r}"
+    )
+    assert _CONTRACT_MENTION.findall(source) == [CONTRACT_VERSION], (
+        f"{relpath}: the source tree must name this tree's contract, "
+        f"{CONTRACT_VERSION}, and no other: {source!r}"
+    )
+    assert "published" not in source.lower(), (
+        f"{relpath} describes the source tree as published: {source!r}"
+    )
+    ahead = CONTRACT_VERSION != LATEST_PUBLISHED_CONTRACT_VERSION
+    assert bool(_AHEAD_OF_RELEASE.search(source)) == ahead, (
+        f"{relpath}: this tree's contract {CONTRACT_VERSION} "
+        + (
+            f"is ahead of the published {LATEST_PUBLISHED_CONTRACT_VERSION}, so say it is unreleased"
+            if ahead
+            else "is the published one now, so drop 'unreleased' / 'ahead of'"
+        )
+        + f": {source!r}"
+    )
+    if ahead:
+        for statement in statements:
+            if "published" in statement.lower():
+                assert CONTRACT_VERSION not in _CONTRACT_MENTION.findall(statement), (
+                    f"{relpath} pairs this tree's unreleased contract "
+                    f"{CONTRACT_VERSION} with a published build: {statement!r}"
+                )
+
+
+def test_llms_txt_states_the_source_and_published_contracts_apart():
+    """#792: a reader of `main` must never pair this tree's contract with a published build.
+
+    `llms.txt` is served from `main`, where the source tree runs ahead of the
+    newest tag. It used to pack both into one parenthetical — "source-tree
+    runtime: 1.0.0 (contract 39; published on the advisory channel, …)" — so
+    bumping that number to this tree's contract would have told a participant's
+    agent that the build it installs emits a contract it does not. Each line now
+    names its own build's contract, and while the two differ no line that speaks
+    of a published build names this tree's contract. The source line says
+    "unreleased" exactly while the contracts differ, so the release that
+    publishes this contract has to take the qualifier out.
+    """
+
+    relpath = "llms.txt"
+    text = _read(relpath)
+    _assert_contract_statements_apart(
+        relpath,
+        text.splitlines(),
+        release=_single_line(text, "- Latest public release:", relpath),
+        source=_single_line(text, "- Current source-tree runtime:", relpath),
+    )
+
+    boundary = build_contract_payload().agent_boundary_result_schema_version
+    stated = set(re.findall(r"shipgate\.agent_boundary_result/v\d+", text))
+    assert stated == {boundary}, (
+        f"{relpath} tells a reader to parse {sorted(stated)}; `check` emits {boundary}."
+    )
+
+
+def test_ai_search_summary_states_the_source_and_published_contracts_apart():
+    """#792: the citable summary splits the same pair `llms.txt` does.
+
+    It used to say "The current source tree is `1.0.0` (runtime contract v40),
+    and `v1.0.0` is the latest published release" in one sentence. The rule is
+    applied per sentence, because the page is hard-wrapped prose rather than one
+    fact per line, and it reads "contract v40" as well as "contract 40".
+    """
+
+    relpath = "docs/ai-search-summary.md"
+    sentences = _prose_sentences(_read(relpath))
+    _assert_contract_statements_apart(
+        relpath,
+        sentences,
+        release=_single_statement(sentences, "published release", relpath),
+        source=_single_statement(sentences, "source tree", relpath),
+    )
+
+
+def test_contract_statement_guard_reads_both_spellings():
+    """#792: a published build paired with "contract vN" is caught, not only "contract N".
+
+    The first version of the guard read only the bare number, so adding
+    "the published `v1.0.0` emits runtime contract v40" to `llms.txt` passed.
+    """
+
+    assert _CONTRACT_MENTION.findall("emits runtime contract v40") == ["40"]
+    assert _CONTRACT_MENTION.findall("emits runtime contract 40") == ["40"]
+    release = f"Latest public release (contract {LATEST_PUBLISHED_CONTRACT_VERSION})"
+    if CONTRACT_VERSION != LATEST_PUBLISHED_CONTRACT_VERSION:
+        seeded = f"the published `v1.0.0` emits runtime contract v{CONTRACT_VERSION}"
+        with pytest.raises(AssertionError, match="pairs this tree's unreleased contract"):
+            _assert_contract_statements_apart(
+                "seeded",
+                [seeded],
+                release=release,
+                source=f"source tree (contract {CONTRACT_VERSION}, unreleased)",
+            )
+    else:
+        # The other phase (#778): once the release that emits this contract is
+        # published, the source line may not go on calling it unreleased. The
+        # qualifier `llms.txt` carried until the pins moved to `v1.1.0` is the
+        # seed, so this branch is exercised rather than skipped while the two
+        # contracts are equal.
+        with pytest.raises(AssertionError, match="is the published one now"):
+            _assert_contract_statements_apart(
+                "seeded",
+                [],
+                release=release,
+                source=(
+                    f"source-tree runtime (contract {CONTRACT_VERSION}; unreleased, "
+                    "ahead of the latest public release)"
+                ),
+            )
 
 
 def test_release_tag_consistency_checks_published_tag_not_prerelease_runtime():
@@ -2221,6 +2547,11 @@ def test_well_known_links_to_agent_discovery_onramps():
     assert any("Codex plugin" in entry for entry in when_to_use), (
         ".well-known when_to_use must mention Codex plugin changes."
     )
+    # #792: the host-configuration review job and its manifest-free route.
+    assert any("agents-shipgate diff" in entry for entry in when_to_use), (
+        ".well-known when_to_use must name `agents-shipgate diff` for reviewing a "
+        "coding-agent configuration change."
+    )
 
     expected_urls = {
         "ai_search_summary_url": "/docs/ai-search-summary.md",
@@ -2407,14 +2738,34 @@ def test_prominent_surfaces_only_promote_check_verify_and_host_audit():
         "agents-shipgate bootstrap",
         "agents-shipgate apply-patches",
     )
+    # #498 replaced the README's own quickstart with a landing page, so the
+    # first-look region is the landing page itself: everything above the
+    # section the README opens by telling human readers to skip. That is
+    # strictly wider than the section slice it replaces. Below the line is a
+    # contract index for coding agents, where naming `agents-shipgate detect`
+    # to say what the zero-install detector is equivalent to is a reference and
+    # not a route.
     readme = _read("README.md")
-    readme_top = readme.split("## Verify-first quickstart", 1)[1].split(
-        "## How to read your first result", 1
-    )[0]
+    readme_marker = "## For coding agents"
+    assert readme_marker in readme, (
+        f"README.md no longer has a {readme_marker!r} heading, so this test "
+        "cannot tell the landing page from the contract index. Restore the "
+        "heading or re-derive the boundary."
+    )
+    readme_top = readme.split(readme_marker, 1)[0]
     quickstart = _read("docs/quickstart.md")
-    quickstart_top = quickstart.split("## Verify-first quickstart", 1)[1].split(
-        "## Supporting zero-install relevance check", 1
-    )[0]
+    # The quickstart's first-look region is everything up to the point where it
+    # stops demonstrating and starts acting: install, the relevance check, and
+    # the one review read end to end. `apply-patches` belongs to the repair
+    # boundary and `detect` / `init` to Route A, both below that line; nothing
+    # above it may send a first-look reader to a setup or repair command.
+    marker = "## Two kinds of fix"
+    assert marker in quickstart, (
+        f"docs/quickstart.md no longer has a {marker!r} heading, so this test "
+        "cannot tell the demonstration region from the adoption region. Restore "
+        "the heading or re-derive the boundary."
+    )
+    quickstart_top = quickstart.split(marker, 1)[0]
     slash = _read(".claude/commands/shipgate.md")
     slash_commands = slash.split("Prominent commands:", 1)[1].split("Required behavior", 1)[0]
     target_snippets = _read("docs/target-repo-agent-snippets.md")
@@ -2468,6 +2819,80 @@ def test_llms_txt_advertises_triggers_and_llms_full():
     assert "llms-full.txt" in text, (
         "llms.txt must reference llms-full.txt so coding agents that "
         "prefer one document over chasing links can find it."
+    )
+
+
+#: The detector list fields a continue rule reads as a reason to go on. Each
+#: names a route `detect` takes forward: framework sources, a Codex plugin
+#: package, or recognized host configuration.
+_DETECT_CONTINUE_LISTS = (
+    "suggested_sources",
+    "codex_plugin_candidates",
+    "host_boundary_candidates",
+)
+
+
+def _continue_rules() -> dict[str, str]:
+    """The one continue rule on each copy an agent or reader follows, whitespace-joined."""
+
+    section = _slice_section(_read("llms.txt"), "## When to recommend", "\n## ")
+    llms = [line for line in section.splitlines() if line.startswith("- Continue when")]
+    assert len(llms) == 1, f"llms.txt must carry one 'Continue when' rule; found {len(llms)}"
+    quickstart = [
+        _normalize_ws(paragraph)
+        for paragraph in _read("docs/quickstart.md").split("\n\n")
+        if paragraph.startswith("Continue when")
+    ]
+    assert len(quickstart) == 1, (
+        f"docs/quickstart.md must carry one 'Continue when' rule; found {len(quickstart)}"
+    )
+    return {"llms.txt": llms[0], "docs/quickstart.md": quickstart[0]}
+
+
+def test_detect_continue_rules_do_not_stop_a_host_only_repository(tmp_path: Path):
+    """#792: the rule an agent reads must continue where the engine continues.
+
+    In a repository whose only agent configuration is `.claude/settings.json`
+    and `.mcp.json`, `detect` reports no agent project, no sources and no plugin
+    candidates, and routes forward on `host_boundary_candidates`. The continue
+    rules in `llms.txt` and the quickstart used to name only the first three, so
+    an agent following them stopped on exactly the change the manifest-free
+    `diff` exists to review. Every condition is required on every rule, not only
+    the one this fixture fires, so dropping another one fails too.
+    """
+
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "settings.json").write_text(
+        '{"permissions": {"allow": ["Bash(npm test:*)"]}}\n', encoding="utf-8"
+    )
+    (tmp_path / ".mcp.json").write_text('{"mcpServers": {}}\n', encoding="utf-8")
+    result = detect_workspace(tmp_path.resolve()).model_dump(mode="json")
+    missing = [
+        field for field in ("is_agent_project", *_DETECT_CONTINUE_LISTS) if field not in result
+    ]
+    assert not missing, f"detect no longer emits {missing}; update _DETECT_CONTINUE_LISTS"
+    fired = [field for field in _DETECT_CONTINUE_LISTS if result[field]]
+    assert result["is_agent_project"] is False and fired == ["host_boundary_candidates"], (
+        "the host-only shape no longer isolates the host route, so this test compares "
+        f"nothing: is_agent_project={result['is_agent_project']!r}, fired={fired!r}"
+    )
+    assert result["next_action"].startswith("agents-shipgate audit --host"), (
+        f"detect no longer routes a host-only repository forward: {result['next_action']!r}"
+    )
+
+    for relpath, rule in _continue_rules().items():
+        assert "`is_agent_project: true`" in rule and "`shipgate.yaml`" in rule, (
+            f"{relpath}'s continue rule lost its project or manifest condition: {rule!r}"
+        )
+        for field in _DETECT_CONTINUE_LISTS:
+            assert f"`{field}`" in rule, (
+                f"{relpath}'s continue rule omits `{field}`, so an agent stops where "
+                f"detect continues: {rule!r}"
+            )
+    section = _slice_section(_read("llms.txt"), "## When to recommend", "\n## ")
+    assert "agents-shipgate diff" in section, (
+        "llms.txt 'When to recommend' must name the manifest-free route a host-only "
+        "repository reviews a change with."
     )
 
 
@@ -3351,10 +3776,16 @@ def _resolve_freeform(text: str) -> tuple[set[str], list[str]]:
     """Substring-scan freeform prose for every alias. Unresolved is
     always empty for prose — the bidirectional adapter test plus the
     structured extractors below catch unknown-input drift on surfaces
-    that have a parseable list shape."""
+    that have a parseable list shape.
+
+    Whitespace is collapsed first. A multi-word alias — ``Codex repo config``
+    — otherwise resolves or not depending on where the paragraph happens to
+    wrap, so re-flowing a sentence drops an input the surface still names. That
+    is a false failure about the *shape* of the prose, not about its claim."""
+    haystack = _normalize_ws(text)
     resolved: set[str] = set()
     for alias in _ALIASES_LONGEST_FIRST:
-        if alias in text:
+        if _normalize_ws(alias) in haystack:
             resolved.add(_ALIAS_TO_ENUM[alias])
     return resolved, []
 
@@ -3554,6 +3985,7 @@ TRUST_QUALIFIER_WINDOW = 400  # ~one paragraph; matches CONTEXT_WINDOW
 
 TRUST_CLAIM_SURFACES = (
     "README.md",
+    "ADOPTERS.md",
     "AGENTS.md",
     "STABILITY.md",
     "llms.txt",
@@ -4003,25 +4435,47 @@ def test_read_first_instructions_match_contract_agent_read_order(relpath):
 
 
 @pytest.mark.parametrize("relpath", RENDERED_PROMPT_PIN_FILES)
-def test_rendered_prompt_pins_match_the_emitting_build(relpath):
-    """A rendered prompt's runner pin must satisfy the floor it demands.
+def test_rendered_prompts_say_what_the_pinned_release_reports(relpath):
+    """A rendered prompt's runner pin resolves, *and* its floor prose is true of it.
 
-    Both come from ``{{ shipgate_version }}`` and
-    ``{{ minimum_control_contract_version }}``, rendered by the build that
-    emitted the file. Hand-writing either is what produced the contradiction
-    these prompts shipped with: a pinned runner reporting contract 10 beside a
-    demand for a much higher floor, which no agent following the prompt
-    literally could ever satisfy.
+    Two failures produced this test, and only one rule avoids both. Hand-writing
+    the floor gave a pinned runner reporting contract 10 beside a demand for a
+    much higher one, which no agent following the prompt could satisfy. Binding
+    the pin to ``__version__`` to fix that gave a pin no index carries, which no
+    agent could fetch at all (#506).
+
+    So the pin names the newest published release — checked by the sweep above,
+    which now covers these files too — and the prompt states whether *that*
+    release reports the floor. Asserting the rendered prose rather than the
+    helper is deliberate: the helper being right is worth nothing if the
+    template stops interpolating it.
     """
 
-    for pattern in (PIP_PIN_PATTERN, UVX_PIN_PATTERN):
-        for line_number, line, found in _file_lines_with_pin(relpath, pattern):
-            assert found == __version__, (
-                f"{relpath}:{line_number} pins agents-shipgate {found}; this "
-                f"build is {__version__}. Render the pin from "
-                f"{{{{ shipgate_version }}}} rather than hand-writing it.\n"
-                f"  line: {line.strip()!r}"
-            )
+    text = _read(relpath)
+    prose = contract_floor_prose(MINIMUM_CONTROL_CONTRACT_VERSION)
+    statement = prose.notice if "add-shipgate-to-repo" in relpath else prose.source
+    assert statement in text, (
+        f"{relpath} does not state what `agents-shipgate` "
+        f"{LATEST_PUBLISHED_VERSION} reports against contract floor "
+        f"{MINIMUM_CONTROL_CONTRACT_VERSION}. Expected:\n  {statement}\n"
+        "Render it from {{ contract_floor_notice }} / {{ contract_floor_source }} "
+        "rather than hand-writing a claim about the pinned release."
+    )
+    if not prose.satisfied:
+        # And it must not, anywhere else in the file, promise that the version
+        # it pins is new enough when it demonstrably is not — the sentence this
+        # replaced. Matched as a pattern rather than as the two spellings that
+        # happened to ship: the satisfied branch renders the version
+        # backticked, so a hand-edit to `(`0.15.0` or newer; …)` would restore
+        # the exact false claim past a literal check for `(0.15.0 or newer`.
+        promise = re.compile(rf"`?{re.escape(LATEST_PUBLISHED_VERSION)}`?\s+or newer")
+        assert not promise.search(text), (
+            f"{relpath} says `{LATEST_PUBLISHED_VERSION} or newer` satisfies "
+            f"contract floor {MINIMUM_CONTROL_CONTRACT_VERSION}, but that "
+            f"release reports contract {LATEST_PUBLISHED_CONTRACT_VERSION}. "
+            "An adopter following it can never satisfy the check it is told "
+            "to gate on."
+        )
 
 
 def test_discovery_and_runtime_publish_the_same_compatibility_floor():
@@ -4034,11 +4488,6 @@ def test_discovery_and_runtime_publish_the_same_compatibility_floor():
     rather than left to the bump checklist, because the checklist is what missed
     it.
     """
-
-    from agents_shipgate.schemas.contract import (
-        CONTRACT_VERSION,
-        MINIMUM_CONTROL_CONTRACT_VERSION,
-    )
 
     published = json.loads(_read(".well-known/agents-shipgate.json"))
 
@@ -4067,7 +4516,8 @@ def test_discovery_and_runtime_publish_the_same_compatibility_floor():
     assert (
         "the permission-scoped agent-control model requires "
         f'`minimum_control_contract_version: "{MINIMUM_CONTROL_CONTRACT_VERSION}"`'
-        in _read("README.md")
+        # Collapsed: the sentence is prose, and where it wraps is not a claim.
+        in _normalize_ws(_read("README.md"))
     )
 
 

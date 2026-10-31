@@ -104,7 +104,7 @@ schema.
 
 - **Markdown** — `agents-shipgate-reports/report.md`, for human review.
 - **JSON** — `agents-shipgate-reports/report.json`, machine-readable
-  (schema v0.42, current). Always parse this for programmatic use.
+  (schema v1.0, current). Always parse this for programmatic use.
   For release gating, read `release_decision.decision`; the legacy
   `summary.status` field is baseline-blind (kept for v0.7 callers). A
   `passed` decision requires complete, conflict-free static surface, effect,
@@ -120,14 +120,14 @@ schema.
 ## What is the Release Evidence Packet?
 
 A reviewer-shaped synthesis of the scan, emitted alongside the report by
-default. The packet is governed by [`docs/packet-schema.v0.17.json`](packet-schema.v0.17.json)
+default. The packet is governed by [`docs/packet-schema.v0.18.json`](packet-schema.v0.18.json)
 and has fixed reviewer sections (release decision, evidence matrix, capability/intent,
 high-risk surface, tool-surface diff, action-surface diff, approval coverage,
 idempotency risk, scope coverage, memory isolation, human-in-the-loop,
 dynamic scenarios, and a
 `not_proven` section that always lists prompt robustness, runtime
 behavior, model correctness, and adversarial resistance verbatim). See
-[STABILITY.md §Release Evidence Packet](../STABILITY.md#release-evidence-packet-v017).
+[STABILITY.md §Release Evidence Packet](../STABILITY.md#release-evidence-packet-v018).
 Packet schema `0.9` adds semantic coverage and gap remediation, and packet §1
 mirrors the report's `static_analysis_only: true`,
 `runtime_behavior_verified: false`, and canonical
@@ -147,16 +147,14 @@ Skip emission with `--no-packet`; re-render later with
 
 ## Is it production-ready?
 
-v0.15.0 is the latest published pre-1.0 beta. The in-tree runtime is
-`0.16.0b7`, which adds content-addressed verification receipts and reproducible
-distributed-execution boundaries on top of typed policy evidence, the
-multi-host boundary, and root-reachable binding contracts. The manifest schema
-remains stable across the 0.x series; see
-[`STABILITY.md`](../STABILITY.md). Public preview.
+v1.2.0 is the latest published release. It ships on the advisory channel —
+runtime contract 41, report schema `1.0` — and makes no qualification claim:
+`.github/release-channels.json` declares it `advisory`, not `qualified`. What
+is frozen, and how it may change, is in [`STABILITY.md`](../STABILITY.md).
 
 ## How do I add it to GitHub Actions?
 
-See [`docs/quickstart.md`](quickstart.md) for the 5-minute integration.
+See [`docs/quickstart.md`](quickstart.md) — one review end to end on a committed sample, then the two adoption routes.
 Advisory mode is the default and never fails CI; strict mode with a
 baseline lets you adopt the gate without flipping every existing PR red.
 

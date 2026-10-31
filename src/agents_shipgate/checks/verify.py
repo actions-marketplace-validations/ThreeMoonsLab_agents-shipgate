@@ -1,9 +1,10 @@
 """Verify category — trust-root protection (the cheap reward-hacking guard).
 
 ``SHIP-VERIFY-TRUST-ROOT-TOUCHED`` is Tier A of trust-root protection
-(docs/engineering/ai-coding-workflow-verifier.md §5.1): pure path/glob
-classification of the PR's changed files against the release gate's
-trust spine. It is fully deterministic, needs no base scan, and fires
+(docs/engineering/ai-coding-workflow-verifier.md §5.1): path/glob classification of the PR's changed files against the release
+gate's trust spine, with a shared complete-text comparison for supported
+instructions. Prose-only edits clear only a positively unchanged structure, and a host
+settings change clears only when the permission lattice decides it narrows (#661). It is fully deterministic, needs no base scan, and fires
 only when a :class:`VerificationContext` is present — plain ``scan``
 (``context.verification is None``) emits nothing.
 
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 from agents_shipgate.core.context import ScanContext
 from agents_shipgate.core.globbing import glob_match_ci
+from agents_shipgate.core.instruction_structure import instruction_profile
 
 # The trust-root table lives in ``core.trust_roots`` so the local boundary
 # evaluator can classify paths from the identical data without an import cycle
@@ -31,6 +33,7 @@ from agents_shipgate.core.trust_roots import (  # noqa: F401
     _LEGACY_TRUST_ROOT_SURFACES,
     PROTECTED_FILE_EDITS,
     TRUST_ROOT_SURFACES,
+    configured_input_trust_root,
     is_configured_manifest,
     is_context_configured_manifest,
 )
@@ -48,21 +51,74 @@ def run(context: ScanContext) -> list[Finding]:
     verification = context.verification
     if verification is None:
         return []
+    from agents_shipgate.core.agent_boundary import assessment_for_scan_context
+
+    assessment = assessment_for_scan_context(context)
     findings: list[Finding] = []
+    if verification.openshell_native is not None:
+        from agents_shipgate.core.openshell_native import native_findings
+
+        findings.extend(native_findings(verification.openshell_native, context))
     seen: set[str] = set()
     for raw in verification.changed_files:
         path = raw.replace("\\", "/")
         if not path or path in seen:
             continue
         seen.add(path)
-        classification = _classify(path) or _configured_manifest(context, path)
+        # A command-line input (#1024) is classified only where nothing else
+        # already explains the path, so existing rows keep their fingerprints,
+        # but it is never cleared by the structural shortcuts below.
+        configured_input = configured_input_trust_root(context, path)
+        classification = (
+            _configured_manifest(context, path) or _classify(path) or configured_input
+        )
+        if path in assessment.openshell_safe_paths and classification is None:
+            continue
+        if classification is None and path in assessment.openshell_paths:
+            classification = ("host_boundary", path)
         if classification is None:
             continue
         trust_root_class, matched_glob = classification
+        if configured_input is not None:
+            findings.append(_finding(context, path, trust_root_class, matched_glob))
+            continue
+        if (
+            trust_root_class in {"agent_instructions", "tool_surface_decl"}
+            and instruction_profile(path) is not None
+            and verification.diff_text_available
+        ):
+            from agents_shipgate.core.agent_boundary import assessment_for_scan_context
+
+            assessment = assessment_for_scan_context(context)
+            if path in assessment.instruction_structure_unchanged:
+                continue
+        if (
+            trust_root_class in {"agent_instructions", "host_boundary"}
+            and verification.diff_text_available
+            and _host_settings_only_narrowed(context, path)
+        ):
+            continue
         findings.append(
             _finding(context, path, trust_root_class, matched_glob)
         )
     return findings
+
+
+def _host_settings_only_narrowed(context: ScanContext, path: str) -> bool:
+    """A host settings change the permission lattice decides only narrows (#661).
+
+    The boundary evaluator read it completely and it can take authority away
+    but never grant it, so touching the file is not a reason for a human to
+    review it. The change stays on the PR in the capability rows.
+    """
+
+    from agents_shipgate.core.agent_boundary import assessment_for_scan_context
+    from agents_shipgate.core.host_boundary import is_host_settings_path
+
+    return (
+        is_host_settings_path(path)
+        and path in assessment_for_scan_context(context).host_settings_narrowed
+    )
 
 
 def _classify(path: str) -> tuple[str, str] | None:

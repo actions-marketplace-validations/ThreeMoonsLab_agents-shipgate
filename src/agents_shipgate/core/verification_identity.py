@@ -11,7 +11,7 @@ import platform
 import stat
 import tempfile
 import tomllib
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -188,9 +188,50 @@ def build_verification_plan(
     diff_logical_path: str = "verification-input.diff",
     external_input_root: Path | None = None,
     captured_input_paths: list[Path] | None = None,
+    auxiliary_origins: dict[Path, dict[str, str | None]] | None = None,
+    auxiliary_source_paths: dict[Path, Path] | None = None,
+    config_from_worktree: bool = False,
+    _engine_requirement: VerificationEngineRequirement | None = None,
 ) -> VerificationPlan:
     effective_plugins_enabled = _plugins_enabled(plugins_enabled)
     normalized_options = dict(options)
+    # This is reader provenance, never a caller-supplied assertion. Named
+    # negative lookups matter as much as the bytes that resolved an import.
+    normalized_options.pop("dependency_inputs", None)
+    normalized_options.pop("input_origins", None)
+    normalized_options.pop("input_directories", None)
+    snapshot = active_static_input_snapshot()
+    if snapshot is not None and snapshot.root == input_root and captured_input_paths is not None:
+        normalized_options["input_directories"] = snapshot.input_directory_identity(
+            source="git_blob" if archived_head else "worktree",
+        )
+    if snapshot is not None and (snapshot.dependency_paths() or snapshot.dependency_links() or snapshot.absent_dependency_paths() or snapshot.present_dependency_paths() or snapshot.unconfirmable_dependency_paths()):
+        normalized_options["dependency_inputs"] = {
+            "files": sorted(
+                [{"path": path.relative_to(input_root).as_posix(),
+                  "sha256": sha256_bytes(snapshot.read_bytes(path)),
+                  "size_bytes": len(snapshot.read_bytes(path))}
+                 for path in snapshot.dependency_paths()],
+                key=lambda row: row["path"],
+            ),
+            "absent_paths": sorted(
+                path.relative_to(input_root).as_posix()
+                for path in snapshot.absent_dependency_paths()
+            ),
+            "present_paths": sorted(
+                path.relative_to(input_root).as_posix()
+                for path in snapshot.present_dependency_paths()
+            ),
+            "unconfirmable_paths": sorted(
+                path.relative_to(input_root).as_posix()
+                for path in snapshot.unconfirmable_dependency_paths()
+            ),
+        }
+        if snapshot.dependency_links():
+            normalized_options["dependency_inputs"]["links"] = sorted(
+                [{"path": path.relative_to(input_root).as_posix(), "sha256": sha256_bytes(raw), "size_bytes": len(raw)}
+                 for path, raw in snapshot.dependency_links().items()], key=lambda row: row["path"],
+            )
     normalized_options["plugins_enabled"] = effective_plugins_enabled
     overlay_paths = sorted(
         set(changed_files if worktree_overlay_paths is None else worktree_overlay_paths)
@@ -230,7 +271,7 @@ def build_verification_plan(
     config_blob = build_blob(
         path=config_path,
         logical_path=config_logical_path,
-        source="git_blob" if archived_head else "worktree",
+        source="git_blob" if archived_head and not config_from_worktree else "worktree",
     )
     diff_bytes = diff_text.encode("utf-8")
     diff_blob = VerificationBlob(
@@ -246,6 +287,7 @@ def build_verification_plan(
         _lexical_path(path)
         for path in [
             config_path,
+            *(auxiliary_source_paths or {}).values(),
             *policy_pack_paths,
             *([baseline_path] if baseline_path is not None else []),
             *([diff_from_path] if diff_from_path is not None else []),
@@ -272,18 +314,56 @@ def build_verification_plan(
         source="git_blob" if archived_head else "worktree",
     )
     bundle_root = external_input_root or input_root
-    policy_blobs = _blobs(
-        policy_pack_paths,
-        root=bundle_root,
-        source="external_input",
-    )
+    def auxiliary_blob(path: Path | None) -> VerificationBlob | None:
+        if path is not None and auxiliary_source_paths is not None and path in auxiliary_source_paths:
+            # A portable export is not a new observation. Hash the captured
+            # original bytes the adapters read, even when the snapshot is
+            # finished and the newly written copy lives under its root.
+            if snapshot is None or not snapshot.has(auxiliary_source_paths[path]):
+                raise ValueError("portable input must name an already captured source")
+            return build_blob(
+                path=auxiliary_source_paths[path],
+                logical_path=path.relative_to(bundle_root).as_posix(),
+                source="external_input",
+            )
+        return _optional_blob(path, root=bundle_root)
+
+    if auxiliary_source_paths is not None:
+        policy_blobs = sorted(
+            [blob for path in set(policy_pack_paths) if (blob := auxiliary_blob(path)) is not None],
+            key=lambda blob: blob.path,
+        )
+    else:
+        policy_blobs = _blobs(policy_pack_paths, root=bundle_root, source="external_input")
     changed_blobs = _existing_changed_blobs(
         changed_files,
         root=input_root if archived_head else git_root,
         source="git_blob" if archived_head else "worktree",
     )
-    baseline_blob = _optional_blob(baseline_path, root=bundle_root)
-    diff_from_blob = _optional_blob(diff_from_path, root=bundle_root)
+    baseline_blob = auxiliary_blob(baseline_path)
+    diff_from_blob = auxiliary_blob(diff_from_path)
+    from agents_shipgate.core.verification_input_currency import auxiliary_input_origin
+
+    # Preserve the source before portable copies collapse distinct origins.
+    # No caller-supplied option can assert this provenance; producers supply
+    # the mapping beside the actual paths they copied from captured inputs.
+    original_paths = {path.relative_to(bundle_root).as_posix(): path for path in policy_pack_paths}
+    for path, blob in ((baseline_path, baseline_blob), (diff_from_path, diff_from_blob)):
+        if path is not None and blob is not None:
+            original_paths[blob.path] = path
+    external_rows = []
+    for blob in [*policy_blobs, *([baseline_blob] if baseline_blob else []),
+                 *([diff_from_blob] if diff_from_blob else [])]:
+        path = original_paths[blob.path]
+        origin = (
+            auxiliary_origins[path]
+            if auxiliary_origins is not None and path in auxiliary_origins
+            else auxiliary_input_origin(path, input_root=input_root, git_root=git_root)
+        )
+        external_rows.append({"input_path": blob.path, **origin})
+    normalized_options["input_origins"] = {
+        "version": 1, "external": sorted(external_rows, key=lambda row: row["input_path"])
+    }
     inputs_payload = {
         "evaluation_date": evaluation_date,
         "config": config_blob,
@@ -311,7 +391,11 @@ def build_verification_plan(
         ),
         **inputs_payload,
     )
-    engine = build_engine_requirement(plugins_enabled=effective_plugins_enabled)
+    # The verifier may already have captured this invocation's engine for its
+    # base-cache lookup. Serialized options never select an engine identity.
+    engine = _engine_requirement or build_engine_requirement(
+        plugins_enabled=effective_plugins_enabled
+    )
     task_payload = {
         "kind": "evaluate",
         "shard": 0,
@@ -668,7 +752,18 @@ def load_validated_receipt_artifacts(
     max_artifact_size: int = 64 * 1024 * 1024,
     max_total_size: int = 256 * 1024 * 1024,
 ) -> tuple[VerificationReceipt, dict[str, bytes]]:
-    """Load receipt-bound artifact bytes from one validated snapshot."""
+    """Load the entire receipt closure as bytes from one validated snapshot.
+
+    Unlike ``read_current_control``, this includes optional artifacts absent
+    from the pointer map. ``allowed_artifact_names`` rejects unexpected names;
+    it does not select a subset to validate. Consume the returned bytes rather
+    than reopening source files after this snapshot has been validated.
+
+    Closure integrity alone establishes neither workspace currency nor action
+    authority. When joining this result to a current-control read, compare the
+    returned receipt with that read's captured ``verification_receipt`` and
+    retain the current-control freshness and consequential-action rechecks.
+    """
 
     with validated_receipt_snapshot(
         receipt_path=receipt_path,
@@ -706,22 +801,154 @@ def read_regular_file_beneath(
     parts = Path(logical_path).parts
     if not parts or Path(logical_path).is_absolute() or any(part in {"", ".", ".."} for part in parts):
         raise ValueError(f"{label} path is not portable: {logical_path!r}")
-    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    descriptors: list[int] = []
     try:
-        current = os.open(root, directory_flags)
-        descriptors.append(current)
-        for part in parts[:-1]:
-            current = os.open(part, directory_flags, dir_fd=current)
-            descriptors.append(current)
-        file_descriptor = os.open(parts[-1], file_flags, dir_fd=current)
-        descriptors.append(file_descriptor)
+        directory = open_directory_beneath(root, parts[:-1])
+    except OSError as exc:
+        raise ValueError(f"could not safely read {label} {logical_path!r}: {exc}") from exc
+    try:
+        return read_regular_file_at(
+            directory, parts[-1], max_size=max_size, label=label, display=logical_path
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(directory)
+
+
+# A FIFO or other non-directory fails ``O_DIRECTORY`` before the open can wait
+# for a writer, and ``O_NOFOLLOW`` refuses a link at the component itself.
+_DIRECTORY_BENEATH_FLAGS = (
+    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+)
+
+
+class UnsafeDirectoryComponent(OSError):
+    """A directory below an anchor is a link, a non-directory, or unopenable.
+
+    ``path`` is the lexical spelling of the refused component and ``reason``
+    completes a sentence about it, so a caller can say what to repair.
+    """
+
+    def __init__(self, path: Path, reason: str) -> None:
+        super().__init__(f"{path} {reason}")
+        self.path = path
+        self.reason = reason
+
+
+def _require_single_component(name: str, label: str) -> None:
+    if name in {"", ".", ".."} or os.sep in name or (os.altsep is not None and os.altsep in name):
+        raise ValueError(f"{label} path is not portable: {name!r}")
+
+
+def _refused_component_reason(name: str, parent: int, exc: OSError) -> str | None:
+    """Describe why ``name`` could not be opened, or ``None`` if it is absent."""
+
+    try:
+        metadata = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        if isinstance(exc, FileNotFoundError):
+            return None
+        return f"could not be opened ({exc.strerror or exc})"
+    except OSError:
+        return f"could not be opened ({exc.strerror or exc})"
+    if stat.S_ISLNK(metadata.st_mode):
+        return "is a symbolic link"
+    if not stat.S_ISDIR(metadata.st_mode):
+        return "is not a directory"
+    return f"could not be opened ({exc.strerror or exc})"
+
+
+def open_directory_beneath(
+    root: Path,
+    parts: Sequence[str],
+    *,
+    create: bool = False,
+) -> int:
+    """Open ``root/parts...`` as one descriptor without following a link below ``root``.
+
+    ``root`` is the caller's anchor and is opened as given. Each later component
+    is opened relative to its parent's descriptor with ``O_NOFOLLOW |
+    O_DIRECTORY``; with ``create``, a missing component is first made inside
+    that same parent descriptor, so creation never resolves a pathname either.
+    A missing component raises ``FileNotFoundError`` when not creating. A link,
+    a non-directory, or a component that cannot be opened or created raises
+    :class:`UnsafeDirectoryComponent`. POSIX only: it needs ``dir_fd`` support.
+    The caller closes the returned descriptor.
+    """
+
+    for part in parts:
+        _require_single_component(part, "directory")
+    current = os.open(root, _DIRECTORY_BENEATH_FLAGS)
+    lexical = Path(root)
+    try:
+        for part in parts:
+            lexical = lexical / part
+            if create:
+                try:
+                    os.mkdir(part, 0o777, dir_fd=current)
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    raise UnsafeDirectoryComponent(
+                        lexical, f"could not be created ({exc.strerror or exc})"
+                    ) from exc
+            try:
+                child = os.open(part, _DIRECTORY_BENEATH_FLAGS, dir_fd=current)
+            except OSError as exc:
+                reason = _refused_component_reason(part, current, exc)
+                if reason is None:
+                    raise
+                raise UnsafeDirectoryComponent(lexical, reason) from exc
+            os.close(current)
+            current = child
+            if not stat.S_ISDIR(os.fstat(current).st_mode):
+                raise UnsafeDirectoryComponent(lexical, "is not a directory")
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(current)
+        raise
+    return current
+
+
+def read_regular_file_at(
+    directory: int,
+    name: str,
+    *,
+    max_size: int,
+    label: str,
+    display: str | None = None,
+    single_link: bool = False,
+) -> bytes:
+    """Read one regular file ``name`` inside an open directory descriptor.
+
+    The file is opened with ``O_NOFOLLOW`` relative to ``directory``. Its stat
+    identity is compared before and after the read so a file swapped mid-read
+    is rejected rather than hashed as two generations. ``single_link`` also
+    refuses a hard-linked file, an alias of bytes that live elsewhere.
+    """
+
+    shown = name if display is None else display
+    _require_single_component(name, label)
+    # O_NONBLOCK makes opening a FIFO return at once, so the type check below
+    # refuses it; without it the open waits for a writer that may never come
+    # (#577). POSIX gives O_NONBLOCK no effect on a regular file's reads;
+    # Windows has neither the flag nor filesystem FIFOs. O_BINARY stops the
+    # Windows C runtime rewriting the bytes that are hashed.
+    file_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    file_descriptor: int | None = None
+    try:
+        file_descriptor = os.open(name, file_flags, dir_fd=directory)
         before = os.fstat(file_descriptor)
         if not stat.S_ISREG(before.st_mode):
-            raise ValueError(f"{label} is not a regular file: {logical_path}")
+            raise ValueError(f"{label} is not a regular file: {shown}")
+        if single_link and before.st_nlink != 1:
+            raise ValueError(f"{label} is not a singly-linked file: {shown}")
         if before.st_size > max_size:
-            raise ValueError(f"{label} exceeds its size limit: {logical_path}")
+            raise ValueError(f"{label} exceeds its size limit: {shown}")
         chunks: list[bytes] = []
         remaining = max_size + 1
         while remaining:
@@ -743,16 +970,70 @@ def read_regular_file_beneath(
             after.st_size,
             after.st_mtime_ns,
         ):
-            raise ValueError(f"{label} changed while it was read: {logical_path}")
+            raise ValueError(f"{label} changed while it was read: {shown}")
         if len(data) > max_size:
-            raise ValueError(f"{label} exceeds its size limit: {logical_path}")
+            raise ValueError(f"{label} exceeds its size limit: {shown}")
         return data
     except OSError as exc:
-        raise ValueError(f"could not safely read {label} {logical_path!r}: {exc}") from exc
+        raise ValueError(f"could not safely read {label} {shown!r}: {exc}") from exc
     finally:
-        for descriptor in reversed(descriptors):
+        if file_descriptor is not None:
             with contextlib.suppress(OSError):
-                os.close(descriptor)
+                os.close(file_descriptor)
+
+
+def replace_file_at(
+    directory: int,
+    name: str,
+    data: bytes,
+    *,
+    temporary_prefix: str,
+    mode: int = 0o644,
+) -> None:
+    """Atomically publish ``data`` as ``name`` inside an open directory descriptor.
+
+    The temporary file is created exclusively in that directory and renamed
+    over ``name`` relative to the same descriptor, so no step resolves a
+    pathname: an existing link at ``name`` is replaced, never followed, and a
+    directory at ``name`` fails the rename and is left as it was.
+
+    ``mode`` is the creation mode of that temporary file, and therefore of the
+    published file; as for any creation it is masked by the process umask.
+    """
+
+    _require_single_component(name, "published file")
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    temporary = ""
+    descriptor = -1
+    for _attempt in range(16):
+        temporary = f"{temporary_prefix}{os.urandom(8).hex()}.tmp"
+        try:
+            descriptor = os.open(temporary, flags, mode, dir_fd=directory)
+        except FileExistsError:
+            continue
+        break
+    if descriptor < 0:
+        raise FileExistsError(f"could not create a temporary file for {name}")
+    published = False
+    try:
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(descriptor, view):]
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+        published = True
+    finally:
+        if not published:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary, dir_fd=directory)
 
 
 
@@ -855,40 +1136,84 @@ def validate_plan_inputs(
 ) -> None:
     """Fail closed unless every portable plan blob matches the supplied root."""
 
-    blobs = [
-        plan.inputs.config,
-        *plan.inputs.tool_sources,
-        *plan.inputs.policy_packs,
-        *plan.inputs.changed_files,
-    ]
-    if plan.inputs.baseline is not None:
-        blobs.append(plan.inputs.baseline)
-    if plan.inputs.diff_from is not None:
-        blobs.append(plan.inputs.diff_from)
-    resolved_root = root.resolve()
-    resolved_bundle_root = (bundle_root or resolved_root).resolve()
-    for blob in blobs:
-        candidate_root = (
-            resolved_bundle_root
-            if blob.source in {"external_input", "generated"}
-            else resolved_root
+    from agents_shipgate.core.verification_input_currency import validate_bound_plan_inputs
+
+    validate_bound_plan_inputs(
+        plan, root=root, artifacts_root=bundle_root or root,
+        live_origins=False, diff_path=diff_path or root / plan.inputs.diff.path,
+    )
+
+
+def validate_dependency_inputs(plan: VerificationPlan, *, root: Path, snapshot=None) -> None:
+    """Reconfirm reader-selected bytes and named absence, including ignored files."""
+
+    from agents_shipgate.core.static_inputs import StaticInputSnapshot
+
+    declaration = plan.inputs.options.get("dependency_inputs")
+    if declaration is None:
+        return
+    if not isinstance(declaration, dict) or set(declaration) not in (
+        {"files", "absent_paths", "present_paths", "unconfirmable_paths"},
+        {"files", "links", "absent_paths", "present_paths", "unconfirmable_paths"},
+    ):
+        raise ValueError("invalid dependency input identity")
+    files, absent, present = declaration["files"], declaration["absent_paths"], declaration["present_paths"]
+    unconfirmable = declaration["unconfirmable_paths"]
+    links = declaration.get("links", [])
+    if not all(isinstance(value, list) for value in (files, links, absent, present, unconfirmable)):
+        raise ValueError("invalid dependency input identity")
+    paths = []
+    for row in [*files, *links]:
+        if not isinstance(row, dict) or set(row) != {"path", "sha256", "size_bytes"}:
+            raise ValueError("invalid dependency file identity")
+        digest = row["sha256"]
+        if (not isinstance(digest, str) or len(digest) != 71
+                or not digest.startswith("sha256:")
+                or any(char not in "0123456789abcdef" for char in digest[7:])
+                or type(row["size_bytes"]) is not int or row["size_bytes"] < 0):
+            raise ValueError("invalid dependency file identity")
+        paths.append(row["path"])
+    for values in ([row["path"] for row in files], [row["path"] for row in links], absent, present, unconfirmable):
+        if any(
+            not isinstance(path, str) or not path or Path(path).is_absolute()
+            or ".." in Path(path).parts or Path(path).as_posix() != path
+            or "\\" in path or ":" in path
+            for path in values
+        ):
+            raise ValueError("dependency input escapes supplied root")
+        if values != sorted(set(values)):
+            raise ValueError("dependency input paths must be sorted and unique")
+    # File and link identities each have canonical order; their union is unique.
+    if len(paths) != len(set(paths)):
+        raise ValueError("dependency has conflicting file/link identities")
+    if (set(paths) | set(present)) & set(absent):
+        raise ValueError("dependency input is both present and absent")
+    if unconfirmable:
+        raise ValueError(
+            "An input dependency could not be captured. Inspect "
+            "dependency_inputs.unconfirmable_paths and the component/guard diagnostics, "
+            "repair unreadable paths "
+            "and re-run verification before using current authority."
         )
-        candidate = (candidate_root / blob.path).resolve()
-        if candidate != candidate_root and candidate_root not in candidate.parents:
-            raise ValueError(f"plan input escapes supplied root: {blob.path}")
-        if not candidate.is_file():
-            raise ValueError(f"plan input is missing: {blob.path}")
-        if sha256_file(candidate) != blob.sha256:
-            raise ValueError(f"plan input hash does not match: {blob.path}")
-        if candidate.stat().st_size != blob.size_bytes:
-            raise ValueError(f"plan input size does not match: {blob.path}")
-    resolved_diff = (diff_path or (resolved_root / plan.inputs.diff.path)).resolve()
-    if not resolved_diff.is_file():
-        raise ValueError(f"plan diff input is missing: {plan.inputs.diff.path}")
-    if sha256_file(resolved_diff) != plan.inputs.diff.sha256:
-        raise ValueError("plan diff input hash does not match")
-    if resolved_diff.stat().st_size != plan.inputs.diff.size_bytes:
-        raise ValueError("plan diff input size does not match")
+    owns_snapshot = snapshot is None
+    if snapshot is None:
+        snapshot = StaticInputSnapshot(root.resolve())
+    for row in files:
+        data = snapshot.read_bytes(root.resolve() / row["path"])
+        if len(data) != row["size_bytes"] or sha256_bytes(data) != row["sha256"]:
+            raise ValueError("dependency input changed since verification")
+    for row in links:
+        data = snapshot.bind_dependency_link(root.resolve() / row["path"])
+        if len(data) != row["size_bytes"] or sha256_bytes(data) != row["sha256"]:
+            raise ValueError("dependency link changed since verification")
+    for path in absent:
+        if not snapshot.bind_dependency_absence(root.resolve() / path):
+            raise ValueError("dependency lookup candidate appeared since verification")
+    for path in present:
+        if snapshot.bind_dependency_absence(root.resolve() / path):
+            raise ValueError("dependency lookup candidate disappeared since verification")
+    if owns_snapshot:
+        snapshot.finish()
 
 
 def _manifest_declared_input_paths(*, config_path: Path, input_root: Path) -> list[Path]:
@@ -1054,9 +1379,38 @@ def _absent_overlay_entry() -> dict[str, Any]:
 
 
 def _overlay_entry(lexical: Path, candidate: Path, snapshot: Any) -> dict[str, Any]:
+    """Keep entry metadata and its digest in one unchanged live observation."""
+
+    before = _overlay_entry_stat(lexical)
+    entry = _overlay_entry_data(lexical, candidate, snapshot, before)
+    after = _overlay_entry_stat(lexical)
+    if _overlay_stat_identity(before) != _overlay_stat_identity(after):
+        raise ValueError(f"worktree entry changed while its identity was read: {lexical}")
+    return entry
+
+
+def _overlay_entry_stat(path: Path) -> os.stat_result | None:
     try:
-        info = os.lstat(lexical)
+        return os.lstat(path)
     except OSError:
+        return None
+
+
+def _overlay_stat_identity(info: os.stat_result | None) -> tuple[int, ...] | None:
+    if info is None:
+        return None
+    # These fields detect drift during the read; they are not persisted in the
+    # normalized overlay, whose identity still excludes timestamps and umask.
+    return (
+        info.st_dev, info.st_ino, info.st_mode, info.st_size,
+        info.st_mtime_ns, info.st_ctime_ns,
+    )
+
+
+def _overlay_entry_data(
+    lexical: Path, candidate: Path, snapshot: Any, info: os.stat_result | None
+) -> dict[str, Any]:
+    if info is None:
         return _absent_overlay_entry()
     if stat.S_ISLNK(info.st_mode):
         # Hash the link target, never what it points at. Following it here is

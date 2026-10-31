@@ -6,6 +6,7 @@ from agents_shipgate.core.surface_exclusions import build_surface_exclusions
 from agents_shipgate.schemas.bindings import AgentBindingGraphAssessment, BindingSurfaceDiff
 from agents_shipgate.schemas.codex_plugin import CodexPluginSurface
 from agents_shipgate.schemas.common import Severity
+from agents_shipgate.schemas.coverage_recovery import SourceRecoveryEvidence
 from agents_shipgate.schemas.manifest import AgentsShipgateManifest
 from agents_shipgate.schemas.report import (
     BaselineSummary,
@@ -19,6 +20,7 @@ from agents_shipgate.schemas.report import (
     ReadinessReport,
 )
 from agents_shipgate.schemas.surfaces import (
+    ActionDeclarationFacts,
     ActionSurfaceDiff,
     ActionSurfaceFacts,
     ToolSurfaceDiff,
@@ -64,12 +66,15 @@ def build_report(
     tool_surface_diff: ToolSurfaceDiff | None = None,
     action_surface_facts: ActionSurfaceFacts | None = None,
     action_surface_diff: ActionSurfaceDiff | None = None,
+    action_declaration_facts: ActionDeclarationFacts | None = None,
     capability_runtime_evidence: CapabilityRuntimeEvidence | None = None,
     policy_audit: PolicyAudit | None = None,
     privacy_audit: PrivacyAudit | None = None,
     heuristics_filter: HeuristicsFilter | None = None,
     policy_evidence_gaps: list[EvidenceGap] | None = None,
     source_omissions: list[SourceSurfaceOmission] | None = None,
+    source_recovery_evidence: list[SourceRecoveryEvidence] | None = None,
+    exit_fail_on_floor: list[Severity] | None = None,
 ) -> ReadinessReport:
     report = ReadinessReport(
         run_id=run_id,
@@ -83,6 +88,7 @@ def build_report(
         tool_surface_diff=tool_surface_diff or ToolSurfaceDiff(),
         action_surface_facts=action_surface_facts or ActionSurfaceFacts(),
         action_surface_diff=action_surface_diff or ActionSurfaceDiff(),
+        action_declaration_facts=action_declaration_facts or ActionDeclarationFacts(),
         binding_surface_facts=(
             binding_surface_facts
             or AgentBindingGraphAssessment(
@@ -125,6 +131,8 @@ def build_report(
         ci_mode=ci_mode,
         fail_on=fail_on,
         new_findings_only=new_findings_only,
+        source_recovery_evidence=source_recovery_evidence,
+        exit_fail_on_floor=exit_fail_on_floor,
     )
     # v0.35: built from the decision, not beside it. Accounting asks whether
     # a gap row names the excluded subject, so the gaps have to exist first —

@@ -12,14 +12,17 @@ from agents_shipgate.core.findings.verifier_blocks import (
     build_verifier_summary,
 )
 from agents_shipgate.core.lenses.capability_intent import apply_capability_diff
+from agents_shipgate.core.lenses.declaration_surface import build_declaration_review
 from agents_shipgate.core.lenses.effective_policy import (
     accepted_debt_fingerprints,
     build_effective_policy_snapshot,
 )
 from agents_shipgate.core.semantic_consistency import validate_semantic_consistency
 from agents_shipgate.report.json_report import report_json_payload
+from agents_shipgate.schemas.common import Severity
 from agents_shipgate.schemas.manifest import AgentsShipgateManifest, CiConfig
 from agents_shipgate.schemas.report import ReadinessReport
+from agents_shipgate.schemas.surfaces import ActionDeclarationFacts
 
 from .models import _OutputPlan, _SanitizedSurfaces
 from .patching import _attach_declaration_patches
@@ -33,6 +36,7 @@ def _build_final_report(
     plan: _OutputPlan,
     config_path: Path,
     declared_ci: CiConfig | None = None,
+    exit_fail_on_floor: list[Severity] | None = None,
 ) -> tuple[ReadinessReport, Any]:
     """Phase 8: hash the run_id, build the ``ReadinessReport`` from the
     fully sanitized surfaces, run capability-diff enrichment, and
@@ -51,6 +55,7 @@ def _build_final_report(
     release decision is built. Findings get theirs three phases earlier, where
     the finding list is final and the decision has not been reached yet.
     """
+    declaration_facts = sanitized.action_declaration_facts
     report = build_report(
         run_id=_run_id(
             manifest,
@@ -94,6 +99,7 @@ def _build_final_report(
         tool_surface_diff=sanitized.tool_surface_diff,
         action_surface_facts=sanitized.action_surface_facts,
         action_surface_diff=sanitized.action_surface_diff,
+        action_declaration_facts=declaration_facts,
         capability_runtime_evidence=sanitized.capability_runtime_evidence,
         # v0.17 (M1): top-of-report policy audit. Always emitted (may
         # be an empty envelope) so consumers can rely on the field
@@ -103,7 +109,35 @@ def _build_final_report(
         heuristics_filter=sanitized.heuristics_filter,
         policy_evidence_gaps=sanitized.policy_evidence_gaps,
         source_omissions=sanitized.source_omissions,
+        source_recovery_evidence=sanitized.source_recovery_evidence,
+        exit_fail_on_floor=exit_fail_on_floor,
     )
+    if report.release_decision is not None:
+        reference_facts = (
+            sanitized.diff_reference.declaration_facts
+            if sanitized.diff_reference is not None
+            else None
+        )
+        base_kind = "report"
+        if reference_facts is None and sanitized.configured_gate_introduced:
+            reference_facts = ActionDeclarationFacts()
+            base_kind = "absent_manifest"
+        semantic = report.release_decision.evidence_coverage.semantic_coverage
+        semantic.declaration_review = build_declaration_review(
+            head=declaration_facts,
+            base=reference_facts,
+            action_surface_facts=sanitized.action_surface_facts,
+            evidence_gaps=report.release_decision.evidence_coverage.evidence_gaps,
+            acknowledged_overrides=semantic.acknowledged_overrides,
+            base_kind=base_kind,
+            base_comparison_requested=sanitized.base_comparison_requested,
+            unavailable_note=(
+                "The requested base comparison did not provide a trustworthy "
+                "action-declaration snapshot; declaration changes could not be compared."
+                if sanitized.base_comparison_requested
+                else None
+            ),
+        )
     _attach_declaration_patches(report, config_path=config_path)
     apply_capability_diff(report, sanitized.tools)
     # v0.20: reviewer_summary is built HERE — after apply_capability_diff

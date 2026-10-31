@@ -15,7 +15,7 @@ strategy needs at once:
    real repos is the headline extraction-coverage KPI; this measures it
    instead of assuming it.
 
-## What one row records (schema v0.1)
+## What one row records (schema v0.3)
 
 Per PR (`base = merge_commit^1`, `head = merge_commit` — the PR's net
 mainline change, correct for both squash and merge):
@@ -30,13 +30,41 @@ mainline change, correct for both squash and merge):
 | **Receipt (v0.2)** | `verify_verdict, verify_decision, verify_can_merge, verify_trust_root_touched, verify_policy_weakened, verify_cap_added/modified/removed` | Real `verify --base <base'> --head <head''>` with the cold-start manifest committed onto **both** sides; `head''` is re-parented onto `base'` (`commit-tree`) so the three-dot diff is exactly the PR's delta and the injected manifest cannot fire the trust-root signal. Diff-aware `SHIP-VERIFY-*` checks and new-findings gating apply — these columns are the per-PR verdict; the scan columns above remain the cold-start whole-surface state. |
 | Lifecycle | `status` (`evaluated \| trigger_skip \| init_skip \| scan_failed \| error`), `notes` | — |
 
+`verify_input_obligation` (v0.3) is either `null` or a typed
+`kind: unsupported_input` object. It retains the original base/head SHAs,
+selected head scope, a reason and exact Git-observed rename pairs, plus the
+required input action. JSONL carries the object directly; CSV carries JSON in
+that cell. Older rows remain readable with no invented obligation.
+
+For a miner-injected manifest, the original base scope must be a readable Git
+tree before any manifest is copied or committed. A Git-proven absent path
+reports `scoped_base_absent`; incoming Git rename pairs report
+`scoped_base_rename_candidates`. Partial or multiple renames remain observed
+file pairs, not a claim that the directories are the same agent. An unreadable
+comparison reports `scoped_comparison_unreadable`; a file where the directory would
+be reports `scoped_base_not_directory`. None supplies a verifier verdict or a
+capability count. An unrelated deleted directory cannot be chosen as the base
+without actual incoming rename evidence.
+
+Real PR-added manifests still use the existing terminal verifier path and
+keep their trust-root change visible. Its `base_status: missing_manifest`
+means there was no manifest at that base path, not that an empty agent surface
+was evaluated. Likewise `--diff-from` can provide a prior report but does not
+establish the normal successful base scan and subject binding. The independent
+base/head scoped-input contract is tracked in
+[#580](https://github.com/ThreeMoonsLab/agents-shipgate/issues/580).
+Typed obligations make missing answers actionable; they do not satisfy
+[#563](https://github.com/ThreeMoonsLab/agents-shipgate/issues/563)'s fixed-history
+catch bars or turn scan fallback into PR verification. All original history
+and labels below remain unchanged.
+
 `evaluated` means the head scan produced a release decision. When the
 repo-root cold start fails (monorepos), the evaluator retries once at the
 deepest common directory of the changed files (`notes: retry_at:<dir>`) —
 the stripe/ai PR #232 pattern, where the agent lives under `tools/python`.
 
-**Privacy rule:** rows carry public PR metadata, verdicts, check IDs, and
-counts only — never diff text, code excerpts, or report evidence. Same
+**Privacy rule:** rows carry public PR metadata, verdicts, check IDs, counts
+and repository-relative input paths — never diff text, code excerpts, or report evidence. Same
 convention as the adoption-harness CSVs.
 
 ## Run it
@@ -81,8 +109,9 @@ python -m benchmark.miner evaluate \
   metrics are in [`LABELING.md`](LABELING.md). Generate the turnkey worksheet
   with `python -m benchmark.miner labels`; a ready blank copy is committed
   alongside each run's results as `<run>.labels.template.csv` (one per run in
-  the table below — currently `2026-W24-…`, `2026-W25-…`, and `2026-W26-…`). Label the run
-  you mean to score, then `python -m benchmark.miner score --results <jsonl>
+  the table below — currently `2026-W24-…`, `2026-W25-…`, `2026-W26-…`,
+  `2026-W36-cutb` and `2026-W36-closeout`). Label the run you mean to score,
+  then `python -m benchmark.miner score --results <jsonl>
   --labels <csv>` prints the confusion matrix + headline accuracy metrics.
 
 | Run | Date | Repos | Rows | Notes |
@@ -91,6 +120,9 @@ python -m benchmark.miner evaluate \
 | [`2026-W25-mined.csv`](results/2026-W25-mined.csv) | 2026-06-12 | google/adk-samples, langchain-ai/langgraph, modelcontextprotocol/servers | 120 (latest 40 merged PRs each) | Widen run over 3 new framework families. Schema v0.2. **Labeled + scored** (see W24–W25 section). Findings below. |
 | [`2026-W26-mined.csv`](results/2026-W26-mined.csv) | 2026-06-16 | stripe/agent-toolkit → **stripe/ai** (see note), block/goose, pydantic/pydantic-ai | 120 (latest 40 merged PRs each) | Deepen run over agent **apps/toolkits**. First run with `tools_scanned` captured (#223); decided rows are cold-start `head_decision=review_required` but `verify`-effective `insufficient_evidence`. Schema v0.2. Findings below. |
 | [`2026-W27-reeval.csv`](results/2026-W27-reeval.csv) | 2026-07-08 | the 19 labeled PRs (stripe/ai, openai/openai-agents-python, crewAIInc/crewAI-examples, google/adk-samples, aaif-goose/goose — formerly block/goose) | 19 (re-eval at fixed SHAs, not a fresh mine) | **v0.15.0 delta on the labeled corpus.** Same PRs / same base→head SHAs as W24–W26, re-run on the released engine. Clears the 4 scan crashes; both `must_block` move abstain→review but `blocked_recall` stays 0.0. Off the `*-mined` glob by design. Findings below. |
+| [`2026-W36-cutb.csv`](results/2026-W36-cutb.csv) | 2026-09-02 | n8n-io/n8n, n8n-io/self-hosted-ai-starter-kit, Zie619/n8n-workflows, enescingoz/awesome-n8n-templates, modelcontextprotocol/servers, microsoft/playwright-mcp, cloudflare/mcp-server-cloudflare, supabase-community/supabase-mcp, Azure/azure-mcp, hashicorp/terraform-mcp-server, elastic/mcp-server-elasticsearch, redis/mcp-redis, openai/openai-agents-python, google/adk-samples, google/adk-python, langchain-ai/langgraph, langchain-ai/langchain-mcp-adapters, langchain-ai/deepagents, crewAIInc/crewAI-examples, aaif-goose/goose, pydantic/pydantic-ai | 912 (latest 40 merged per repo, plus `--state closed` on openai-agents-python and adk-samples, `--state reverted` on the same plus goose and pydantic-ai, and `--pr` named candidates) | **The Cut B sourcing sweep for [#456](https://github.com/ThreeMoonsLab/agents-shipgate/issues/456), and the first post-#403 run.** Every n8n repository this project had never mined, eight unwalked MCP servers, and the rejected vein (closed-unmerged + reverted PRs, new in this run). Schema v0.2. **Labeled** in `2026-W36-cutb.labels.csv` — one session's Cut B cell-targeting labels from the PR diffs, *not adjudicated*; corpus labels come only from the Amendment 1 raters. Off the `*-mined` glob by design (see note). Findings below. |
+| [`2026-W36-closeout.csv`](results/2026-W36-closeout.csv) | 2026-09-02 | github/github-mcp-server, grafana/mcp-grafana, bytedance/deer-flow | 45 (three `--pr` named walk candidates, the latest 40 merged on deer-flow, and two `--pr` named deer-flow candidates) | **The Cut B close-out for [#456](https://github.com/ThreeMoonsLab/agents-shipgate/issues/456).** Resolves the pins for the three walked candidates the inventory carried unpinned (two MCP-server repositories), and mines the LangChain application repository that closes its last cell. Schema v0.2. **Labeled** in `2026-W36-closeout.labels.csv` — one row, the claimed candidate, cell-targeting and *not adjudicated* like every other sourcing label here. Off the `*-mined` glob by design: every row is either a named PR or a repository chosen for one cell, and its own trigger-skip rate is 14 of 40 (0.35) on the one repository swept by window — an agent application, not the unselected sample the noise bound measures. Findings below. |
+| [`2026-W37-reeval.csv`](results/2026-W37-reeval.csv) | 2026-09-08 | the same five repositories and 19 fixed W27 PRs | 19 | Candidate after the core implementation slices. **Release-exit regression: 0/19 verifier results**; original labels/SHAs and all no-answer attempts retained. See the W37 comparison below. |
 
 > **W26 repo note (data-integrity):** `gh pr list --repo stripe/agent-toolkit`
 > follows GitHub's transfer redirect — `stripe/agent-toolkit` was folded into the
@@ -100,6 +132,118 @@ python -m benchmark.miner evaluate \
 > why they reuse W24's labels), and only `block/goose` + `pydantic/pydantic-ai`
 > were genuinely new repos that week. The corpus therefore spans **8 distinct
 > repos**, not 9; row counts (361 mined, 336 trigger-skip) are unaffected.
+
+> **W36 glob note (data-integrity):** `2026-W36-cutb` is deliberately named
+> off the `*-mined` glob. That glob feeds
+> `test_cross_run_trigger_skip_rate_is_high_on_real_history`, which pins the
+> "~93% of *unselected* merged PRs trigger-skip" noise bound. W36 is not an
+> unselected sample: it aims at capability-dense repositories (MCP servers,
+> n8n template collections, where 35 of 40 awesome-n8n-templates PRs add a
+> workflow), and it mixes in closed-unmerged, reverted and named PRs. Its own
+> trigger-skip rate is 648/912 (0.71), and folding it into the aggregate would
+> either fail that guard or silently change what the guard measures. It is
+> therefore a *sourcing* sweep for the safety-qualification corpus, not a
+> noise-bound row; the CSV/JSONL pair still carries the v0.2 row schema and
+> its template is still generated by `python -m benchmark.miner labels`.
+
+### 2026-W36 findings — the Cut B sourcing sweep
+
+Read this as a sourcing run, not an accuracy row: the labels are one
+session's, made from the diffs to aim [#456](https://github.com/ThreeMoonsLab/agents-shipgate/issues/456)
+cells, and nothing here is scored.
+
+- **The rejected vein exists and is minable.** `--state closed` and
+  `--state reverted` are new in this run. Five `rejected_or_reverted`
+  candidates from five repositories were placed: a closed remote-MCP OTC
+  trading example (openai-agents-python#2932), a closed sub-agent
+  financial-writes sample (adk-samples#2148), a closed "execute any
+  Elasticsearch API" tool (mcp-server-elasticsearch#57), a closed runtime
+  governance plugin (adk-python#6605), and a *reverted* CI change that gave a
+  coding agent write permissions (pydantic-ai#4199, reverted by #4202).
+  Merged history, as expected, contributed one destructive MCP tool in 912
+  rows (terraform-mcp-server#469).
+- **n8n is now mined.** Four repositories, 140 rows. Template collections
+  trigger on nearly every PR (`n8n-nodes-base.` in the diff); the n8n core
+  monorepo triggers on CI and node code, never on exported workflow JSON.
+- **Engine surprises, recorded rather than fixed** (all reproduce from the
+  committed pins with `python -m benchmark.miner evaluate`):
+  - `init` writes the `CHANGE_ME` placeholder and the scan exits 2 on every
+    TypeScript MCP server swept — playwright-mcp (`defineTool`), supabase-mcp
+    (`tool({...})` via `@supabase/mcp-utils`), mcp-server-elasticsearch — so
+    those repositories never reach a verdict (`scan_failed` ×24).
+  - Go servers on mark3labs/mcp-go and the official go-sdk evaluate with
+    `tools_scanned=0` (terraform-mcp-server ×15, every row
+    `insufficient_evidence`): the `mcp.NewTool(` registration behind a runtime
+    registry (`createDynamicTFETool`, `tools.RegisterTools`) is triggered on but
+    not read.
+  - `verify` exits 4 (unparseable) on 31 of 35 evaluated
+    awesome-n8n-templates rows and exits 2 on all 7 evaluated goose rows; the
+    cold-start `head_decision` survives, the receipt does not.
+  - The scan crashes on duplicate tool names in test fixtures and in exported
+    n8n workflows: langchain-mcp-adapters (`tests/test_tools.py` defines `add`
+    twice) and Zie619/n8n-workflows (a node named by an `={{ $fromAI(...) }}`
+    expression), `head_scan_failed_exit_3`.
+  - openai/openai-agents-python now `init_skip`s every triggered PR (11 of
+    40; W24 evaluated 4 of 40 on the same repository), and so do pydantic-ai,
+    langgraph and deepagents. **Cause corrected by the close-out run below:**
+    this is not the example trees going unseen. `init --write` at the root of
+    openai-agents-python returns `refused_unresolved_scope` — the repository
+    holds three self-contained projects that define agents, and one manifest
+    describes one agent surface. The refusal is the monorepo behavior working;
+    what the miner cannot do is act on it, because its only fallback is the
+    deepest common directory of the changed files.
+- **Trigger misses worth knowing.** goose#9736 (a new global `AGENTS.md`
+  hints path), goose#11233 (two built-in skills) and pydantic-ai#3248 (an
+  agent-delegation example) are `trigger_skip`; each was placed or reserved
+  from the diff, and each is a shape the catalog does not see.
+
+### 2026-W36 close-out findings — the pins and the last cell
+
+A three-repository run with two jobs: resolve the pins the strata inventory
+carried as abbreviations, and close
+`langchain_crewai × insufficient_evidence`. Same reading rules as the Cut B
+sweep — one session's cell-targeting labels, nothing scored.
+
+- **`init_skip` on a monorepo is a refusal, not a failure, and the miner
+  cannot tell them apart.** 24 of the 40 deer-flow rows are `init_skip`
+  because a cold start at the repository root returns
+  `refused_unresolved_scope`: more than one self-contained project defines
+  agents there, and one manifest describes one agent surface. Pointed at
+  `backend/packages/harness`, `init --write` writes a manifest and the scan
+  reaches `insufficient_evidence`. The miner records `init_status: failed`
+  for both cases, because `_run_init` reads only "did a manifest appear",
+  so a refusal that names the right next step is indistinguishable in the
+  CSV from a crash. Re-checking openai-agents-python at its own recorded
+  pin gives the same refusal, which is the correction to the Cut B bullet
+  above. **A repository that `init_skip`s is not thereby unevaluable** — it
+  needs a scope, and the sweep does not carry one.
+- **The walked-candidate pins had drifted, in the direction the inventory
+  warned about.** `github-mcp-server#3076`'s walk note recorded the head as
+  `5ea9a0e8…`, which is `refs/pull/3076/head`; after a squash merge that
+  commit is not reachable from the default branch, so resolving the
+  abbreviation would have pinned an object no clone reaches. The merge
+  commit is `8ec62491…` and its first parent is the `bfb59bb7…` the same
+  note recorded — half of the pin was right.
+- **All three pinned walk candidates read `tools_scanned=0`.** Both
+  github-mcp-server rows and the mcp-grafana row evaluate to
+  `insufficient_evidence` with zero tools read, on two Go servers whose
+  published surfaces are around a hundred tools each. That is the Go-server
+  finding from the Cut B sweep reproducing on the two servers the adoption
+  walks knew best — one of them the server whose walk drove
+  `tool_sources[].binding` in the first place.
+- **The dynamic-toolkit shape is in applications, not in the adapter.** The
+  Cut B lead was to stop mining `langchain-mcp-adapters` and find a
+  repository that *calls* it. deer-flow does: tools are assembled at run
+  time from an out-of-tree extensions config, and the claimed candidate
+  (#4868) makes which credential a call carries depend on the run-time
+  user. Its own latest-40 window yielded one decided row and no candidate,
+  and the claim came from `--pr` on a PR five days older than the window's
+  oldest. **`--limit 40` is not a time window.** On this repository the
+  latest 40 merged PRs span six days (2026-08-28 → 2026-09-03); on
+  crewAI-examples the same 40 reach back eighteen months
+  (2024-10 → 2026-04). A repository's merge rate
+  decides how much history a sweep sees, so a busy application needs
+  `--pr` or a much larger limit before its silence means anything.
 
 ## Constructed-adversarial accuracy — the blocked-recall proof
 
@@ -137,6 +281,97 @@ The live engine is re-run against these fixtures in CI
 verdict fails there rather than silently in the data file. The mined runs below
 supply the complementary halves — the **negative control** (the 336
 trigger-skips) and the real-history **extraction-coverage** (`insufficient_evidence`) rate.
+
+## 2026-W37 re-eval — the fixed cold-start workflow no longer reaches verify
+
+**The release-exit bars fail.** On 2026-09-08, the same 19 W27 PRs and exact
+base/head SHAs were evaluated against candidate `60d44cae17d1ce75b47cff9f9b0a8dfe579a027f`
+(tree `52ac3118e6819212386a03b384a13a5cc797c4b9`, final #562 head). The
+candidate includes the completed #515/#516/#520 slices and the reader,
+identity, review and presentation work preceding them. This is source-tree
+measurement, not a released wheel, signed qualification or a new human study.
+The fixed population is **five repositories**; eight describes the wider
+mining history. Original W24–W26 label files are unchanged.
+
+The [CSV](results/2026-W37-reeval.csv), [JSONL](results/2026-W37-reeval.jsonl)
+and [comparison](results/2026-W37-reeval.comparison.json) preserve all attempts.
+The comparison binds the candidate commit/tree, measurement-driver bytes,
+baseline and label-file hashes. The driver digest records the version that
+actually ran; later driver changes must not restamp this historical record.
+It records command-level counts and routing
+without source excerpts, prompts or raw stderr.
+
+| Metric | W27 | W37 candidate | Interpretation |
+|---|---:|---:|---|
+| `must_block_caught` | 1.0 (2/2) | **0.0 (0/2)** | Both must-block cases are unscored. Required 1.0 is unmet. |
+| `needs_human_caught` | 1.0 (3/3) | **0.333 (1/3)** | The one caught case uses the legacy scan fallback. Required 1.0 is unmet. |
+| `blocked_recall` | 0.0 (0/2) | 0.0 (0/2) | No real-history hard block was established. |
+| `benign_escalation_rate` | 0.286 (4/14) | 0.071 (1/14) | Fewer answers explain the apparent improvement. |
+| `ie_rate_on_safe` | 0.714 (10/14) | 0.071 (1/14) | Twelve safe cases are now unscored; coverage did not improve. |
+
+Those are the **unchanged historical scorer's** metrics: it falls back from
+`verify_verdict` to `head_decision`. The operational view is stricter:
+
+| Outcome | W27 | W37 candidate |
+|---|---:|---:|
+| PR verifier results / attempted cases | 17/19 | **0/19** |
+| Allowed verifier outcome / attempted cases | 0/19 | 0/19 |
+| Review verifier outcome / attempted cases | 4/19 | 0/19 |
+| IE verifier outcome / attempted cases | 13/19 | 0/19, with **19/19 lacking a verifier result** |
+| Cold-start scan fallback / attempted cases | 2/19 | 3/19: two review, one IE |
+| No scan or verifier answer / attempted cases | 0/19 | 16/19 |
+
+The candidate has **no observed terminal allowed/complete outcome, hard-block
+outcome or named PR human-review outcome**. No verifier ran, so whether a
+reviewer could act on a named change and bounded question is unmeasured, not
+an inferred success. All recorded setup permissions deny completion/merge.
+A successful init or head scan does not change that. The 14 benign cases have
+zero allowed outcomes, one legacy review escalation, one scan IE, and twelve
+with no answer. Both must-block cases have no answer. None was auto-passed.
+
+**Where the workflow stops.** Every initial repository-root init returned
+`refused_unresolved_scope`: 17 routes ask a human to choose scope and two ADK
+routes ask for discovery beyond the parse cap. The unchanged miner tries its
+existing deepest-common-directory fallback; it does not follow those new setup
+routes or invent a reviewed scope. Fifteen cases end at init refusal. Goose#9637
+instead writes the unsupported-surface placeholder in `evals/harbor` and scan
+exits 2. There were no observed exit-4 product crashes or observation failures;
+input/refusal failures are reported as such rather than counted as safe gates.
+
+The three head scans do not rescue the PR comparison. CrewAI-examples#184
+still has `base_lock_failed;verify_baseline_failed`. That was one of W27's two
+baseline failures; the other, #169, now stops earlier at scope refusal.
+ADK#1975/#1977 select a new/renamed project directory that does not exist at
+base and return `verify_base_subdir_missing`. **No result proves whether
+#538's connection diff would help on these PRs**, because the verifier never
+gets the base input. W27's standing-surface explanation for benign escalation
+cannot be validated by this run either.
+
+[#563](https://github.com/ThreeMoonsLab/agents-shipgate/issues/563) owns the
+reviewed-scope/release regression; [#564](https://github.com/ThreeMoonsLab/agents-shipgate/issues/564)
+owns new/renamed base inputs. Both were discovered in this implementation pass
+and are deferred. Keep the original cold-start data; any reviewed-scope rerun
+must be a separately named view. Do not lower a catch bar or convert setup
+refusals into release catches. #312's measurement is delivered; these failed
+bars remain a release blocker. No retention or external adoption claim follows.
+
+Reproduce after fetching each unique W27 base/head SHA into local repositories
+named `<owner>__<repo>` under a canonical, non-symlink directory:
+
+```bash
+python -m benchmark.miner.reevaluate \
+  --baseline benchmark/miner/results/2026-W27-reeval.jsonl \
+  --repos /absolute/path/to/repos \
+  --out-prefix /absolute/path/to/output/2026-W37-reeval
+```
+
+The driver uses the existing evaluator with `force_run=True`, the historical
+root/deepest-common-directory behavior and unchanged scan fallback. It refuses
+tracked engine changes and does not fetch or execute repository code. Outputs
+remain miner schema v0.2. Source artifacts and clone directories are not
+committed. A separate fixture verifies that operational observation can read a
+real verifier result before the evaluator cleans its temporary files; it does
+not enter the 19-case denominator.
 
 ## 2026-W27 re-eval — the v0.15.0 delta on the labeled corpus
 

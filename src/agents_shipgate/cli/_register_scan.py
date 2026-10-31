@@ -19,13 +19,19 @@ from agents_shipgate.cli._helpers import (
     _run_multi_scan,
 )
 from agents_shipgate.cli.agent_mode import emit_agent_mode_error as _emit_agent_mode_error
+from agents_shipgate.cli.current_workspace import (
+    explicit_output_path,
+    relative_output_notice,
+)
 from agents_shipgate.cli.diagnostics import input_parse_recovery, top_next_actions
 from agents_shipgate.cli.scan.orchestrator import run_scan
+from agents_shipgate.cli.verify.git import path_committed_at_head
 from agents_shipgate.cli.workspace_guard import require_workspace
 from agents_shipgate.core.agent_controls import git_root_for
 from agents_shipgate.core.current_control import CurrentControlPublishError
 from agents_shipgate.core.errors import AgentsShipgateError, ConfigError, InputParseError
 from agents_shipgate.core.logging import configure_logging
+from agents_shipgate.core.manifest_provenance import manifest_provenance
 from agents_shipgate.core.trust_roots import inspect_lexical_path_identity
 from agents_shipgate.schemas.diagnostics import NextAction
 from agents_shipgate.schemas.verification import VerificationContext
@@ -193,6 +199,36 @@ def _configured_manifest_identity(
     raise ConfigError(f"--config identity did not converge safely: {config_path}")
 
 
+def _notice_moved_relative_out(out: Path, config_paths: list[Path]) -> None:
+    """Say on stderr when a relative ``--out`` no longer lands where 1.0 put it.
+
+    ``--out`` replaces the manifest's ``output.directory``, and 1.0 joined it
+    to the manifest's directory the way that manifest field is joined. Typed on
+    the command line it now resolves against the current directory, like every
+    other ``--out`` (#818). The notice names both directories for one manifest;
+    across several, where 1.0 wrote beneath each manifest, it names the new one.
+    """
+
+    try:
+        bases = {path.resolve().parent for path in config_paths}
+    except (OSError, RuntimeError):
+        return  # A notice never stops a run; the scan reports the path itself.
+    if len(bases) == 1:
+        notice = relative_output_notice(
+            "--out",
+            out,
+            previous_base=next(iter(bases)),
+            previous_label="the manifest's directory",
+        )
+    else:
+        # Distinct manifest directories never join a relative path to one place.
+        notice = relative_output_notice(
+            "--out", out, previous_base=None, previous_label="each manifest's directory"
+        )
+    if notice is not None:
+        typer.echo(notice, err=True)
+
+
 def register(app: typer.Typer) -> None:
     @app.command(hidden=True)
     def scan(
@@ -210,7 +246,13 @@ def register(app: typer.Typer) -> None:
         out: Path | None = typer.Option(
             None,
             "--out",
-            help="Output directory for reports. Overrides manifest output.directory.",
+            help=(
+                "Output directory (not a file) for reports; overrides manifest "
+                "output.directory. A relative path resolves against the current "
+                "directory, not the manifest's. Default: output.directory, "
+                "relative to the manifest (agents-shipgate-reports beside it). "
+                "With --workspace, each manifest's reports go to a subdirectory."
+            ),
         ),
         formats: str = typer.Option(
             "markdown,json",
@@ -365,6 +407,9 @@ def register(app: typer.Typer) -> None:
 
         try:
             config_paths = _resolve_config_paths(config=config, workspace=workspace)
+            if out is not None:
+                _notice_moved_relative_out(out, config_paths)
+                out = explicit_output_path(out)
             if verification_context is not None and len(config_paths) > 1:
                 # --changed-files describes ONE PR's diff against ONE
                 # manifest's trust roots. Fanning the same changed-files
@@ -385,9 +430,23 @@ def register(app: typer.Typer) -> None:
                     )
                 )
                 config_paths[0] = validated_config_path
+                manifest_root = git_root_for(validated_config_path.parent)
+                committed_at_head = (
+                    path_committed_at_head(
+                        manifest_root,
+                        Path(configured_manifest_path),
+                    )
+                    if manifest_root is not None
+                    else None
+                )
                 verification_context = verification_context.model_copy(
                     update={
-                        "configured_manifest_path": configured_manifest_path
+                        "configured_manifest_path": configured_manifest_path,
+                        "manifest_provenance": manifest_provenance(
+                            Path(configured_manifest_path),
+                            present=validated_config_path.is_file(),
+                            committed_at_head=committed_at_head,
+                        ),
                     }
                 )
             if len(config_paths) == 1:
@@ -422,6 +481,7 @@ def register(app: typer.Typer) -> None:
                     exit_code,
                     verbose=verbose,
                     human_context=human_context,
+                    reports_base=config_paths[0].resolve().parent,
                 )
                 raise typer.Exit(exit_code)
             exit_code = _run_multi_scan(

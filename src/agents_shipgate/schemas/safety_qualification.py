@@ -8,13 +8,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from agents_shipgate.schemas.common import ReleaseDecisionStatus
 from agents_shipgate.schemas.disclaimers import STATIC_VERDICT_DISCLAIMER
+from agents_shipgate.schemas.report import EvidenceGap
 
 SAFETY_CORPUS_SCHEMA_VERSION = "shipgate.safety_corpus/v4"
 SAFETY_RECEIPT_INDEX_SCHEMA_VERSION = "shipgate.safety_receipt_index/v4"
-# v5 carries the ``pre_1_0`` tier and the production_qualified/tier invariant
-# added for issue #341. The corpus and receipt-index envelopes stay at v4: their
-# grammar did not move, and versions here track grammar, not release batches.
-SAFETY_QUALIFICATION_SCHEMA_VERSION = "shipgate.safety_qualification/v5"
+# v6 adds diagnostic coverage misses and explicit metric applicability. v5
+# remains readable without inventing diagnostics its producer never recorded.
+SAFETY_QUALIFICATION_SCHEMA_VERSION = "shipgate.safety_qualification/v6"
 
 SafetyProfile = Literal[
     "mcp",
@@ -338,7 +338,7 @@ class SafetyStratumRequirementV1(BaseModel):
 
 
 class SafetyQualificationRequirementsV1(BaseModel):
-    """Qualification thresholds. The CLI always uses the production defaults."""
+    """Qualification thresholds for the named policy selected by wheel version."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -366,43 +366,36 @@ def production_safety_requirements() -> SafetyQualificationRequirementsV1:
         "mcp_openapi_declared_binding": {
             "passed": 6,
             "review_required": 4,
-            "insufficient_evidence": 4,
             "blocked": 6,
         },
         "openai_agents_sdk": {
             "passed": 5,
             "review_required": 3,
-            "insufficient_evidence": 3,
             "blocked": 4,
         },
         "langchain_crewai": {
             "passed": 5,
             "review_required": 3,
-            "insufficient_evidence": 3,
             "blocked": 4,
         },
         "google_adk": {
             "passed": 3,
             "review_required": 2,
-            "insufficient_evidence": 2,
             "blocked": 3,
         },
         "n8n": {
             "passed": 3,
             "review_required": 2,
-            "insufficient_evidence": 2,
             "blocked": 3,
         },
         "multi_agent_handoffs": {
             "passed": 4,
             "review_required": 3,
-            "insufficient_evidence": 3,
             "blocked": 5,
         },
         "coding_agent_trust_roots": {
             "passed": 4,
             "review_required": 3,
-            "insufficient_evidence": 3,
             "blocked": 5,
         },
     }
@@ -417,21 +410,36 @@ def production_safety_requirements() -> SafetyQualificationRequirementsV1:
     )
     return SafetyQualificationRequirementsV1(
         required_strata=strata,
-        minimum_qualified_origins=40,
+        # 40% of the corpus, rounded up: ceil(0.40 x 80) = 32. The share is
+        # what was approved -- it read "40 of 100" while `insufficient_evidence`
+        # still held 20 cells. Those cells left the vocabulary (#520), so the
+        # corpus is 80 and holding the *count* at 40 would raise the demand to
+        # half the corpus as a side effect of deleting a decision. The share is
+        # the decision; the count follows it.
+        minimum_qualified_origins=32,
         minimum_kappa=0.80,
         minimum_holdout_fraction_per_stratum=0.20,
         maximum_unsafe_auto_passes=0,
         minimum_safe_passes=27,
         minimum_blocked_exact=30,
         minimum_review_exact=19,
-        minimum_insufficient_evidence_exact=19,
+        # `insufficient_evidence` is not a ground-truth decision in either
+        # tier (#520): it says the reader failed, not what a correct gate
+        # should do. The field stays because it is shipped surface.
+        minimum_insufficient_evidence_exact=0,
         # The schema the engine this gate qualifies actually emits. Pinned to
         # a literal rather than read from ``ReadinessReport`` so a bump is a
         # deliberate edit a reviewer sees — and pinned *equal* to it by
         # ``test_the_qualification_gate_demands_the_schema_the_engine_emits``,
         # because a gate demanding a schema no build produces rejects every
         # receipt with "qualification report schema mismatch".
-        required_report_schema_version="0.42",
+        #
+        # Moved 0.43 -> 1.0 with the report freeze (#569). This is the pin a
+        # v1.0 candidate's receipts are collected against, so it, the engine
+        # and the exact candidate wheel have to agree *before* those receipts
+        # exist -- a mismatch discovered afterwards invalidates every one of
+        # them.
+        required_report_schema_version="1.0",
     )
 
 
@@ -454,15 +462,14 @@ def pre_release_safety_requirements() -> SafetyQualificationRequirementsV1:
 
     Recorded by Pengfei Hu on 2026-08-29 under
     ``docs/release-evidence-policy-decision.md`` (issue #341, Route 2). It
-    governs ``0.x`` tags only; ``1.0`` and later still require the 100-case
+    governs ``0.x`` tags only; ``1.0`` and later still require the 80-case
     production policy, and this constructor is never selected for them.
 
-    Two cases per stratum is the smallest allocation that keeps all 28
-    profile x decision cells non-empty *and* leaves room for a tuning/holdout
-    split in every cell: at one case per cell, ``ceil(1 x 0.20) = 1`` forces
-    that case to be holdout. Dropping a cell to zero would delete coverage of a
-    profile/outcome pair outright, which is a strictness reduction and not a
-    coverage one; the uniform layout is what avoids it at this size.
+    Amendment 3 keeps 21 profile x decision cells: two cases in 17 cells and
+    one case in four approved blocked cells, for 38 total. No cell expects
+    ``insufficient_evidence``. At one case per cell, ``ceil(1 x 0.20) = 1``
+    requires that case to be holdout; a zero-count cell would delete coverage
+    of a profile/outcome pair outright.
 
     What is *enforced* is the holdout floor, not a one-of-each split. A corpus
     that marks more cases holdout is accepted: holdout evidence was never tuned
@@ -476,31 +483,77 @@ def pre_release_safety_requirements() -> SafetyQualificationRequirementsV1:
     fraction, the kappa floor, the report schema) are byte-identical.
     """
 
+    # 21 cells, not 28: `insufficient_evidence` left the ground-truth
+    # vocabulary (#520). It is a statement about the reader -- what a gate says
+    # when its own extraction failed -- and a *correct* gate with complete
+    # inputs can always name the binding, so it cannot be what a correct gate
+    # "should do" with a change. The engine still emits the value; a corpus
+    # case is never targeted at it.
+    #
+    # Two cases per cell, except where the material does not exist. The
+    # exceptions are all `blocked`, and they are measured rather than assumed:
+    # the first corpus round labeled 48 cases blind, and of the seven profiles
+    # only four have any real-world `blocked` case at all. `google_adk` and
+    # `langchain_crewai` hold a construction and nothing else -- each was
+    # sourced with a real candidate that two independent raters then placed at
+    # `review_required`; `openai_agents_sdk` and `coding_agent_trust_roots`
+    # hold one real case each. Cut B recorded the cause before any of this:
+    # a blocked-shaped change is usually stopped before it merges, which is
+    # why the inventory hunts `blocked` in the rejected-or-reverted vein.
+    #
+    # Requiring a second `blocked` in those four cells would be met the only
+    # way it could be -- by building another construction -- and a cell filled
+    # entirely with constructions measures our imagination rather than the
+    # world. One real case is worth more than two invented ones, and the count
+    # says so.
+    scarce_blocked = frozenset(
+        {"openai_agents_sdk", "langchain_crewai", "google_adk", "coding_agent_trust_roots"}
+    )
     strata = tuple(
         SafetyStratumRequirementV1(
             profile=profile,
             expected_decision=decision,
-            count=2,
+            count=1 if decision == "blocked" and profile in scarce_blocked else 2,
         )
         for profile in RELEASE_SAFETY_PROFILES
-        for decision in ("passed", "review_required", "insufficient_evidence", "blocked")
+        for decision in ("passed", "review_required", "blocked")
     )
     return SafetyQualificationRequirementsV1(
         required_strata=strata,
-        # 40% of 56, rounded up -- the same origin floor production applies
-        # (40 of 100), not a smaller share of a smaller corpus.
-        minimum_qualified_origins=23,
+        # 40% of the corpus, rounded up -- the same origin floor production
+        # applies (32 of 80), not a smaller share of a smaller corpus:
+        # ceil(0.40 x 38) = 16.
+        minimum_qualified_origins=16,
         minimum_kappa=0.80,
         minimum_holdout_fraction_per_stratum=0.20,
         maximum_unsafe_auto_passes=0,
-        # 14 cases per outcome. Production's rates, rounded up: safe 27/30
-        # -> ceil(0.90 x 14) = 13; blocked 30/30 -> 14; review 19/20 and
-        # insufficient evidence 19/20 -> ceil(0.95 x 14) = 14.
+        # Production's rates, applied to this corpus's cases and rounded up --
+        # the same derivation as before, over 14 `passed`, 14
+        # `review_required` and 10 `blocked` (2 x 3 profiles + 1 x 4 scarce):
+        # safe 27/30 -> ceil(0.90 x 14) = 13; review 19/20 -> ceil(0.95 x 14)
+        # = 14; blocked 30/30 -> ceil(1.00 x 10) = 10. The blocked floor falls
+        # from 14 only because four cells hold one case, which is the honest
+        # consequence of the scarcity documented above and not a rate anyone
+        # relaxed -- `test_the_pre_1_0_policy_is_never_laxer_than_production_
+        # per_rate` is what holds that line.
         minimum_safe_passes=13,
-        minimum_blocked_exact=14,
+        minimum_blocked_exact=10,
         minimum_review_exact=14,
-        minimum_insufficient_evidence_exact=14,
-        required_report_schema_version="0.42",
+        # No corpus case is targeted at `insufficient_evidence`, so there is
+        # no floor to meet. The field stays for shipped-schema compatibility;
+        # both named policies require zero expected-IE cases.
+        minimum_insufficient_evidence_exact=0,
+        # Deliberately *not* moved to 1.0 with the report freeze (#569). This
+        # policy is now historical: issuance of ``pre_1_0`` artifacts is
+        # retired, and the only remaining job of this constructor is to let an
+        # artifact that was already scored against it still be read, named and
+        # diagnosed. ``tier_for_requirements`` names a policy by byte-equality,
+        # so re-pinning this to a schema no ``pre_1_0`` artifact ever carried
+        # would demote every existing one to the unnamed ``test`` tier and
+        # replace an accurate diagnosis with a misleading one. A ``pre_1_0``
+        # artifact still cannot publish a 1.0 release: that is decided by
+        # ``accepted_qualification_tiers``, which admits production only.
+        required_report_schema_version="0.43",
     )
 
 
@@ -610,6 +663,9 @@ class SafetyQualificationMetricV1(BaseModel):
     interval: WilsonIntervalV1
     requirement: str
     passed: bool
+    applicability: Literal["applicable", "not_applicable", "diagnostic"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class SafetyQualificationCaseResultV1(BaseModel):
@@ -639,14 +695,46 @@ class SafetyQualificationSummaryV1(BaseModel):
     outcome_counts: dict[ReleaseDecisionStatus, int]
 
 
+class QualificationCoverageMissCaseV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    case_id: str
+    gap_status: Literal["named_gaps", "unclassified"]
+    evidence_gaps: list[EvidenceGap]
+
+    @model_validator(mode="after")
+    def _gap_status_matches_evidence(self) -> QualificationCoverageMissCaseV1:
+        expected = "named_gaps" if self.evidence_gaps else "unclassified"
+        if self.gap_status != expected:
+            raise ValueError("coverage gap status must describe the recorded evidence")
+        return self
+
+
+class QualificationCoverageMissV1(BaseModel):
+    """Recorded actual-IE outcomes, over all attempted cases in this profile.
+
+    Unscored cases are not zero misses: the rate is a lower bound while any
+    exist. Named gaps explain evidence, not ownership of the missing remedy.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    profile: SafetyProfile
+    count: int = Field(ge=0)
+    denominator: int = Field(gt=0)
+    rate: float = Field(ge=0, le=1)
+    unscored_case_ids: list[str]
+    cases: list[QualificationCoverageMissCaseV1]
+
+
 class SafetyQualificationResultV1(BaseModel):
     """Deterministic, wheel-bound qualification result for a named policy."""
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal["shipgate.safety_qualification/v5"] = (
-        SAFETY_QUALIFICATION_SCHEMA_VERSION
-    )
+    schema_version: Literal[
+        "shipgate.safety_qualification/v5", "shipgate.safety_qualification/v6"
+    ] = SAFETY_QUALIFICATION_SCHEMA_VERSION
     qualification_tier: QualificationTier
     qualified: bool
     production_qualified: bool
@@ -661,6 +749,9 @@ class SafetyQualificationResultV1(BaseModel):
     intervals: list[SafetyQualificationMetricV1]
     cases: list[SafetyQualificationCaseResultV1]
     failures: list[SafetyQualificationFailureV1]
+    coverage_misses: list[QualificationCoverageMissV1] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -682,6 +773,22 @@ class SafetyQualificationResultV1(BaseModel):
         if not isinstance(data, dict):
             return data
         declared = data.get("schema_version")
+        # An older closed grammar must not be widened by changing its label.
+        if (
+            declared in LEGACY_QUALIFICATION_ENVELOPES
+            or declared == "shipgate.safety_qualification/v5"
+        ):
+            intervals = data.get("intervals")
+            # Leave malformed containers to typed validation. A before-hook
+            # must not turn invalid input into an uncaught TypeError.
+            intervals = intervals if isinstance(intervals, (list, tuple)) else ()
+            if "coverage_misses" in data or any(
+                "applicability" in item
+                if isinstance(item, dict)
+                else getattr(item, "applicability", None) is not None
+                for item in intervals
+            ):
+                raise ValueError("coverage diagnostics and applicability require the v6 envelope")
         if declared not in LEGACY_QUALIFICATION_ENVELOPES:
             return data
         if data.get("qualification_tier") not in LEGACY_QUALIFICATION_TIERS:
@@ -690,11 +797,55 @@ class SafetyQualificationResultV1(BaseModel):
                 f"{sorted(LEGACY_QUALIFICATION_TIERS)}; this payload requires "
                 f"{SAFETY_QUALIFICATION_SCHEMA_VERSION}"
             )
-        return {**data, "schema_version": SAFETY_QUALIFICATION_SCHEMA_VERSION}
+        return {**data, "schema_version": "shipgate.safety_qualification/v5"}
+
+    @model_validator(mode="after")
+    def _coverage_accounting_matches_cases(self) -> SafetyQualificationResultV1:
+        if self.schema_version != SAFETY_QUALIFICATION_SCHEMA_VERSION:
+            return self
+        if self.coverage_misses is None:
+            raise ValueError("v6 requires coverage diagnostics")
+        profiles = {case.profile for case in self.cases}
+        if {row.profile for row in self.coverage_misses} != profiles or len(
+            self.coverage_misses
+        ) != len(profiles):
+            raise ValueError("coverage profiles must cover every case exactly once")
+        for row in self.coverage_misses:
+            cases = [case for case in self.cases if case.profile == row.profile]
+            miss_ids = sorted(
+                case.id for case in cases if case.actual_decision == "insufficient_evidence"
+            )
+            unscored = sorted(case.id for case in cases if case.actual_decision is None)
+            if (
+                row.count != len(miss_ids)
+                or row.denominator != len(cases)
+                or row.rate != round(len(miss_ids) / len(cases), 6)
+                or sorted(item.case_id for item in row.cases) != miss_ids
+                or sorted(row.unscored_case_ids) != unscored
+            ):
+                raise ValueError("coverage accounting must match recorded case outcomes")
+            row.cases.sort(key=lambda item: item.case_id)
+            row.unscored_case_ids.sort()
+        self.coverage_misses.sort(key=lambda item: item.profile)
+        for metric in self.intervals:
+            expected = "applicable"
+            if metric.name == "overall_exact_rate":
+                expected = "diagnostic"
+            elif (
+                metric.name == "insufficient_evidence_exact_rate"
+                and metric.denominator == 0
+                and self.requirements.minimum_insufficient_evidence_exact == 0
+            ):
+                expected = "not_applicable"
+            if metric.applicability != expected:
+                raise ValueError(
+                    "metric applicability must match its actual denominator and policy"
+                )
+        return self
 
     @model_validator(mode="after")
     def _production_claim_matches_the_tier(self) -> SafetyQualificationResultV1:
-        """``production_qualified`` means the 100-case bar, in every artifact.
+        """``production_qualified`` means the approved beta bar, in every artifact.
 
         Enforced structurally rather than at each gate so the *producer* cannot
         emit the inconsistency in the first place. A pre-1.0 artifact asserting

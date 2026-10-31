@@ -10,13 +10,58 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  suite:
+    # The aggregate test run, split across parallel jobs.
+    #
+    # It used to be one step inside `test`, and that job spent 456-839s of its
+    # 15-minute budget on it depending on runner speed — so whether a green
+    # commit stayed green was decided by which runner it drew, and `main`
+    # itself was cancelled at the cap. Splitting the *suite* rather than
+    # raising the number keeps a real bound: each shard is roughly an equal share
+    # of the work, so the margin grows back and stays there as the suite grows
+    # (add a shard). Three shards had reached 13 of their 15 minutes on `main`
+    # by #904, and #872's tests took one past the cap: a fourth was added.
+    # By 2026-10-08 the slowest of four reached 12-14 minutes on `main` and
+    # timed out on PRs adding heavy fixture tests: a fifth was added. The same
+    # day the slowest of five took about 11 of its 15 minutes on `main` (Test
+    # steps of 311, 405, 623, 508 and 538 seconds, about 40 minutes in all),
+    # and #964, which adds roughly 45% more test time, had a shard cancelled at
+    # the cap: a sixth was added, with a `slow` marker beside it.
+    #
+    # `-m "not slow"` is the second lever: a test that is heavy and rarely the
+    # one that catches a regression is marked `slow`, runs nightly
+    # (`slow-tests.yml`) and in release verification, and stays off the
+    # per-pull-request path. Release verification runs it on every candidate,
+    # so the marker moves a test's cost; it never removes the test.
+    #
+    # `conftest.py` assigns whole test *files* to shards, deterministically,
+    # from the collection and the measured seconds per file in
+    # `tests/shard_seconds.json` — nothing is exchanged between these jobs.
+    # Balancing item counts instead left one shard at 13 of its 15 minutes on
+    # `main` while another took 8, and any new test file reshuffled the rest
+    # (#904). When a shard nears the cap, re-measure with
+    # `scripts/measure_shard_seconds.py` before adding a shard.
+    # `tests/test_shard_partition.py` asserts the union of the shards is the
+    # suite, because a partition that silently drops a file leaves every job
+    # green while a test stops running.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # Tags, because `tests/test_adopter_pins_resolve.py` checks the pins
+          # `init` writes into an adopter's repository against this
+          # repository's release tags — the check whose absence let a workflow
+          # pinned to a tag that was never cut ship for 56 days (#506). The
+          # default shallow fetch brings none, and that test fails loudly
+          # rather than passing over an empty tag list.
+          fetch-tags: true
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
@@ -26,6 +71,190 @@ jobs:
           cache-dependency-path: |
             constraints/dev.txt
             constraints/build-backend.txt
+
+      - name: Install
+        # The same hash-locked closure the `test` job installs; the rationale
+        # for each flag is on that job. `pip check` runs there rather than
+        # once more in every shard.
+        run: |
+          python -m pip install --require-hashes --requirement constraints/dev.txt
+          python -m pip install --require-hashes --requirement constraints/build-backend.txt
+          python -m pip install -e . --no-deps --no-build-isolation
+
+      - name: Verify the dependency locks match the declared requirements
+        # Repeated from the `test` job on purpose. It exists to fail by name
+        # *before* the suite, rather than surfacing as a confusing ImportError
+        # partway through it — and now that the suite runs in its own job, a
+        # copy in `test` alone would merely race it.
+        run: python scripts/verify_dependency_lock.py
+
+      - name: Test (shard ${{ matrix.shard }} of ${{ strategy.job-total }})
+        # Excludes the `perf` marker — the latency budget tests run in the
+        # `test` job, alone, so their timing isn't disturbed by parallel load —
+        # and the `slow` marker, which runs nightly and in release
+        # verification rather than on every pull request.
+        #
+        # The static adapter invariant lint runs as its own fail-fast step
+        # there too, so keep it out of the coverage pass rather than doing the
+        # same AST sweep twice on every PR.
+        #
+        # No `--cov-fail-under` here: a shard covers a fraction of the suite, so
+        # its coverage is a fragment. The threshold is enforced once, on the
+        # combined data, in `coverage` below.
+        env:
+          SHIPGATE_TEST_SHARDS: 6
+          SHIPGATE_TEST_SHARD: ${{ matrix.shard }}
+        run: python -m pytest -n auto -m "not perf and not slow" --ignore=tests/test_adapter_static_only.py --cov=agents_shipgate --cov-report=
+
+      - name: Upload coverage fragment
+        # Renamed off the leading dot on purpose: `.coverage` is a hidden file
+        # and whether the uploader picks one up depends on the action version
+        # this workflow pins. A fragment that silently fails to upload would
+        # leave the gate measuring a fraction of the suite and passing.
+        run: mv .coverage coverage-fragment.dat
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: coverage-${{ matrix.shard }}
+          path: coverage-fragment.dat
+          if-no-files-found: error
+
+  coverage:
+    # The coverage gate, enforced once over the combined fragments.
+    #
+    # Splitting the suite split its coverage with it, and each shard's partial
+    # measurement fails an 85% threshold that the whole run passes. This job is
+    # where the number is a number about the suite again.
+    needs: [suite]
+    # Starts even when a shard failed, so that it can fail by name. `needs`
+    # alone would skip this job, and a skipped required check counts as passing:
+    # the ruleset requires `suite (1)` to `suite (3)` and not the shards after
+    # them, so a failure in shard 4, 5 or 6 would leave the pull request
+    # mergeable. Cancellation still skips it.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Require every suite shard to have passed
+        env:
+          SUITE_RESULT: ${{ needs.suite.result }}
+        run: |
+          set -euo pipefail
+          if [ "${SUITE_RESULT}" != "success" ]; then
+            echo "::error::The suite did not pass on every shard (result: ${SUITE_RESULT}); refusing to gate coverage on a partial run."
+            exit 1
+          fi
+          echo "OK: every suite shard passed."
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: constraints/dev.txt
+
+      - name: Install
+        # Only `coverage` itself. This job never imports the package: it reads
+        # the data files and reports against the source paths recorded in them,
+        # which are this checkout's. Installing the project editable here would
+        # also have failed — `--no-build-isolation` needs the backend closure
+        # from `constraints/build-backend.txt`, which this job has no other
+        # reason to want.
+        run: python -m pip install --require-hashes --requirement constraints/dev.txt
+
+      - name: Download coverage fragments
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: coverage-*
+          path: coverage-fragments
+
+      - name: Combine and enforce the threshold
+        # v0.21 (E7): bumped from 75 → 85. Actual aggregate coverage on
+        # current main is ~88%, so the gate is +10pp tighter with ~3pp
+        # headroom for day-to-day movement. The bump catches the next time a
+        # refactor lands materially less-covered code without a corresponding
+        # test pass.
+        #
+        # `coverage combine` consumes its inputs, so the fragments are copied
+        # to distinct names first — one file per shard, all named alike in
+        # separate directories, would otherwise collide on the way in.
+        #
+        # Exactly one fragment per shard, not merely some: `needs` already
+        # waits for every shard, but a gate that combined five of six would
+        # report the coverage of five sixths of the suite and could still pass.
+        # `EXPECTED_FRAGMENTS` is the matrix size; a test holds it equal to the
+        # matrix and to `SHIPGATE_TEST_SHARDS`.
+        env:
+          EXPECTED_FRAGMENTS: 6
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          fragments=(coverage-fragments/coverage-*/coverage-fragment.dat)
+          if [ "${#fragments[@]}" -eq 0 ]; then
+            echo "no coverage fragments were downloaded; the shards produced none." >&2
+            exit 1
+          fi
+          if [ "${#fragments[@]}" -ne "${EXPECTED_FRAGMENTS}" ]; then
+            echo "expected ${EXPECTED_FRAGMENTS} coverage fragments, found ${#fragments[@]}; refusing to gate a partial measurement." >&2
+            exit 1
+          fi
+          index=0
+          for fragment in "${fragments[@]}"; do
+            index=$((index + 1))
+            cp "${fragment}" ".coverage.${index}"
+          done
+          echo "combining ${index} coverage fragment(s)"
+          python -m coverage combine
+          python -m coverage report --show-missing --fail-under=85
+
+  test:
+    # Everything that is not the aggregate suite: the fail-fast lints, the
+    # named safety canaries, the latency budget, and the release-shaped
+    # packaging checks.
+    #
+    # Deliberately independent of `suite`. Several of these steps exist to
+    # fail *before* the long run, by name — a `needs` here would make them
+    # report after it instead, which is the opposite of what they are for.
+    # Every job is its own required check, so "CI passed" is still all of
+    # them passing.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # Tags, so the cadence step below can see the newest release. The
+          # default shallow fetch brings none, and a cadence metric that
+          # silently reports `unknown` is the same defect as not having one.
+          fetch-tags: true
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            constraints/dev.txt
+            constraints/build-backend.txt
+
+      - name: Release cadence
+        # #491: 81% of the changelog had never shipped because nothing counted
+        # the gap. This is the surface that counts it -- every pull request and
+        # every push to `main` prints the number into the job summary, and
+        # annotates a warning once the interval lapses. The policy the number
+        # is measured against is in `docs/release-runbook.md` (# Cadence).
+        #
+        # Deliberately not a failing check. Going red here would fail whichever
+        # unrelated change happened to arrive after the interval lapsed, and
+        # that author is not the actor who can fix it. `--fail-when-overdue`
+        # exists for an operator and is not passed here. It runs before the
+        # install so the number is recorded even when a later step fails.
+        run: python scripts/release_cadence.py --github
 
       - name: Install
         # The hash-locked closure, not a fresh resolve of `.[dev]`. Release
@@ -90,22 +319,6 @@ jobs:
         # Keep false-complete, input-integrity, and secret-redaction failures
         # visible before the aggregate coverage run.
 
-      - name: Test
-        # v0.21 (E7): bumped from 75 → 85. Actual aggregate coverage on
-        # current main is ~88%, so the gate is +10pp tighter with ~3pp
-        # headroom for day-to-day movement. The bump catches the next
-        # time a refactor lands materially less-covered code without
-        # a corresponding test pass.
-        #
-        # Excludes the `perf` marker — the latency budget tests run as
-        # a separate step below (after the main suite finishes so their
-        # timing isn't disturbed by parallel test load).
-        #
-        # The static adapter invariant lint runs in its own fail-fast
-        # step above, so keep it out of the coverage pass to avoid
-        # doing the same AST sweep twice on every PR.
-        run: python -m pytest -n auto -m "not perf" --ignore=tests/test_adapter_static_only.py --cov=agents_shipgate --cov-report=term-missing --cov-fail-under=85
-
       - name: Latency budget
         # Runs the `benchmark/perf/scenarios/` synthetic scans and
         # asserts median wallclock stays under the per-scenario budget
@@ -119,7 +332,7 @@ jobs:
       - name: Build package
         # `--no-isolation` for the same reason the release build uses it: with
         # isolation, `build` creates a fresh environment and re-resolves
-        # `hatchling>=1.31.0` from the index — twice, once per distribution —
+        # `hatchling>=1.32.4` from the index — twice, once per distribution —
         # so the artifact CI checks was produced by a backend nothing pinned,
         # even though the hashed closure is already installed in this job.
         run: |
@@ -178,6 +391,58 @@ jobs:
         with:
           name: sbom
           path: sbom.json
+
+  mcp-extra:
+    # #713: `agents-shipgate[mcp]` is optional and in no lock, so no other job
+    # installs it and `test_build_server_registers_read_only_tools` is skipped
+    # everywhere else. A green suite said nothing about the SDK the extra
+    # actually installs, and the extra shipped a server that could not start.
+    # This job installs the extra's SDK twice, at the floor pyproject.toml
+    # declares and at the newest release that range admits, and fails unless
+    # the real SDK builds the server and answers over stdio.
+    #
+    # The SDK comes from the index, not a hash lock: it is an optional extra
+    # nothing else depends on, and the newest admitted release is the point.
+    # The locked closure underneath it stays hashed.
+    name: mcp extra (${{ matrix.sdk }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: [floor, newest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: constraints/dev.txt
+
+      - name: Install the locked closure and the project
+        run: |
+          python -m pip install --require-hashes --requirement constraints/dev.txt
+          python -m pip install --require-hashes --requirement constraints/build-backend.txt
+          python -m pip install -e . --no-deps --no-build-isolation
+
+      - name: Install the SDK the extra admits
+        env:
+          SDK: ${{ matrix.sdk }}
+        run: |
+          requirement="$(python scripts/mcp_extra_requirement.py "$SDK")"
+          echo "Installing ${requirement}"
+          python -m pip install "${requirement}"
+          python -m pip show mcp
+
+      - name: The real SDK builds the server
+        run: python -m pytest tests/test_mcp_server.py -rs
+
+      - name: The installed command answers over stdio with five read-only tools
+        run: python scripts/mcp_extra_requirement.py --stdio-smoke
 
   clean-checkout-launcher:
     # `./shipgate` has to work on a checkout where Agents Shipgate itself is

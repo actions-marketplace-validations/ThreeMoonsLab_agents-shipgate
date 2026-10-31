@@ -5,6 +5,12 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agents_shipgate.schemas.common import BaselineStatus, Confidence, Severity
+from agents_shipgate.schemas.finding_attribution import FindingAttribution
+from agents_shipgate.schemas.guard_dependencies import (
+    GuardDependencyComparison,
+    GuardDependencyEvidence,
+)
+from agents_shipgate.schemas.operation_attribution import OperationAttribution, OperationComparison
 from agents_shipgate.schemas.semantic import ToolSemanticEvidence
 
 ToolSurfaceDiffBaseKind = Literal["none", "report", "baseline"]
@@ -90,6 +96,8 @@ class ToolSurfaceFacts(BaseModel):
     scopes: list[ToolSurfaceScopeFact] = Field(default_factory=list)
     controls: list[ToolSurfaceControlFact] = Field(default_factory=list)
     policies: list[ToolSurfacePolicyFact] = Field(default_factory=list)
+    guard_dependencies: list[GuardDependencyEvidence] = Field(default_factory=list, exclude_if=lambda value: not value)
+    operation_attributions: list[OperationAttribution] = Field(default_factory=list, exclude_if=lambda value: not value)
 
 
 class ToolSurfaceDiffBase(BaseModel):
@@ -251,6 +259,18 @@ class ToolSurfaceDiff(BaseModel):
         default_factory=ToolSurfaceFindingDeltas
     )
     notes: list[str] = Field(default_factory=list)
+    guard_comparisons: list[GuardDependencyComparison] = Field(default_factory=list, exclude_if=lambda value: not value)
+    operation_comparisons: list[OperationComparison] = Field(default_factory=list, exclude_if=lambda value: not value)
+    # The canonical per-finding projection over the two comparison lists above.
+    # ``finding_deltas`` stays an identity comparison; this answers what the
+    # change did to the bound each finding depends on (#515), and never
+    # excludes a finding from the release decision.
+    finding_attributions: list[FindingAttribution] = Field(default_factory=list, exclude_if=lambda value: not value)
+    # Active findings no comparison profile could speak about at all. Carried
+    # as a value, not only as a diff note, because renderers truncate notes and
+    # this is the statement that stops an empty attribution reading as a clean
+    # one. It is a count of what was *not* compared, never a pass.
+    unattributed_findings: int = Field(default=0, ge=0, exclude_if=lambda value: not value)
 
 
 ActionEffect = Literal[
@@ -275,6 +295,106 @@ ActionSurfaceChangeType = Literal[
     "SAFEGUARD_REMOVED",
     "INPUT_SCHEMA_EXPANDED",
 ]
+
+ActionDeclarationResolution = Literal["resolved", "unresolved", "ambiguous"]
+
+
+class ActionDeclarationSelectorFact(BaseModel):
+    """The parsed selector that gives one manifest declaration its identity.
+
+    Kept separate from the resolved ``subject_id``: the selector is what a
+    reviewer changed, while the canonical id is what evidence joins on.  A
+    normalized selector hash therefore ignores YAML order/comments without
+    ever falling back to a display-name join.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tool: str
+    tool_id: str | None = None
+    source_type: str | None = None
+    source_id: str | None = None
+    provider: str | None = None
+    operation: str | None = None
+
+
+class ActionDeclarationFact(BaseModel):
+    """One parsed ``action_surface.actions[]`` row and its canonical join."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    row_id: str = Field(min_length=1)
+    selector: ActionDeclarationSelectorFact
+    subject: str
+    subject_id: str | None = Field(default=None, min_length=1)
+    resolution: ActionDeclarationResolution
+    declared_effect: ActionEffect | None = None
+    declared_risk_tags: list[str] = Field(default_factory=list)
+    has_override: bool = False
+    #: Content identity of this row's override evidence/reason.  The review
+    #: projection uses it to prevent another row for the same canonical tool
+    #: from donating an acknowledgement.
+    override_identity: str | None = None
+    basis: str | None = None
+    declaration_hash: str
+    manifest_path: str = Field(min_length=1)
+
+
+class ActionDeclarationFacts(BaseModel):
+    """Parsed declaration rows carried so a PR can compare manifest answers."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    snapshot_version: Literal["0.1"] = "0.1"
+    rows: list[ActionDeclarationFact] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def declaration_rows_have_distinct_identities(self) -> ActionDeclarationFacts:
+        row_ids: set[str] = set()
+        selectors: dict[tuple[object, ...], list[ActionDeclarationResolution]] = {}
+        manifest_paths: set[str] = set()
+        resolved_subject_ids: set[str] = set()
+        for row in self.rows:
+            if row.row_id in row_ids:
+                raise ValueError("action declaration row_ids must be unique")
+            row_ids.add(row.row_id)
+            selector = (
+                row.selector.tool,
+                row.selector.tool_id,
+                row.selector.source_type,
+                row.selector.source_id,
+                row.selector.provider,
+                row.selector.operation,
+            )
+            prior_resolutions = selectors.get(selector, [])
+            if prior_resolutions and (
+                row.resolution != "ambiguous"
+                or any(resolution != "ambiguous" for resolution in prior_resolutions)
+            ):
+                raise ValueError(
+                    "colliding action declaration selectors must all be marked ambiguous"
+                )
+            selectors.setdefault(selector, []).append(row.resolution)
+            if row.manifest_path in manifest_paths:
+                raise ValueError("action declaration manifest paths must be unique")
+            manifest_paths.add(row.manifest_path)
+            if row.resolution == "resolved":
+                if row.subject_id is None:
+                    raise ValueError(
+                        "resolved action declaration rows require a canonical subject_id"
+                    )
+                if row.subject_id in resolved_subject_ids:
+                    raise ValueError(
+                        "resolved action declaration subject_ids must be unique; "
+                        "aliasing rows must be marked ambiguous"
+                    )
+                resolved_subject_ids.add(row.subject_id)
+            if row.has_override != (row.override_identity is not None):
+                raise ValueError(
+                    "action declaration override_identity must be present exactly "
+                    "when has_override is true"
+                )
+        return self
 
 
 class ActionApprovalFact(BaseModel):

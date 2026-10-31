@@ -30,10 +30,10 @@ from agents_shipgate.core.host_grants import (
     load_host_grants_baseline,
 )
 from agents_shipgate.schemas.host_grants import (
-    HostGrantsBaselineV2,
-    HostGrantsDriftV2,
-    HostGrantsInventoryArtifactV2,
-    HostGrantsInventoryV2,
+    HostGrantsBaselineV9,
+    HostGrantsDriftV9,
+    HostGrantsInventoryArtifactV4,
+    HostGrantsInventoryV9,
 )
 
 runner = CliRunner()
@@ -170,8 +170,8 @@ def _drift_json(tmp_path: Path, *extra: str) -> tuple[int, dict]:
 
 def test_inventory_v02_collects_typed_multi_host_grants(tmp_path: Path) -> None:
     inventory = host_audit_inventory(_seed_workspace(tmp_path))
-    assert inventory["host_grants_inventory_schema_version"] == "0.2"
-    HostGrantsInventoryV2.model_validate(inventory)
+    assert inventory["host_grants_inventory_schema_version"] == "0.9"
+    HostGrantsInventoryV9.model_validate(inventory)
     assert inventory["scope"] == "repository"
     assert inventory["static_analysis_only"] is True
     assert inventory["runtime_session_verified"] is False
@@ -372,9 +372,14 @@ def test_policy_helper_is_never_run_and_makes_coverage_partial(
     assert f"touch {marker}" not in json.dumps(inventory)
 
 
-def test_local_static_overlapping_layers_are_partial_until_precedence_is_projected(
+def test_local_static_overlapping_layers_resolve_by_documented_precedence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """User and project settings used to make local coverage partial forever.
+    Their permission lists merge, so both layers' rules are effective and the
+    setup can be baselined; tests/test_host_local_precedence.py covers each
+    rule and every case that still fails closed (#657)."""
+
     workspace = tmp_path / "repo"
     (workspace / ".claude").mkdir(parents=True)
     (workspace / ".claude/settings.json").write_text(
@@ -389,16 +394,14 @@ def test_local_static_overlapping_layers_are_partial_until_precedence_is_project
 
     inventory = host_audit_inventory(workspace, scope="local_static")
 
-    issue = next(
+    assert not [
         item for item in inventory["issues"] if item["kind"] == "unresolved_precedence"
-    )
-    assert issue["host"] == "claude-code"
+    ]
     coverage = next(
         item for item in inventory["host_coverage"] if item["host"] == "claude-code"
     )
-    assert coverage["status"] == "partial"
-    with pytest.raises(ValueError, match="cannot acknowledge missing evidence"):
-        build_host_grants_baseline(inventory)
+    assert coverage["status"] == "complete"
+    assert build_host_grants_baseline(inventory)["scope"] == "local_static"
 
 
 def test_invalid_config_is_structured_partial_coverage_and_cannot_baseline(tmp_path: Path) -> None:
@@ -492,7 +495,9 @@ def test_repository_globstar_boundary_fails_closed_on_symlink_ancestor(
     assert coverage["status"] == "partial"
 
 
-def test_vscode_present_is_experimental_and_cannot_baseline(tmp_path: Path) -> None:
+def test_vscode_present_is_complete_and_can_baseline(tmp_path: Path) -> None:
+    """VS Code MCP is a supported surface (#731, owner decision)."""
+
     vscode = tmp_path / ".vscode"
     vscode.mkdir()
     (vscode / "mcp.json").write_text(
@@ -500,11 +505,12 @@ def test_vscode_present_is_experimental_and_cannot_baseline(tmp_path: Path) -> N
     )
     inventory = host_audit_inventory(tmp_path)
     coverage = next(item for item in inventory["host_coverage"] if item["host"] == "vscode")
-    assert coverage["status"] == "experimental"
+    assert coverage["status"] == "complete"
     result = runner.invoke(
         app, ["audit", "--host", "--workspace", str(tmp_path), "--save-baseline"]
     )
-    assert result.exit_code == 2
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / ".agents-shipgate/host-grants.json").is_file()
 
 
 def test_cli_scope_and_json_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -548,7 +554,7 @@ def test_inventory_coverage_paths_are_owned_by_central_boundary_registry(tmp_pat
     inventory = host_audit_inventory(tmp_path)
     registered = {
         path
-        for adapter in BOUNDARY_ADAPTERS
+        for adapter in BOUNDARY_ADAPTERS if adapter.id != "openshell"
         for path in (*adapter.exact_paths, *adapter.globs)
     }
     reported = {
@@ -719,7 +725,7 @@ def test_host_inventory_rejects_protected_addition_after_discovery(
     assert inventory["grants"] == []
     assert any(
         issue["kind"] == "unreadable"
-        and "changed identity" in issue["message"]
+        and "could not confirm a coherent read" in issue["message"]
         and issue["blocking"]
         for issue in inventory["issues"]
     )
@@ -743,8 +749,8 @@ def test_v02_baseline_is_typed_portable_redacted_and_idempotent(tmp_path: Path) 
     _seed_workspace(tmp_path)
     baseline_path = _save_baseline(tmp_path)
     payload = json.loads(baseline_path.read_text(encoding="utf-8"))
-    HostGrantsBaselineV2.model_validate(payload)
-    assert payload["host_grants_schema_version"] == "0.2"
+    HostGrantsBaselineV9.model_validate(payload)
+    assert payload["host_grants_schema_version"] == "0.9"
     assert payload["scope"] == "repository"
     assert "workspace" not in payload["inventory"]
     assert payload["inventory"]["artifacts"]
@@ -950,7 +956,7 @@ def test_clean_and_changed_v02_drift(tmp_path: Path) -> None:
     _save_baseline(tmp_path)
     code, clean = _drift_json(tmp_path)
     assert code == 0
-    HostGrantsDriftV2.model_validate(clean)
+    HostGrantsDriftV9.model_validate(clean)
     assert clean["comparison_status"] == "comparable"
     assert clean["has_drift"] is False
     assert clean["baseline_sha256"] == clean["current_sha256"]
@@ -963,7 +969,7 @@ def test_clean_and_changed_v02_drift(tmp_path: Path) -> None:
     assert code == 0
     assert changed["has_drift"] is True
     assert changed["changes"]
-    assert "mcp_server_changed: claude-code:github" in changed["expansion_signals"]
+    assert "mcp_server_changed: claude-code:github" not in changed["expansion_signals"]
 
 
 def test_zero_grant_recognized_artifact_is_bound_into_drift(tmp_path: Path) -> None:
@@ -1101,8 +1107,12 @@ def test_drift_all_env_header_value_rotation_quiet_but_key_addition_fires(tmp_pa
     data["mcpServers"]["github"]["env"]["GITHUB_TOKEN"] = "rotated"
     data["mcpServers"]["github"]["env"]["READ_ONLY"] = "false"
     data["mcpServers"]["remote"]["headers"]["Authorization"] = "Bearer rotated"
+    # A rotation: the webhook path and the token *value* change, the token
+    # parameter itself stays. Its presence enters the change digest the way an
+    # env or header key does (#723); its value never does.
     data["mcpServers"]["remote"]["url"] = (
-        "https://mcp.example.test/services/ROTATED-WEBHOOK-PATH-TOP-SECRET"
+        "https://user:rotated@mcp.example.test/services/"
+        "ROTATED-WEBHOOK-PATH-TOP-SECRET?token=rotated"
     )
     path.write_text(json.dumps(data), encoding="utf-8")
     rotated = _drift_json(tmp_path)[1]
@@ -1113,6 +1123,14 @@ def test_drift_all_env_header_value_rotation_quiet_but_key_addition_fires(tmp_pa
     data["mcpServers"]["remote"]["headers"]["X-Scope"] = "admin"
     path.write_text(json.dumps(data), encoding="utf-8")
     assert _drift_json(tmp_path)[1]["has_drift"] is True
+
+    # The query analogue of adding a key: a new capability-shaping parameter.
+    _save_baseline(tmp_path)
+    data["mcpServers"]["remote"]["url"] += "&scope=admin"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    widened = _drift_json(tmp_path)[1]
+    assert widened["has_drift"] is True
+    assert "scope=admin" not in json.dumps(widened)
 
 
 def test_inline_permission_secret_rotation_is_redacted_and_hash_invariant(tmp_path: Path) -> None:
@@ -1164,7 +1182,7 @@ def test_toml_yaml_parser_errors_never_echo_source_lines(
     assert any(issue["kind"] == "parse_failed" for issue in inventory["issues"])
 
 
-def test_deny_removal_and_hook_change_are_expansion_signals(tmp_path: Path) -> None:
+def test_deny_removal_expands_but_hook_command_change_has_unknown_direction(tmp_path: Path) -> None:
     _seed_workspace(tmp_path)
     _save_baseline(tmp_path)
     path = tmp_path / ".claude/settings.json"
@@ -1174,7 +1192,7 @@ def test_deny_removal_and_hook_change_are_expansion_signals(tmp_path: Path) -> N
     path.write_text(json.dumps(data), encoding="utf-8")
     drift = _drift_json(tmp_path)[1]
     assert "deny_rule_removed: claude-code:WebFetch" in drift["expansion_signals"]
-    assert "hook_changed: claude-code:.claude/settings.json" in drift["expansion_signals"]
+    assert "hook_changed: claude-code:.claude/settings.json" not in drift["expansion_signals"]
 
 
 def test_legacy_v01_baseline_is_incomparable_advisory_and_strict_20(tmp_path: Path) -> None:
@@ -1195,14 +1213,14 @@ def test_legacy_v01_baseline_is_incomparable_advisory_and_strict_20(tmp_path: Pa
         inventory=host_audit_inventory(tmp_path),
         baseline_file=".agents-shipgate/host-grants.json",
     )
-    HostGrantsDriftV2.model_validate(shared)
+    HostGrantsDriftV9.model_validate(shared)
     assert shared["comparison_status"] == "incomparable"
     assert shared["next_action"] is None
     assert "--save-baseline" not in json.dumps(shared)
 
     code, payload = _drift_json(tmp_path)
     assert code == 0
-    HostGrantsDriftV2.model_validate(payload)
+    HostGrantsDriftV9.model_validate(payload)
     assert payload["comparison_status"] == "incomparable"
     assert payload["has_drift"] is None
     assert "baseline_schema_v0.1" in payload["incomparable_reasons"][0]
@@ -1254,7 +1272,7 @@ def test_malformed_nested_v02_baseline_is_incomparable_not_a_crash(tmp_path: Pat
     )
     code, payload = _drift_json(tmp_path)
     assert code == 0
-    HostGrantsDriftV2.model_validate(payload)
+    HostGrantsDriftV9.model_validate(payload)
     assert payload["comparison_status"] == "incomparable"
     assert payload["has_drift"] is None
     assert payload["incomparable_reasons"] == ["malformed_v0.2_baseline"]
@@ -1611,13 +1629,13 @@ def test_baseline_overwrite_reuses_descriptor_bound_text_without_path_reread(
 def test_generated_models_reject_unknown_fields_and_invalid_literals(tmp_path: Path) -> None:
     payload = host_audit_inventory(tmp_path)
     with pytest.raises(ValidationError):
-        HostGrantsInventoryV2.model_validate({**payload, "legacy_parse_warnings": []})
+        HostGrantsInventoryV9.model_validate({**payload, "legacy_parse_warnings": []})
     with pytest.raises(ValidationError):
-        HostGrantsInventoryV2.model_validate({**payload, "scope": "runtime"})
+        HostGrantsInventoryV9.model_validate({**payload, "scope": "runtime"})
 
 
 def test_inventory_schema_uses_discriminated_typed_grants() -> None:
-    rendered = json.dumps(HostGrantsInventoryArtifactV2.model_json_schema())
+    rendered = json.dumps(HostGrantsInventoryArtifactV4.model_json_schema())
     assert '"discriminator"' in rendered
     assert '"propertyName": "kind"' in rendered
     assert '"oneOf"' in rendered

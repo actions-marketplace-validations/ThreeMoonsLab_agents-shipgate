@@ -6,6 +6,7 @@ from types import UnionType
 from typing import Union, get_args, get_origin
 
 import pytest
+import typer
 from pydantic import BaseModel
 from typer.main import get_command
 from typer.testing import CliRunner
@@ -20,6 +21,15 @@ from agents_shipgate.schemas.capabilities import (
     CAPABILITY_LOCK_DIFF_SCHEMA_VERSION,
     CAPABILITY_LOCK_SCHEMA_VERSION,
     CAPABILITY_STANDARD_VERSION,
+)
+from agents_shipgate.schemas.capability_attestation import (
+    CAPABILITY_DELTA_ATTESTATION_SCHEMA_PATH,
+    CAPABILITY_DELTA_ATTESTATION_SCHEMA_VERSION,
+    CAPABILITY_DELTA_PREDICATE_TYPE,
+)
+from agents_shipgate.schemas.capability_payload import (
+    CAPABILITY_PAYLOAD_SCHEMA_PATH,
+    CAPABILITY_PAYLOAD_SCHEMA_VERSION,
 )
 from agents_shipgate.schemas.contract import (
     AGENT_BOUNDARY_RESULT_SCHEMA_PATH,
@@ -336,6 +346,12 @@ def test_cli_contract_json_outputs_runtime_contract():
         "human_authorization_trust_policy_schema_version",
         "human_authorization_trust_policy_default_path",
         "human_authorization_schema_path",
+        "human_review_request_schema_version",
+        "human_review_request_schema_path",
+        "human_review_request_artifact",
+        "human_review_decision_schema_version",
+        "human_review_evaluation_schema_version",
+        "human_review_decision_schema_path",
         "agent_handoff_schema_version",
         "agent_handoff_schema_path",
         "agent_handoff_artifact",
@@ -344,6 +360,12 @@ def test_cli_contract_json_outputs_runtime_contract():
         "agent_boundary_result_schema_path",
         "capability_lock_schema_version",
         "capability_lock_diff_schema_version",
+        "capability_payload_schema_version",
+        "capability_payload_schema_path",
+        "capability_delta_attestation_schema_version",
+        "capability_delta_attestation_schema_path",
+        "capability_delta_predicate_type",
+        "capability_delta_attestation_artifact",
         "preflight_schema_version",
         "capability_standard_version",
         "governance_benchmark_catalog_schema_version",
@@ -416,6 +438,12 @@ def test_cli_contract_json_outputs_runtime_contract():
             HUMAN_AUTHORIZATION_TRUST_POLICY_ACCOUNT_PATH
         ),
         "human_authorization_schema_path": HUMAN_AUTHORIZATION_SCHEMA_PATH,
+        "human_review_request_schema_version": "shipgate.human_review_request/v1",
+        "human_review_request_schema_path": "docs/human-review-request-schema.v1.json",
+        "human_review_request_artifact": ARTIFACTS["human_review_request"],
+        "human_review_decision_schema_version": "shipgate.human_review_decision/v1",
+        "human_review_evaluation_schema_version": "shipgate.human_review_evaluation/v1",
+        "human_review_decision_schema_path": "docs/human-review-decision-schema.v1.json",
         "agent_handoff_schema_version": AGENT_HANDOFF_SCHEMA_VERSION,
         "agent_handoff_schema_path": AGENT_HANDOFF_SCHEMA_PATH,
         "agent_handoff_artifact": ARTIFACTS["agent_handoff"],
@@ -424,6 +452,18 @@ def test_cli_contract_json_outputs_runtime_contract():
         "agent_boundary_result_schema_path": AGENT_BOUNDARY_RESULT_SCHEMA_PATH,
         "capability_lock_schema_version": CAPABILITY_LOCK_SCHEMA_VERSION,
         "capability_lock_diff_schema_version": CAPABILITY_LOCK_DIFF_SCHEMA_VERSION,
+        "capability_payload_schema_version": CAPABILITY_PAYLOAD_SCHEMA_VERSION,
+        "capability_payload_schema_path": CAPABILITY_PAYLOAD_SCHEMA_PATH,
+        "capability_delta_attestation_schema_version": (
+            CAPABILITY_DELTA_ATTESTATION_SCHEMA_VERSION
+        ),
+        "capability_delta_attestation_schema_path": (
+            CAPABILITY_DELTA_ATTESTATION_SCHEMA_PATH
+        ),
+        "capability_delta_predicate_type": CAPABILITY_DELTA_PREDICATE_TYPE,
+        "capability_delta_attestation_artifact": ARTIFACTS[
+            "capability_delta_attestation"
+        ],
         "preflight_schema_version": PREFLIGHT_SCHEMA_VERSION,
         "capability_standard_version": CAPABILITY_STANDARD_VERSION,
         "governance_benchmark_catalog_schema_version": (
@@ -439,7 +479,7 @@ def test_cli_contract_json_outputs_runtime_contract():
         "trigger_catalog_schema_version": TRIGGER_CATALOG_SCHEMA_VERSION,
         "deprecated_surfaces": {
             "codex-boundary-json": (
-                "Deprecated compatibility projection through 0.16.x; use agent-boundary-json."
+                "Deprecated compatibility projection through 1.x; use agent-boundary-json."
             )
         },
         "external_integration_surfaces": list(EXTERNAL_INTEGRATION_SURFACES),
@@ -548,7 +588,8 @@ def _unwrap_optional(annotation: object) -> object:
 
 def test_cli_scan_help_hides_deferred_flags():
     result = runner.invoke(app, ["scan", "--help"])
-    scan_command = get_command(app).commands["scan"]
+    root = get_command(app)
+    scan_command = root.get_command(typer.Context(root), "scan")
     public_options = {
         option
         for parameter in scan_command.params
@@ -580,14 +621,12 @@ HIDDEN_TOP_LEVEL_COMMANDS = {
     "capability",
     "contract",
     "detect",
-    "doctor",
     "evidence-packet",
     "explain",
     "explain-finding",
     "feedback",
     "findings",
     "fixture",
-    "init",
     "install-hooks",
     "list-checks",
     "mcp",
@@ -602,27 +641,34 @@ HIDDEN_TOP_LEVEL_COMMANDS = {
     "trigger",
 }
 VISIBLE_CORE_COMMANDS = {
+    # The six a reader needs to get from a fresh checkout to an answer.
+    # `init` and `doctor` were hidden while every quickstart step named
+    # them, and `diff` is the first-value command (#652).
+    "diff",
     "check",
     "verify",
     "audit",
+    "init",
+    "doctor",
 }
 
 
 def test_cli_help_hides_niche_commands_but_keeps_them_invokable():
     root = get_command(app)
+    ctx = typer.Context(root)
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
     output = _plain_cli_output(result.output)
 
     for name in HIDDEN_TOP_LEVEL_COMMANDS:
-        assert root.commands[name].hidden, f"{name} should be hidden from --help"
+        assert root.get_command(ctx, name).hidden, f"{name} should be hidden from --help"
         assert f"│ {name}" not in output
         # Hidden, not removed: the command still resolves and answers --help.
         invoked = runner.invoke(app, [name, "--help"])
         assert invoked.exit_code == 0, f"{name} must remain invokable: {invoked.output}"
 
     for name in VISIBLE_CORE_COMMANDS:
-        assert not root.commands[name].hidden, f"{name} must stay visible"
+        assert not root.get_command(ctx, name).hidden, f"{name} must stay visible"
         assert re.search(rf"\b{re.escape(name)}\b", output), output
 
 
@@ -819,7 +865,15 @@ def test_cli_findings_invalid_provenance_kind_exits_three(tmp_path):
     assert "unsupported --provenance-kind value" in result.output
 
 
-def test_cli_findings_pre_v15_report_agent_mode_error(tmp_path, monkeypatch):
+def test_cli_findings_pre_freeze_report_agent_mode_error(tmp_path, monkeypatch):
+    """A pre-freeze report reaches an agent as a typed error with a route.
+
+    Was "requires >= 0.15 for provenance_kind"; the 1.0 freeze routes every
+    external report input through one boundary (#569). The agent-facing
+    contract is unchanged: exit 3, `input_parse_error`, and a `next_actions`
+    command that actually produces a readable report.
+    """
+
     monkeypatch.setenv("AGENTS_SHIPGATE_AGENT_MODE", "1")
     old_report = tmp_path / "report.json"
     old_report.write_text(
@@ -833,7 +887,7 @@ def test_cli_findings_pre_v15_report_agent_mode_error(tmp_path, monkeypatch):
     )
 
     assert result.exit_code == 3
-    assert ">= 0.15" in result.output
+    assert "[report_schema_pre_freeze]" in result.output
     json_lines = [line for line in (result.output or "").splitlines() if line.startswith("{")]
     assert json_lines
     payload = json.loads(json_lines[-1])

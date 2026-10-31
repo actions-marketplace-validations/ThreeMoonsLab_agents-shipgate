@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+from dataclasses import replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -12,6 +13,7 @@ from agents_shipgate.cli.verify.git import (
     read_file_at_ref,
     removes_a_yaml_file,
 )
+from agents_shipgate.cli.verify.host_comparison import enabled_plugin_hook_evidence
 from agents_shipgate.config.loader import load_manifest_text
 from agents_shipgate.core.agent_boundary import (
     build_agent_boundary_result as project_agent_boundary_result,
@@ -77,21 +79,25 @@ def build_codex_agent_result(
     """
 
     return freeze_codex_boundary_result(
-        _assessment_for_diff(
-            agent=agent,
-            workspace=workspace,
-            diff_text=diff_text,
-            config=config,
-            policy=policy,
-            input_mode=input_mode,
-            input_issues=input_issues,
-            base=base,
-            head=head,
-            verification_replayable=verification_replayable,
-            base_manifest_absent=base_manifest_absent,
-            requested_workspace=requested_workspace,
-            changed_files_override=changed_files_override,
-            manifest_text_snapshot=manifest_text_snapshot,
+        _with_compared_refs(
+            _assessment_for_diff(
+                agent=agent,
+                workspace=workspace,
+                diff_text=diff_text,
+                config=config,
+                policy=policy,
+                input_mode=input_mode,
+                input_issues=input_issues,
+                base=base,
+                head=head,
+                verification_replayable=verification_replayable,
+                base_manifest_absent=base_manifest_absent,
+                requested_workspace=requested_workspace,
+                changed_files_override=changed_files_override,
+                manifest_text_snapshot=manifest_text_snapshot,
+            ),
+            base,
+            head,
         ).legacy_result
     )
 
@@ -129,7 +135,65 @@ def build_agent_boundary_result(
         changed_files_override=changed_files_override,
         manifest_text_snapshot=manifest_text_snapshot,
     )
-    return project_agent_boundary_result(assessment)
+    result = project_agent_boundary_result(_with_compared_refs(assessment, base, head))
+    if input_mode == "provided_diff":
+        from agents_shipgate.core.host_diff_comparison import compare_host_diff
+        from agents_shipgate.schemas.host_comparison import HostComparison
+
+        try:
+            comparison = (
+                compare_host_diff(workspace, diff_text)
+                if result.input_coverage == "complete"
+                else HostComparison(
+                    comparison_status="incomparable",
+                    incomparable_reasons=["diff_input_coverage_incomplete"],
+                    head_kind="provided_diff",
+                )
+            )
+        except (OSError, ValueError, RuntimeError, ConfigError) as exc:
+            comparison = HostComparison(
+                comparison_status="incomparable",
+                incomparable_reasons=[f"host_comparison_unavailable:{type(exc).__name__}"],
+                head_kind="provided_diff",
+            )
+        result = result.model_copy(
+            update={
+                "rows": comparison.rows,
+                "comparison_status": comparison.comparison_status,
+                "incomparable_reasons": comparison.incomparable_reasons,
+                "comparison_scope": "changed_host_files",
+            }
+        )
+    return result
+
+
+def _with_compared_refs(assessment, base: str | None, head: str | None):
+    """Name the refs the check compared, on the assessment it produced.
+
+    `check` resolves an omitted base to the default branch's merge base
+    (#649), so which question was answered is no longer evident from the
+    request. `AgentResultSubject` already carries `base`/`head` and nothing
+    ever filled them. Set only when a ref was actually resolved, so a plain
+    worktree check is byte-identical to before.
+
+    Both projections read `assessment.legacy_result`, so replacing the
+    subject there reaches the current and the frozen v2 contract from one
+    place rather than two.
+    """
+
+    if base is None and head is None:
+        return assessment
+    legacy = assessment.legacy_result
+    return replace(
+        assessment,
+        legacy_result=legacy.model_copy(
+            update={
+                "subject": legacy.subject.model_copy(
+                    update={"base": base, "head": head}
+                )
+            }
+        ),
+    )
 
 
 def _assessment_for_diff(
@@ -248,6 +312,20 @@ def _assessment_for_diff(
         config_path=config_path,
         changed_files=changed_files,
     )
+    host_snapshot, enabled_plugin_hooks, evidence_issues = enabled_plugin_hook_evidence(
+        workspace=workspace,
+        changed_files=changed_files,
+        head_is_worktree=not (input_mode == "git_range" and head),
+        # A provided diff names no commit: only the tree it was given is read.
+        base=None if input_mode == "provided_diff" else base,
+        head=head,
+    )
+    if evidence_issues:
+        input_issues = [*(input_issues or []), *evidence_issues]
+    if enabled_plugin_hooks and enabled_plugin_hooks.openshell:
+        trigger = evaluate_trigger(paths=changed_files, diff_text=diff_text,
+            manifest_present=manifest_present, user_requested=True,
+            selected_host_paths=sorted(enabled_plugin_hooks.openshell.paths))
     return evaluate_agent_boundary(
         workspace=workspace,
         diff_text=diff_text,
@@ -270,6 +348,8 @@ def _assessment_for_diff(
         head=head,
         verification_replayable=verification_replayable,
         base_manifest_absent=base_manifest_absent,
+        host_snapshot=host_snapshot,
+        enabled_plugin_hooks=enabled_plugin_hooks,
     )
 
 
@@ -527,6 +607,124 @@ def _declared_codex_marketplace_roots(
     return roots
 
 
+class UnresolvedComparisonError(RuntimeError):
+    """No base could be resolved, and guessing one would answer a
+    different question than the caller asked."""
+
+
+def _resolve_comparison(
+    *,
+    workspace: Path,
+    base: str | None,
+    head: str | None,
+) -> tuple[str | None, str | None, str, str]:
+    """Decide what this check compares, and say so.
+
+    Returns ``(resolved_base, resolved_head, revspec, comparison_ref)``.
+    A non-empty ``revspec`` selects the committed-range diff; otherwise
+    the worktree is compared against ``comparison_ref``, which keeps
+    untracked capability paths and the manifest binding in scope.
+
+    Before #649 an omitted pair meant "worktree against ``HEAD``", so a
+    branch whose changes were already committed reported ``allow`` with
+    an empty change set — the tool answered "nothing is uncommitted"
+    to the question "what does this branch change". The ladder now:
+
+    1. **Both refs** — unchanged: ``base...head``, the merge-base range.
+    2. **``--base`` alone** — that base's merge base with ``HEAD``,
+       compared against the worktree, so uncommitted work still counts.
+    3. **``--head`` alone** — the detected default base against it.
+    4. **Neither** — the detected default base's merge base against the
+       worktree. This is the reviewer's question by default.
+    5. **On the default branch** (the detected base *is* ``HEAD``) —
+       ``HEAD`` against the worktree, which is both the old behaviour and
+       the complete answer there.
+    6. **No base detectable at all** — refuse and name ``--base``. A
+       repository whose base cannot be identified gets an honest stop,
+       never an ``allow`` computed from a question nobody asked.
+    """
+
+    from agents_shipgate.cli.verify.git import detect_default_base, merge_base_sha
+
+    if base and head:
+        return base, head, f"{base}...{head}", "HEAD"
+
+    def default_base() -> str:
+        detected = detect_default_base(
+            workspace,
+            head or "HEAD",
+            allow_local_when_no_remote=True,
+            allow_equal_head=True,
+        )
+        if detected is None:
+            raise UnresolvedComparisonError(
+                "No base ref could be detected for this repository, so there is "
+                "nothing to compare this working tree against. Pass --base "
+                "<ref> to name one explicitly (use --base HEAD for uncommitted "
+                "changes only)."
+            )
+        return detected
+
+    if head and not base:
+        detected = default_base()
+        return detected, head, f"{detected}...{head}", "HEAD"
+
+    requested = base or default_base()
+
+    if requested == "HEAD":
+        return "HEAD", None, "", "HEAD"
+    merge_base = merge_base_sha(workspace, requested, "HEAD")
+    if merge_base is None:
+        raise UnresolvedComparisonError(
+            f"No merge base between {requested!r} and HEAD, so this working "
+            "tree cannot be compared against it. Pass --base <ref> naming a "
+            "ref that shares history with HEAD."
+        )
+    return requested, None, "", merge_base
+
+
+def _reports_exclusion(
+    workspace: Path,
+    *,
+    requested_workspace: Path,
+    comparison_ref: str,
+) -> Path | None:
+    """The reports directory ``verify`` leaves out, left out here too (#1023).
+
+    ``verify`` writes its default reports beneath the requested workspace and
+    excludes that directory from every working-tree read, so a check, verify,
+    check loop counted the reports it had just written as the developer's
+    change. The same directory is left out here, through the same
+    :func:`worktree_exclusion`, and only where
+    :func:`classify_output_directory` shows that it holds nothing but
+    uncommitted Shipgate artifacts. Anything else Git would report there is
+    content, and keeping it costs only a longer change set.
+    """
+
+    from agents_shipgate.cli.current_workspace import (
+        classify_output_directory,
+        default_reports_dir,
+        worktree_exclusion,
+    )
+    from agents_shipgate.cli.verify.git import commit_sha
+
+    try:
+        reports = default_reports_dir(requested_workspace)
+        if not os.path.lexists(reports):
+            return None
+        compared = commit_sha(workspace, comparison_ref)
+        if (
+            classify_output_directory(
+                workspace, reports, compared=[compared] if compared else []
+            )
+            is not None
+        ):
+            return None
+        return worktree_exclusion(workspace, reports)
+    except Exception:  # noqa: BLE001 - no exclusion can only surface more paths.
+        return None
+
+
 def git_boundary_change_set(
     *,
     workspace: Path,
@@ -551,19 +749,26 @@ def git_boundary_change_set(
             config_path,
             requested_workspace=requested_workspace,
         )
-    if bool(base) != bool(head):
-        raise RuntimeError(
-            "--base and --head must be provided together; omit both to check "
-            "local uncommitted changes."
-        )
-    if base and head:
-        revspec = f"{base}...{head}"
-    else:
-        revspec = ""
     if repository_root is None:
         raise RuntimeError("Workspace is not inside a Git repository.")
+    resolved_base, resolved_head, revspec, comparison_ref = _resolve_comparison(
+        workspace=workspace, base=base, head=head
+    )
     try:
-        changed_paths, diff_text = _git_diff_context(revspec, cwd=workspace)
+        changed_paths, diff_text = _git_diff_context(
+            revspec,
+            cwd=workspace,
+            comparison_ref=comparison_ref,
+            exclude=(
+                None
+                if revspec
+                else _reports_exclusion(
+                    workspace,
+                    requested_workspace=requested_workspace,
+                    comparison_ref=comparison_ref,
+                )
+            ),
+        )
     except BinaryCapabilityDiffError as exc:
         return BoundaryChangeSet(
             mode="git_range" if revspec else "worktree",
@@ -612,7 +817,9 @@ def git_boundary_change_set(
     if revspec and config_path is not None:
         try:
             relative = config_path.relative_to(workspace)
-            manifest_text_snapshot = read_file_at_ref(workspace, head, relative)
+            manifest_text_snapshot = read_file_at_ref(
+                workspace, resolved_head or "HEAD", relative
+            )
         except (OSError, RuntimeError, ValueError) as exc:
             raise ConfigError(
                 f"Configured manifest could not be read from head ref {head!r}: {exc}"
@@ -637,6 +844,8 @@ def git_boundary_change_set(
         changed_paths=tuple(sorted(changed_paths)),
         issues=tuple(issues),
         manifest_text_snapshot=manifest_text_snapshot,
+        resolved_base=resolved_base,
+        resolved_head=resolved_head,
     )
 
 

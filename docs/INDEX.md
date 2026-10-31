@@ -2,6 +2,18 @@
 
 A single entry point for human readers and AI agents walking the `docs/` tree.
 
+**Start here.** A human evaluating one change wants
+[`quickstart.md`](quickstart.md) — one review end to end on a committed sample,
+including which build provides which commands. A coding agent wants
+[`../AGENTS.md`](../AGENTS.md) and [`agents/README.md`](agents/README.md). The
+repository [`README.md`](../README.md) is the landing page that routes to both.
+
+[Three constructed host-review examples](examples/host-review/README.md) show
+shell permissions, a remote MCP declaration and workflow token permissions,
+with exact Git histories and captured output from released 1.1.0. The asset
+bundle includes a short demo and transcript; publication and reader observations
+remain separate, pending work.
+
 ## Concepts
 
 - [`overview.md`](overview.md) — one-page summary for developers, reviewers, and AI agents
@@ -17,8 +29,10 @@ A single entry point for human readers and AI agents walking the `docs/` tree.
 - [`glossary.md`](glossary.md) — category vocabulary
 - [`ai-search-summary.md`](ai-search-summary.md) — human-readable summary for AI search and coding agents
 - [`design-partners.md`](design-partners.md) — early design partner criteria and contact path
-- [`design-partner-verifier-pilot.md`](design-partner-verifier-pilot.md) — runbook for design partners bringing one AI-generated agent PR through the verifier loop
+- [`design-partner-verifier-pilot.md`](design-partner-verifier-pilot.md) — runbook for the design-partner cohort: the two routes under test, the denominators, what counts as reviewer-understood first value, and the pre-registered continue/narrow/stop rule
+- [`design-partner-pilot-results.md`](design-partner-pilot-results.md) — the public aggregate ledger for that experiment: denominators, dated enrollment shortfall, reproduced blockers, and the standing decision
 - [`architecture.md`](architecture.md) — codebase layout for new contributors
+- [`decisions.md`](decisions.md) — current accepted-decision index, superseded v0.1 defaults and explicit implementation obligations before the v1.0 freeze
 - [`engineering/ai-coding-workflow-verifier.md`](engineering/ai-coding-workflow-verifier.md) — canonical engineering guide and roadmap for making Agents Shipgate the deterministic verifier inside AI coding workflows
 - [`engineering/insufficient-evidence-cold-start.md`](engineering/insufficient-evidence-cold-start.md) — proposed design for getting first-adoption repos out of a standing `insufficient_evidence` verdict on every turn
 - [`engineering/host-authenticated-approval-receipts.md`](engineering/host-authenticated-approval-receipts.md) — proposed design for in-session approval receipts a host attests, and the record of why the unsigned version was rejected
@@ -26,20 +40,28 @@ A single entry point for human readers and AI agents walking the `docs/` tree.
 - [`product-hardening-gap-closure.md`](product-hardening-gap-closure.md) — closure map for the root dogfood gate, governance case catalog, policy-pack tests, trace contract, and runtime-inventory boundary
 - [`agent-workflow-evidence.md`](agent-workflow-evidence.md) — local Agent Workflow Evidence and AgentTraceEvent contract for replayable verifier scenarios
 - [`capability-standard.md`](capability-standard.md) — stable static capability lock/diff standard for external integrations and research
+- [`capability-payload.md`](capability-payload.md) — the frozen `shipgate.capability_payload/v1` payload shared by the exported capability delta and the committed capability state; one payload, two views, one subject per row
+- [`capability-delta-attestation.md`](capability-delta-attestation.md) — the capability delta published as a standalone in-toto attestation any consumer can verify without running Agents Shipgate; predicate type, subject binding, and the reference verifier
 - [`passed-verdict-contract.md`](passed-verdict-contract.md) — evidence-backed static meaning of `passed`, semantic gap routing, and 0.15 migration
 - [`governance-benchmark.md`](governance-benchmark.md) — stable research benchmark for evaluating agent governance behavior
 - [`manifest-v0.1.md`](manifest-v0.1.md) — manifest schema in prose form
 - [`trust-model.md`](trust-model.md) — what the scanner does and doesn't do
 - [`baseline.md`](baseline.md) — baseline workflow
 - [`framework-adapter-checklist.md`](framework-adapter-checklist.md) — checklist for adding static framework adapters
+- [`mcp-registration-idioms.md`](mcp-registration-idioms.md) — the 30-server survey behind the built-in MCP registration-idiom registry: which shapes ship, what the reader excludes, and why an export still wins
+- [`distribution-surfaces.md`](distribution-surfaces.md) — every surface this engine is published through, what each one claims, and the test that proves it; the registry a new surface has to be added to
+- [`determinism-boundary.md`](determinism-boundary.md) — generated coverage matrix: what each input can establish per declaration shape, the extraction-confidence ceiling it reaches, and what that ceiling means for a verdict
 
 ## Reference
 
 - [`checks.md`](checks.md) — full check catalog (human-readable)
 - [`checks.json`](checks.json) — machine-readable check catalog (regenerated each release)
+- [`determinism-boundary.json`](determinism-boundary.json) — machine-readable determinism boundary (`shipgate.determinism_boundary/v1`; regenerated from the adapter registry, drift-checked in CI)
 - [`manifest-v0.1.json`](manifest-v0.1.json) — JSON Schema for `shipgate.yaml`
-- [`report-schema.v0.42.json`](report-schema.v0.42.json) — JSON Schema for `report.json` (current; emitted reports carry `report_schema_version: "0.42"`, and `effective_policy.control_pack` names the control pack in force, so a base-vs-head comparison can see a pack moved to one that requires less)
-- [`report-schema.v0.41.json`](report-schema.v0.41.json) — frozen reference (`effective_policy.control_pack` names the control pack in force)
+- [`report-schema.v1.0.json`](report-schema.v1.0.json) — JSON Schema for `report.json` (current, frozen at `1.0`, superseding `0.43`; emitted reports carry `report_schema_version: "1.0"`. `1.x` is additive-only — see [`report-1-0-contract.md`](report-1-0-contract.md))
+- [`report-schema.v0.43.json`](report-schema.v0.43.json) — frozen reference; the last pre-freeze version (privacy-safe `declaration_review` projection for PR verification)
+- [`report-schema.v0.42.json`](report-schema.v0.42.json) — frozen reference (`effective_policy.control_pack` names the control pack in force)
+- [`report-schema.v0.41.json`](report-schema.v0.41.json) — frozen reference
 - [`report-schema.v0.39.json`](report-schema.v0.39.json) — frozen reference (a confirmed declaration whose evidence has since moved re-opens as a `declaration_drift` gap)
 - [`report-schema.v0.38.json`](report-schema.v0.38.json) — frozen v0.38 reference; pre-v0.39 reports validate against this
 - [`report-schema.v0.37.json`](report-schema.v0.37.json) — frozen reference (added `semantic_coverage.declaration_questions`, the questionnaire projection that says how many declarations a repository still owes)
@@ -54,7 +76,11 @@ A single entry point for human readers and AI agents walking the `docs/` tree.
 - [`report-schema.v0.27.json`](report-schema.v0.27.json) — frozen v0.27 reference schema; pre-v0.28 reports validate against this
 - [`report-schema.v0.26.json`](report-schema.v0.26.json) — frozen v0.26 reference schema; pre-v0.27 reports validate against this
 - [`report-schema.v0.25.json`](report-schema.v0.25.json) — frozen v0.25 reference schema; pre-v0.26 reports validate against this
-- [`verifier-schema.v0.15.json`](verifier-schema.v0.15.json) — current JSON Schema for `verifier.json`, including the fail-closed signed authorization evaluation, the `diff_status` input-health block, and `capability_review.policy_weakening_proven`
+- [`verifier-schema.v0.21.json`](verifier-schema.v0.21.json) — current JSON Schema for `verifier.json`, including declaration review in the embedded release decision, the unchanged limits a host comparison names, what each host comparison established and the changed inputs it does not read
+- [`verifier-schema.v0.20.json`](verifier-schema.v0.20.json) — frozen prior reference; what each host comparison established, without the changed inputs it does not read
+- [`verifier-schema.v0.19.json`](verifier-schema.v0.19.json) — frozen prior reference; published by `1.0.0`, without host comparison coverage
+- [`verifier-schema.v0.16.json`](verifier-schema.v0.16.json) — frozen prior reference; no inferred structural comparison
+- [`verifier-schema.v0.15.json`](verifier-schema.v0.15.json) — frozen verifier reference
 - [`verifier-schema.v0.12.json`](verifier-schema.v0.12.json) — frozen v0.12 reference; pre-v0.13 verifier artifacts validate against this
 - [`verifier-schema.v0.11.json`](verifier-schema.v0.11.json) — frozen v0.11 reference; pre-v0.12 verifier artifacts validate against this
 - [`verifier-schema.v0.8.json`](verifier-schema.v0.8.json) — frozen prior JSON Schema for `verifier.json`
@@ -69,7 +95,8 @@ A single entry point for human readers and AI agents walking the `docs/` tree.
 - [`verify-run-schema.v1.json`](verify-run-schema.v1.json) — frozen verify-run v1 reference
 - [`human-authorization-schema.v1.json`](human-authorization-schema.v1.json) — current schema family for unsigned requests, externally signed grants, evaluations, and external trust policies
 - [`human-authorization-signature-v1.json`](human-authorization-signature-v1.json) — canonical Ed25519 signature interoperability vector
-- [`agent-handoff-schema.v8.json`](agent-handoff-schema.v8.json) — current compact verifier handoff schema with authorization provenance
+- [`agent-handoff-schema.v9.json`](agent-handoff-schema.v9.json) — current compact verifier handoff schema with authorization provenance
+- [`agent-handoff-schema.v8.json`](agent-handoff-schema.v8.json) — frozen prior reference; no inferred structural comparison
 - [`agent-handoff-schema.v5.json`](agent-handoff-schema.v5.json) — frozen handoff v5 reference
 - [`verification-plan-schema.v1.json`](verification-plan-schema.v1.json) — content-addressed verification subject, inputs, engine requirement, and task plan
 - [`verification-unit-result-schema.v1.json`](verification-unit-result-schema.v1.json) — decision-free worker result contract
@@ -81,11 +108,13 @@ A single entry point for human readers and AI agents walking the `docs/` tree.
 - [`agent-handoff-schema.v3.json`](agent-handoff-schema.v3.json) — frozen handoff v3 reference
 - [`agent-handoff-schema.v2.json`](agent-handoff-schema.v2.json) — frozen handoff v2 reference
 - [`agent-result-schema.v3.json`](agent-result-schema.v3.json) — current shared local-check and MCP result schema
-- [`agent-boundary-result-schema.v2.json`](agent-boundary-result-schema.v2.json) — current host-neutral JSON Schema for `shipgate check --format agent-boundary-json`
+- [`agent-boundary-result-schema.v3.json`](agent-boundary-result-schema.v3.json) — current host-neutral JSON Schema for `shipgate check --format agent-boundary-json`
 - [`codex-boundary-result-schema.v2.json`](codex-boundary-result-schema.v2.json) — frozen deprecated compatibility projection for `--format codex-boundary-json`
 - [`codex-boundary-result-schema.v1.json`](codex-boundary-result-schema.v1.json) — frozen boundary v1 reference
 - [`agent-result-schema.v1.json`](agent-result-schema.v1.json) — legacy JSON Schema retained for existing local-agent protocol and MCP surfaces; not emitted by `agents-shipgate verify`
-- [`preflight-schema.v0.4.json`](preflight-schema.v0.4.json) — current proactive preflight control schema
+- [`preflight-schema.v0.6.json`](preflight-schema.v0.6.json) — current proactive preflight control schema; `planning_only`, and no permission on any route
+- [`preflight-schema.v0.5.json`](preflight-schema.v0.5.json) — frozen prior reference; an empty plan returned the shared `complete`
+- [`preflight-schema.v0.4.json`](preflight-schema.v0.4.json) — frozen reference; no inferred structural comparison
 - [`policy-pack-schema.v0.4.json`](policy-pack-schema.v0.4.json) — JSON Schema for local policy-pack YAML files (current; selectors are evaluated against typed predicate evidence)
 - [`policy-pack-schema.v0.3.json`](policy-pack-schema.v0.3.json) — frozen v0.3 policy-pack reference
 - [`policy-pack-schema.v0.2.json`](policy-pack-schema.v0.2.json) — frozen v0.2 policy-pack reference
@@ -96,14 +125,28 @@ A single entry point for human readers and AI agents walking the `docs/` tree.
 - [`org-evidence-bundle-schema.v2.json`](org-evidence-bundle-schema.v2.json) — JSON Schema for `agents-shipgate org bundle`; compact CI/ledger ingestion artifact over verifier/report/attestation/org/host-grant evidence, not a release verdict
 - [`registry-schema.v0.4.json`](registry-schema.v0.4.json) — JSON Schema for `agents-shipgate registry query --json`, `registry summary --json`, `registry verify --json`, and `registry report --bypass --json`
 - [`registry-schema.v0.3.json`](registry-schema.v0.3.json) — frozen v0.3 registry reference
-- [`host-grants-inventory-schema.v0.2.json`](host-grants-inventory-schema.v0.2.json) — current typed, redacted, scope-aware host inventory
-- [`host-grants-baseline-schema.v0.2.json`](host-grants-baseline-schema.v0.2.json) — current acknowledged host-grant baseline
-- [`host-grants-drift-schema.v0.2.json`](host-grants-drift-schema.v0.2.json) — current comparable/incomparable host-grant drift result
+- [`host-grants-inventory-schema.v0.7.json`](host-grants-inventory-schema.v0.7.json) — current typed, redacted, scope-aware host inventory; records the in-tree links a read followed, each workflow step's action reference, and each agent launch and checkout ref a workflow declares, plus hook handlers and MCP package/argument digests
+- [`host-grants-inventory-schema.v0.6.json`](host-grants-inventory-schema.v0.6.json) — frozen v0.6 reference
+- [`host-grants-inventory-schema.v0.5.json`](host-grants-inventory-schema.v0.5.json) — frozen v0.5 reference
+- [`host-grants-inventory-schema.v0.4.json`](host-grants-inventory-schema.v0.4.json) — frozen v0.4 reference
+- [`host-grants-inventory-schema.v0.2.json`](host-grants-inventory-schema.v0.2.json) — frozen prior reference; no inferred structural comparison
+- [`host-grants-baseline-schema.v0.7.json`](host-grants-baseline-schema.v0.7.json) — current acknowledged host-grant baseline
+- [`host-grants-baseline-schema.v0.6.json`](host-grants-baseline-schema.v0.6.json) — frozen v0.6 reference; compared by drift only when it holds no workflow grant
+- [`host-grants-baseline-schema.v0.5.json`](host-grants-baseline-schema.v0.5.json) — frozen v0.5 reference; compared by drift only when it holds no workflow grant
+- [`host-grants-baseline-schema.v0.4.json`](host-grants-baseline-schema.v0.4.json) — frozen v0.4 reference; compared by drift only when it holds no workflow grant
+- [`host-grants-baseline-schema.v0.2.json`](host-grants-baseline-schema.v0.2.json) — frozen prior reference; no inferred structural comparison
+- [`host-grants-drift-schema.v0.7.json`](host-grants-drift-schema.v0.7.json) — current comparable/incomparable host-grant drift result
+- [`host-grants-drift-schema.v0.6.json`](host-grants-drift-schema.v0.6.json) — frozen v0.6 reference
+- [`host-grants-drift-schema.v0.5.json`](host-grants-drift-schema.v0.5.json) — frozen v0.5 reference
+- [`host-grants-drift-schema.v0.4.json`](host-grants-drift-schema.v0.4.json) — frozen v0.4 reference
+- [`host-grants-drift-schema.v0.2.json`](host-grants-drift-schema.v0.2.json) — frozen prior reference; no inferred structural comparison
 - [`host-grants-inventory-schema.v0.1.json`](host-grants-inventory-schema.v0.1.json) — frozen legacy host inventory reference
 - [`attestation-schema.v0.3.json`](attestation-schema.v0.3.json) — frozen v0.3 attestation reference
 - [`attestation-schema.v0.2.json`](attestation-schema.v0.2.json) — frozen v0.2 attestation reference
 - [`attestation-schema.v0.1.json`](attestation-schema.v0.1.json) — frozen v0.1 attestation reference
 - [`registry-schema.v0.2.json`](registry-schema.v0.2.json) — frozen v0.2 registry reference
+- [`capability-payload-schema.v1.json`](capability-payload-schema.v1.json) — frozen JSON Schema for `shipgate.capability_payload/v1`; the shared payload of the exported delta and the committed state, non-gating
+- [`capability-delta-attestation-schema.v1.json`](capability-delta-attestation-schema.v1.json) — frozen JSON Schema for the in-toto statement `verify` writes as `capability-delta-attestation.json`, non-gating
 - [`capability-lock-schema.v0.8.json`](capability-lock-schema.v0.8.json) — current JSON Schema for `capabilities.lock.json`; carries typed semantic evidence and remains non-gating
 - [`capability-lock-schema.v0.7.json`](capability-lock-schema.v0.7.json) — frozen v0.7 reference
 - [`capability-lock-schema.v0.6.json`](capability-lock-schema.v0.6.json) — frozen v0.6 reference; a v0.6 lock still loads and is advanced on read
@@ -143,7 +186,8 @@ A single entry point for human readers and AI agents walking the `docs/` tree.
 - [`report-schema.v0.8.json`](report-schema.v0.8.json) — frozen v0.8 reference schema; pre-v0.9 reports validate against this
 - [`report-schema.v0.7.json`](report-schema.v0.7.json) — frozen v0.7 reference schema; pre-v0.8 reports validate against this
 - [`report-schema.v0.6.json`](report-schema.v0.6.json) — frozen v0.6 reference schema; pre-v0.7 reports validate against this
-- [`packet-schema.v0.17.json`](packet-schema.v0.17.json) — JSON Schema for the Release Evidence Packet (current; emitted packets project typed policy support, evidence gaps, semantic coverage, and the static-only verdict boundary in §1)
+- [`packet-schema.v0.18.json`](packet-schema.v0.18.json) — JSON Schema for the Release Evidence Packet (current; emitted packets add exhaustive base-vs-head declaration review while the PR comment remains attention-only)
+- [`packet-schema.v0.17.json`](packet-schema.v0.17.json) — frozen packet reference
 - [`packet-schema.v0.15.json`](packet-schema.v0.15.json) — frozen v0.15 reference; pre-v0.16 packets validate against this
 - [`packet-schema.v0.14.json`](packet-schema.v0.14.json) — frozen v0.14 declaration-questionnaire packet reference; pre-v0.15 packets validate against this
 - [`packet-schema.v0.11.json`](packet-schema.v0.11.json) — frozen v0.11 typed policy-evidence packet reference
@@ -161,9 +205,13 @@ A single entry point for human readers and AI agents walking the `docs/` tree.
 
 - [`examples.md`](examples.md) — narrative tour of sample agents and CI recipes
 - [`../examples/golden-prs/`](../examples/golden-prs/) — end-to-end advisory PR examples for humans and coding agents
+- [`incidents/`](incidents/) — three replayable public-incident shapes, an honest expected-fail, and the response-article template
 - [`manifest-v0.1.example.minimal.yaml`](manifest-v0.1.example.minimal.yaml) — smallest valid manifest
 - [`manifest-v0.1.example.full.yaml`](manifest-v0.1.example.full.yaml) — every section populated
 - [`examples/capability-fact.v0.2.example.json`](examples/capability-fact.v0.2.example.json) — capability-standard v0.2 fact with normalized semantic evidence
+- [`examples/capability-payload.v1.state.example.json`](examples/capability-payload.v1.state.example.json) — worked `view: state` capability payload, generated from `samples/ai_generated_refund_pr`
+- [`examples/capability-payload.v1.delta.example.json`](examples/capability-payload.v1.delta.example.json) — worked `view: delta` capability payload for the same sample's one-added-tool PR
+- [`examples/capability-delta-attestation.v1.example.json`](examples/capability-delta-attestation.v1.example.json) — the same delta wrapped as an in-toto statement; the file `tools/verify-capability-delta.py` is demonstrated against
 - [`examples/capability-lock.v0.5.example.json`](examples/capability-lock.v0.5.example.json) — current deterministic capability lock example
 - [`examples/capability-lock-diff.v0.6.example.json`](examples/capability-lock-diff.v0.6.example.json) — current semantic capability-lock diff example
 - [`../samples/`](../samples/) — runnable fixtures
@@ -171,13 +219,18 @@ A single entry point for human readers and AI agents walking the `docs/` tree.
 
 ## Workflows
 
-- [`quickstart.md`](quickstart.md) — verify-first AI-generated PR workflow
+- [`quickstart.md`](quickstart.md) — **the human entry path**: one review end to end on a committed sample — which build you get, what the change added, why the top result matters, what was not established, and who owns the next action; then the two adoption routes, advisory CI, and the second PR
 - [`faq.md`](faq.md) — common questions, AI-search-friendly
 - [`integrations.md`](integrations.md) — CI/CD integration recipes (GitHub Actions, GitLab CI, CircleCI, Jenkins snippet)
 - [`troubleshooting.md`](troubleshooting.md) — error messages → fixes
 - [`distribution.md`](distribution.md) — release process and SBOM/signature verification
 - [`release-runbook.md`](release-runbook.md) — cutting a tag: mandatory rehearsal, the two-job publication transaction, provenance bindings, and the recovery path when PyPI succeeds but finalization fails
-- [`release-evidence-policy-decision.md`](release-evidence-policy-decision.md) — the approved release evidence bar: the 56-case `pre_1_0` policy for `0.x` tags, the 100-case `beta` policy from 1.0 on, and the promotion path between them (decided 2026-08-29, #341)
+- [`release-evidence-policy-decision.md`](release-evidence-policy-decision.md) — the approved release evidence bar: the 38-case `pre_1_0` policy for `0.x` tags, the 80-case `beta` policy from 1.0 on, and the promotion path between them (decided 2026-08-29, #341; amended 2026-09-04, #520)
+- [`release-evidence-policy-decision.md`](release-evidence-policy-decision.md) § Amendment 2 — the unqualified preview channel: the admissibility finding, the five conditions it holds under, and what would have made it inadmissible (decided 2026-09-02, #491)
+- [`changelog/1.2.0.md`](changelog/1.2.0.md) — the full reviewed prose for every 1.2.0 change; `CHANGELOG.md` carries the one-line-per-change release note
+- [`changelog/1.1.0.md`](changelog/1.1.0.md) — the full reviewed prose for every 1.1.0 change; `CHANGELOG.md` carries the one-line-per-change release note
+- [`changelog/1.0.0.md`](changelog/1.0.0.md) — the full reviewed prose for every 1.0.0 change made after the `0.16.0` section was cut; `CHANGELOG.md` carries the one-line-per-change release note
+- [`changelog/0.16.0.md`](changelog/0.16.0.md) — the full reviewed prose for every 0.16.0 change; `CHANGELOG.md` carries the one-line-per-change release note
 - [`decisions.md`](decisions.md) — architectural decisions
 
 ## For agents
@@ -203,3 +256,5 @@ A single entry point for human readers and AI agents walking the `docs/` tree.
 - [`../llms.txt`](../llms.txt) — AI-readable project summary
 - [`ai-search-summary.md`](ai-search-summary.md) — prose companion to `llms.txt`
 - [`../.well-known/agents-shipgate.json`](../.well-known/agents-shipgate.json) — discovery metadata
+
+- [Instruction structure and review routing](engineering/instruction-structure-boundary.md) — supported profiles, edit-hook behavior and legacy evidence migration.

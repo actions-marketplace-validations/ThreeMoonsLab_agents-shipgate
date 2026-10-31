@@ -228,7 +228,12 @@ def _test_requirements() -> SafetyQualificationRequirementsV1:
         minimum_blocked_exact=1,
         minimum_review_exact=1,
         minimum_insufficient_evidence_exact=1,
-        required_report_schema_version="0.42",
+        # Read from the model rather than pinned: this fixture measures scoring,
+        # and a stale literal here fails every receipt on a schema comparison
+        # that has nothing to do with what the test is about.
+        required_report_schema_version=str(
+            ReadinessReport.model_fields["report_schema_version"].default
+        ),
     )
 
 
@@ -311,7 +316,18 @@ def _fixture(
     actual_overrides: dict[str, str] | None = None,
     disagreement_case: str | None = None,
     cases: list[SafetyCorpusCaseV1] | None = None,
+    evidence_gaps: dict[str, list[dict]] | None = None,
+    report_schema_version: str | None = None,
 ) -> tuple[Path, Path, Path, Path]:
+    """Build a qualification input set.
+
+    ``report_schema_version`` writes the receipts' reports at a version other
+    than the one this engine emits. That is what scoring a *historical*
+    artifact looks like, and it is the only way the retired ``pre_1_0`` policy
+    can be exercised at all: its pin deliberately stays at the ``0.43`` its
+    artifacts actually carry (#569), so a report from the current engine fails
+    its schema comparison, correctly.
+    """
     wheel = tmp_path / "agents_shipgate-0.16.0b7-py3-none-any.whl"
     _write_wheel(wheel)
     policy = tmp_path / "qualification-policy.json"
@@ -355,6 +371,11 @@ def _fixture(
         report_path = reports / "report.json"
         verifier_path = reports / "verifier.json"
         report = ReadinessReport(
+            **(
+                {"report_schema_version": report_schema_version}
+                if report_schema_version is not None
+                else {}
+            ),
             run_id=f"run-{case.id}",
             request_id=plan.request_id,
             subject_id=plan.subject.subject_id,
@@ -372,6 +393,7 @@ def _fixture(
                 "runtime_behavior_verified": False,
                 "static_verdict_disclaimer": STATIC_VERDICT_DISCLAIMER,
                 "evidence_coverage": {
+                    "evidence_gaps": (evidence_gaps or {}).get(case.id, []),
                     "level": "complete",
                     "human_review_recommended": actual != "passed",
                     "source_warning_count": 0,
@@ -401,7 +423,7 @@ def _fixture(
             report.model_dump(mode="json"),
         )
         control = (
-            derive_agent_control(reason="Static verification passed.")
+            derive_agent_control(reason="Static verification passed.", subject_evaluated=True)
             if actual == "passed"
             else derive_agent_control(
                 reason=f"Qualification decision is {actual}.",
@@ -541,16 +563,20 @@ def test_production_defaults_pin_the_exact_beta_contract() -> None:
         (item.profile, item.expected_decision): item.count for item in requirements.required_strata
     }
 
-    assert len(counts) == 28
-    assert sum(counts.values()) == 100
+    assert len(counts) == 21
+    assert sum(counts.values()) == 80
     assert sum(count for (_, decision), count in counts.items() if decision == "passed") == 30
-    assert sum(count for (_, decision), count in counts.items() if decision != "passed") == 70
+    assert sum(count for (_, decision), count in counts.items() if decision != "passed") == 50
+    # No cell targets `insufficient_evidence` in either tier (#520), so the
+    # seven cells that did are gone and the corpus is 80, not 100. Every
+    # surviving cell keeps the count it was approved with.
+    assert not [decision for _, decision in counts if decision == "insufficient_evidence"]
     assert requirements.minimum_safe_passes == 27
     assert requirements.minimum_blocked_exact == 30
     assert requirements.minimum_review_exact == 19
-    assert requirements.minimum_insufficient_evidence_exact == 19
+    assert requirements.minimum_insufficient_evidence_exact == 0
     assert requirements.maximum_unsafe_auto_passes == 0
-    assert requirements.minimum_qualified_origins == 40
+    assert requirements.minimum_qualified_origins == 32
     assert requirements.minimum_kappa == 0.80
 
 
@@ -566,17 +592,27 @@ def test_pre_release_defaults_pin_the_exact_pre_1_0_contract() -> None:
         (item.profile, item.expected_decision): item.count for item in requirements.required_strata
     }
 
-    assert len(counts) == 28
-    assert set(counts.values()) == {2}
-    assert sum(counts.values()) == 56
+    assert len(counts) == 21
+    assert sum(counts.values()) == 38
     assert sum(count for (_, decision), count in counts.items() if decision == "passed") == 14
-    assert sum(count for (_, decision), count in counts.items() if decision != "passed") == 42
+    assert sum(count for (_, decision), count in counts.items() if decision != "passed") == 24
+    # Two per cell, except the four `blocked` cells where the material does not
+    # exist. Pinned by name so shrinking any *other* cell is a visible edit.
+    assert {
+        cell for cell, count in counts.items() if count == 1
+    } == {
+        ("openai_agents_sdk", "blocked"),
+        ("langchain_crewai", "blocked"),
+        ("google_adk", "blocked"),
+        ("coding_agent_trust_roots", "blocked"),
+    }
+    assert set(counts.values()) == {1, 2}
     assert requirements.minimum_safe_passes == 13
-    assert requirements.minimum_blocked_exact == 14
+    assert requirements.minimum_blocked_exact == 10
     assert requirements.minimum_review_exact == 14
-    assert requirements.minimum_insufficient_evidence_exact == 14
+    assert requirements.minimum_insufficient_evidence_exact == 0
     assert requirements.maximum_unsafe_auto_passes == 0
-    assert requirements.minimum_qualified_origins == 23
+    assert requirements.minimum_qualified_origins == 16
     assert requirements.minimum_kappa == 0.80
 
 
@@ -600,10 +636,24 @@ def test_the_pre_1_0_policy_covers_every_production_stratum() -> None:
     # Two per cell is what leaves *room* for a tuning case beside the required
     # holdout one. It is room, not a requirement: see
     # ``test_a_corpus_with_more_holdout_than_required_is_accepted``.
-    assert all(
-        item.count - math.ceil(item.count * pre_1_0.minimum_holdout_fraction_per_stratum) >= 1
-        for item in pre_1_0.required_strata
+    #
+    # A cell of one has no such room: its single case is the holdout, and the
+    # cell contributes no tuning observation at all. That is the price of the
+    # `blocked` scarcity `pre_release_safety_requirements` documents, and it
+    # is priced here rather than hidden — the room invariant is asserted for
+    # every cell that has more than one case, and a cell of one is asserted to
+    # be holdout-only so that a *silent* drop to one somewhere else still
+    # fails this test.
+    def tuning_room(item: SafetyStratumRequirementV1) -> int:
+        holdout = math.ceil(item.count * pre_1_0.minimum_holdout_fraction_per_stratum)
+        return item.count - holdout
+
+    scarce = [item for item in pre_1_0.required_strata if item.count == 1]
+    assert {item.expected_decision for item in scarce} <= {"blocked"}, (
+        "only the documented `blocked` scarcity may reduce a cell to one case"
     )
+    assert all(tuning_room(item) >= 1 for item in pre_1_0.required_strata if item.count > 1)
+    assert all(tuning_room(item) == 0 for item in scarce)
 
 
 def test_the_pre_1_0_policy_is_never_laxer_than_production_per_rate() -> None:
@@ -636,6 +686,16 @@ def test_the_pre_1_0_policy_is_never_laxer_than_production_per_rate() -> None:
         "insufficient_evidence": "minimum_insufficient_evidence_exact",
     }
     for decision, attribute in floors.items():
+        if production_totals[decision] == 0:
+            # A decision no case is targeted at governs an empty population,
+            # so it has no rate to compare. `insufficient_evidence` is that
+            # decision in both tiers (#520). The demand is then that neither
+            # tier invents a floor over nothing: a positive floor here could
+            # never be met, and would reject every conforming corpus.
+            assert pre_1_0_totals[decision] == 0, attribute
+            assert getattr(production, attribute) == 0, attribute
+            assert getattr(pre_1_0, attribute) == 0, attribute
+            continue
         production_rate = getattr(production, attribute) / production_totals[decision]
         pre_1_0_rate = getattr(pre_1_0, attribute) / pre_1_0_totals[decision]
         assert pre_1_0_rate >= production_rate, attribute
@@ -650,9 +710,17 @@ def test_the_pre_1_0_policy_is_never_laxer_than_production_per_rate() -> None:
         == production.minimum_holdout_fraction_per_stratum
     )
     assert pre_1_0.minimum_kappa == production.minimum_kappa
-    assert (
-        pre_1_0.required_report_schema_version == production.required_report_schema_version
+    # The schema pins deliberately stopped being equal at the 1.0 freeze
+    # (#569). Production follows the engine; the retired `pre_1_0` tier keeps
+    # the pin its artifacts actually carry, because `tier_for_requirements`
+    # names a policy by byte-equality and re-pinning it would rename every
+    # existing artifact to the unnamed `test` tier. A schema pin is not a
+    # strictness bar, so this is not a relaxation -- the rate comparison below
+    # is what holds strictness.
+    assert production.required_report_schema_version == str(
+        ReadinessReport.model_fields["report_schema_version"].default
     )
+    assert pre_1_0.required_report_schema_version == "0.43"
     # The origin floor is the same share of the corpus, rounded up.
     production_total = sum(item.count for item in production.required_strata)
     pre_1_0_total = sum(item.count for item in pre_1_0.required_strata)
@@ -664,18 +732,21 @@ def test_the_governing_policy_is_derived_from_the_wheel_version() -> None:
     """#341 approved a policy keyed to the version range, so applying it is
     implementing the decision -- not inferring one from the tag."""
 
-    assert select_release_requirements("0.16.0b7") == pre_release_safety_requirements()
-    assert select_release_requirements("0.16.0") == pre_release_safety_requirements()
-    assert select_release_requirements("1.0.0") == production_safety_requirements()
-    assert select_release_requirements("1.0.0rc1") == production_safety_requirements()
-    # Unparsable versions fall to the strictest policy, never the cheapest.
-    assert select_release_requirements("not-a-version") == production_safety_requirements()
+    # Issuance of the `pre_1_0` tier is retired with the report 1.0 freeze
+    # (#569), so every version now selects the production policy -- including
+    # the `0.x` versions #341's rule used to route to the cheaper one.
+    for version in ("0.16.0b7", "0.16.0", "1.0.0", "1.0.0rc1", "not-a-version"):
+        assert select_release_requirements(version) == production_safety_requirements()
 
-    # Opting *up* is always available; opting down past 1.0 is refused where
-    # the artifact would be produced, not only where it would be gated.
+    # Naming the only remaining policy explicitly is not an error.
     assert select_release_requirements("0.16.0b7", "production") == production_safety_requirements()
-    with pytest.raises(ConfigError, match="does not govern 1.0.0"):
-        select_release_requirements("1.0.0", "pre-1.0")
+    # The retired tier is refused *by name* rather than dropped from the choice
+    # list, so an operator running a pre-freeze runbook line gets the reason
+    # instead of "invalid choice". It is refused for a 0.x wheel too: the point
+    # is that no wheel gets one, not that 1.0 stopped admitting it.
+    for version in ("1.0.0", "0.16.0b7"):
+        with pytest.raises(ConfigError, match="retired and no longer issued"):
+            select_release_requirements(version, "pre-1.0")
     with pytest.raises(ConfigError, match="Unknown qualification policy tier"):
         select_release_requirements("0.16.0b7", "whatever")
 
@@ -739,46 +810,70 @@ def test_an_ad_hoc_threshold_set_can_never_name_itself_a_release_tier() -> None:
     assert tier_for_requirements(weakened) == "test"
 
 
-def test_a_conforming_56_case_corpus_qualifies_a_0_x_wheel(tmp_path: Path) -> None:
-    """End-to-end: the approved pre-1.0 bar is satisfiable, and honest about it.
+def test_the_retired_pre_1_0_policy_still_scores_its_own_historical_artifacts(
+    tmp_path: Path,
+) -> None:
+    """Retirement is about issuance; readability and diagnostics survive it.
 
-    This is the only test in which the runner produces a *passing* named-policy
-    artifact, so it is the only place that can catch the runner claiming
-    ``production_qualified`` for a tier that did not meet the 100-case bar.
+    The approved pre-1.0 bar is still satisfiable by the corpus it was written
+    for, still names itself ``pre_1_0``, and is still emphatically *not*
+    production-qualified. What changed at the 1.0 freeze (#569) is that the
+    runner will not *produce* one -- so this scores explicitly, at the report
+    schema that policy pins, which is what a historical re-score is.
     """
 
     requirements = pre_release_safety_requirements()
-    paths = _fixture(tmp_path, cases=_conforming_cases(requirements))
-    wheel, corpus, receipts, policy = paths
-    output = tmp_path / "safety-qualification.json"
-
-    exit_code = main(
-        [
-            "--wheel", str(wheel),
-            "--corpus", str(corpus),
-            "--receipts", str(receipts),
-            "--policy", str(policy),
-            "--out", str(output),
-        ]
+    wheel, corpus, receipts, policy = _fixture(
+        tmp_path,
+        cases=_conforming_cases(requirements),
+        report_schema_version=requirements.required_report_schema_version,
     )
-    payload = json.loads(output.read_text(encoding="utf-8"))
+
+    result = run_safety_qualification(
+        wheel_path=wheel,
+        corpus_path=corpus,
+        receipt_index_path=receipts,
+        policy_paths=[policy],
+        requirements=requirements,
+    )
+    payload = json.loads(render_safety_qualification_json(result))
 
     assert payload["failures"] == []
-    assert exit_code == 0
+    assert qualification_exit_code(result) == 0
     assert payload["qualification_tier"] == "pre_1_0"
     assert payload["qualified"] is True
     # The whole point of keeping the flag's meaning: a passing pre-1.0 run is
     # emphatically *not* production-qualified.
     assert payload["production_qualified"] is False
-    assert payload["summary"]["total_cases"] == 56
-    assert payload["summary"]["receipt_count"] == 56
+    assert payload["summary"]["total_cases"] == 38
+    assert payload["summary"]["receipt_count"] == 38
     assert payload["summary"]["unsafe_auto_pass_count"] == 0
-    assert payload["summary"]["qualified_origin_cases"] >= 23
-    assert len(payload["strata"]) == 28
+    assert payload["summary"]["qualified_origin_cases"] >= 16
+    assert len(payload["strata"]) == 21
+    # No stratum targets `insufficient_evidence` (#520), so a conforming corpus
+    # carries no case expecting it -- the value survives only as something the
+    # verifier may *emit*, which is a miss against whatever the case expected.
+    assert not [row for row in payload["strata"] if row["expected_decision"] == "insufficient_evidence"]
     assert all(row["holdout_count"] >= row["minimum_holdout_count"] for row in payload["strata"])
 
-    # ...and the same corpus is nowhere near the production bar it does not claim.
-    production_output = tmp_path / "production.json"
+
+def test_the_runner_will_not_issue_a_pre_1_0_artifact_for_any_wheel(
+    tmp_path: Path,
+) -> None:
+    """The retirement, at the only boundary ``main`` can reach.
+
+    A 38-case corpus used to qualify a ``0.x`` wheel through the CLI with no
+    flag at all. After the freeze the same invocation is scored against the
+    80-case production policy and fails on the bar it does not meet -- which is
+    the honest outcome, not an error message about a flag.
+    """
+
+    requirements = pre_release_safety_requirements()
+    wheel, corpus, receipts, policy = _fixture(
+        tmp_path, cases=_conforming_cases(requirements)
+    )
+    output = tmp_path / "safety-qualification.json"
+
     assert (
         main(
             [
@@ -786,16 +881,30 @@ def test_a_conforming_56_case_corpus_qualifies_a_0_x_wheel(tmp_path: Path) -> No
                 "--corpus", str(corpus),
                 "--receipts", str(receipts),
                 "--policy", str(policy),
-                "--out", str(production_output),
-                "--policy-tier", "production",
+                "--out", str(output),
             ]
         )
         == 1
     )
-    production = json.loads(production_output.read_text(encoding="utf-8"))
-    assert production["qualification_tier"] == "beta"
-    assert production["production_qualified"] is False
-    assert production["failures"]
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["qualification_tier"] == "beta"
+    assert payload["production_qualified"] is False
+    assert payload["failures"]
+
+    # And asking for the retired tier by name is refused with the reason.
+    assert (
+        main(
+            [
+                "--wheel", str(wheel),
+                "--corpus", str(corpus),
+                "--receipts", str(receipts),
+                "--policy", str(policy),
+                "--out", str(tmp_path / "retired.json"),
+                "--policy-tier", "pre-1.0",
+            ]
+        )
+        == 2
+    )
 
 
 def test_a_corpus_with_more_holdout_than_required_is_accepted(tmp_path: Path) -> None:
@@ -813,18 +922,31 @@ def test_a_corpus_with_more_holdout_than_required_is_accepted(tmp_path: Path) ->
         case.model_copy(update={"split": "holdout"})
         for case in _conforming_cases(requirements)
     ]
-    wheel, corpus, receipts, policy = _fixture(tmp_path, cases=every_case_held_out)
+    wheel, corpus, receipts, policy = _fixture(
+        tmp_path,
+        cases=every_case_held_out,
+        report_schema_version=requirements.required_report_schema_version,
+    )
     result = run_safety_qualification(
         wheel_path=wheel,
         corpus_path=corpus,
         receipt_index_path=receipts,
         policy_paths=[policy],
+        requirements=requirements,
     )
 
     assert result.failures == []
     assert qualification_exit_code(result) == 0
     assert result.qualification_tier == "pre_1_0"
-    assert all(row.tuning_count == 0 and row.holdout_count == 2 for row in result.strata)
+    expected_sizes = {
+        (item.profile, item.expected_decision): item.count
+        for item in requirements.required_strata
+    }
+    assert all(
+        row.tuning_count == 0
+        and row.holdout_count == expected_sizes[(row.profile, row.expected_decision)]
+        for row in result.strata
+    )
 
 
 def test_the_production_flag_cannot_disagree_with_the_tier(tmp_path: Path) -> None:
@@ -875,7 +997,10 @@ def test_the_qualification_envelope_advanced_for_the_new_grammar(tmp_path: Path)
     """
 
     payload = _run(_fixture(tmp_path)).model_dump(mode="json")
-    assert payload["schema_version"] == "shipgate.safety_qualification/v5"
+    assert payload["schema_version"] == "shipgate.safety_qualification/v6"
+    payload.pop("coverage_misses")
+    for metric in payload["intervals"]:
+        metric.pop("applicability")
 
     legacy = (
         "shipgate.safety_qualification/v1",
@@ -905,7 +1030,7 @@ def test_the_qualification_envelope_advanced_for_the_new_grammar(tmp_path: Path)
 
     for rejected in (
         "shipgate.safety_qualification/v3",
-        "shipgate.safety_qualification/v6",
+        "shipgate.safety_qualification/v7",
         "shipgate.safety_qualification",
     ):
         with pytest.raises(ValidationError):
@@ -1070,10 +1195,10 @@ def test_cli_uses_an_unrelaxed_named_policy_and_emits_failed_artifact(
 ) -> None:
     """The CLI never scores the corpus it was handed on the corpus's own terms.
 
-    The four-case fixture satisfies no named policy, so both the version-derived
-    default and an explicit opt-up to production must reject it. ``0.16.0b7`` is
-    a ``0.x`` wheel, so the default is the pre-1.0 policy approved in #341 --
-    smaller, and still nothing this fixture can meet.
+    The four-case fixture satisfies no named policy, so both the default and an
+    explicit ``production`` must reject it. Since the 1.0 freeze (#569) those
+    are the same policy: ``pre_1_0`` issuance is retired, so a ``0.x`` wheel no
+    longer routes to the smaller bar, and asking for it by name is refused.
     """
 
     wheel, corpus, receipts, policy = _fixture(tmp_path)
@@ -1102,9 +1227,8 @@ def test_cli_uses_an_unrelaxed_named_policy_and_emits_failed_artifact(
         assert payload["failures"]
         return payload
 
-    assert _run_cli()["qualification_tier"] == "pre_1_0"
+    assert _run_cli()["qualification_tier"] == "beta"
     assert _run_cli("--policy-tier", "production")["qualification_tier"] == "beta"
-    assert _run_cli("--policy-tier", "pre-1.0")["qualification_tier"] == "pre_1_0"
 
 
 def test_human_adjudicated_non_safe_pass_fails_closed(tmp_path: Path) -> None:
@@ -1229,3 +1353,185 @@ def test_fallback_receipt_declaration_is_schema_invalid(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="Invalid safety receipt index"):
         load_receipt_index(receipts)
+
+
+@pytest.mark.parametrize(
+    'target_name',
+    ['wheel', 'corpus', 'index', 'policy', 'receipt', 'report.json', 'verifier.json', 'verify-run.json'],
+)
+def test_scoring_uses_the_captured_input_after_path_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target_name: str,
+) -> None:
+    from scripts import run_safety_qualification as runner
+
+    paths = _fixture(tmp_path)
+    expected = _run(paths)
+    targets = dict(zip(('wheel', 'corpus', 'index', 'policy'), paths, strict=True))
+    targets['receipt'] = tmp_path / 'receipts/case-passed.json'
+    for name in ('report.json', 'verifier.json', 'verify-run.json'):
+        targets[name] = tmp_path / 'artifacts/case-passed/agents-shipgate-reports' / name
+    target = targets[target_name]
+    real_read = runner.read_regular_file_beneath
+    reads = 0
+
+    def replace_after_read(root: Path, logical_path: str, **kwargs: object) -> bytes:
+        nonlocal reads
+        data = real_read(root, logical_path, **kwargs)
+        if root / logical_path == target:
+            reads += 1
+            replacement = target.with_suffix('.replacement')
+            replacement.write_bytes(b'{"unbound": "replacement bytes"}')
+            replacement.replace(target)
+        return data
+
+    monkeypatch.setattr(runner, 'read_regular_file_beneath', replace_after_read)
+    actual = _run(paths)
+
+    assert reads == 1
+    assert actual.qualified is True
+    assert actual == expected
+    assert target.read_bytes() == b'{"unbound": "replacement bytes"}'
+
+
+@pytest.mark.parametrize('target_name', ['receipt', 'report.json', 'verifier.json', 'verify-run.json'])
+def test_scorer_does_not_reopen_after_accepting_a_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target_name: str,
+) -> None:
+    """Reproduce the old hash-then-parse interleaving with real bindings."""
+    from scripts import run_safety_qualification as runner
+
+    paths = _fixture(tmp_path)
+    target = (
+        tmp_path / 'receipts/case-passed.json' if target_name == 'receipt'
+        else tmp_path / 'artifacts/case-passed/agents-shipgate-reports' / target_name
+    )
+    real_hash = runner.sha256_file
+
+    def replace_after_hash(path: Path) -> str:
+        digest = real_hash(path)
+        if path == target:
+            path.write_bytes(b'{"unbound": "different parsed bytes"}')
+        return digest
+
+    monkeypatch.setattr(runner, 'sha256_file', replace_after_hash)
+    result = _run(paths)
+    assert result.qualified is True
+    assert result.summary.runtime_failure_count == 0
+
+
+@pytest.mark.parametrize('target_offset', [1, 2])
+def test_scorer_does_not_reopen_parsed_corpus_or_index_for_its_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target_offset: int,
+) -> None:
+    paths = _fixture(tmp_path)
+    expected = _run(paths)
+    real_read = Path.read_text
+
+    def replace_after_parse_input(path: Path, *args: object, **kwargs: object) -> str:
+        data = real_read(path, *args, **kwargs)
+        if path == paths[target_offset]:
+            path.write_bytes(b'{"unbound": "later digest bytes"}')
+        return data
+
+    monkeypatch.setattr(Path, 'read_text', replace_after_parse_input)
+    assert _run(paths) == expected
+
+
+@pytest.mark.parametrize('target_name', ['receipt', 'report.json', 'verifier.json', 'verify-run.json'])
+@pytest.mark.parametrize('damage', ['missing', 'corrupt', 'symlink'])
+def test_unreadable_or_unbound_archive_inputs_never_fallback_to_scoring(
+    tmp_path: Path, target_name: str, damage: str,
+) -> None:
+    paths = _fixture(tmp_path)
+    target = (
+        tmp_path / 'receipts/case-passed.json' if target_name == 'receipt'
+        else tmp_path / 'artifacts/case-passed/agents-shipgate-reports' / target_name
+    )
+    data = target.read_bytes()
+    target.unlink()
+    if damage == 'corrupt':
+        target.write_bytes(b'{}')
+    elif damage == 'symlink':
+        replacement = tmp_path / 'same-bytes.json'
+        replacement.write_bytes(data)
+        target.symlink_to(replacement)
+
+    result = _run(paths)
+    case = next(case for case in result.cases if case.id == 'case-passed')
+    assert result.qualified is False
+    assert case.runtime_failure is True
+    assert case.actual_decision is None
+    assert any(f.code == 'invalid_verifier_receipt' for f in result.failures)
+
+
+def test_archive_root_symlink_is_not_resolved_away(tmp_path: Path) -> None:
+    paths = _fixture(tmp_path)
+    root = tmp_path / 'artifacts/case-passed/agents-shipgate-reports'
+    moved = root.with_name('moved')
+    root.rename(moved)
+    root.symlink_to(moved, target_is_directory=True)
+
+    result = _run(paths)
+    assert result.qualified is False
+    assert result.summary.runtime_failure_count == 1
+
+
+def test_bound_artifact_size_must_match_the_captured_bytes(tmp_path: Path) -> None:
+    paths = _fixture(tmp_path)
+    receipt_path = tmp_path / 'receipts/case-passed.json'
+    receipt = json.loads(receipt_path.read_text())
+    receipt['artifact_manifest']['artifacts']['report_json']['size_bytes'] += 1
+    # Rebind the intentionally inconsistent size claim so this reaches the
+    # consumer's size check instead of being rejected by an outer digest.
+    manifest = receipt['artifact_manifest']
+    manifest['artifact_set_id'] = content_id({
+        key: value for key, value in manifest.items()
+        if key not in {'schema_version', 'artifact_set_id'}
+    })
+    receipt['artifact_set_id'] = manifest['artifact_set_id']
+    receipt['receipt_id'] = content_id({
+        key: value for key, value in receipt.items()
+        if key not in {'schema_version', 'receipt_id', 'attempt_id'}
+    })
+    _write_json(receipt_path, receipt)
+    index = json.loads(paths[2].read_text())
+    row = next(row for row in index['receipts'] if row['case_id'] == 'case-passed')
+    row.update(
+        receipt_sha256=sha256_file(receipt_path), receipt_id=receipt['receipt_id'],
+        artifact_set_id=receipt['artifact_set_id'],
+    )
+    _write_json(paths[2], index)
+
+    result = _run(paths)
+    assert result.qualified is False
+    assert any('size mismatch' in f.message for f in result.failures)
+
+
+@pytest.mark.parametrize('kind', ['receipt', 'artifact', 'wheel', 'metadata', 'corpus', 'index', 'policy'])
+def test_qualification_input_limits_refuse_before_scoring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str,
+) -> None:
+    from scripts import run_safety_qualification as runner
+
+    paths = _fixture(tmp_path)
+    if kind in {'receipt', 'artifact'}:
+        target = (
+            tmp_path / 'receipts/case-passed.json' if kind == 'receipt'
+            else tmp_path / 'artifacts/case-passed/agents-shipgate-reports/report.json'
+        )
+        limit = runner.MAX_RECEIPT_BYTES if kind == 'receipt' else runner.MAX_INPUT_BYTES
+        with target.open('wb') as handle:
+            handle.truncate(limit + 1)
+        result = _run(paths)
+        assert result.summary.runtime_failure_count == 1
+        assert any('size limit' in f.message for f in result.failures)
+    elif kind in {'wheel', 'metadata'}:
+        monkeypatch.setattr(runner, 'MAX_WHEEL_BYTES' if kind == 'wheel' else 'MAX_WHEEL_METADATA_BYTES', 1)
+        with pytest.raises(ConfigError, match='size limit'):
+            _run(paths)
+    else:
+        target = paths[{'corpus': 1, 'index': 2, 'policy': 3}[kind]]
+        with target.open('wb') as handle:
+            handle.truncate(runner.MAX_INPUT_BYTES + 1)
+        with pytest.raises(ConfigError, match='size limit'):
+            _run(paths)

@@ -12,6 +12,8 @@ import typer
 
 from agents_shipgate.checks.verify import TRUST_ROOT_SURFACES
 from agents_shipgate.cli.workspace_guard import require_workspace
+from agents_shipgate.core.boundary_registry import BOUNDARY_ADAPTERS
+from agents_shipgate.core.capability_diff_rows import DIRECTION_UNKNOWN
 from agents_shipgate.core.errors import ConfigError
 from agents_shipgate.core.trust_roots import inspect_lexical_path_identity
 
@@ -448,6 +450,30 @@ def _write_text_atomic(path: Path, content: str) -> None:
             temp_path.unlink(missing_ok=True)
 
 
+def host_config_change_patterns() -> list[str]:
+    """Paths the Stop hook compares with `shipgate diff` when no manifest exists (#661).
+
+    Host configuration files and GitHub workflows: what the capability diff
+    reads as host grants. Instruction files, skills, commands, Cursor rules and
+    policies keep their existing route, by the owner decision on #661. Rendered
+    from the boundary registry, so the hook and the reader cannot name a
+    different surface.
+    """
+
+    patterns: set[str] = set()
+    for adapter in BOUNDARY_ADAPTERS:
+        for pattern in (*adapter.exact_paths, *adapter.globs):
+            folded = pattern.casefold()
+            if adapter.id == "shared":
+                if "/.github/workflows/" in f"/{folded}":
+                    patterns.add(pattern)
+            elif folded.endswith((".json", ".toml")) and not folded.startswith(
+                (".claude/commands/", ".cursor/rules/")
+            ):
+                patterns.add(pattern)
+    return sorted(patterns)
+
+
 def _hook_script_text() -> str:
     # The protected-surface list is rendered at install time from the
     # same TRUST_ROOT_SURFACES the verify check classifies against, so
@@ -456,7 +482,12 @@ def _hook_script_text() -> str:
         [[kind, pattern] for kind, pattern in TRUST_ROOT_SURFACES],
         indent=4,
     )
-    return _HOOK_SCRIPT_TEMPLATE.replace("__PROTECTED_SURFACES_JSON__", surfaces)
+    host_config = json.dumps(host_config_change_patterns(), indent=4)
+    return (
+        _HOOK_SCRIPT_TEMPLATE.replace("__PROTECTED_SURFACES_JSON__", surfaces)
+        .replace("__HOST_CONFIG_SURFACES_JSON__", host_config)
+        .replace("__DIRECTION_UNKNOWN_JSON__", json.dumps(DIRECTION_UNKNOWN))
+    )
 
 
 _HOOK_SCRIPT_TEMPLATE = r'''#!/usr/bin/env python3
@@ -469,6 +500,7 @@ It is local-only, deterministic, and advisory. CI remains authoritative.
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import json
 import os
@@ -525,6 +557,15 @@ _UNPROMPTED_PERMISSION_MODES = frozenset({"bypasspermissions", "dontask"})
 # TRUST_ROOT_SURFACES — the same classification the PR-time verifier
 # uses. Each entry is [trust_root_class, glob_pattern].
 PROTECTED_SURFACES = __PROTECTED_SURFACES_JSON__
+
+# Rendered at install time from agents_shipgate.core.boundary_registry: the
+# host-configuration files and workflows `shipgate diff` compares (#661).
+HOST_CONFIG_SURFACES = __HOST_CONFIG_SURFACES_JSON__
+
+# Rendered at install time from agents_shipgate.core.capability_diff_rows: the
+# words a `diff` row's `why` ends with when the engine cannot establish which
+# way an edit that may widen authority went (#820).
+DIRECTION_UNKNOWN = __DIRECTION_UNKNOWN_JSON__
 
 
 def main() -> int:
@@ -586,7 +627,16 @@ def _pretooluse(
         # against the memory: an out-of-workspace absolute path degrades to its
         # basename, and `/elsewhere/shipgate.yaml` must not authorize the
         # repository's own manifest.
-        if path in already_approved and path in contained:
+        conditional = _conditional_instruction_surface(hit)
+        # A silently accepted prose edit is not a human approval. Conditional
+        # paths must neither consume nor seed the path-based approval memory.
+        if (
+            decision == "ask" and conditional and alias_kind is None
+            and path in contained
+            and _unchanged_instruction_preview(payload, root, args, path)
+        ):
+            continue
+        if not conditional and path in already_approved and path in contained:
             continue
         matched.append((path, hit[0], hit[1]))
     if not matched:
@@ -597,8 +647,8 @@ def _pretooluse(
     )
     reason = (
         "Agents Shipgate protects this surface: "
-        f"{preview}. Changes here alter what agents are allowed to do and "
-        "route to human review at PR time (suppression-immune "
+        f"{preview}. This edit has not been proven to preserve parsed authority "
+        "structure; it requires review (suppression-immune "
         "SHIP-VERIFY-* checks). If the change is intended, have the human "
         "approve this edit; never weaken the manifest, policies, CI gate, "
         "or agent instructions just to make a verifier verdict pass."
@@ -617,6 +667,136 @@ def _pretooluse(
     return 0
 
 
+def _conditional_instruction_surface(hit: tuple[str, str]) -> bool:
+    return hit[0] == "agent_instructions" or hit[1] == "**/SKILL.md"
+
+
+def _unchanged_instruction_preview(
+    payload: dict[str, Any], root: Path, args: argparse.Namespace, path: str,
+) -> bool:
+    """Ask the shared static parser about one exact Edit/Write, never run it.
+
+    Missing preview fields, unsupported edits, old CLIs, timeouts, ambiguous
+    identity and malformed answers retain the prompt. This is a pre-edit
+    routing hint: the completed edit must still pass the verifier.
+    """
+    node = payload.get("tool_input")
+    tool = payload.get("tool_name")
+    if (
+        not isinstance(node, dict) or tool not in {"Write", "Edit"}
+        or set(node) - {"file_path", "content", "old_string", "new_string", "replace_all"}
+        or not isinstance(node.get("file_path"), str)
+        or _changed_paths(payload, root) != [path]
+        or _contained_repo_paths({"tool_input": {"file_path": node["file_path"]}}, root) != frozenset({path})
+        or _unsafe_alias_kind(root, path) is not None
+    ):
+        return False
+    raw, metadata = _read_untracked_file(root, path)
+    new_file = raw is None and not (root / path).exists()
+    if new_file:
+        if tool != "Write":
+            return False
+        before = ""
+    elif raw is None or metadata is None or metadata.st_size > UNTRACKED_DIFF_CONTENT_LIMIT_BYTES:
+        return False
+    else:
+        try:
+            before = raw.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return False
+    if tool == "Write":
+        if set(node) != {"file_path", "content"} or not isinstance(node["content"], str):
+            return False
+        after = node["content"]
+    else:
+        if set(node) - {"file_path", "old_string", "new_string", "replace_all"}:
+            return False
+        old, new = node.get("old_string"), node.get("new_string")
+        replace_all = node.get("replace_all", False)
+        if (
+            not isinstance(old, str) or not old or not isinstance(new, str)
+            or type(replace_all) is not bool or not before.count(old)
+            or (not replace_all and before.count(old) != 1)
+        ):
+            return False
+        after = before.replace(old, new, -1 if replace_all else 1)
+    # LF-terminated complete text has one exact unified-diff representation.
+    # Other encodings/newline transports keep the prompt rather than normalize
+    # a different proposed edit. The parser itself supports more formats.
+    if any(
+        "\r" in text or "\0" in text or (text and not text.endswith("\n"))
+        or len(text.encode("utf-8")) > UNTRACKED_DIFF_CONTENT_LIMIT_BYTES
+        for text in (before, after)
+    ) or before == after:
+        return False
+    old_path, new_path = json.dumps("a/" + path, ensure_ascii=False), json.dumps("b/" + path, ensure_ascii=False)
+    diff = f"diff --git {old_path} {new_path}\n"
+    if new_file:
+        diff += "new file mode 100644\n"
+    diff += "".join(difflib.unified_diff(
+        before.splitlines(keepends=True), after.splitlines(keepends=True),
+        fromfile="/dev/null" if new_file else old_path, tofile=new_path,
+        n=max(len(before.splitlines()), len(after.splitlines())) + 1,
+    ))
+    plan = {"changed_files": [path], "diff_text": diff}
+    command = [*_cli(), "preflight", "--workspace", str(root), "--config", args.config,
+               "--plan", "-", "--json"]
+    try:
+        # Avoid unbounded in-memory capture. Preflight has its own bounded
+        # static readers; an oversized response is still not a positive proof.
+        with tempfile.TemporaryFile() as output:
+            result = subprocess.run(
+                command, cwd=root, input=json.dumps(plan).encode("utf-8"),
+                stdout=output, stderr=subprocess.DEVNULL, timeout=6, check=False,
+            )
+            if result.returncode != 0 or output.tell() > 2 * 1024 * 1024:
+                return False
+            output.seek(0)
+            answer = json.load(output)
+    except (OSError, subprocess.TimeoutExpired, ValueError, UnicodeError):
+        return False
+    # 0.5 and 0.6 route this proof identically; a hook installed now keeps
+    # working against either CLI. Anything else is not a proof (#610). Tuples,
+    # not sets: membership then compares rather than hashes, so a malformed
+    # answer (a list where a string belongs) is refused, never a crash that
+    # lets the edit through unprompted.
+    if not isinstance(answer, dict) or answer.get("preflight_schema_version") not in ("0.5", "0.6"):
+        return False
+    control = answer.get("control")
+    human = control.get("human_review") if isinstance(control, dict) else None
+    action = control.get("next_action") if isinstance(control, dict) else None
+    permissions = control.get("permissions") if isinstance(control, dict) else None
+    touches = answer.get("protected_surface_touches")
+    if (
+        not isinstance(control, dict) or control.get("state") != "agent_action_required"
+        or control.get("must_stop") is not False
+        or not isinstance(human, dict) or human.get("required") is not False
+        or not isinstance(action, dict) or action.get("kind") != "verify"
+        or not isinstance(permissions, dict)
+        or set(permissions) != {"edit", "commit", "push", "update_pr", "merge", "report_complete"}
+        or any(value is not False for value in permissions.values())
+        or answer.get("workspace") != str(root.resolve())
+        or answer.get("requires_human_review") is not False
+        or answer.get("changed_files") != [path]
+        or not isinstance(touches, list) or len(touches) != 1
+        or not isinstance(touches[0], dict) or touches[0].get("path") != path
+        or touches[0].get("kind") not in ("agent_instructions", "tool_surface_decl")
+        or touches[0].get("instruction_structure_unchanged") is not True
+        or touches[0].get("requires_human_review") is not False
+    ):
+        return False
+    # Discard even a positive parse if its captured source moved in the meantime.
+    if _unsafe_alias_kind(root, path) is not None:
+        return False
+    if new_file:
+        return not (root / path).exists()
+    current, current_metadata = _read_untracked_file(root, path)
+    return bool(
+        current == raw and current_metadata is not None
+        and _file_metadata(current_metadata) == _file_metadata(metadata)
+    )
+
+
 def _protected_surface_for(
     path: str,
     *,
@@ -633,6 +813,15 @@ def _protected_surface_for(
         ):
             return kind, pattern
     return None
+
+
+def _is_host_config_path(path: str) -> bool:
+    normalized = path.replace("\\", "/").removeprefix("./")
+    return any(
+        _glob_match(pattern, normalized)
+        or _glob_match(pattern.casefold(), normalized.casefold())
+        for pattern in HOST_CONFIG_SURFACES
+    )
 
 
 def _glob_match(pattern: str, path: str) -> bool:
@@ -749,6 +938,12 @@ def _trigger(payload: dict[str, Any], root: Path, args: argparse.Namespace) -> i
     if not paths:
         return 0
     _record_in_session_approvals(payload, root, args)
+    # The Stop hook compares host configuration with the host readers, through
+    # `diff` without a manifest and `verify` with one (#661). A nudge on every
+    # edit would repeat itself without naming a row.
+    paths = [path for path in paths if not _is_host_config_path(path)]
+    if not paths:
+        return 0
     diff_text = _git_diff_for_paths(root, paths)
     if diff_text is None:
         return _emit_context(
@@ -771,7 +966,12 @@ def _trigger(payload: dict[str, Any], root: Path, args: argparse.Namespace) -> i
     )
     if result is None and not protected:
         return 0
-    if not protected and not _trigger_wants_attention(result):
+    status = (
+        _advisory_status(result, protected=protected)
+        if protected or _trigger_wants_attention(result)
+        else None
+    )
+    if not _advisory_is_news(payload, root, args, paths=paths, status=status, at_stop=False):
         return 0
 
     path_preview = ", ".join(paths[:3])
@@ -826,7 +1026,8 @@ def _record_in_session_approvals(
     protected = [
         path
         for path in _contained_repo_paths(payload, root)
-        if _protected_surface_for(path, configured_manifest=args.config) is not None
+        if (hit := _protected_surface_for(path, configured_manifest=args.config)) is not None
+        and not _conditional_instruction_surface(hit)
     ]
     if protected:
         _remember_approved_surfaces(root, str(payload.get("session_id") or ""), protected)
@@ -879,27 +1080,43 @@ def _verify(payload: dict[str, Any], root: Path, args: argparse.Namespace) -> in
     if not config_path.is_file():
         if not snapshot["paths"]:
             return 0
+        signature = str(snapshot["signature"])
+        host_paths = [path for path in snapshot["paths"] if _is_host_config_path(path)]
+        other_paths = [path for path in snapshot["paths"] if path not in host_paths]
+        if not other_paths:
+            # Only host configuration changed and nothing is configured: name
+            # what the change did rather than advise initializing a manifest.
+            return _route_host_diff(root, args, signature=signature)
+        messages: list[str] = []
+        if host_paths:
+            # Host configuration beside other edits is still compared with the
+            # host readers, not folded into the manifest advice (#661).
+            _route_host_diff(root, args, signature=signature, collect=messages)
         trigger = _run_trigger_for_paths(
             root,
-            snapshot["paths"],
-            diff_text=snapshot["diff_text"],
+            other_paths,
+            diff_text=_diff_without_paths(snapshot["diff_text"], host_paths),
             manifest_present=False,
         )
         protected = any(
             _protected_surface_for(path, configured_manifest=args.config) is not None
-            for path in snapshot["paths"]
+            for path in other_paths
         )
-        if protected or _trigger_wants_attention(trigger):
+        status = (
+            _advisory_status(trigger, protected=protected)
+            if protected or _trigger_wants_attention(trigger)
+            else None
+        )
+        if _advisory_is_news(payload, root, args, paths=other_paths, status=status, at_stop=True):
             # Advisory: nothing is configured yet, so nobody has decided this
             # repo is gated — advise, never force the turn to continue.
-            return _emit_context(
-                "Stop",
+            messages.append(
                 f"{_trigger_lead(trigger)}, and the configured manifest "
                 f"{args.config!r} does not exist. "
                 "Run `agents-shipgate verify --preview --json` and initialize "
-                "the manifest if this workspace contains an agent.",
+                "the manifest if this workspace contains an agent."
             )
-        return 0
+        return _emit_context("Stop", "\n\n".join(messages)) if messages else 0
 
     if not snapshot["paths"]:
         return 0
@@ -1013,6 +1230,109 @@ _PUBLISH_ONLY_PERMISSIONS: dict[str, bool] = {
     "merge": False,
     "report_complete": False,
 }
+
+
+#: At most this many widening rows are quoted; the rest are counted.
+_MAX_ANNOUNCED_HOST_ROWS = 20
+
+
+def _route_host_diff(
+    root: Path,
+    args: argparse.Namespace,
+    *,
+    signature: str,
+    collect: list[str] | None = None,
+) -> int:
+    """Compare changed host configuration and speak only about widening (#661).
+
+    Quiet for a covered comparison with no row marked `expands` and none whose
+    direction the engine could not establish (#820). Rows that widen what the
+    agent can do, and apart from them rows of unknown direction, such as a
+    hook command or MCP argument edit, are named once: the announcement is bound to
+    the change's snapshot signature, the base and the rows, so an unchanged
+    repeat stays quiet and any change is announced again. An incomparable,
+    unparsed or unavailable comparison is never quiet. A row is a description,
+    never a permission, and this route grants no authority. With ``collect``,
+    the message is added to it instead of emitted, so a Stop that also advises
+    on other paths speaks once.
+    """
+
+    base = os.environ.get("AGENTS_SHIPGATE_VERIFY_BASE", args.base).strip()
+    manual = " ".join(
+        shlex.quote(part)
+        for part in ["agents-shipgate", "diff", "--workspace", ".", *(["--base", base] if base else [])]
+    )
+    if not base or not _safe_ref_token(base) or not _ref_exists(root, base):
+        return _speak(
+            collect,
+            "Agents Shipgate could not compare the host configuration this change "
+            f"edits: base ref {base!r} is not available locally. Make it available, "
+            f"then run `{manual}`.",
+        )
+    completed = _run(
+        [*_cli(), "diff", "--workspace", str(root), "--base", base, "--json"],
+        cwd=root,
+        timeout=VERIFY_TIMEOUT_SECONDS,
+        env={**os.environ, "AGENTS_SHIPGATE_AGENT_MODE": "1"},
+    )
+    try:
+        payload = json.loads(completed.stdout) if completed is not None else None
+    except json.JSONDecodeError:
+        payload = None
+    if not isinstance(payload, dict) or payload.get("comparison_status") != "comparable":
+        reasons = (
+            ", ".join(str(item) for item in payload.get("incomparable_reasons") or [])
+            if isinstance(payload, dict)
+            else ""
+        )
+        return _speak(
+            collect,
+            "Agents Shipgate could not compare the host configuration this change edits"
+            + (f" ({reasons})" if reasons else "")
+            + f". Treat it as unreviewed and run `{manual}`.",
+        )
+    listed = [row for row in payload.get("rows") or [] if isinstance(row, dict)]
+    rows = [row for row in listed if row.get("expands") is True]
+    # #820: an edit the engine cannot order is not a widening, and not silent.
+    # The marker is one `; ` clause of `why`; later notes (#825, #826) may
+    # follow it, so it is matched as a clause, not as the ending.
+    unknown = [
+        row for row in listed
+        if row.get("expands") is not True
+        and DIRECTION_UNKNOWN in str(row.get("why") or "").split("; ")
+    ]
+    if not rows and not unknown:
+        return 0
+    digest = hashlib.sha256(
+        json.dumps([signature, base, rows, *([unknown] if unknown else [])], sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    state = _read_state(root)
+    if state.get("last_host_diff_announcement") == digest:
+        return 0
+    state["last_host_diff_announcement"] = digest
+    _write_state(root, state)
+
+    def lines(selected: list[dict[str, Any]]) -> str:
+        quoted = [
+            f"- {row.get('subject')}: {row.get('before')} -> {row.get('after')} ({row.get('why')})"
+            for row in selected[:_MAX_ANNOUNCED_HOST_ROWS]
+        ]
+        if len(selected) > _MAX_ANNOUNCED_HOST_ROWS:
+            quoted.append(f"- and {len(selected) - _MAX_ANNOUNCED_HOST_ROWS} more; run `{manual}`")
+        return "\n".join(quoted) + "\n"
+
+    return _speak(
+        collect,
+        "Agents Shipgate compared the host configuration this change edits. "
+        + (f"These rows widen what the agent can do:\n{lines(rows)}" if rows else "")
+        + (
+            "These rows may change what the agent can do; their direction is "
+            f"not established:\n{lines(unknown)}"
+            if unknown else ""
+        )
+        + "Quote them to the user and in the pull request body. A row is a "
+        "description, never a permission.",
+    )
 
 
 def _authorizes_publication(control: dict[str, Any]) -> bool:
@@ -2159,6 +2479,120 @@ def _trigger_lead(trigger: dict[str, object] | None) -> str:
     if trigger and trigger.get("evaluation_status") in _WITHHELD_EVALUATION_STATUSES:
         return "Agents Shipgate could not decide whether this diff is relevant"
     return "Agents Shipgate trigger matched"
+
+
+def _speak(collect: list[str] | None, message: str) -> int:
+    """Emit a Stop message, or add it to ``collect`` for one combined message."""
+
+    if collect is None:
+        return _emit_context("Stop", message)
+    collect.append(message)
+    return 0
+
+
+def _diff_without_paths(diff_text: str, drop: list[str]) -> str:
+    """Remove the file sections for ``drop`` from a unified diff.
+
+    A section whose header does not parse is kept: evaluating more of the
+    change can only add advice, never hide it.
+    """
+
+    if not drop:
+        return diff_text
+    dropped = set(drop)
+    kept: list[str] = []
+    keep = True
+    for line in diff_text.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            header = line[len("diff --git "):].rstrip("\n")
+            _left, separator, right = header.rpartition(" b/")
+            keep = not (separator and not header.startswith('"') and right in dropped)
+        if keep:
+            kept.append(line)
+    return "".join(kept)
+
+
+_QUIET_ADVISORY = "quiet"
+# A verdict withheld because the input could not be read is announced every
+# time: it is missing evidence, not a repeat of evidence already shown.
+_ALWAYS_ANNOUNCED_STATUSES = frozenset({"not_evaluated"})
+
+
+def _advisory_status(trigger: dict[str, object] | None, *, protected: bool) -> str:
+    """Name the verdict an advisory reports, so a repeat can be recognised."""
+
+    if trigger and trigger.get("should_run"):
+        rules = sorted(
+            str(match.get("rule_id") or match.get("id") or "")
+            for match in trigger.get("matched_rules") or []  # type: ignore[union-attr]
+            if isinstance(match, dict)
+        )
+        return "matched:" + ",".join(rules)
+    if trigger and trigger.get("evaluation_status") in _WITHHELD_EVALUATION_STATUSES:
+        return str(trigger.get("evaluation_status"))
+    return "protected" if protected else "matched:"
+
+
+def _advisory_is_news(
+    payload: dict[str, Any],
+    root: Path,
+    args: argparse.Namespace,
+    *,
+    paths: list[str],
+    status: str | None,
+    at_stop: bool,
+) -> bool:
+    """Record this session's advisory verdict per path; say whether it is news (#661).
+
+    Presentation only: the change is still evaluated every time, and this
+    decides whether saying so again tells the agent anything. Each path
+    remembers its last verdict in the session and the verdicts already
+    announced for it. PostToolUse names the edited paths. Stop names the
+    changed paths whose own last verdict was not quiet, or that no hook
+    evaluated in this session. An advisory is news when a path it names has not
+    had that verdict announced. A new session, base or manifest starts over. A
+    verdict withheld because input could not be read, and any advisory without
+    a session id, is always news.
+    """
+
+    session = payload.get("session_id")
+    if not isinstance(session, str) or not session or status in _ALWAYS_ANNOUNCED_STATUSES:
+        return status is not None
+    state = _read_state(root)
+    scope = [
+        session,
+        os.environ.get("AGENTS_SHIPGATE_VERIFY_BASE", args.base).strip(),
+        str(args.config),
+    ]
+    record = state.get("session_advisories")
+    if not isinstance(record, dict) or record.get("scope") != scope:
+        record = {"scope": scope, "paths": {}}
+    verdicts = record.get("paths")
+    if not isinstance(verdicts, dict):
+        verdicts = {}
+
+    def entry(path: str) -> dict[str, Any]:
+        value = verdicts.get(path)
+        if not isinstance(value, dict) or not isinstance(value.get("announced"), list):
+            value = {"last": None, "announced": []}
+        return value
+
+    if at_stop:
+        named = [path for path in paths if entry(path).get("last") != _QUIET_ADVISORY]
+    else:
+        named = list(paths)
+    news = status is not None and any(status not in entry(path)["announced"] for path in named)
+    for path in paths:
+        value = entry(path)
+        if not at_stop or value.get("last") is None:
+            value["last"] = status if status is not None else _QUIET_ADVISORY
+        if news and path in named and status not in value["announced"]:
+            value["announced"] = [*value["announced"], status]
+        verdicts[path] = value
+    record["paths"] = verdicts
+    state["session_advisories"] = record
+    _write_state(root, state)
+    return news
 
 
 def _emit_context(event: str, message: str) -> int:

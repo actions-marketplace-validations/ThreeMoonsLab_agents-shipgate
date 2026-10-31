@@ -8,8 +8,10 @@ from agents_shipgate.ci.github_summary import write_github_step_summary
 from agents_shipgate.cli.discovery.placeholders import manifest_placeholder_fields
 from agents_shipgate.core.capability_lock import build_capability_lock
 from agents_shipgate.core.errors import AgentsShipgateError, ConfigError
+from agents_shipgate.core.operation_attribution import ReconstructedOperationBase
 from agents_shipgate.report.human_order import HumanArtifactContext
 from agents_shipgate.schemas.capabilities import CapabilityLockFileV1
+from agents_shipgate.schemas.common import parse_severity
 from agents_shipgate.schemas.report import ReadinessReport
 from agents_shipgate.schemas.verification import VerificationContext
 
@@ -34,6 +36,7 @@ def run_scan(
     fail_on: list[str] | None = None,
     baseline_path: Path | None = None,
     diff_from_path: Path | None = None,
+    diff_from_display_path: Path | None = None,
     baseline_mode: str = "new-findings",
     deep_import: bool = False,
     policy_pack_paths: list[Path] | None = None,
@@ -48,6 +51,8 @@ def run_scan(
     capability_lock_callback: Callable[[CapabilityLockFileV1], None] | None = None,
     human_context_callback: Callable[[HumanArtifactContext], None] | None = None,
     manifest_text: str | None = None,
+    operation_base: ReconstructedOperationBase | None = None,
+    exit_fail_on_floor: list[str] | None = None,
 ) -> tuple[ReadinessReport, int]:
     """Run a full scan pipeline. Returns ``(report, exit_code)``.
 
@@ -69,6 +74,7 @@ def run_scan(
             fail_on=fail_on,
             baseline_path=baseline_path,
             diff_from_path=diff_from_path,
+            diff_from_display_path=diff_from_display_path,
             baseline_mode=baseline_mode,
             policy_pack_paths=policy_pack_paths,
             plugins_enabled=plugins_enabled,
@@ -82,6 +88,8 @@ def run_scan(
             capability_lock_callback=capability_lock_callback,
             human_context_callback=human_context_callback,
             manifest_text=manifest_text,
+            operation_base=operation_base,
+            exit_fail_on_floor=exit_fail_on_floor,
         )
     except AgentsShipgateError as exc:
         # Every recovery route that names a file to edit needs the manifest
@@ -130,6 +138,7 @@ def _run_scan(
     fail_on: list[str] | None,
     baseline_path: Path | None,
     diff_from_path: Path | None,
+    diff_from_display_path: Path | None,
     baseline_mode: str,
     policy_pack_paths: list[Path] | None,
     plugins_enabled: bool | None,
@@ -143,6 +152,8 @@ def _run_scan(
     capability_lock_callback: Callable[[CapabilityLockFileV1], None] | None,
     human_context_callback: Callable[[HumanArtifactContext], None] | None,
     manifest_text: str | None,
+    operation_base: ReconstructedOperationBase | None,
+    exit_fail_on_floor: list[str] | None = None,
 ) -> tuple[ReadinessReport, int]:
     """The pipeline itself. Split from :func:`run_scan` so the manifest the
     run read can be attached to any failure on the way out, in one place."""
@@ -196,6 +207,7 @@ def _run_scan(
         diffs = _load_diff_references(
             baseline_path=baseline_path,
             diff_from_path=diff_from_path,
+            diff_from_display_path=diff_from_display_path,
             base_dir=resolved.base_dir,
         )
     with _perf.phase("run_checks_and_decide"):
@@ -228,6 +240,7 @@ def _run_scan(
             decision=decision,
             plan=plan,
             plugins_enabled=plugins_enabled,
+            operation_base=operation_base,
         )
     with _perf.phase("build_final_report"):
         report, public_report_payload = _build_final_report(
@@ -236,6 +249,11 @@ def _run_scan(
             plan=plan,
             config_path=config_path,
             declared_ci=resolved.declared_ci,
+            exit_fail_on_floor=(
+                [parse_severity(item) for item in exit_fail_on_floor]
+                if exit_fail_on_floor
+                else None
+            ),
         )
     human_context = human_artifact_context(config_path, verification_context)
     if human_context_callback is not None:

@@ -25,6 +25,15 @@ from agents_shipgate.schemas.capabilities import (
     CAPABILITY_LOCK_SCHEMA_VERSION,
     CAPABILITY_STANDARD_VERSION,
 )
+from agents_shipgate.schemas.capability_attestation import (
+    CAPABILITY_DELTA_ATTESTATION_SCHEMA_PATH,
+    CAPABILITY_DELTA_ATTESTATION_SCHEMA_VERSION,
+    CAPABILITY_DELTA_PREDICATE_TYPE,
+)
+from agents_shipgate.schemas.capability_payload import (
+    CAPABILITY_PAYLOAD_SCHEMA_PATH,
+    CAPABILITY_PAYLOAD_SCHEMA_VERSION,
+)
 from agents_shipgate.schemas.codex_boundary_result import (
     CODEX_BOUNDARY_RESULT_SCHEMA_VERSION,
 )
@@ -48,6 +57,15 @@ from agents_shipgate.schemas.human_authorization import (
     HUMAN_AUTHORIZATION_SCHEMA_VERSION,
     HUMAN_AUTHORIZATION_TRUST_POLICY_ACCOUNT_PATH,
     HUMAN_AUTHORIZATION_TRUST_POLICY_SCHEMA_VERSION,
+)
+from agents_shipgate.schemas.human_review_decision import (
+    HUMAN_REVIEW_DECISION_SCHEMA_PATH,
+    HUMAN_REVIEW_DECISION_SCHEMA_VERSION,
+    HUMAN_REVIEW_EVALUATION_SCHEMA_VERSION,
+)
+from agents_shipgate.schemas.human_review_request import (
+    HUMAN_REVIEW_REQUEST_SCHEMA_PATH,
+    HUMAN_REVIEW_REQUEST_SCHEMA_VERSION,
 )
 from agents_shipgate.schemas.org_evidence_bundle import ORG_EVIDENCE_BUNDLE_SCHEMA_VERSION
 from agents_shipgate.schemas.packet import EvidencePacket
@@ -117,15 +135,155 @@ from agents_shipgate.schemas.verify_run import VERIFY_RUN_SCHEMA_VERSION
 # ``AgentControl`` and ``shipgate.agent_control/v1`` are both byte-identical to
 # v26 — the same envelope reaches one more place — so
 # ``MINIMUM_CONTROL_CONTRACT_VERSION`` stays at 21 for the fourth time.
-CONTRACT_VERSION: Literal["27"] = "27"
+#
+# v28 publishes the capability delta as a standalone, versioned attestation
+# (#470). ``verify`` writes
+# ``agents-shipgate-reports/capability-delta-attestation.json`` — an in-toto
+# Statement whose predicate carries the frozen
+# ``shipgate.capability_payload/v1`` delta — and the contract now names the
+# predicate type, the two schema versions and the artifact, so a consumer can
+# discover the format without reading our source. The payload schema was frozen
+# in v27's cycle but deliberately left unregistered while nothing emitted it;
+# this is the increment that ships both halves together.
+#
+# Additive on the agent side: ``AgentControl`` and
+# ``shipgate.agent_control/v1`` are byte-identical to v27, so
+# ``MINIMUM_CONTROL_CONTRACT_VERSION`` stays at 21 for the fifth time. The
+# attestation gates nothing — ``release_decision.decision`` remains the only
+# release gate — and is absent, with a note on the run, whenever the evaluated
+# subject is a worktree snapshot rather than a committed tree.
+#
+# v29 publishes action-declaration review as a first-class reviewer surface
+# (#428). The contract advertises report 0.43, packet 0.18, and verifier 0.16
+# so consumers can discover the declaration comparison without guessing from
+# prose. Runtime v28 is already the capability-delta contract;
+# reusing that number here would give one version two incompatible meanings.
+#
+# The operational control shapes remain byte-identical to v28, so
+# ``MINIMUM_CONTROL_CONTRACT_VERSION`` stays at 21 for the sixth time.
+# v30 publishes a separately bound human review question (#536). No shared
+# control type or historical grammar changes; the control floor stays at 21.
+# v31 advertises the separate, host-neutral decision evaluator. It does not
+# add a CLI command, widen operational control or create a trust context.
+# v32 adds conditional instruction-edit routing (verifier 0.17/handoff v9),
+# preflight 0.5 and host inventories/baselines/drift 0.3. Old readers retain
+# their conservative boundary; structural comparison never grants authority.
+# v33 routes recognized host-only configuration from discovery to audit,
+# without inventing a manifest. The new detect fields are filename evidence
+# and incomplete traversal, not grants. Operational control is unchanged.
+# v34 advertises host inventories/baselines/drift 0.4: workflow permission
+# projections and reusable secret recipients. Operational control is unchanged.
+# v35 carries manifest-free advisory host comparison evidence and named check rows.
+# v36 freezes the report contract at ``1.0`` (#569). No field is added,
+# renamed, retyped or removed: the emitted shape is the one v35 advertised as
+# report ``0.43``. The bump exists because what the runtime *promises* about
+# that shape changed -- 1.x is additive-only, a breaking change needs 2.0, and
+# a deprecation cycle is counted in shipped releases -- and a consumer must be
+# able to discover that from ``contract --json`` rather than from prose. The
+# operational control shapes remain byte-identical, so
+# ``MINIMUM_CONTROL_CONTRACT_VERSION`` stays at 21.
+# v37 names the unchanged limits a host comparison compared past (#721).
+# v38 widens ``shipgate.agent_control/v1`` in place with an optional, bounded
+# ``capability_rows`` block (#662): the host capability rows the control was
+# decided beside, a count of rows cut by the cap, the comparison status and
+# reasons. It is omitted when no comparison ran, so those envelopes are
+# byte-identical. The object is closed, so a reader validating against the
+# v37 schema rejects an envelope that carries rows; that break is deliberate
+# and documented. ``AgentControl`` is unchanged, so
+# ``MINIMUM_CONTROL_CONTRACT_VERSION`` stays at 21, as it did for v23-v25.
+# v39 reads through an in-tree link at a boundary path (#700). Host-grants
+# inventory, baseline and drift move to 0.5 with an optional
+# ``artifacts[].resolved_through``. A 0.4 baseline stays comparable, and
+# ``MINIMUM_CONTROL_CONTRACT_VERSION`` stays at 21: operational control is unchanged.
+# v40 reads the action reference each workflow step declares (#771). Host-grants
+# inventory, baseline and drift move to 0.6 with ``step_actions[]`` on a
+# workflow grant, omitted when no step declares a listed reference. A 0.4/0.5 baseline holding a workflow
+# grant is incomparable, since it never read step references; one without a
+# workflow stays comparable. ``MINIMUM_CONTROL_CONTRACT_VERSION`` stays at 21.
+# v40 also reads the named secrets a job passes to a reusable workflow (#693),
+# extended in place because neither v40 nor host-grants 0.6 had shipped before
+# 1.1.0, which publishes both: a
+# reusable call adds ``secret_mappings[]`` and ``uses_redacted``, both omitted
+# when unset. ``${{ github.token }}`` reads as the ``GITHUB_TOKEN`` source and
+# source names compare case-insensitively. An unreadable value is a named
+# non-blocking limit, so coverage stays complete; only a redacting name or
+# target blocks. A 0.4/0.5 baseline holding a reusable call also names
+# ``baseline_reusable_workflow_secret_mappings_unavailable``.
+# v40 also says what each host comparison established (#812), extended in
+# place because v40 had not shipped before 1.1.0: verifier 0.20 adds an optional
+# ``host_comparison.coverage`` and ``shipgate diff --json`` (capability diff
+# 0.3) the same block. It is evidence beside the rows and moves no state,
+# permission, route or row. A 0.19 verifier reads with coverage not recorded.
+# v41, shipped in 1.2.0, carries three changes. It names the changed inputs a host
+# comparison does not read (#821): verifier 0.21 and ``shipgate diff --json``
+# (capability diff 0.4) add a ``changed_not_read`` coverage item with its
+# ``candidate`` rule, a ``read_sources_only`` that is ``false`` while one is
+# named, and whether the comparison's changed files were examined. A name is
+# never a row, a widening or a ``check`` violation. The one route it moves, on
+# ``verify`` and ``verify --preview`` alike: a manifest-free comparison whose
+# only host-relevant change is such an input, or a changed candidate it counts
+# as not examined, is now published, on the host route's ``audit --host`` next
+# action, instead of the setup route (``verify``) or the ``initialize`` next
+# action (``verify --preview``). A 0.20 verifier reads with the search not
+# recorded. And it reads how a coding agent is launched inside a workflow job
+# (#823). Host-grants 0.6 shipped in 1.1.0, so this mints host-grants
+# inventory, baseline and drift 0.7: a workflow grant adds ``agent_launches[]``
+# (a documented agent action's permission inputs, or the permission flags of a
+# ``run:`` that is one plain ``claude -p`` / ``codex exec`` command, compared as
+# text), ``unread_agent_runs[]`` (any other ``run:`` that mentions an agent CLI:
+# a named limit, never compared) and ``checkout_refs[]`` (each
+# ``actions/checkout`` step's ``with.ref``), each omitted when empty. Shell is
+# not parsed; an argument input that is not a plain list of words is compared by
+# a digest and read for no rule. Only a documented rule gained by a job's agent
+# launches widens; every other edit is a ``changed`` row, and a workflow row
+# that runs an agent names the job facts beside it. A 0.4-0.6 baseline holding a
+# workflow grant is incomparable
+# (``baseline_workflow_agent_launches_unavailable``); one without a workflow
+# stays comparable. #823 moves neither verifier 0.21 nor capability diff 0.4:
+# its rows keep their shape. ``MINIMUM_CONTROL_CONTRACT_VERSION`` stays at 21.
+# And v41 keeps what a comparison established outside a plugin directory it
+# could not compare (#808), extended in place because v41 was then unreleased: where
+# every blocking limit is a plugin-reference limit that its plugin directory
+# bounds, and no compared source depends on that directory, verifier 0.21 and
+# capability diff 0.4 publish ``comparison_status: partial`` with the rows
+# outside it, the same ``incomparable_reasons``, and the directory as the
+# reserved ``coverage.items[].scope`` on those limits. A partial comparison is
+# not comparable: every control state, permission, route and ``check``
+# decision is the refusal's, and the control envelope projects it as
+# ``incomparable`` with no rows. A 0.20 verifier claiming either is refused.
+# v41 also publishes what changed in a hook and in an MCP server's launch
+# (#819). Host-grants inventory, baseline and drift move to 0.7: a hook grant
+# adds ``handlers[]`` (each group's matcher, the handler's command as its
+# executable's name and a digest, and its timeout) and ``omitted_handlers``,
+# and an MCP server grant adds ``package`` and ``args_sha256``. No command or
+# argument text is published.
+# They display what ``config_sha256`` already binds, so grant equality and the
+# inventory digests leave them out: a 0.6 baseline stays comparable with no new
+# row or reason, and ``audit --host --save-baseline`` may replace it. It moves
+# no row value, row count, verifier or capability-diff schema; the field
+# difference reaches the text and ``review.changes[].change``.
+# ``MINIMUM_CONTROL_CONTRACT_VERSION`` stays at 21.
+# v42 stops an empty preflight plan from minting authority (#610). Through
+# preflight 0.5 a plan that named nothing returned the shared ``complete``,
+# whose vector grants ``merge`` and ``report_complete``, with no verifier
+# identity behind it. Preflight 0.6 carries its own control union instead:
+# ``planning_only`` (new: nothing to route, only planning finished),
+# ``agent_action_required`` and ``human_review_required``. ``complete`` and
+# ``review_publishable`` cannot appear, and every permission is false on every
+# route, in the model and in the generated schema. 0.5 stays frozen and
+# readable as a ``--base-preflight``. The shared ``AgentControl`` union is
+# byte-identical, so ``MINIMUM_CONTROL_CONTRACT_VERSION`` stays at 21: a
+# reader that does not know ``planning_only`` cannot mistake it for
+# ``complete``, and it authorizes nothing either way.
+CONTRACT_VERSION: Literal["42"] = "42"
 MINIMUM_CONTROL_CONTRACT_VERSION: Literal["21"] = "21"
 GATING_SIGNAL: Literal["release_decision.decision"] = "release_decision.decision"
 AGENT_RESULT_SCHEMA_VERSION: Literal["agent_result_v3"] = "agent_result_v3"
 AGENT_RESULT_SCHEMA_PATH: Literal["docs/agent-result-schema.v3.json"] = (
     "docs/agent-result-schema.v3.json"
 )
-AGENT_BOUNDARY_RESULT_SCHEMA_PATH: Literal["docs/agent-boundary-result-schema.v2.json"] = (
-    "docs/agent-boundary-result-schema.v2.json"
+AGENT_BOUNDARY_RESULT_SCHEMA_PATH: Literal["docs/agent-boundary-result-schema.v3.json"] = (
+    "docs/agent-boundary-result-schema.v3.json"
 )
 TRIGGER_CATALOG_SCHEMA_VERSION: Literal["0.4"] = "0.4"
 # Fields of the SHARED agent result (``agent_result_schema_path``). The graded
@@ -201,6 +359,8 @@ EXTERNAL_INTEGRATION_SURFACES: tuple[str, ...] = (
     "preflight",
     "capability_lock",
     "capability_lock_diff",
+    "capability_payload",
+    "capability_delta_attestation",
     "capability_standard",
     "attestation",
     "registry",
@@ -211,6 +371,9 @@ EXTERNAL_INTEGRATION_SURFACES: tuple[str, ...] = (
     "verification_artifact_manifest",
     "verification_receipt",
     "human_authorization",
+    "human_review_request",
+    "human_review_decision",
+    "human_review_evaluation",
     "host_grants_inventory",
     "host_grants_baseline",
     "host_grants_drift",
@@ -396,10 +559,14 @@ ARTIFACTS: dict[str, str] = {
         "agents-shipgate-reports/human-authorization-request.json"
     ),
     "human_authorization": "agents-shipgate-reports/human-authorization.json",
+    "human_review_request": "agents-shipgate-reports/human-review-request.json",
     "report": "agents-shipgate-reports/report.json",
     "pr_comment": "agents-shipgate-reports/pr-comment.md",
     "packet": "agents-shipgate-reports/packet.json",
     "attestation": "agents-shipgate-reports/attestation.json",
+    "capability_delta_attestation": (
+        "agents-shipgate-reports/capability-delta-attestation.json"
+    ),
     "org_evidence_bundle": "agents-shipgate-reports/org-evidence-bundle.json",
     "host_grants": "agents-shipgate-reports/host-grants.json",
     "org_status": "agents-shipgate-reports/org-status.json",
@@ -503,6 +670,12 @@ class ContractPayload(BaseModel):
     human_authorization_trust_policy_schema_version: str
     human_authorization_trust_policy_default_path: str
     human_authorization_schema_path: str
+    human_review_request_schema_version: str
+    human_review_request_schema_path: str
+    human_review_request_artifact: str
+    human_review_decision_schema_version: str
+    human_review_evaluation_schema_version: str
+    human_review_decision_schema_path: str
     agent_handoff_schema_version: str
     agent_handoff_schema_path: str
     agent_handoff_artifact: str
@@ -511,6 +684,12 @@ class ContractPayload(BaseModel):
     agent_boundary_result_schema_path: str
     capability_lock_schema_version: str
     capability_lock_diff_schema_version: str
+    capability_payload_schema_version: str
+    capability_payload_schema_path: str
+    capability_delta_attestation_schema_version: str
+    capability_delta_attestation_schema_path: str
+    capability_delta_predicate_type: str
+    capability_delta_attestation_artifact: str
     preflight_schema_version: str
     capability_standard_version: str
     governance_benchmark_catalog_schema_version: str
@@ -588,6 +767,12 @@ def build_contract_payload() -> ContractPayload:
             HUMAN_AUTHORIZATION_TRUST_POLICY_ACCOUNT_PATH
         ),
         human_authorization_schema_path=HUMAN_AUTHORIZATION_SCHEMA_PATH,
+        human_review_request_schema_version=HUMAN_REVIEW_REQUEST_SCHEMA_VERSION,
+        human_review_request_schema_path=HUMAN_REVIEW_REQUEST_SCHEMA_PATH,
+        human_review_request_artifact=ARTIFACTS["human_review_request"],
+        human_review_decision_schema_version=HUMAN_REVIEW_DECISION_SCHEMA_VERSION,
+        human_review_evaluation_schema_version=HUMAN_REVIEW_EVALUATION_SCHEMA_VERSION,
+        human_review_decision_schema_path=HUMAN_REVIEW_DECISION_SCHEMA_PATH,
         agent_handoff_schema_version=AGENT_HANDOFF_SCHEMA_VERSION,
         agent_handoff_schema_path=AGENT_HANDOFF_SCHEMA_PATH,
         agent_handoff_artifact=ARTIFACTS["agent_handoff"],
@@ -596,6 +781,18 @@ def build_contract_payload() -> ContractPayload:
         agent_boundary_result_schema_path=AGENT_BOUNDARY_RESULT_SCHEMA_PATH,
         capability_lock_schema_version=CAPABILITY_LOCK_SCHEMA_VERSION,
         capability_lock_diff_schema_version=CAPABILITY_LOCK_DIFF_SCHEMA_VERSION,
+        capability_payload_schema_version=CAPABILITY_PAYLOAD_SCHEMA_VERSION,
+        capability_payload_schema_path=CAPABILITY_PAYLOAD_SCHEMA_PATH,
+        capability_delta_attestation_schema_version=(
+            CAPABILITY_DELTA_ATTESTATION_SCHEMA_VERSION
+        ),
+        capability_delta_attestation_schema_path=(
+            CAPABILITY_DELTA_ATTESTATION_SCHEMA_PATH
+        ),
+        capability_delta_predicate_type=CAPABILITY_DELTA_PREDICATE_TYPE,
+        capability_delta_attestation_artifact=ARTIFACTS[
+            "capability_delta_attestation"
+        ],
         preflight_schema_version=PREFLIGHT_SCHEMA_VERSION,
         capability_standard_version=CAPABILITY_STANDARD_VERSION,
         governance_benchmark_catalog_schema_version=(GOVERNANCE_BENCHMARK_CATALOG_SCHEMA_VERSION),
@@ -609,7 +806,7 @@ def build_contract_payload() -> ContractPayload:
         trigger_catalog_schema_version=TRIGGER_CATALOG_SCHEMA_VERSION,
         deprecated_surfaces={
             "codex-boundary-json": (
-                "Deprecated compatibility projection through 0.16.x; use agent-boundary-json."
+                "Deprecated compatibility projection through 1.x; use agent-boundary-json."
             )
         },
         external_integration_surfaces=list(EXTERNAL_INTEGRATION_SURFACES),

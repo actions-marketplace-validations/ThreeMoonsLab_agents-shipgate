@@ -7,7 +7,7 @@ Target: local
 ## Release Decision
 
 Decision: insufficient_evidence
-Reason: Insufficient evidence: the agent's tool binding graph is incomplete \(durable\_order\_agent \[conductor\_workflows\]\). Fix at shipgate.yaml\#agent\_bindings. Context: 1 binding evidence gap\(s\), 1 semantic evidence gap\(s\), 1 low-confidence tool\(s\) and 4 source warning\(s\); scan results are not trustworthy enough to gate release.
+Reason: Insufficient evidence: some tools cannot be traced to an agent that can call them \(durable\_order\_agent \[conductor\_workflows\]\). Fix at shipgate.yaml\#agent\_bindings. Context: 1 binding evidence gap\(s\), 1 semantic evidence gap\(s\), 1 low-confidence tool\(s\) and 4 source warning\(s\); scan results are not trustworthy enough to gate release.
 
 Blockers (0): none
 
@@ -16,6 +16,8 @@ Review items (2):
 - HIGH SHIP-CONDUCTOR-DYNAMIC-TOOL-SURFACE-NOT-ENUMERABLE — Conductor tool surface cannot be statically enumerated
 
 Evidence coverage: mixed (1 low-confidence tool(s); 4 source warning(s); 1 binding evidence gap(s); 1/1 catalog tools reachable; 1 semantic evidence gap(s); 0/1 actions pass-eligible; human review recommended)
+
+What Agents Shipgate can prove, per framework: https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/determinism-boundary.md
 
 Baseline delta: not enabled
 

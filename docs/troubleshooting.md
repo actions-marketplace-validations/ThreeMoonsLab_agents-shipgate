@@ -41,6 +41,36 @@ inside it (`shipgate.yaml` goes to `--config`).
 If you see "must contain a YAML object" for a file you never created, that is a
 bug — the three states are asserted to stay distinguishable.
 
+## `agent control` keeps refusing as `workspace_unverifiable`
+
+Read the start of the refusal: it says why the workspace could not be read, and
+`next_actions[0]` follows from that.
+
+- **`Static worktree collection refuses executable Git filters (filter.lfs.clean)`**,
+  **`… refuses Git filter attributes … (assets/logo.bin)`**,
+  **`… refuses repository-local diff.* configuration … (diff.git-crypt.textconv)`**
+  or **`… non-empty or aliased .git/info/attributes …`**. The repository's own
+  Git configuration runs programs, or rewrites what Git reports, while the
+  working tree is read, and Shipgate does not read a working tree under it.
+  Git LFS and git-crypt repositories are configured this way on purpose. No
+  `verify` run changes the answer, with or without `--head`: the refresh reads
+  the working tree for every pointer, so `verify` and `agent control` cannot
+  give a current answer in this repository while the configuration is in
+  place. The next action is a `review` step for a human, not a rerun. Do not
+  remove LFS or git-crypt configuration to get past it. `agents-shipgate diff`
+  still shows what the change does to the agent's host grants, read-only.
+- **`The reports directory … holds …`**: see
+  [One Repo, Several Agent Projects](#one-repo-several-agent-projects) for the
+  output-directory rule.
+- **`… could not be read (body_limit_exceeded)`**, `metadata_limit_exceeded` or
+  `git_timeout`: the uncommitted change is larger than Shipgate reads, or Git
+  did not finish in time. Commit or shrink the change (keep generated output
+  out of the working tree), then re-run the `verify` command the next action
+  names.
+- **`Workspace is not inside a git checkout: …`**: `.git` is missing or Git
+  refuses the checkout. Every pointer that binds a Git identity refuses until
+  the checkout reads again; a `verify --preview` run outside Git is unaffected.
+
 ## First Real Repo Decision Tree
 
 Use this before reading the full manifest schema.
@@ -49,15 +79,17 @@ Use this before reading the full manifest schema.
 | --- | --- | --- |
 | `detect --json` returns `is_agent_project: false`, but `suggested_sources` has MCP or OpenAPI files | `SHIP-DIAG-MCP-OPENAPI-ARTIFACT-ONLY` | Continue to `init --workspace . --write`; artifact-only repos are valid Shipgate targets. |
 | `detect --json` returns `is_agent_project: false`, but `codex_plugin_candidates` is non-empty | `SHIP-DIAG-CODEX-PLUGIN-PACKAGE-DETECTED` | Continue to `init --workspace . --write`; Codex plugin repos are valid static Shipgate targets. |
+| `host_boundary_candidates` is non-empty while framework and tool-source lists are empty | Host-only discovery (contract 33) | Follow `control.next_action` to `audit --host`; no manifest is needed. Config directories require inspection. |
+| `host_discovery_incomplete_paths` is non-empty | Host traversal the census could not see through | Inspect the named paths — resolve an unfollowed directory link, make an unreadable directory readable, or select the actual project directory. Empty candidates do not prove absence; the rest of the classification is unaffected. |
 | `doctor` shows zero tools | `SHIP-DIAG-ZERO-TOOLS` | Check `tool_sources[].path`, MCP `tools[]`, OpenAPI `paths`, optional source parse warnings, and dynamic toolset warnings. |
 | SDK/framework extractor finds no tools | `SHIP-DIAG-DYNAMIC-TOOLSETS-ONLY` | Add an explicit MCP export, OpenAPI spec, or local tool inventory instead of relying on dynamic code discovery. |
-| `shipgate.yaml` still has `CHANGE_ME` | `SHIP-DIAG-CHANGE-ME-PLACEHOLDERS` | Replace `agent.name` and `agent.declared_purpose` from prompt, main agent file, or README context before scanning. |
+| `shipgate.yaml` still has `CHANGE_ME` | `SHIP-DIAG-CHANGE-ME-PLACEHOLDERS` | `placeholders[]` gives locations only. `control.next_action.actor` routes the turn: `"human"` means surface all of them and stop, and its `why` may end `and N more in placeholders[]`, so absence from it grants nothing. `agent.name` is repository reading a coding agent may do; `agent.declared_purpose` must be supplied by a human — Shipgate never invents a declaration nobody made, so do not derive it from a prompt, main agent file or README. |
 | Required `tool_sources[].path` does not resolve | `SHIP-DIAG-MISSING-SOURCE-FILE` | `doctor --json` reports `unresolved_sources: [...]` and a diagnostic with `kind="edit", path="shipgate.yaml:<line>"`. Fix the path. (`scan` still exits 3 on the same condition — fix it before scanning.) |
 | `init --write` exits 2 with `manifest_status: "refused_unresolved_scope"` | — | The manifest scope is unresolved: agents in more than one self-contained project, or discovery capped before it could tell. Re-run with `--workspace` pointed at one of `auto_detected.agent_project_candidates[].path`. See [One repo, several agent projects](#one-repo-several-agent-projects). |
 | Install fails in an older project environment | — | Agents Shipgate requires Python 3.12+. Install with `pipx` or `uv` using a Python 3.12+ interpreter. |
 | A fix or an upgrade behaves as though it never happened; a documented subcommand looks "missing" | — | Another copy is answering. `doctor --json` reports `environment.mismatches[]` with the interpreter, the imported package, and a runnable recovery command. See [diagnostics.md](diagnostics.md#which-shipgate-answered-the-environment-block). |
 | `agents-shipgate` exits with `ModuleNotFoundError` or "bad interpreter" before printing anything | — | The console script outlived the environment that backed it, so nothing in Shipgate can report it. Run `python -m agents_shipgate doctor --json` with a working interpreter: it names the stale wrapper as `console_script_interpreter_missing`. Then reinstall or remove that wrapper. |
-| Reports show up as untracked files | — | Add `agents-shipgate-reports/` to `.gitignore`; do not commit reports by default. |
+| Reports show up as untracked files | — | For durable adoption, add `agents-shipgate-reports/` to `.gitignore`. For a temporary external-repository assessment, rerun setup with `init --local-review`; it uses `.git/info/exclude` and reports its cleanup paths without editing tracked files. |
 
 When run under `AGENTS_SHIPGATE_AGENT_MODE=1`, errors carry a `next_actions: [...]` array alongside the legacy `next_action: str`. The full catalog and schema is in [diagnostics.md](diagnostics.md).
 
@@ -86,6 +118,15 @@ So Shipgate scopes rather than guesses:
   beside a sibling project does not send the answer back to the root. When the
   changed project already carries its own `shipgate.yaml`, preview routes you
   to `verify` there instead of to setup.
+- An unconfigured project routes to durable `init --write` by default. For a
+  temporary external assessment, explicitly preview with
+  `--config .agents-shipgate-local-review.yaml`; that route creates
+  `.agents-shipgate-local-review.yaml`, privately excludes it and the report
+  directory through `.git/info/exclude`, and leaves the worktree clean. Its
+  verifier finding `SHIP-VERIFY-LOCAL-REVIEW-PROVISIONAL` makes the one release
+  decision review-required, so a structurally valid local manifest cannot look
+  like durable release policy. Run `init --local-review --undo --json` to remove
+  the local manifest and exclusion block while preserving reports.
 - Preview reads project markers from the **working tree**, because that is the
   tree the `init` it recommends would write to. So `verify --preview --head
   <ref>` claims no scope whenever `<ref>` is not the commit the worktree has
@@ -113,8 +154,40 @@ So Shipgate scopes rather than guesses:
 - Reports follow the workspace: `verify --workspace apps/a` writes
   `apps/a/agents-shipgate-reports/`, which is what the managed `.gitignore`
   block in that project covers, and two projects in one repository never
-  overwrite each other's results. An explicit `--out` still resolves against
-  the repository root.
+  overwrite each other's results. An explicit `--out` is your path: absolute
+  as given, or relative to the directory you run the command in, not the
+  repository root (#818). Run from anywhere else, `verify` prints a `note:` on
+  stderr naming the directory it now writes to and the one `1.0.0` wrote to;
+  pass that absolute path to keep the old location. The artifact paths
+  `verify --format json` prints open from the directory you ran it in.
+- `verify` exits `2` with `Verifier --out <dir> holds tracked repository files`
+  (or `held committed repository files that the change being verified
+  removes`, `holds untracked files that Git does not ignore and that are not
+  Shipgate artifacts`, `lies inside a trust root (…) that Git does not
+  ignore`, or `holds trust-root files named like Shipgate artifacts`) when the
+  output directory is inside the repository and holds anything besides
+  uncommitted Shipgate artifacts outside any trust root. The run leaves that
+  directory out of the change it decides on, so `--out docs` or `--out
+  .claude/commands` would hide those files from the decision. Omit `--out`, or
+  name a directory that is gitignored or outside the repository; do not
+  gitignore, untrack or move that directory's files to get past it.
+  `agent control` refuses a pointer already sitting in such a directory as
+  `workspace_unverifiable`, and its recovery is the producing run's command
+  without `--out`.
+- The same refusal for the default directory reads `The default verifier
+  output directory agents-shipgate-reports holds …` (or `Verifier --out
+  agents-shipgate-reports holds …` when `--out` names it, as the Action does).
+  Omitting `--out` would publish back into it, so it is never the advice
+  there. Move stray files that are not Shipgate artifacts out, or gitignore
+  `agents-shipgate-reports/` as `init` does. Committed reports need a change
+  that runs `git rm -r --cached agents-shipgate-reports` and gitignores the
+  directory; a worktree `verify` of that change still finds the removal, so
+  verify it with `--out` naming a directory that is gitignored or outside the
+  repository until it merges. The Action's `--head` run passes. Reports that
+  `skill lint`, `skill security` and `skill review` write there are Shipgate
+  artifacts and are not refused. The Claude Code Stop hook runs `verify` into
+  the default directory and reports this exit `2` as advisory context without
+  blocking the Stop, so resolve the refusal rather than relying on the hook.
 - With `--ci`, each manifest gets its own workflow — `agents-shipgate.yml` for
   a repository-root manifest, `agents-shipgate-<project>.yml` for a scoped one.
   The action takes a single `config`, so one shared file would gate whichever

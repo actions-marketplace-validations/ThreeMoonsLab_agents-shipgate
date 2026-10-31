@@ -2,7 +2,7 @@
 # repo root when a downstream project uses
 #   repos:
 #     - repo: https://github.com/ThreeMoonsLab/agents-shipgate
-#       rev: v0.12.0
+#       rev: v1.2.0
 #       hooks:
 #         - id: <hook id below>
 #
@@ -61,10 +61,10 @@
       (.*/)?conductor/.*\.json|
       (.*/)?ai/examples/.*\.json|
       (.*/)?\.codex/(config\.toml|hooks\.json|requirements\.toml)|
-      (.*/)?\.claude/(settings(\.local)?\.json|commands(/.*)?)|
+      (.*/)?\.claude/(settings(\.local)?\.json|commands(/.*)?|hooks/hooks\.json)|
       (.*/)?\.cursor/(cli\.json|mcp\.json|rules(/.*)?)|
       (.*/)?\.vscode/mcp\.json|
-      (.*/)?\.shipgate/agent-contract\.json|
+      (.*/)?\.shipgate/(agent-contract|openshell)\.json|
       (.*/)?(AGENTS(\.override)?|CLAUDE)\.md|
       \.(agents|claude)/skills/.*|
       (.*/)?\.codex-plugin(/.*)?|
@@ -109,10 +109,10 @@
       (.*/)?conductor/.*\.json|
       (.*/)?ai/examples/.*\.json|
       (.*/)?\.codex/(config\.toml|hooks\.json|requirements\.toml)|
-      (.*/)?\.claude/(settings(\.local)?\.json|commands(/.*)?)|
+      (.*/)?\.claude/(settings(\.local)?\.json|commands(/.*)?|hooks/hooks\.json)|
       (.*/)?\.cursor/(cli\.json|mcp\.json|rules(/.*)?)|
       (.*/)?\.vscode/mcp\.json|
-      (.*/)?\.shipgate/agent-contract\.json|
+      (.*/)?\.shipgate/(agent-contract|openshell)\.json|
       (.*/)?(AGENTS(\.override)?|CLAUDE)\.md|
       \.(agents|claude)/skills/.*|
       (.*/)?\.codex-plugin(/.*)?|

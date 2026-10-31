@@ -3,7 +3,7 @@
 A single-page summary of the `agents-shipgate` codebase for new
 contributors and AI coding agents extending the project. Current as of
 2026-07-13; auto-checked against `agents-shipgate contract --json`:
-runtime contract `27`, report schema `v0.42`, packet schema `v0.17`.
+runtime contract `42`, report schema `v1.0`, packet schema `v0.18`.
 
 For the per-field stability contract, see
 [`../STABILITY.md`](../STABILITY.md). For the agent-facing field index,
@@ -207,6 +207,12 @@ Adding a new wire field: edit the relevant `schemas/<name>.py`, run
 `report_schema_version` / `packet_schema_version` if the addition is
 public. The CI step `python scripts/generate_schemas.py --check`
 fails if the committed JSON drifts from the live model.
+Regenerate affected sample artifacts with
+`python scripts/regenerate_goldens.py` and confirm
+`python scripts/regenerate_goldens.py --check`; the
+[contributor recipe](../CONTRIBUTING.md#sample-goldens) owns the output paths,
+normalization and subsequent scan-pointer rebinding. Keep the independent
+semantic assertions when reviewing the resulting golden diff.
 
 ## Typed domain types: `Scope`, `SideEffect`, `Action`
 
@@ -521,7 +527,7 @@ containment); files larger than 10 MB rejected.
 
 `scan` emits a reviewer-shaped artifact alongside `report.{md,json,sarif}`
 whenever `output.packet.enabled` is true (default). The packet has its
-own JSON contract ([`packet-schema.v0.17.json`](packet-schema.v0.17.json))
+own JSON contract ([`packet-schema.v0.18.json`](packet-schema.v0.18.json))
 so the report schema stays minimal.
 
 The packet is derived from the in-memory scan (manifest, tools,
@@ -664,11 +670,12 @@ See [`../STABILITY.md`](../STABILITY.md) for the full per-field
 contract. Headlines:
 
 - **Manifest schema** stable across `0.x` (`version: "0.1"`).
-- **Report JSON shape** is additive across the `0.x` line. Current
-  `report_schema_version: "0.42"`; older schemas frozen as
-  `docs/report-schema.v0.N.json`.
+- **Report JSON shape** is frozen at `1.0` and additive across the `1.x`
+  line; a change that cannot be expressed additively needs `2.0`. Current
+  `report_schema_version: "1.0"`; every superseded schema stays published as
+  `docs/report-schema.v<version>.json`.
 - **Packet JSON shape** is additive across the `0.x` line. Current
-  `packet_schema_version: "0.17"`; older schemas frozen.
+  `packet_schema_version: "0.18"`; older schemas frozen.
 - **Exit codes**: `0` pass, `2` manifest config error, `3` input
   parse error, `4` other error, `6` baseline integrity failure (strict
   `baseline verify` only), `20` strict-mode gate failure.

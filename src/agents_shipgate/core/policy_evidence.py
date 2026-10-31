@@ -5,8 +5,10 @@ import json
 from collections.abc import Iterable
 from typing import Any, cast
 
+from agents_shipgate.core.adopter_text import INTERNAL_POLICY_IDS
 from agents_shipgate.schemas.common import Confidence, confidence_rank
 from agents_shipgate.schemas.report import (
+    EvidenceBasis,
     EvidenceGap,
     EvidenceGapAction,
     FindingSupport,
@@ -19,6 +21,29 @@ _CONFIDENCE_BY_RANK: dict[int, Confidence] = {
     confidence_rank("medium"): "medium",
     confidence_rank("high"): "high",
 }
+
+_POLICY_EVIDENCE_LABELS = {
+    "reviewed_declaration": "a reviewed declaration",
+    "protocol_structure": "protocol structure",
+    "typed_provider_fact": "typed provider facts",
+    "structural_scope": "structural scope evidence",
+    "inferred_keyword": "keyword inference",
+    "inferred_regex": "regular-expression inference",
+}
+
+
+def _join_evidence_labels(bases: set[EvidenceBasis]) -> str:
+    if not bases:
+        raise ValueError("at least one evidence basis is required")
+    labels = [
+        _POLICY_EVIDENCE_LABELS.get(basis, basis.replace("_", " "))
+        for basis in sorted(bases)
+    ]
+    if len(labels) == 1:
+        return labels[0]
+    if len(labels) == 2:
+        return " and ".join(labels)
+    return f"{', '.join(labels[:-1])}, and {labels[-1]}"
 
 
 def predicate_evidence(
@@ -145,8 +170,24 @@ def policy_evidence_gap(
         "agents-shipgate verify --workspace . --config shipgate.yaml "
         "--ci-mode advisory --format json"
     ),
+    detected: str | None = None,
 ) -> EvidenceGap:
+    """Describe why ``policy_id``'s finding could not become policy.
+
+    ``detected`` is the check's catalog description — what it observed — and
+    leads ``why`` when given, so the gap names the observation ("Tool
+    description contains a secret-like value.") before saying that its
+    applicability is only inferred (#1026). It is catalog text, never the
+    matched value.
+    """
     bases = set(support.evidence_bases)
+    authoritative = bases & {
+        "reviewed_declaration",
+        "protocol_structure",
+        "typed_provider_fact",
+        "structural_scope",
+    }
+    heuristic = bases & {"inferred_keyword", "inferred_regex"}
     if status == "conflicting":
         kind = "conflicting_policy_evidence"
         action_kind = "resolve_policy_evidence_conflict"
@@ -155,25 +196,39 @@ def policy_evidence_gap(
         kind = "inferred_policy_applicability"
         action_kind = "provide_policy_evidence"
         why = "Policy applicability is supported only by heuristic evidence."
-    elif bases & {"inferred_keyword", "inferred_regex"} and bases & {
-        "reviewed_declaration",
-        "protocol_structure",
-        "typed_provider_fact",
-        "structural_scope",
-    }:
+    elif heuristic and authoritative:
         kind = "mixed_policy_evidence"
         action_kind = "review_policy_evidence"
-        why = "Policy applicability mixes authoritative and heuristic evidence."
+        why = (
+            "Policy applicability combines "
+            f"{_join_evidence_labels(authoritative)} with "
+            f"{_join_evidence_labels(heuristic)}. Review the heuristic match "
+            f"against {_join_evidence_labels(authoritative)}; correct whichever "
+            "evidence source is wrong or add a reviewed declaration that resolves "
+            "the conflict, then rerun verification."
+        )
     else:
         kind = "unknown_policy_evidence"
         action_kind = "provide_policy_evidence"
         why = "Policy applicability cannot be established from complete static evidence."
+    observed = " ".join((detected or "").split())
+    if observed:
+        if not observed.endswith((".", "!", "?")):
+            observed = f"{observed}."
+        why = f"{observed} {why}"
     return EvidenceGap(
         kind=cast(Any, kind),
         subject=subject,
         subject_id=subject_id,
         source_ref=source_ref,
-        why=f"{policy_id}: {why}",
+        policy_id=policy_id,
+        # Public and organization-defined check ids remain useful, stable gap
+        # labels. Engine-owned ids are different: a reader cannot locate or
+        # act on ``builtin-effect-control-applicability``, so exposing it in
+        # adopter prose only leaks the implementation vocabulary (#420). The
+        # id remains exact in structured ``policy_id`` above; this prohibition
+        # applies to prose, not machine identity.
+        why=why if policy_id in INTERNAL_POLICY_IDS else f"{policy_id}: {why}",
         next_action=EvidenceGapAction(
             kind=cast(Any, action_kind),
             command=rerun_command,

@@ -1,7 +1,9 @@
 import json
+import shutil
 from pathlib import Path
 
 import pytest
+import yaml
 from typer.testing import CliRunner
 
 from agents_shipgate.cli._artifact_lifecycle import (
@@ -11,6 +13,7 @@ from agents_shipgate.cli._artifact_lifecycle import (
 from agents_shipgate.cli.main import app
 from agents_shipgate.cli.scan import run_scan
 from agents_shipgate.core.baseline import write_baseline
+from agents_shipgate.schemas.report_compatibility import report_schema_refusal_code
 
 SAMPLE = Path("samples/support_refund_agent/shipgate.yaml")
 GOOGLE_ADK_SAMPLE = Path("samples/google_adk_agent/shipgate.yaml")
@@ -48,7 +51,12 @@ def test_scan_removes_stale_verifier_route_artifacts(tmp_path: Path) -> None:
         "verification-unit-result.json",
         "verification-artifacts.json",
         "verification-receipt.json",
+        "openshell-native.json",
         "human-authorization.json",
+        # Identity-bearing too: it names the ``input_set_id`` of the run that
+        # produced it, so a stale one beside a later run's receipt would offer
+        # a chain into a verification that is no longer current (#470).
+        "capability-delta-attestation.json",
     }
     for name in VERIFIER_ROUTE_ARTIFACT_NAMES:
         (tmp_path / name).write_text('{"stale": true}\n', encoding="utf-8")
@@ -158,6 +166,21 @@ def test_openai_agents_sdk_directory_fixture_scans_static_tools(tmp_path):
         "review_concern_count": 0,
         "reason_counts": {},
         "acknowledged_overrides": [],
+        "declaration_review": {
+            "enabled": False,
+            "base_comparison_requested": False,
+            "base_kind": "none",
+            "changed_count": 0,
+            "summary": {
+                "evidence_consistent": 0,
+                "unverified": 0,
+                "acknowledged_override": 0,
+            },
+            "rows": [],
+            "notes": [
+                "No trustworthy base declaration snapshot was available; declaration review disabled."
+            ],
+        },
         # Nothing was ever asked: both actions' effect and authority come
         # from the reviewed inventory's own annotations, so the scan proved
         # them without a declaration. The counter says so rather than crediting
@@ -323,6 +346,100 @@ ci:
     assert report.summary.critical_count == 0
     assert report.summary.high_count > 0
     assert exit_code == 20
+
+
+#: The three critical controls the #1029 repro ignores. Only the last is a
+#: mandatory current-surface control, which a suppression cannot waive.
+_IGNORED_CRITICAL_CONTROLS = (
+    "SHIP-POLICY-APPROVAL-MISSING",
+    "SHIP-SIDEFX-IDEMPOTENCY-MISSING",
+    "SHIP-ACTION-FINANCIAL-WRITE-CONTROL-MISSING",
+)
+
+
+def _advisory_support_refund_sample(
+    tmp_path: Path, *, ignored: tuple[str, ...], fail_on: list[str] | None
+) -> Path:
+    root = tmp_path / "support_refund_agent"
+    shutil.copytree(SAMPLE.parent, root, ignore=shutil.ignore_patterns("expected"))
+    manifest_path = root / "shipgate.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    manifest["ci"]["mode"] = "advisory"
+    if fail_on is not None:
+        manifest["ci"]["fail_on"] = fail_on
+    manifest["checks"]["ignore"].extend(
+        {"check_id": check_id, "reason": "accepted for #1029"} for check_id in ignored
+    )
+    manifest_path.write_text(yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8")
+    return manifest_path
+
+
+@pytest.mark.parametrize(
+    ("ignored", "fail_on", "expected_exit"),
+    [
+        # The repro: the ignores must not turn the configured gate green.
+        (_IGNORED_CRITICAL_CONTROLS, ["critical"], 20),
+        # Control: the same gate without the ignores.
+        ((), ["critical"], 20),
+        # Advisory without fail_on still never fails CI, blocked or not.
+        (_IGNORED_CRITICAL_CONTROLS, None, 0),
+    ],
+)
+def test_checks_ignore_cannot_turn_an_advisory_fail_on_gate_green(
+    tmp_path, ignored, fail_on, expected_exit
+):
+    """#1029: the exit code reads the blockers the decision engine keeps."""
+
+    manifest_path = _advisory_support_refund_sample(tmp_path, ignored=ignored, fail_on=fail_on)
+    out = tmp_path / "reports"
+
+    result = CliRunner().invoke(
+        app,
+        ["scan", "--config", str(manifest_path), "--out", str(out), "--no-plugins"],
+    )
+
+    assert result.exit_code == expected_exit, result.output
+    report = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    decision = report["release_decision"]
+    assert decision["decision"] == "blocked"
+    assert decision["fail_policy"]["exit_code"] == expected_exit
+    assert decision["fail_policy"]["would_fail_ci"] is (expected_exit != 0)
+    assert {
+        finding["check_id"] for finding in report["findings"] if finding["suppressed"]
+    } == set(ignored)
+    # The waivable controls stay waived; the mandatory one stays a blocker.
+    blocker_ids = {item["check_id"] for item in decision["blockers"]}
+    assert "SHIP-ACTION-FINANCIAL-WRITE-CONTROL-MISSING" in blocker_ids
+    assert ("SHIP-POLICY-APPROVAL-MISSING" in blocker_ids) is not bool(ignored)
+    assert ("SHIP-SIDEFX-IDEMPOTENCY-MISSING" in blocker_ids) is not bool(ignored)
+
+
+def test_a_blocker_in_fail_on_that_would_not_fail_ci_is_refused_at_emission(
+    tmp_path, monkeypatch
+):
+    """Negative control for #1029: an exit rule that stops reading the
+    decision's blockers fails the scan instead of shipping a green gate."""
+
+    from agents_shipgate.ci import release_decision
+    from agents_shipgate.core.semantic_consistency import SemanticConsistencyError
+
+    reads_blockers = release_decision.exit_code_for_report
+
+    def ignores_blockers(*args, blockers, **kwargs):
+        return reads_blockers(*args, blockers=(), **kwargs)
+
+    monkeypatch.setattr(release_decision, "exit_code_for_report", ignores_blockers)
+    manifest_path = _advisory_support_refund_sample(
+        tmp_path, ignored=_IGNORED_CRITICAL_CONTROLS, fail_on=["critical"]
+    )
+
+    with pytest.raises(SemanticConsistencyError, match="release blocker in fail_on"):
+        run_scan(
+            config_path=manifest_path,
+            output_dir=tmp_path / "reports",
+            formats=["json"],
+            plugins_enabled=False,
+        )
 
 
 def test_agent_finding_does_not_emit_duplicate_policy_evidence_source(tmp_path):
@@ -939,7 +1056,14 @@ def test_baseline_save_and_scan_matches_existing_findings(tmp_path):
     assert (
         second_report.release_decision.evidence_coverage.semantic_coverage.gap_count > 0
     )
+    # The sample intentionally conflicts with its reviewed bindings; matching
+    # a baseline cannot establish a comparable capability surface.
+    assert second_report.binding_surface_facts.status == "conflicting"
     assert second_report.tool_surface_diff.enabled is True
+    assert second_report.tool_surface_diff.finding_deltas.resolved_findings == []
+    assert second_report.binding_surface_diff.base_comparison_requested
+    assert second_report.binding_surface_diff.enabled is False
+    assert any("comparison incomplete" in note for note in second_report.tool_surface_diff.notes)
     assert second_report.tool_surface_diff.base.kind == "baseline"
     assert all(finding.baseline_status in {None, "matched"} for finding in second_report.findings)
 
@@ -991,13 +1115,26 @@ def test_scan_diff_from_prior_report_does_not_change_release_gate(tmp_path):
     assert with_diff.release_decision is not None
     assert without_diff.release_decision is not None
     assert with_diff.release_decision.decision == without_diff.release_decision.decision
+    assert with_diff.binding_surface_facts.status == "conflicting"
     assert with_diff.tool_surface_diff.enabled is True
+    assert with_diff.tool_surface_diff.finding_deltas.resolved_findings == []
+    assert with_diff.binding_surface_diff.base_comparison_requested
+    assert with_diff.binding_surface_diff.enabled is False
+    assert any("comparison incomplete" in note for note in with_diff.tool_surface_diff.notes)
     assert with_diff.tool_surface_diff.base.kind == "report"
 
 
-def test_pre_v029_diff_reference_requires_regeneration_instead_of_effect_deltas(
+def test_pre_freeze_diff_reference_requires_regeneration_instead_of_effect_deltas(
     tmp_path,
 ):
+    """A base this engine may not interpret withholds the verdict.
+
+    Was "pre-v0.29 semantic evidence"; the 1.0 freeze refuses every pre-freeze
+    base for the wider reason (#569). What must not change is the *route*: the
+    scan still runs, the incomparable base is still a `source_warning` carrying
+    a `provide_source` gap, and the decision is still withheld rather than
+    downgraded to `review_required`.
+    """
     project = tmp_path / "project"
     project.mkdir()
     (project / "tools.json").write_text(
@@ -1081,9 +1218,11 @@ action_surface:
     assert report.release_decision is not None
     assert report.release_decision.decision == "insufficient_evidence"
     warning = next(
-        item for item in report.source_warnings if "not comparable with --diff-from" in item
+        item
+        for item in report.source_warnings
+        if report_schema_refusal_code(item) == "report_schema_pre_freeze"
     )
-    assert "uses report schema 0.28" in warning
+    assert "report schema 0.28" in warning
     assert "agents-shipgate scan -c shipgate.yaml --format json" in warning
     gap = next(
         item
@@ -1960,3 +2099,151 @@ def test_scan_reports_a_manifest_type_mismatch_as_a_config_error(tmp_path):
     assert "file an issue" not in json.dumps(payload)
     assert payload["next_actions"][0]["kind"] == "edit"
     assert payload["next_actions"][0]["path"] == str(manifest)
+
+
+_ARCHIVE_CASE = {
+    "operationId": "support.archive_case",
+    "summary": "Archive a support case.",
+    "parameters": [
+        {"name": "case_id", "in": "path", "required": True, "schema": {"type": "string"}}
+    ],
+    "responses": {"204": {"description": "archived"}},
+}
+
+
+def _google_adk_sample_with_delete(tmp_path: Path, *, behind_path_item_ref: bool) -> Path:
+    root = tmp_path / ("ref" if behind_path_item_ref else "inline")
+    shutil.copytree(GOOGLE_ADK_SAMPLE.parent, root)
+    spec_path = root / "specs" / "support.openapi.yaml"
+    spec = yaml.safe_load(spec_path.read_text(encoding="utf-8"))
+    if behind_path_item_ref:
+        spec["paths"]["/cases/{case_id}/archive"] = {"$ref": "#/components/pathItems/Archive"}
+        spec["components"] = {"pathItems": {"Archive": {"delete": _ARCHIVE_CASE}}}
+    else:
+        spec["paths"]["/cases/{case_id}/archive"] = {"delete": _ARCHIVE_CASE}
+    spec_path.write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8")
+    return root / "shipgate.yaml"
+
+
+def test_openapi_delete_behind_a_path_item_ref_is_gated_like_an_inline_one(tmp_path):
+    """#1021: the same DELETE behind `$ref` was invisible and left the base verdict."""
+
+    verdicts = {}
+    for behind_ref in (False, True):
+        config = _google_adk_sample_with_delete(tmp_path, behind_path_item_ref=behind_ref)
+        out = config.parent / "out"
+        report, exit_code = run_scan(
+            config_path=config, output_dir=out, ci_mode="strict", plugins_enabled=False
+        )
+        assert "support.archive_case" in (out / "report.json").read_text(encoding="utf-8")
+        verdicts[behind_ref] = (
+            report.release_decision.decision,
+            exit_code,
+            sorted(
+                (finding.check_id, finding.severity)
+                for finding in report.findings
+                if finding.tool_name == "support.archive_case"
+            ),
+        )
+
+    assert verdicts[True] == verdicts[False]
+    decision, _, findings = verdicts[True]
+    assert decision == "blocked"
+    assert ("SHIP-POLICY-APPROVAL-MISSING", "critical") in findings
+
+
+_READ_TOOLS = ("listLabels", "getLabel", "listBoards", "getBoard")
+_LABEL_SCHEMA = {"type": "object", "properties": {"name": {"type": "string"}}}
+
+
+def _openapi_read_workspace(tmp_path: Path, extra_paths: dict | None = None, *, refs: bool):
+    """Four reviewed read operations, scanned strictly; ``refs`` names the schema."""
+
+    label = {"$ref": "#/components/schemas/Label"} if refs else _LABEL_SCHEMA
+    paths: dict = {
+        f"/reads/{index}": {
+            "get": {
+                "operationId": name,
+                "description": "Read label metadata.",
+                "responses": {
+                    "200": {
+                        "description": "ok",
+                        "content": {
+                            "application/json": {
+                                "schema": {"type": "object", "additionalProperties": label}
+                            }
+                        },
+                    }
+                },
+            }
+        }
+        for index, name in enumerate(_READ_TOOLS)
+    }
+    paths.update(extra_paths or {})
+    document = {
+        "openapi": "3.1.0",
+        "info": {"title": "Labels", "version": "1"},
+        "security": [],
+        "paths": paths,
+        "components": {"schemas": {"Label": _LABEL_SCHEMA}},
+    }
+    manifest = {
+        "version": "0.1",
+        "project": {"name": "labels", "owner": "test"},
+        "agent": {"name": "label_helper", "declared_purpose": ["look up labels"]},
+        "environment": {"target": "local"},
+        "tool_sources": [{"id": "labels", "type": "openapi", "path": "api.json"}],
+        "agent_bindings": {
+            "declarations": [
+                {
+                    "agent": "root",
+                    "complete": True,
+                    "tools": [{"tool": name, "source_id": "labels"} for name in _READ_TOOLS],
+                    "handoffs": [],
+                    "reason": "Synthetic isolated regression fixture",
+                }
+            ]
+        },
+        "action_surface": {
+            "actions": [
+                {"tool": name, "effect": "read", "authority": {"mode": "none"}}
+                for name in _READ_TOOLS
+            ]
+        },
+    }
+    root = tmp_path / ("refs" if refs else "inline")
+    root.mkdir()
+    (root / "shipgate.yaml").write_text(yaml.safe_dump(manifest), encoding="utf-8")
+    (root / "api.json").write_text(json.dumps(document), encoding="utf-8")
+    report, _ = run_scan(
+        config_path=root / "shipgate.yaml",
+        output_dir=root / "out",
+        ci_mode="strict",
+        plugins_enabled=False,
+    )
+    return report
+
+
+def test_openapi_schema_refs_the_document_resolves_do_not_degrade_evidence(tmp_path):
+    """#1021: four `additionalProperties` refs read as four unresolved-ref warnings."""
+
+    inline = _openapi_read_workspace(tmp_path, refs=False)
+    referenced = _openapi_read_workspace(tmp_path, refs=True)
+
+    assert referenced.source_warnings == []
+    assert referenced.release_decision.decision == inline.release_decision.decision == "passed"
+
+
+def test_openapi_external_path_item_ref_withholds_a_pass_and_is_ledgered(tmp_path):
+    report = _openapi_read_workspace(
+        tmp_path, {"/accounts/{id}": {"$ref": "./paths/accounts.yaml"}}, refs=True
+    )
+
+    (warning,) = report.source_warnings
+    assert "'/accounts/{id}'" in warning and "'./paths/accounts.yaml'" in warning
+    assert report.release_decision.decision != "passed"
+    (row,) = [
+        entry for entry in report.surface_exclusions.entries if entry.stage == "adapter_parse"
+    ]
+    assert (row.subject, row.reason) == ("/paths/~1accounts~1{id}", "unresolved_path_item_ref")
+    assert (row.accounting, row.accounted_by) == ("evidence_gap", warning)

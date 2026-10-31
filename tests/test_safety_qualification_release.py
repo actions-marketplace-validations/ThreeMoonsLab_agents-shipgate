@@ -23,7 +23,12 @@ from agents_shipgate.schemas.safety_qualification import (
     production_safety_requirements,
     tier_for_requirements,
 )
-from scripts.run_safety_qualification import _confusion_matrix, _metric, sha256_file
+from scripts.run_safety_qualification import (
+    _confusion_matrix,
+    _coverage_misses,
+    _metric,
+    sha256_file,
+)
 from scripts.verify_safety_qualification_release import (
     main,
     verify_release_qualification,
@@ -129,6 +134,7 @@ def _result(
             denominator=outcome_counts["insufficient_evidence"],
             requirement=f">= {requirements.minimum_insufficient_evidence_exact} cases",
             passed=True,
+            applicability="not_applicable",
         ),
         _metric(
             name="overall_exact_rate",
@@ -136,6 +142,7 @@ def _result(
             denominator=total,
             requirement="reported for audit; outcome-specific thresholds govern",
             passed=True,
+            applicability="diagnostic",
         ),
     ]
     matrices = [_confusion_matrix(cases, profile="all")]
@@ -177,7 +184,20 @@ def _result(
         intervals=metrics,
         cases=cases,
         failures=[],
+        coverage_misses=_coverage_misses(cases, {}),
     )
+
+
+def _case_total(requirements: SafetyQualificationRequirementsV1) -> int:
+    """How many cases a policy demands.
+
+    Derived rather than spelled, because these tests are about *which* policy
+    a tag selects, not about the counts themselves --
+    ``test_production_defaults_pin_the_exact_beta_contract`` and its pre-1.0
+    twin are where a count change has to be an explicit edit.
+    """
+
+    return sum(item.count for item in requirements.required_strata)
 
 
 def _fixture(
@@ -318,7 +338,7 @@ def test_a_pre_1_0_artifact_publishes_a_0_x_tag_and_nothing_later(
 ) -> None:
     """The whole point of the #341 decision, and its limit.
 
-    A 56-case ``pre_1_0`` artifact is a complete answer for a ``0.x`` tag, and
+    A conforming ``pre_1_0`` artifact is a complete answer for a ``0.x`` tag, and
     is *not* an answer for ``1.0``: the same bytes that pass on ``v0.16.0b7``
     must fail on ``v1.0.0``, because the governing policy is read from the
     version and never from the artifact.
@@ -334,7 +354,7 @@ def test_a_pre_1_0_artifact_publishes_a_0_x_tag_and_nothing_later(
     assert result.qualification_tier == "pre_1_0"
     assert result.qualified is True
     assert result.production_qualified is False
-    assert len(result.cases) == 56
+    assert len(result.cases) == _case_total(pre_release_safety_requirements())
 
     later_wheel, later_qualification = _fixture(
         tmp_path / "later",
@@ -361,9 +381,7 @@ def test_a_pre_1_0_artifact_may_not_claim_a_legacy_envelope(tmp_path: Path) -> N
     wheel, qualification = _fixture(tmp_path, requirements=pre_release_safety_requirements())
     _mutate(
         qualification,
-        lambda payload: payload.__setitem__(
-            "schema_version", "shipgate.safety_qualification/v4"
-        ),
+        lambda payload: _as_v4(payload),
     )
 
     with pytest.raises(ConfigError, match="admits only qualification_tier"):
@@ -376,9 +394,7 @@ def test_a_pre_1_0_artifact_may_not_claim_a_legacy_envelope(tmp_path: Path) -> N
     )
     _mutate(
         qualification,
-        lambda payload: payload.__setitem__(
-            "schema_version", "shipgate.safety_qualification/v4"
-        ),
+        lambda payload: _as_v4(payload),
     )
     assert (
         verify_release_qualification(
@@ -386,6 +402,13 @@ def test_a_pre_1_0_artifact_may_not_claim_a_legacy_envelope(tmp_path: Path) -> N
         ).schema_version
         == "shipgate.safety_qualification/v5"
     )
+
+
+def _as_v4(payload):
+    payload["schema_version"] = "shipgate.safety_qualification/v4"
+    payload.pop("coverage_misses")
+    for metric in payload["intervals"]:
+        metric.pop("applicability")
 
 
 def test_a_production_artifact_still_publishes_a_0_x_tag(tmp_path: Path) -> None:
@@ -405,8 +428,11 @@ def test_the_tier_a_0_x_artifact_names_selects_the_counts_it_must_meet(
     tmp_path: Path,
 ) -> None:
     """Both tiers are admissible for ``0.x``, so neither may borrow the other's
-    numbers: a 56-case corpus cannot call itself ``beta``, and a 100-case one
-    cannot call itself ``pre_1_0``."""
+    numbers: a pre-1.0-sized corpus cannot call itself ``beta``, and a
+    production-sized one cannot call itself ``pre_1_0``."""
+
+    production_total = _case_total(production_safety_requirements())
+    pre_1_0_total = _case_total(pre_release_safety_requirements())
 
     def _relabel(tier: str, production: bool):
         # Both fields together: relabelling only the tier trips the artifact's
@@ -422,7 +448,7 @@ def test_the_tier_a_0_x_artifact_names_selects_the_counts_it_must_meet(
         tmp_path / "understated", requirements=pre_release_safety_requirements()
     )
     _mutate(qualification, _relabel("beta", True))
-    with pytest.raises(ConfigError, match="exactly 100 cases"):
+    with pytest.raises(ConfigError, match=f"exactly {production_total} cases"):
         verify_release_qualification(
             wheel_path=wheel, qualification_path=qualification, tag=f"v{VERSION}"
         )
@@ -431,14 +457,14 @@ def test_the_tier_a_0_x_artifact_names_selects_the_counts_it_must_meet(
         tmp_path / "overstated", requirements=production_safety_requirements()
     )
     _mutate(qualification, _relabel("pre_1_0", False))
-    with pytest.raises(ConfigError, match="exactly 56 cases"):
+    with pytest.raises(ConfigError, match=f"exactly {pre_1_0_total} cases"):
         verify_release_qualification(
             wheel_path=wheel, qualification_path=qualification, tag=f"v{VERSION}"
         )
 
 
 def test_a_pre_1_0_artifact_may_not_claim_the_production_flag(tmp_path: Path) -> None:
-    """``production_qualified`` keeps meaning "met the 100-case bar".
+    """``production_qualified`` keeps meaning "met the production bar".
 
     The artifact schema refuses to construct the inconsistency at all, so the
     runner cannot emit one and the verifier rejects it while parsing -- before
@@ -494,7 +520,7 @@ def test_an_unnamed_tier_is_rejected_and_still_scored_against_production(
 
     message = str(excinfo.value)
     assert "qualification tier is not one of beta, pre_1_0" in message
-    assert "exactly 100 cases" in message
+    assert f"exactly {_case_total(production_safety_requirements())} cases" in message
 
 
 def test_release_workflow_reuses_signed_qualified_wheel_before_publish() -> None:
@@ -532,7 +558,7 @@ def test_release_workflow_reuses_signed_qualified_wheel_before_publish() -> None
     # graph rather than by step position.
     assert "uv publish --trusted-publishing always" not in verify
     parsed_release = yaml.safe_load(release)
-    assert parsed_release["jobs"]["publish"]["needs"] == ["verify", "stage"]
+    assert parsed_release["jobs"]["publish"]["needs"] == ["candidate", "stage"]
 
     # The wheel is addressed by the filename verification approved, and the
     # source-built wheel never enters the publishable set.
@@ -542,7 +568,13 @@ def test_release_workflow_reuses_signed_qualified_wheel_before_publish() -> None
     assert "safety-qualification.json" in verify
     assert "safety-qualification.sigstore.json" in verify
 
-    for workflow in ("release.yml", "release-verify.yml", "release-rehearsal.yml"):
+    for workflow in (
+        "release.yml",
+        "release-verify.yml",
+        "release-rehearsal.yml",
+        "release-advisory-verify.yml",
+        "release-advisory-rehearsal.yml",
+    ):
         parsed = yaml.safe_load(
             (REPO_ROOT / ".github/workflows" / workflow).read_text(encoding="utf-8")
         )
@@ -574,3 +606,170 @@ def test_release_validator_is_directly_executable_from_the_documented_command() 
 
     assert result.returncode == 0, result.stderr
     assert "--qualification" in result.stdout
+
+
+# --------------------------------------------------------------------------
+# #491 — the unqualified preview channel cannot be read as a qualified release
+#
+# `docs/release-evidence-policy-decision.md` § Amendment 2 finds the channel
+# admissible *conditionally*, and condition C4 is that no existing reader may
+# confuse a preview for a release. This gate is the reader with the most
+# authority — the release pipeline runs it before publication — so it is the
+# one whose refusal has to be proved rather than assumed.
+# --------------------------------------------------------------------------
+
+PREVIEW_VERSION = f"{VERSION}+preview.20260902.g1a2b3c4"
+
+
+def test_a_preview_artifact_set_is_refused_because_it_carries_no_qualification(
+    tmp_path: Path,
+) -> None:
+    """The shape a preview actually publishes: a wheel, and nothing else.
+
+    This is the first of the two independent refusals. A preview attaches one
+    asset, so the gate's required input is simply absent — and the failure is a
+    refusal, not a pass-by-default.
+    """
+
+    wheel = tmp_path / f"agents_shipgate-{PREVIEW_VERSION}-py3-none-any.whl"
+    _write_wheel(wheel, PREVIEW_VERSION)
+    missing = tmp_path / "safety-qualification.json"
+    assert not missing.exists()
+
+    with pytest.raises(ConfigError, match="qualification artifact not found"):
+        verify_release_qualification(
+            wheel_path=wheel,
+            qualification_path=missing,
+            tag=f"preview-{PREVIEW_VERSION}",
+        )
+
+    assert (
+        main(
+            [
+                "--wheel",
+                str(wheel),
+                "--qualification",
+                str(missing),
+                "--tag",
+                f"preview-{PREVIEW_VERSION}",
+            ]
+        )
+        == 1
+    )
+
+
+def test_a_preview_ref_is_refused_even_carrying_a_wholly_valid_artifact(
+    tmp_path: Path,
+) -> None:
+    """The second refusal, and the one that survives an operator error.
+
+    Supplying the *release's* own qualification artifact alongside a preview
+    ref is the realistic mistake — a paste of the documented command with the
+    wrong `--tag`. The gate requires `tag == v<wheel version>`, so a
+    `preview-` ref cannot satisfy it no matter how good the evidence beside it
+    is. Nothing about the preview channel weakened this: the check is the one
+    that was already there.
+    """
+
+    wheel, qualification = _fixture(tmp_path)
+
+    with pytest.raises(ConfigError, match="tag does not match"):
+        verify_release_qualification(
+            wheel_path=wheel,
+            qualification_path=qualification,
+            tag=f"preview-{VERSION}",
+        )
+
+
+def test_a_preview_wheel_is_refused_by_the_artifact_that_qualified_the_release(
+    tmp_path: Path,
+) -> None:
+    """A preview wheel is different bytes under a different version, so the
+    release's artifact cannot vouch for it — the digest binding refuses first,
+    and the tag binding refuses after. Both are stated because a reader that
+    only checked the tag would accept a rebuilt wheel under the right name."""
+
+    _, qualification = _fixture(tmp_path)
+    preview_wheel = tmp_path / f"agents_shipgate-{PREVIEW_VERSION}-py3-none-any.whl"
+    _write_wheel(preview_wheel, PREVIEW_VERSION)
+
+    with pytest.raises(ConfigError, match="wheel SHA-256 mismatch|tag does not match"):
+        verify_release_qualification(
+            wheel_path=preview_wheel,
+            qualification_path=qualification,
+            tag=f"v{PREVIEW_VERSION}",
+        )
+
+
+def test_current_operator_policy_table_matches_both_gate_implementations() -> None:
+    from scripts._release_support import QUALIFICATION_POLICIES
+
+    readme = (REPO_ROOT / 'benchmark/safety-qualification/README.md').read_text()
+    section = readme.split('### Current policy contract\n', 1)[1].split('\n### ', 1)[0]
+    rows = {
+        cells[0]: cells[1:]
+        for line in section.splitlines()
+        if line.startswith('| ')
+        for cells in [[cell.strip() for cell in line.strip('|').split('|')]]
+    }
+    for column, (tier, requirements) in enumerate((
+        ('pre_1_0', pre_release_safety_requirements()),
+        ('beta', production_safety_requirements()),
+    )):
+        counts = {
+            decision: sum(s.count for s in requirements.required_strata if s.expected_decision == decision)
+            for decision in ('passed', 'review_required', 'blocked')
+        }
+        total = sum(counts.values())
+        policy = QUALIFICATION_POLICIES[tier]
+        assert total == policy.case_count
+        assert requirements.minimum_qualified_origins == policy.minimum_qualified_origins
+        expected = {
+            'Cases': str(total),
+            'Strata': str(len(requirements.required_strata)),
+            'Expected passed / review_required / blocked': ' / '.join(map(str, counts.values())),
+            'Qualifying origins, minimum': str(requirements.minimum_qualified_origins),
+            'Safe passes, minimum': f'{requirements.minimum_safe_passes} / {counts["passed"]}',
+            'Review exact, minimum': f'{requirements.minimum_review_exact} / {counts["review_required"]}',
+            'Blocked exact, minimum': f'{requirements.minimum_blocked_exact} / {counts["blocked"]}',
+            'Unsafe auto-passes, maximum': f'{requirements.maximum_unsafe_auto_passes} / {total - counts["passed"]}',
+            "Cohen's kappa, minimum": f'{requirements.minimum_kappa:.2f}',
+            'Holdout per stratum, minimum fraction': f'{requirements.minimum_holdout_fraction_per_stratum:.2f}',
+            'Report schema': f'`{requirements.required_report_schema_version}`',
+        }
+        for name, value in expected.items():
+            assert rows[name][column] == value, (tier, name)
+
+
+def test_current_operator_envelopes_and_version_table_match_the_runner() -> None:
+    from agents_shipgate.schemas.safety_qualification import (
+        SAFETY_CORPUS_SCHEMA_VERSION,
+        SAFETY_QUALIFICATION_SCHEMA_VERSION,
+        SAFETY_RECEIPT_INDEX_SCHEMA_VERSION,
+    )
+    from scripts._release_support import QUALIFICATION_POLICIES
+    from scripts.run_safety_qualification import _parser
+
+    readme = (REPO_ROOT / 'benchmark/safety-qualification/README.md').read_text()
+    runbook = (REPO_ROOT / 'docs/release-runbook.md').read_text()
+    for version in (
+        SAFETY_CORPUS_SCHEMA_VERSION, SAFETY_RECEIPT_INDEX_SCHEMA_VERSION,
+        SAFETY_QUALIFICATION_SCHEMA_VERSION,
+    ):
+        assert f'`{version}`' in readme.split('Current envelopes:', 1)[1].split('\n### ', 1)[0]
+    pre = QUALIFICATION_POLICIES['pre_1_0'].case_count
+    beta = QUALIFICATION_POLICIES['beta'].case_count
+    assert f'| `0.x` (epoch 0, major 0) | `pre_1_0`, or the stronger `beta` | {pre}, or {beta} |' in runbook
+    assert f'| `1.0` and later | `beta` only | {beta} |' in runbook
+    assert f'| unparsable | `beta` only | {beta} |' in runbook
+    assert f'{beta}-case bar' in _parser().format_help()
+
+
+def test_distribution_origin_floor_is_not_the_external_rollout_gate() -> None:
+    text = (REPO_ROOT / 'docs/distribution.md').read_text()
+    beta = production_safety_requirements().minimum_qualified_origins
+    pre = pre_release_safety_requirements().minimum_qualified_origins
+    assert f'combined origin minimum — {beta} real-history,' in text
+    assert f'under the production policy and {pre}\nunder the pre-1.0 one' in text
+    assert 'four-week, three-design-partner rollout' in text
+    assert 'external beta stop condition' in text

@@ -10,7 +10,10 @@ from agents_shipgate.core.domain import (
     Tool,
 )
 from agents_shipgate.core.errors import InputParseError
+from agents_shipgate.core.mcp_host_selection import declared_component_paths
+from agents_shipgate.core.static_inputs import active_static_input_snapshot
 from agents_shipgate.inputs.common import (
+    MAX_INPUT_FILE_BYTES,
     PositionIndex,
     json_pointer_escape,
     list_input_directory,
@@ -20,6 +23,7 @@ from agents_shipgate.inputs.common import (
     manifest_relative_path,
     resolve_input_path,
 )
+from agents_shipgate.inputs.coverage import BoundaryCell, SourceCoverage
 from agents_shipgate.inputs.mcp import load_mcp_tools
 from agents_shipgate.inputs.protocol import LoadedAdapterResult
 from agents_shipgate.schemas.codex_plugin import (
@@ -561,7 +565,7 @@ def _load_skills(
     plugin_name: str,
     artifacts: CodexPluginArtifacts,
 ) -> None:
-    paths = _component_paths(data, root, "skills", default="skills")
+    paths = _component_paths(data, root, "skills", plugin_name, artifacts, default="skills")
     skill_files: list[Path] = []
     for path in paths:
         resolved = _resolve_component_path(
@@ -627,7 +631,7 @@ def _load_apps(
     plugin_name: str,
     artifacts: CodexPluginArtifacts,
 ) -> None:
-    for path in _component_paths(data, root, "apps", default=".app.json"):
+    for path in _component_paths(data, root, "apps", plugin_name, artifacts, default=".app.json"):
         resolved = _resolve_component_path(
             root=root,
             base_dir=base_dir,
@@ -675,7 +679,7 @@ def _load_mcp_servers(
     inventories: dict[tuple[str, str], CodexPluginMcpInventoryConfig],
 ) -> list[LoadedToolSource]:
     loaded_sources: list[LoadedToolSource] = []
-    for path in _component_paths(data, root, "mcpServers", default=".mcp.json"):
+    for path in _component_paths(data, root, "mcpServers", plugin_name, artifacts, default=".mcp.json"):
         resolved = _resolve_component_path(
             root=root,
             base_dir=base_dir,
@@ -785,7 +789,7 @@ def _load_hooks(
     plugin_name: str,
     artifacts: CodexPluginArtifacts,
 ) -> None:
-    for path in _component_paths(data, root, "hooks"):
+    for path in _component_paths(data, root, "hooks", plugin_name, artifacts):
         resolved = _resolve_component_path(
             root=root,
             base_dir=base_dir,
@@ -818,17 +822,35 @@ def _component_paths(
     data: dict[str, Any],
     root: Path,
     key: str,
+    plugin: str,
+    artifacts: CodexPluginArtifacts,
     *,
     default: str | None = None,
 ) -> list[str]:
-    value = data.get(key)
-    paths: list[str] = []
-    if isinstance(value, str) and value.strip():
-        paths.append(value)
-    elif isinstance(value, list):
-        paths.extend(item for item in value if isinstance(item, str) and item.strip())
-    if not paths and default and (root / default).exists():
-        paths.append(default)
+    # One rule with the host reader, which attributes a `.mcp.json` to the
+    # Codex plugin whose `mcpServers` names it (#936).
+    paths = declared_component_paths(data.get(key))
+    if not paths and default:
+        candidate = root / default
+        snapshot = active_static_input_snapshot()
+        if snapshot is not None and (root == snapshot.root or snapshot.contains(root)):
+            try:
+                if snapshot.excludes(candidate):
+                    raise ValueError("default component path overlaps excluded verification output")
+                if not snapshot.bind_dependency_absence(candidate):
+                    paths.append(default)
+            except (OSError, ValueError) as exc:
+                snapshot.mark_unconfirmable_dependency(candidate)
+                artifacts.component_path_issues.append(
+                    CodexPluginComponentPathIssue(
+                        plugin=plugin,
+                        component=key,
+                        path=default,
+                        reason=f"Default component lookup could not be captured: {exc}",
+                    )
+                )
+        elif candidate.exists():
+            paths.append(default)
     return paths
 
 
@@ -842,7 +864,7 @@ def _resolve_component_path(
     artifacts: CodexPluginArtifacts,
 ) -> Path | None:
     try:
-        resolved = _resolve_plugin_path(root, raw_path)
+        resolved = _resolve_plugin_path(root, raw_path, allow_directory=component == "skills")
     except InputParseError as exc:
         artifacts.component_path_issues.append(
             CodexPluginComponentPathIssue(
@@ -878,9 +900,39 @@ def _resolve_component_path(
     return resolved
 
 
-def _resolve_plugin_path(root: Path, raw_path: str) -> Path:
+def _resolve_plugin_path(root: Path, raw_path: str, *, allow_directory: bool) -> Path:
     raw = Path(raw_path)
     candidate = raw if raw.is_absolute() else root / raw_path
+    snapshot = active_static_input_snapshot()
+    if snapshot is not None and (root == snapshot.root or snapshot.contains(root)):
+        # Preserve the declared lookup. Resolving first would erase an in-root
+        # alias, leaving only its old target in the verification input set.
+        try:
+            if ".." in raw.parts:
+                raise ValueError("parent traversal is not a confirmable component lookup")
+            if candidate != root and root not in candidate.parents:
+                raise ValueError("component path is outside plugin root")
+            if snapshot.excludes(candidate):
+                raise ValueError("component path overlaps excluded verification output")
+            # _skill_files treats this basename as a direct file before any
+            # directory walk. Match that selection, including './' when the
+            # plugin root itself is named SKILL.md, before parser recovery.
+            snapshot.capture_selected_path(
+                candidate, max_bytes=MAX_INPUT_FILE_BYTES,
+                allow_directory=allow_directory and candidate.name != "SKILL.md",
+            )
+        except (OSError, ValueError) as exc:
+            # The caller turns InputParseError into a component diagnostic.
+            # Keep the failed lookup visible to currency validation as well:
+            # repairing an alias must never reconfirm an old empty capture.
+            if ".." in raw.parts or candidate == root or root not in candidate.parents:
+                snapshot.mark_unconfirmable_input_directory(root)
+            else:
+                snapshot.mark_unconfirmable_dependency(candidate)
+            raise InputParseError(
+                f"Codex plugin component path {raw_path!r} could not be captured: {exc}"
+            ) from exc
+        return candidate
     resolved = candidate.resolve()
     try:
         resolved.relative_to(root.resolve())
@@ -965,6 +1017,70 @@ class CodexPluginAdapter:
     source_type: ClassVar[str] = "codex_plugin"
     scope: ClassVar[Literal["per_source", "per_scan"]] = "per_scan"
     artifact_class: ClassVar[type | None] = CodexPluginArtifacts
+
+    coverage: ClassVar[SourceCoverage] = SourceCoverage(
+        adapter="codex_plugin",
+        label="Codex plugin package / marketplace",
+        reads=(
+            "Plugin manifests, marketplace indexes, and the skills, apps, hooks, "
+            "MCP server stubs, and MCP inventories a plugin ships."
+        ),
+        manifest_section="codex_plugins",
+        manifest_section_role="supplements",
+        cells=(
+            BoundaryCell(
+                shape="export_artifact",
+                variant="reviewed inventory",
+                status="extracted",
+                reads=(
+                    "An MCP tool inventory shipped inside the plugin and declared by "
+                    "`codex_plugins.mcp_tool_inventories[]`, read through the same "
+                    "loader as a standalone export."
+                ),
+                emits=("codex_plugin_mcp_inventory",),
+                ceiling="high",
+            ),
+            BoundaryCell(
+                shape="export_artifact",
+                variant="wildcard inventory",
+                status="extracted",
+                reads=(
+                    "An inventory that declares `wildcard: true` instead of "
+                    "listing tools. It is a reviewed file and still names "
+                    "nothing, so it loads at `high` and proves no surface — a "
+                    "reviewed statement that says nothing is not evidence."
+                ),
+                emits=("codex_plugin_mcp_inventory",),
+                ceiling="high",
+                surface_flags=("wildcard_tools",),
+            ),
+            BoundaryCell(
+                shape="literal_registration",
+                status="not_extracted",
+                reads=(
+                    "A plugin's MCP server stub names a server without a tool "
+                    "contract. It is recorded as a plugin component and a host "
+                    "boundary fact; no action enters the catalog, and a plugin whose "
+                    "whole component graph parsed with no callable tool says so "
+                    "structurally rather than by silence."
+                ),
+            ),
+            BoundaryCell(
+                shape="factory",
+                status="not_applicable",
+                reads="A plugin manifest declares components; it does not construct them.",
+            ),
+            BoundaryCell(
+                shape="dynamic_construction",
+                status="not_extracted",
+                reads=(
+                    "A marketplace entry that is unreadable or unnamed is recorded "
+                    "as a skipped entry against its index position, so the count of "
+                    "what was refused is published rather than absorbed."
+                ),
+            ),
+        ),
+    )
 
     def load(
         self,

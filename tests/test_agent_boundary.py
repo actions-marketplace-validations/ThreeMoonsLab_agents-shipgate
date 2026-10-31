@@ -258,14 +258,14 @@ def test_codex_requirements_change_requires_human_review(tmp_path: Path) -> None
     assert result.affected_hosts == ["codex"]
 
 
-def test_stored_lowercase_agent_instructions_keep_the_human_stop(
+def test_stored_lowercase_instruction_prose_has_the_same_structural_classification(
     tmp_path: Path,
 ) -> None:
     result = _build(tmp_path, _new_file_diff("agents.md", "Run Shipgate."))
 
-    assert result.control.state == "review_publishable"
-    assert result.control.permissions.merge is False
-    assert any(item.path == "agents.md" for item in result.violations)
+    assert result.control.state == "complete"
+    assert result.control.permissions.merge is True
+    assert not result.violations
 
 
 def test_untracked_unicode_agent_instructions_are_not_hidden_by_git_quoting(
@@ -293,7 +293,7 @@ def test_untracked_unicode_agent_instructions_are_not_hidden_by_git_quoting(
     assert invoked.exit_code == 0, invoked.output
     payload = json.loads(invoked.output)
     assert "caf\u00e9/AGENTS.md" in payload["changed_files"]
-    assert payload["control"]["state"] == "review_publishable"
+    assert payload["control"]["state"] == "agent_action_required"
     assert payload["input_coverage"] == "complete"
 
 
@@ -350,14 +350,14 @@ def test_nested_codex_config_retains_structural_dangerous_grant_check(
     [
         ("sub/.mcp.json", "agent_action_required", "verify"),
         ("sub/.github/workflows/release.yml", "agent_action_required", "verify"),
-        ("claude.md", "review_publishable", "review"),
+        ("claude.md", "complete", None),
     ],
 )
-def test_nested_and_case_variant_boundary_paths_never_complete(
+def test_nested_and_case_variant_paths_preserve_their_actual_surface_kind(
     tmp_path: Path,
     path: str,
     expected_state: str,
-    expected_action: str,
+    expected_action: str | None,
 ) -> None:
     content = (
         json.dumps({"mcpServers": {"danger": {"command": "danger"}}})
@@ -366,17 +366,16 @@ def test_nested_and_case_variant_boundary_paths_never_complete(
     )
     result = _build(tmp_path, _new_file_diff(path, content))
 
-    # Nested copies remain verify-routed, while a case-variant root instruction
-    # file is a live gate-governing trust root that a human must approve before
-    # merge. Contract v20 keeps publishing it for that review authorized.
+    # Nested structured copies remain verify-routed; plain guidance has no grant.
     assert result.control.state == expected_state
-    assert result.control.next_action.kind == expected_action
+    if expected_action is not None:
+        assert result.control.next_action.kind == expected_action
     if expected_state == "agent_action_required":
         assert result.pending_review
-    else:
+    elif expected_state != "complete":
         assert result.violations
         assert result.control.human_review.required is True
-    assert result.control.completion_allowed is False
+    assert result.control.completion_allowed is (expected_state == "complete")
 
 
 def test_claude_nested_permission_expansion_is_not_ignored(tmp_path: Path) -> None:
@@ -506,14 +505,14 @@ def test_central_snapshot_reads_each_static_source_at_most_once(tmp_path: Path) 
         ),
     ],
 )
-def test_instruction_trust_root_weakening_requires_review(
+def test_complete_prose_comparison_does_not_judge_instruction_weakening(
     tmp_path: Path, path: str, old: str, new: str
 ) -> None:
     target = tmp_path / path
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(old, encoding="utf-8")
     result = _build(tmp_path, _change_diff(path, old, new))
-    assert result.control.state == "review_publishable"
+    assert result.control.state == "complete"
 
 
 def test_unclassified_workflow_behavior_change_requires_review(tmp_path: Path) -> None:
@@ -568,13 +567,17 @@ def test_explicit_custom_policy_is_a_protected_shared_boundary(
     assert shared.status == "complete"
 
 
-def test_changed_experimental_vscode_mcp_never_completes(tmp_path: Path) -> None:
+def test_a_changed_vscode_mcp_config_never_completes_unverified(tmp_path: Path) -> None:
+    """Supported now (#731), so its coverage is complete, and a changed host file still never completes here."""
+
     result = _build(
         tmp_path,
         _new_file_diff(".vscode/mcp.json", json.dumps({"servers": {}})),
     )
-    assert result.control.state == "human_review_required"
-    assert any(item.status == "experimental" for item in result.host_coverage)
+    assert result.control.state != "complete"
+    assert not any(item.status == "experimental" for item in result.host_coverage)
+    [vscode] = [item for item in result.host_coverage if item.adapter == "vscode_mcp"]
+    assert vscode.status == "complete"
 
 
 @pytest.mark.parametrize(
@@ -602,6 +605,114 @@ def test_shared_trust_roots_never_complete_without_safe_receipt(
         assert result.pending_review
     assert result.control.completion_allowed is False
 
+
+def test_untracked_baseline_with_blocked_host_expansion_routes_to_human_review(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    old = json.dumps({"permissions": {"allow": ["Bash(npm test)", "Read(src/**)"]}})
+    new = json.dumps({"permissions": {"allow": ["Bash(*)", "Read(**)", "WebFetch(*)"]}})
+    target = tmp_path / ".claude" / "settings.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(old, encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "boundary base"], cwd=tmp_path, check=True)
+    target.write_text(new, encoding="utf-8")
+    diff = _change_diff(".claude/settings.json", old, new) + _new_file_diff(
+        ".agents-shipgate/host-grants.json",
+        json.dumps({"version": 1, "grants": []}),
+    )
+
+    result = _build(tmp_path, diff, agent="claude-code")
+
+    assert result.decision == "block"
+    assert result.control.state == "human_review_required"
+    assert result.control.permissions.publishes is False
+    assert result.control.completion_allowed is False
+    assert result.required_reviewers == list(
+        result.control.human_review.required_reviewers
+    )
+    assert "SHIP-HOST-BOUNDARY-PERMISSION-WILDCARD-ALLOW" in [
+        item.check_id for item in result.violations
+    ]
+
+
+
+@pytest.mark.parametrize(
+    "format_",
+    ["text", "agent-boundary-json", "agent-control-json", "codex-boundary-json"],
+)
+def test_check_stops_an_untracked_baseline_with_a_blocked_expansion_in_every_format(
+    tmp_path: Path, format_: str
+) -> None:
+    """#694 through the real command, on the issue's route.
+
+    The new baseline is an undeclared surface and the widening is a policy
+    block. Every format must answer, and none may hand the blocked result a
+    coding-agent command or publication: the frozen codex projection used to
+    route it to a configuration command while the others crashed.
+    """
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=tmp_path, check=True)
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test")
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.parent.mkdir()
+    settings.write_text(
+        json.dumps({"permissions": {"allow": ["Bash(npm test)", "Read(src/**)"]}}),
+        encoding="utf-8",
+    )
+    mcp = tmp_path / ".mcp.json"
+    local = {"command": "node", "args": ["server.js"]}
+    mcp.write_text(json.dumps({"mcpServers": {"local": local}}), encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+    saved = CliRunner().invoke(
+        app, ["audit", "--host", "--save-baseline", "--workspace", str(tmp_path)]
+    )
+    assert saved.exit_code == 0, saved.output
+    assert (tmp_path / ".agents-shipgate" / "host-grants.json").is_file()
+    git("checkout", "-qb", "feature")
+    settings.write_text(
+        json.dumps({"permissions": {"allow": ["Bash(*)", "Read(**)", "WebFetch(*)"]}}),
+        encoding="utf-8",
+    )
+    remote = {"type": "http", "url": "https://example.com/mcp"}
+    mcp.write_text(
+        json.dumps({"mcpServers": {"local": local, "remote": remote}}),
+        encoding="utf-8",
+    )
+    git("add", ".claude", ".mcp.json")
+    git("commit", "-qm", "widen")
+
+    result = CliRunner().invoke(
+        app, ["check", "--workspace", str(tmp_path), "--format", format_]
+    )
+
+    assert result.exit_code == 0, result.output
+    if format_ == "text":
+        assert "Bash(*)" in result.output
+        return
+    payload = json.loads(result.output)
+    assert payload["decision"] == "block"
+    if format_ == "agent-control-json":
+        state, next_action = payload["control_state"], payload["next_action"]
+        assert not any(payload["permissions"].values())
+    else:
+        control = payload["control"]
+        state, next_action = control["state"], control["next_action"]
+        assert control["completion_allowed"] is False
+        assert payload["required_reviewers"]
+    if format_ == "agent-boundary-json":
+        assert not any(payload["control"]["permissions"].values())
+        assert "SHIP-HOST-BOUNDARY-PERMISSION-WILDCARD-ALLOW" in [
+            item["check_id"] for item in payload["violations"]
+        ]
+    assert state == "human_review_required"
+    assert (next_action["actor"], next_action["kind"]) == ("human", "stop")
 
 def test_unified_policy_cannot_downgrade_host_safety_floor(tmp_path: Path) -> None:
     policy = tmp_path / "policies" / "agent-boundary.shipgate.yaml"
@@ -693,7 +804,7 @@ def test_header_only_cli_and_mcp_never_complete(tmp_path: Path) -> None:
 
     cli = runner.invoke(
         app,
-        ["check", "--workspace", str(tmp_path), "--diff", str(diff_path)],
+        ["check", "--workspace", str(tmp_path), "--diff", str(diff_path), "--format", "agent-boundary-json"],
     )
     assert cli.exit_code == 0, cli.output
     cli_payload = json.loads(cli.output)
@@ -713,7 +824,7 @@ def test_cli_and_mcp_never_serialize_permission_argument_secrets(tmp_path: Path)
     diff_path.write_text(diff, encoding="utf-8")
     cli = runner.invoke(
         app,
-        ["check", "--workspace", str(tmp_path), "--diff", str(diff_path)],
+        ["check", "--workspace", str(tmp_path), "--diff", str(diff_path), "--format", "agent-boundary-json"],
     )
     assert cli.exit_code == 0, cli.output
     mcp = shipgate_check(workspace=str(tmp_path), diff_text=diff)
@@ -1195,8 +1306,11 @@ def test_check_authorizes_a_verify_command_for_its_own_target(tmp_path: Path) ->
 
 
 def test_check_verify_command_preserves_the_evaluated_ref_range(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # This is a command-quoting unit test with deliberately invalid Git refs.
+    # Selection from real compared trees is covered by hook routing tests.
+    monkeypatch.setattr("agents_shipgate.cli.agent_result.enabled_plugin_hook_evidence", lambda **kwargs: (None, None, []))
     (tmp_path / "new-gate.yml").write_text(_MCP_MANIFEST, encoding="utf-8")
     result = build_agent_boundary_result(
         agent="codex",
@@ -1323,8 +1437,10 @@ def test_undeclared_recovery_commands_preserve_the_requested_workspace(
 
 
 def test_ref_range_undeclared_discovery_never_targets_the_current_checkout(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Synthetic refs isolate the discovery command's checkout constraint.
+    monkeypatch.setattr("agents_shipgate.cli.agent_result.enabled_plugin_hook_evidence", lambda **kwargs: (None, None, []))
     (tmp_path / "custom-gate.yml").write_text(_MCP_MANIFEST, encoding="utf-8")
 
     result = build_agent_boundary_result(

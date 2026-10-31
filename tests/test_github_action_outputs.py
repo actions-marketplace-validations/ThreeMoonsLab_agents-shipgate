@@ -12,6 +12,14 @@ from scripts.github_action_outputs import (
     trigger_action,
 )
 
+#: These fixtures exercise how the step projects verifier and report fields,
+#: with no receipt beside them, so the ones that state an outcome declare a
+#: verifier written before receipts, and the ones that read a report name it in
+#: ``head_report_json`` as every verify run with a head scan does. Receipt
+#: validation on real verify output is in
+#: tests/test_verification_receipt_consumers.py (#1022).
+PRE_RECEIPT_VERIFIER = "0.4"
+
 
 @pytest.mark.parametrize(
     ("trigger", "expected"),
@@ -112,6 +120,8 @@ def test_action_outputs_prefer_canonical_capability_and_verifier_blocks(
     _write_json(
         output_dir / "verifier.json",
         {
+            "verifier_schema_version": PRE_RECEIPT_VERIFIER,
+            "head_report_json": "agents-shipgate-reports/report.json",
             "execution": "succeeded",
             "head_status": "succeeded",
             "trigger": {
@@ -152,6 +162,7 @@ def test_action_outputs_fall_back_to_verifier_artifact_for_older_reports(
     _write_json(
         output_dir / "verifier.json",
         {
+            "verifier_schema_version": PRE_RECEIPT_VERIFIER,
             "execution": "succeeded",
             "head_status": "succeeded",
             "capability_review": {
@@ -191,6 +202,7 @@ def test_action_outputs_include_verify_run_and_agent_control_fields(tmp_path: Pa
     _write_json(
         output_dir / "verifier.json",
         {
+            "verifier_schema_version": PRE_RECEIPT_VERIFIER,
             "execution": "succeeded",
             "head_status": "succeeded",
             "merge_verdict": "human_review_required",
@@ -248,6 +260,7 @@ def test_action_boolean_outputs_are_exact_control_mirrors(tmp_path: Path) -> Non
     _write_json(
         output_dir / "verifier.json",
         {
+            "verifier_schema_version": PRE_RECEIPT_VERIFIER,
             "execution": "skipped",
             "head_status": "skipped",
             "merge_verdict": "mergeable",
@@ -286,6 +299,7 @@ def test_action_outputs_reject_merge_authority_that_contradicts_control(
     _write_json(
         output_dir / "verifier.json",
         {
+            "verifier_schema_version": PRE_RECEIPT_VERIFIER,
             "execution": "skipped",
             "head_status": "skipped",
             "merge_verdict": "mergeable",
@@ -361,6 +375,8 @@ def test_step_summary_leads_with_verifier_merge_state(
     _write_json(
         output_dir / "verifier.json",
         {
+            "verifier_schema_version": PRE_RECEIPT_VERIFIER,
+            "head_report_json": "agents-shipgate-reports/report.json",
             "execution": "succeeded",
             "head_status": "succeeded",
             "applicability": "verified",
@@ -390,6 +406,12 @@ def test_step_summary_leads_with_verifier_merge_state(
             },
         },
     )
+    # The manifest route links artifacts it actually produced.
+    for name in (
+        "attestation.json", "org-evidence-bundle.json", "host-grants.json",
+        "org-status.json", "verify-run.json", "agent-handoff.json", "pr-comment.md",
+    ):
+        (output_dir / name).write_text("{}", encoding="utf-8")
     values = extract_outputs(output_dir)
 
     append_step_summary(output_dir, values)
@@ -467,6 +489,8 @@ def test_action_outputs_do_not_reinstate_a_stop_the_runtime_overrode(
             "is_agent_project": False,
             "suggested_sources": [],
             "codex_plugin_candidates": [],
+            "host_boundary_candidates": [],
+            "host_discovery_incomplete_paths": [],
             "python_parse_truncated": False,
         },
     )
@@ -487,3 +511,57 @@ def _trigger_outputs(out_dir: Path, trigger: dict) -> dict[str, object]:
         json.dumps({"trigger": trigger}), encoding="utf-8"
     )
     return extract_outputs(out_dir)
+
+
+@pytest.mark.parametrize("fork_fallback", [False, True])
+def test_host_only_summary_lists_existing_artifacts_without_scan_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fork_fallback: bool,
+) -> None:
+    from scripts.github_action_annotations import build_annotations
+
+    output_dir = tmp_path / "agents-shipgate-reports"
+    output_dir.mkdir()
+    summary_path = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_path))
+    _write_json(output_dir / "verifier.json", {
+        "merge_verdict": "unknown", "can_merge_without_human": False,
+        "host_comparison": {"comparison_status": "comparable", "rows": [
+            {"subject": "claude-code .mcp.json", "direction": "added", "severity": "high", "expands": True},
+        ]},
+    })
+    for name in ("agent-handoff.json", "current-control.json", "check-annotations.json"):
+        _write_json(output_dir / name, {})
+    review = "## Agents Shipgate\n\n### Human summary\n\n⚠ high / added — claude-code .mcp.json\n"
+    (output_dir / "pr-comment.md").write_text(review, encoding="utf-8")
+    append_step_summary(output_dir, extract_outputs(output_dir))
+    if fork_fallback:
+        # Publication appends the review to this same job summary after a 403.
+        with summary_path.open("a", encoding="utf-8") as stream:
+            stream.write("\nPR comment publication is unavailable.\n\n" + review)
+    text = summary_path.read_text()
+    assert "Status:" not in text and "Critical:" not in text
+    assert "High: 0" not in text and "Medium: 0" not in text
+    for missing in ("Report JSON:", "Verify-run JSON:", "Attestation JSON:",
+                    "Org evidence bundle JSON:", "Host grants JSON:", "Org status JSON:"):
+        assert missing not in text
+    for name in ("verifier.json", "agent-handoff.json", "pr-comment.md"):
+        assert str(output_dir / name) in text
+    if fork_fallback:
+        assert "⚠ high / added" in text
+    assert "source_report" not in build_annotations(output_dir)
+
+
+def test_legacy_scan_summary_keeps_computed_severity_counts(tmp_path, monkeypatch):
+    output_dir = tmp_path / "reports"
+    output_dir.mkdir()
+    summary_path = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_path))
+    _write_json(output_dir / "report.json", {"summary": {
+        "status": "findings_detected", "critical_count": 1, "high_count": 2, "medium_count": 3,
+    }})
+    append_step_summary(output_dir, extract_outputs(output_dir))
+    text = summary_path.read_text()
+    assert "- Status: `findings_detected`" in text
+    assert "- Critical: 1 - High: 2 - Medium: 3" in text
+    assert f"- Report JSON: `{output_dir / 'report.json'}`" in text
+    assert "Scan report: unavailable" not in text

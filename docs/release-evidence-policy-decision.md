@@ -23,19 +23,26 @@ must carry. It reduces nothing about how that evidence is judged.
 | | `beta` (production) | `pre_1_0` (approved here) |
 |---|---|---|
 | Governs | `1.0` and later — and any tag, if offered | `0.x` tags only |
-| Adjudicated cases | 100 | **56** |
-| Strata (profile × decision) | 28, weighted | **28, two cases each** |
-| Qualifying origins | ≥ 40 (40%) | **≥ 23** (40%, rounded up) |
+| Adjudicated cases³ | 80 | **38** |
+| Strata (profile × decision)³ | 21, weighted | **21, two cases each but four** |
+| Qualifying origins³ | ≥ 32 (40%) | **≥ 16** (40%, rounded up) |
 | Cohen's κ floor | 0.80 | **0.80** — unchanged |
 | Holdout per stratum | ≥ 20% | **≥ 20%** — unchanged |
 | Unsafe auto-passes | 0, per profile and overall | **0** — unchanged |
 | Per-case verifier receipt | required, unique digest | **required** — unchanged |
 | `static_only` / `runtime_behavior_proven` | `true` / `false` | **unchanged** |
 | Safe passes | ≥ 27 of 30 (90%) | **≥ 13 of 14** (92.9%) |
-| Blocked exact | ≥ 30 of 30 (100%) | **≥ 14 of 14** (100%) |
+| Blocked exact³ | ≥ 30 of 30 (100%) | **≥ 10 of 10** (100%) |
 | Review exact | ≥ 19 of 20 (95%) | **≥ 14 of 14** (100%) |
-| Insufficient-evidence exact | ≥ 19 of 20 (95%) | **≥ 14 of 14** (100%) |
-| Report schema | `0.42` | **`0.42`** — unchanged |
+| Insufficient-evidence exact³ | no cases target it | **no cases target it** |
+| Report schema² | `1.0` | **`0.43`** — historical; this tier's issuance is retired (#569) |
+
+² The approved table read `0.42`. The pin follows the schema the engine emits
+(`test_the_qualification_gate_demands_the_schema_the_engine_emits`), a later
+bump moved both tiers together, and this row was left behind — corrected here,
+not decided here.
+³ Changed by [Amendment 3](#amendment-3--insufficient_evidence-leaves-the-ground-truth-vocabulary-and-four-cells-hold-one-case).
+Every other row is what was approved on 2026-08-29.
 
 ### Why these numbers
 
@@ -45,10 +52,11 @@ to `google_adk`. Scaling that shape to 56 pushes the smallest cells to zero or
 one. A zero-count cell deletes every observation of a profile × outcome pair,
 which is a reduction in *strictness*, not in coverage: the gate stops being able
 to fail for that combination at all. Two per cell is the smallest allocation
-that keeps all 28 cells non-empty **and** leaves room for a tuning/holdout split
+that keeps all cells non-empty **and** leaves room for a tuning/holdout split
 in every cell at the unchanged 20% holdout fraction — at one case per cell,
 `ceil(1 × 0.20) = 1` forces the single case to be holdout and no cell can hold a
-tuning case at all.
+tuning case at all. Amendment 3 sets four cells to one case anyway, and accepts
+exactly that consequence for them, because the alternative is worse: see there.
 
 **What is enforced is a holdout floor, not a 1/1 split.** Each cell must carry
 at least `ceil(size × 0.20)` holdout cases — one, at this size. A corpus that
@@ -59,7 +67,7 @@ reject a corpus for being more conservative than required.
 
 **Exact-match floors are the production rates, rounded up.** 27 of 30 and 13 of
 14 are the same 90% demand at two sizes; 12 of 14 would not be. Rounding up
-means three of the four floors land on 100% at this size — the smaller corpus
+means two of the three floors land on 100% at this size — the smaller corpus
 buys less tolerance for error, not more. That is the correct direction: fewer
 cases already widen every Wilson interval, so the *claim* is weaker even though
 the *gate* is not.
@@ -93,7 +101,7 @@ Nothing in the artifact influences which policy applies to it.
 
 **Promotion to 1.0 is not automatic and has no shortcut.** There is no path by
 which `pre_1_0` evidence qualifies a `1.0` tag. Shipping 1.0 requires the full
-100-case artifact, which is what corpus-delivery issue
+`beta` artifact, which is what corpus-delivery issue
 [#456](https://github.com/ThreeMoonsLab/agents-shipgate/issues/456) exists to
 produce.
 When it lands, `pre_1_0` stops being reachable by construction — every tag from
@@ -110,12 +118,12 @@ installing `v0.15.0` — an older, less-verified build than the one being
 withheld. Withholding a better build behind a 1.0-grade evidence bar makes
 users less safe, not more. That is the trade the owner declined.
 
-**Renaming the 100-case policy.** Explicitly rejected by #341 and not done:
+**Renaming the production policy.** Explicitly rejected by #341 and not done:
 `beta` still means exactly what it meant, with the same thresholds and the same
 constructor. `pre_1_0` is additive.
 
 **Reusing `production_qualified` for both tiers.** The flag keeps meaning "met
-the 100-case bar". A `pre_1_0` artifact reports `production_qualified: false`,
+the production bar". A `pre_1_0` artifact reports `production_qualified: false`,
 and the artifact schema refuses to *construct* one that says otherwise — so the
 producer cannot emit the inconsistency, rather than every reader having to
 catch it after signing. A field that quietly changed meaning would be the
@@ -154,8 +162,9 @@ the wrong shape.
   declared `requirements` against the restatement for the rest;
   `test_the_stdlib_policy_table_matches_the_named_policies` binds every field
   of the two copies. Restating only a case count is not enough — it cannot
-  tell 56 correctly stratified cases from 56 identical ones, nor notice a
-  corpus two safe passes below its floor, which is exactly the class of
+  tell a correctly stratified corpus from the same number of identical rows,
+  nor notice a
+  corpus two safe passes below its floor — which is exactly the class of
   weakening this gate exists to stop. *This site is easy to miss: an earlier
   draft of this brief listed only five.*
 - `scripts/_release_support.py` — the version→tier rule, shared by both gates
@@ -179,8 +188,8 @@ the wrong shape.
 - [x] Documentation, schema vocabulary, qualification generator, release
       verifiers, and this runbook agree — enforced by the tests named above,
       not only asserted here.
-- [x] A separate corpus-delivery issue is opened for the 56-case artifact and
-      the 100-case 1.0 bar —
+- [x] A separate corpus-delivery issue is opened for the `pre_1_0` artifact and
+      the production 1.0 bar —
       [#456](https://github.com/ThreeMoonsLab/agents-shipgate/issues/456).
 - [ ] A rehearsal proves the chosen policy **fails closed** — dispatch
       **Release Rehearsal** against an artifact that misses the bar and confirm
@@ -219,7 +228,7 @@ commits to human primary labels, and since `pre_1_0` evidence cannot qualify a
 
 ### The protocol
 
-For the 56-case `pre_1_0` corpus, the two blind primary labels are produced by
+For the `pre_1_0` corpus, the two blind primary labels are produced by
 **two independent agent sessions**, one per discipline role, and **every
 disagreement is adjudicated by the owner**, who is never a primary rater.
 Three distinct identities per disputed case, exactly as the schema demands.
@@ -247,8 +256,8 @@ Three distinct identities per disputed case, exactly as the schema demands.
    discloses that, per case.
 5. **A calibration round first.** The protocol runs on five non-corpus cases
    before any corpus label exists; ambiguities it finds in the labeling guide
-   are fixed first. A κ failure discovered after 56 labels is a relabeling of
-   56 cases.
+   are fixed first. A κ failure discovered after the whole corpus is labelled
+   is a relabeling of the whole corpus.
 6. **A disclosure block in the artifact.** The published qualification
    artifact names this protocol, the model families, and the location of the
    archived transcripts. The schema's label type is named
@@ -295,3 +304,494 @@ Its pre-registered rules, fixed here so they cannot drift under incentive:
       artifact's disclosure block.
 - [ ] Gate 2 outreach uses the committed card and template, and its responses
       are recorded in the committed log format.
+
+---
+
+## Amendment 2 — the unqualified preview channel
+
+**Status: decided. Finding: admissible, under the five conditions below.**
+**Owner: Pengfei Hu (`pengfei-threemoonslab`), product/security. Recorded
+2026-09-02.** Tracked by
+[#491](https://github.com/ThreeMoonsLab/agents-shipgate/issues/491).
+
+Issue #491 asked a question this document is the right place to answer, and
+required that it be answered before anything was built: **is a distribution
+channel that is explicitly not a tag, not on PyPI, and carries no qualification
+claim consistent with the policy approved above?**
+
+This is the finding. It is written as one, and it includes what would have made
+the answer *no*.
+
+### The measurement that prompted it
+
+On `main` at `87adfc7a`, 5,039 of `CHANGELOG.md`'s 6,242 lines sat under
+`## Unreleased` — 81% of the project's shipped work, installable by nobody.
+Two milestones of engine work were complete and untagged, the newest published
+build was `v0.15.0`, and 56 days had passed since it. The base decision above
+was taken to unblock exactly this, and it did not: it moved the bar from 100
+adjudicated cases to 56, and 56 is still 56 more than exist.
+
+### The question, put precisely
+
+The approved policy binds a **qualification tier** to a **version**, and the
+pipeline applies that rule at `push: tags: v*`. Its subject throughout is the
+artifact that carries a safety claim — `safety-qualification.json` — and the
+release that publishes it. Read literally, it says nothing about an artifact
+that makes no such claim.
+
+"The policy does not mention it" is the weak form of the question and is not
+what was asked. The strong form is: **does a preview channel reduce any
+protection this policy exists to provide?** Those protections are three:
+
+1. a published build's safety claim is backed by adjudicated evidence;
+2. the bytes an installer receives came from the commit they claim;
+3. nothing in the artifact chooses which bar applies to it.
+
+A preview cannot touch (3): it names no tier, and the version→tier rule is
+never consulted because no gate ever runs. It touches (1) **only through
+confusion** — a reader taking an unqualified artifact for a qualified one. It
+touches (2) if the channel ships bytes with weaker provenance than the path it
+routes around.
+
+So the finding is not "yes" or "no" in the abstract. It is: **admissible if and
+only if every reader that could confuse the two is closed, and the provenance
+the channel does offer is stated exactly.** Five conditions follow, each
+attached to the reader it closes.
+
+### The conditions
+
+**C1 — the preview version must carry a PEP 440 local segment.**
+This is the condition the finding turns on, and the one that would have made
+the answer *no* if it could not be met.
+
+PyPI is immutable: a version can never be replaced. An unqualified build
+reaching the index as `0.16.0` would therefore not merely be a bad artifact —
+it would **permanently consume the version the qualified build needs**, and the
+only remedy would be to renumber a release that had already been announced.
+"We will remember not to upload it" is not a control.
+
+A local version identifier is. PEP 440 states that local identifiers must not
+be used when publishing and that a public index must not allow them, and
+Warehouse rejects such an upload at the API. `0.16.0+preview.20260902.g1a2b3c4`
+is therefore unpublishable to PyPI *by protocol*, not by anyone's discipline —
+and it leaves `0.16.0` untouched. It is also self-describing in `pip freeze`,
+in `--version`, and in any bug report a preview user files.
+
+**C2 — the ref must be outside the `v*` namespace.**
+`release.yml` triggers on `push: tags: v*`. A preview publishes at
+`preview-<version>`, so it cannot start a release run. This also keeps the
+cadence metric honest: `scripts/release_cadence.py` counts only `v` + a
+complete PEP 440 version, so the channel that exists *because* the cadence
+slipped cannot report the cadence as kept.
+
+**C3 — a preview run must not be able to serve as release evidence.**
+`release.yml`'s `stage` job requires a successful run of
+`release-rehearsal.yml` for the candidate commit, located *by workflow file*.
+The preview therefore lives in its own file, `release-preview.yml`, and is
+invisible to that query. This is why the preview was **not** implemented as a
+third `mode` of `release-verify.yml`, which would have been the tidier change:
+a mode that skips the qualification gates, inside the workflow `release.yml`
+calls, makes the separation a matter of getting `if:` conditions right. Two
+files make it a matter of construction. The same reasoning already produced
+`release-rehearsal.yml` as a separate file with no publication job in it.
+
+**C4 — no qualification artifact may be produced, attached, or implied.**
+A preview ships one wheel and nothing else. `verify_safety_qualification_release.py`
+consequently rejects it twice over: it requires a `--qualification` artifact
+that does not exist, and it separately requires `tag == v<version>`, which
+`preview-<version>` cannot satisfy. The release body is generated by the
+workflow file — not by anything the build produced — and states the four things
+the build is not. No tier name appears in it.
+
+**C5 — the release must be a GitHub pre-release.**
+`--prerelease` is what keeps a preview out of `Latest`, out of
+`/releases/latest`, and out of the PyPI-shaped badges in `README.md`. A reader
+who lands on the repository's releases page sees the newest *qualified* release
+labelled as such, and previews below it labelled as not one.
+
+### Field note: the first preview violated C1, and what now enforces it
+
+Recorded because this amendment asserted a property the first implementation did
+not have. C1 claims a preview is "self-describing in `pip freeze`, in
+`--version`, and in any bug report a preview user files." The first published
+preview — `0.16.0+preview.20260902.gcc59410`, cut from `cc594109` — was not.
+
+The version lives in **two** places: `pyproject.toml` decides the wheel's
+METADATA, and `src/agents_shipgate/__init__.py` carries `__version__` as a
+literal, which is what `--version` and `doctor` report. The workflow stamped
+only the first. The published wheel therefore said `0.16.0+preview…` in its
+METADATA — so C1's index refusal held — while the installed CLI reported plain
+`0.16.0`, **indistinguishable from the qualified release it was supposed to be
+distinguishable from**.
+
+The second-order effect was worse than the first. `doctor` compares
+`installed_version` against `imported_version` and emitted a
+`installed_version_differs` mismatch reading *"Two installed copies are
+shadowing each other; which one runs depends on path order"* — on an
+environment holding exactly one copy. A diagnostic built (#334) to be
+trustworthy was made to lie by a normal install.
+
+What enforces it now is not "stamp both files". It is a check on the
+**artifact**: the build opens the wheel it just produced and requires
+`METADATA: Version` to equal the `__version__` literal packaged inside it. That
+holds regardless of how many version sites exist or how the stamping is spelled,
+and a companion test pins the committed tree to exactly two sites that already
+agree. Both are in `tests/test_release_pipeline.py` § #491, and a perturbation
+sweep replays the shipped defect to confirm the guard fails on it.
+
+The general lesson, which is not specific to previews: **a claim in this
+document is not a control.** C1's index refusal was structural and held. C1's
+self-description was prose, and did not.
+
+### What the channel does and does not attest
+
+The issue proposed attaching "the wheel built by the existing verify path".
+That is not available, and saying so is part of this finding: **the
+qualification-bound verify path cannot run at all** while
+`.github/release-trust-roots.json` holds `CHANGE_ME` and the four
+`SAFETY_QUALIFICATION_*` repository variables are unset. Neither can the
+rehearsal, which calls the same reusable workflow. A preview that claimed to
+come from that path would be claiming something no run could produce.
+
+What the preview *can* honestly attest, and does:
+
+| Property | Preview | Qualified release |
+|---|---|---|
+| Built from a named commit | yes, `github.sha`, pinned before checkout | yes |
+| That commit passed CI | **required** — the build refuses without a successful `ci.yml` run for the exact SHA | yes, and the release suite besides |
+| Hash-locked build toolchain | yes — the same `constraints/release-seal.txt`, the same `--no-isolation` | yes |
+| Source-to-wheel byte binding | **no** | yes (`verify_wheel_provenance.py`) |
+| Signed, wheel-scoped SBOM | **no** | yes |
+| Sigstore signatures | **no** | yes |
+| Adjudicated safety corpus | **no** | yes, at the tier the version requires |
+| Reachable from PyPI | **no, by protocol** | yes |
+
+The one deviation from the committed tree is the version line in
+`pyproject.toml`, and the build proves it: it restores the original version
+string and requires the result to be byte-identical to the commit's bytes
+before it builds.
+
+### What would have made this inadmissible
+
+Recorded so that a future reader can tell a considered *yes* from a convenient
+one. Any of these would have made the finding **no**:
+
+- **A preview version PyPI could accept.** A `.devN` or plain pre-release
+  segment is uploadable, so the only thing standing between an unqualified
+  build and a permanently burnt release version would have been operator
+  discipline. C1 exists because that is not good enough.
+- **Reusing `release-verify.yml` with the gates behind a flag.** The
+  qualification steps would then be skipped by configuration rather than absent
+  by construction, and one wrong `if:` would put an unqualified artifact on the
+  release path.
+- **A body, a title or an asset set that reads like a release.** Attaching an
+  SBOM, a signature, or anything named `qualification` would have created
+  precisely the "quietly implies qualification" outcome #491 forbade — most
+  dangerously to a machine reader that checks for the *presence* of the file
+  rather than its contents.
+- **Relaxing an existing invariant to fit.** `release_publication.py`'s
+  `build_manifest` requires `tag == v<version>`; a preview cannot satisfy it,
+  and the correct response was for the preview to produce no candidate manifest
+  at all, not to widen the check. Nothing in the release path was changed by
+  this amendment.
+- **Counting a preview as a release.** If the cadence metric had treated a
+  preview as shipping, the channel would have suppressed the very signal that
+  justified it.
+
+### What this does not change
+
+Nothing about the bar. `pre_1_0` and `beta` keep their thresholds, their
+constructors and their gates. `v0.16.0` still cannot publish until #456
+delivers the signed artifact, the four artifact-location variables are set, and
+`signer_identity` stops being `CHANGE_ME`. A preview does not shorten that
+list, does not partially satisfy it, and is not evidence toward it.
+
+The direction of the trade is the same one the base decision made and should be
+read the same way: withholding a better build behind a bar it does not claim to
+meet makes users less safe, not more — provided nobody can mistake it for a
+build that does claim to meet one.
+
+### Acceptance
+
+- [x] The question is answered by the named owner, with the conditions that
+      make the answer hold and the cases that would have reversed it — above,
+      2026-09-02.
+- [x] The channel exists (`.github/workflows/release-preview.yml`), publishes
+      from a CI-accepted commit using the release build's hash-locked
+      toolchain, and carries no qualification language.
+- [x] Negative controls prove a preview artifact cannot be mistaken for a
+      qualified release by any existing reader —
+      `tests/test_release_pipeline.py` § #491, including
+      `scripts/verify_safety_qualification_release.py` rejecting one on both
+      the missing artifact and the tag mismatch.
+- [x] The cadence policy the channel is measured against is recorded in
+      [`release-runbook.md`](release-runbook.md) § Cadence, and the number is
+      printed by `scripts/release_cadence.py` on every CI run.
+
+## Amendment 4 — the advisory line has its own cadence, and no authority
+
+Amendment 2 admitted the unqualified preview channel as an exception to a
+blocked tag. This amendment makes it a **line** with a stated promise and a
+measured interval, because treating it as an exception is what let it be
+forgotten.
+
+**The rule.** Two lines ship from one engine:
+
+- the **advisory line** publishes `diff`, `check`, `audit --host`, drift and
+  advisory PR comments through the preview pre-release, on a 14-day interval;
+- the **qualified gate line** publishes blocking verdicts, receipts and
+  attestations through a `v*` tag, on evidence only.
+
+**Why an advisory pre-release needs no qualification.** Every bar in this
+document exists to justify one thing: a verdict that may stop a merge. The
+advisory line makes no such claim. It publishes rows a reviewer reads and a
+verdict it explicitly does not gate on, so there is no authority for the
+qualification to underwrite. Requiring it would not make the advisory line
+safer; it would only keep the engine out of reach, which is the state
+Amendment 2 was written to end.
+
+**What is not weakened.** No gate-line bar moves. The preview stays outside
+the `v*` namespace, still carries a PEP 440 local segment a public index
+must refuse, still ships no qualification artifact, and still says in its own
+release body what it is not. A preview cannot satisfy
+`release_publication.build_manifest`, which requires `tag == v<version>`.
+
+**How each is measured.** `scripts/release_cadence.py` reports both, from one
+renderer, counting `v*` for the gate line and `preview-*` for the advisory
+line. The separation is load-bearing: counting previews in the release metric
+would let the channel that exists *because* the release cadence slipped
+report that cadence as kept. Preview age uses the UTC build date encoded in
+the preview version, explicitly reported as a build-date proxy: lightweight
+Git tags expose source commit time, and local Git cannot prove GitHub
+publication time. Publication records remain necessary to establish the
+operational shipping cadence.
+
+**Why neither fails a pull request.** Both lines warn and neither blocks, for
+the reason already recorded for the release cadence: whichever change happens
+to arrive after an interval lapses is not the one that can cut a release, and
+failing it punishes the wrong author. `--fail-when-overdue` exists for an
+operator or a scheduled job, and now covers both lines.
+
+*Amendment 5 (2026-09-13) lets the advisory line also publish an ordinary `v*`
+release for a version declared advisory. The rest of this amendment stands.*
+
+## Amendment 3 — `insufficient_evidence` leaves the ground-truth vocabulary, and four cells hold one case
+
+**Status: decided.**
+**Owner: Pengfei Hu (`pengfei-threemoonslab`), product/security. Recorded
+2026-09-04.** Tracked by
+[#520](https://github.com/ThreeMoonsLab/agents-shipgate/issues/520) and
+[#508](https://github.com/ThreeMoonsLab/agents-shipgate/issues/508).
+
+Two changes to the corpus *shape*. Neither changes how a case is judged, and
+neither moves a rate. The base decision's rule still governs: a smaller corpus
+may reduce coverage; it must not reduce strictness.
+
+### 1. No case is targeted at `insufficient_evidence`
+
+**The reasoning, from first principles.** A verdict exists to route a change to
+an outcome: `passed` merges, `review_required` goes to a human with a named
+capability to look at, `blocked` stops. `insufficient_evidence` routes nowhere
+— it is what the gate says when *its own reader* failed to establish the
+surface. That is a statement about shipgate, not about the change.
+
+The consequence for a corpus is exact. Ground truth answers "what should a
+correct gate do with this change?" A correct gate — one whose extraction
+succeeded — can always name the binding, because the authority is the binding
+itself and not the leaves it resolves to at runtime. So `insufficient_evidence`
+is never the right answer to that question, and a cell that demands it is
+demanding that the corpus contain changes shipgate is expected to fail to read.
+
+**What the evidence showed.** The first corpus round put the line under load.
+All four cases where both blind raters chose `insufficient_evidence` named a
+capability the diff had introduced — they could have decided. One slot sourced
+as `insufficient_evidence` was placed at `blocked` by both raters
+independently. And 12 of the 15 `insufficient_evidence` slots were sourced from
+a miner label, which is the engine's own verdict, so the cell was largely
+measuring the engine against itself.
+
+**What changes.** The 7 `insufficient_evidence` cells leave both tiers: 28
+cells → 21, and 100 → 80 / 56 → 38 cases. The exact-match floor for the outcome
+becomes 0 over a population of 0 —
+`test_the_pre_1_0_policy_is_never_laxer_than_production_per_rate` requires both
+tiers to agree on that rather than inventing a floor over nothing.
+
+**What does not change.** The value stays in the enum and the verifier still
+emits it: a real run whose extraction failed must still be able to say so. It
+is scored as a *miss* against whatever the case expected — a coverage failure,
+which is what it is. `SHIP-*` behaviour is untouched.
+
+### 2. Four `blocked` cells hold one case, because the second does not exist
+
+The `pre_1_0` corpus asks for two cases per cell. `openai_agents_sdk ×
+blocked`, `langchain_crewai × blocked`, `google_adk × blocked` and
+`coding_agent_trust_roots × blocked` ask for one.
+
+This is a claim about the world, and it was measured. Of the seven profiles,
+four produced a real-world `blocked` case at all, and each produced exactly
+one; in two of those cells the sourced real candidate was placed at
+`review_required` by both blind raters, leaving a construction. Cut B recorded
+the cause and the W36 sweep confirmed it: every `blocked` slot with a
+qualifying origin came from a closed-unmerged or reverted PR, never from merged
+history — because a change that should have been stopped usually was. The
+per-cell detail is in
+[`benchmark/safety-qualification/strata-inventory.md`](../benchmark/safety-qualification/strata-inventory.md)
+§ Why four cells hold one case and not two.
+
+**The alternative was refused.** Two cases in each of those cells is reachable
+today by building four more constructions. A cell filled entirely with
+constructions measures our imagination rather than the world. One real case is
+worth more than two invented ones.
+
+**The cost, stated plainly.** At one case per cell `ceil(1 × 0.20) = 1`, so
+each of those four cells is entirely holdout and carries no tuning case. The
+base decision named that as the reason not to go below two. It is the right
+trade here in the other direction: a cell with one real holdout case still
+measures the engine on evidence it was never tuned on, which is the stronger
+half of the split; a cell with two constructions measures neither.
+
+`minimum_blocked_exact` falls from 14 to 10 because there are 10 `blocked`
+cases. The **rate** is unchanged at 100% — the gate still tolerates zero wrong
+`blocked` answers. `minimum_qualified_origins` falls to 16 (production, 32) for
+the same reason: 40% of the corpus, which is what was approved. Holding a
+*count* fixed while the corpus shrank would have raised production's origin
+demand from 40% to 50% as a side effect of deleting a decision, which nobody
+decided.
+
+### Acceptance
+
+- [x] The named owner records the ruling and its reasoning — 2026-09-04, above,
+      and in [#520](https://github.com/ThreeMoonsLab/agents-shipgate/issues/520).
+- [x] Both tiers, the stdlib restatement in `scripts/_release_support.py`, and
+      the strata inventory carry the same shape — bound by
+      `test_the_stdlib_policy_table_matches_the_named_policies` and
+      `test_the_register_reports_the_plan_the_csv_actually_holds`.
+- [x] The exact counts are pinned as literals so a further change is a visible
+      edit — `test_production_defaults_pin_the_exact_beta_contract` and
+      `test_pre_release_defaults_pin_the_exact_pre_1_0_contract`, the latter
+      naming the four scarce cells so shrinking any *other* cell fails.
+- [x] No rate moved — `test_the_pre_1_0_policy_is_never_laxer_than_production_per_rate`
+      re-derives every floor from production's rate and fails on a one-case
+      relaxation.
+- [x] The reason each cell is short is written where a corpus owner reads it —
+      `strata-inventory.md` § Why four cells hold one case and not two.
+
+## Amendment 5 — the advisory line may publish a `v*` release
+
+**Status: decided. Owner: Pengfei Hu (`pengfei-threemoonslab`), product/security.
+Recorded 2026-09-13.** Tracked by
+[#648](https://github.com/ThreeMoonsLab/agents-shipgate/issues/648).
+
+The owner decided that 1.0 is the advisory line's release: `v1.0.0`, published
+to PyPI, making no qualified blocking claim. This amendment records what that
+changes in this document, what it does not, and the structure that keeps the
+two claims apart now that they share one tag namespace.
+
+### The rule
+
+**The production-tier bar governs a release that makes a qualified blocking
+claim, not a version number.** Every release version is on one of two
+channels, declared in reviewed code in `.github/release-channels.json`:
+
+- a **qualified** release is unchanged in every respect: `release-verify.yml`,
+  the version-to-tier rule, the signed qualification artifact, the trust roots
+  and the mandatory `release-rehearsal.yml` run;
+- an **advisory** release publishes the wheel, a wheel-scoped SBOM, a
+  provenance record, the candidate manifest and a signed
+  `advisory-statement.json`, and carries no qualification artifact. It is
+  governed by the readiness criteria in
+  [`engineering/v1-release-readiness.md`](engineering/v1-release-readiness.md)
+  (#643), not by a qualification tier.
+
+"No shortcut to 1.0" stays true of the blocking claim. It never applied to a
+release that does not make one.
+
+### What it supersedes, and nothing else
+
+Amendment 4 said the advisory line publishes "through the preview
+pre-release". For a version declared advisory, it may now also publish through
+a `v*` tag and PyPI. The preview channel is unchanged, and so is the rest of
+Amendment 4: the advisory line keeps its own cadence and has no authority.
+
+Amendment 2's C1 kept an unqualified build from consuming a version the
+qualified line needs. An advisory `1.0.0` deliberately consumes `1.0.0`, so
+C1's purpose is restated as the rule it served: **no version carries both
+claims.** A version is declared once, and a tagged version's declaration
+cannot change (`release_channel.assert_history_preserved`, checked against
+this repository's tags by the suite). A qualified claim needs a later version.
+
+### The structure, and why each part has its shape
+
+1. **The channel comes from a declaration, not from what a run finds.**
+   Choosing the qualified path by the presence of a qualification artifact
+   fails open on intent: a qualified release whose download broke would
+   publish as advisory, permanently. A missing, malformed or unknown entry
+   stops the release before anything is built.
+2. **Two verification files, one switch.** `release.yml` calls exactly one of
+   `release-verify.yml` and `release-advisory-verify.yml`, gated on the
+   declared channel, and `release_channel.py candidate` refuses every other
+   outcome before publication reads anything. The advisory file has no
+   qualification step to skip, so C3's reasoning holds: the separation is
+   structural, not a set of `if:` conditions inside the qualified workflow.
+   The steps the two files share are copied byte for byte and held equal by a
+   test, and the advisory file refuses a version declared qualified.
+3. **One publisher.** Staging, index classification, signing, the PyPI upload
+   and finalisation stay single jobs for both channels. PyPI Trusted
+   Publishing is bound to `release.yml`, and a second publisher would mean
+   every integrity fix landing twice.
+4. **A closed asset set per channel.** `release_publication.CHANNEL_ASSETS` is
+   the one table. The manifest records the channel, and staging and
+   finalisation refuse a manifest whose channel or asset set is not the
+   declared channel's. A qualified release cannot drop its qualification
+   artifact, and an advisory release cannot carry one.
+5. **The exact candidate is exercised before publication (#570).** The
+   advisory path publishes the wheel a Release Engine Smoke run installed and
+   ran through both the CLI and the Action for the exact source commit. That
+   run's evidence must name those bytes and that commit, and the wheel must be
+   byte-identical to the one the tagged tree builds. The two builds use
+   different entry points over the same pinned backend; on `e6f1ddff` they
+   produced the same SHA-256.
+6. **The statement is reviewed text.** Its claims are fixed in
+   `scripts/release_channel.py`: no qualification, advisory by default,
+   blocking opt-in. It names no tier and has no key a tier could appear under,
+   and the release signs it with the wheel and the SBOM.
+7. **Rehearsal stays mandatory.** `stage` requires a successful run of the
+   declared channel's own rehearsal file, with a byte-identical candidate
+   manifest.
+8. **Cadence stays honest.** `scripts/release_cadence.py` reads each tag's own
+   declaration, so an advisory `v*` tag counts on the advisory line and never
+   as a gate-line release.
+
+### What is not weakened
+
+- No qualification evidence is marked satisfied. #512, #509 and #510 still
+  govern any qualified claim, and `accepted_qualification_tiers` still admits
+  only `beta` for `1.0` and later.
+- No publication control moves. Write and OIDC authority are never held
+  together, the tag is re-peeled before each irreversible step, the index is
+  classified before anything is mutated, only drafts are mutated, and the
+  remote asset set is verified byte for byte before undrafting.
+- The Action's default is unchanged: `ci_mode: advisory`, with an empty
+  `fail_on`. Blocking stays opt-in, and an advisory release says it is
+  unqualified.
+
+### What would have made this inadmissible
+
+- **Selecting the channel by artifact presence**, the fail-open case above.
+- **A mode in `release-verify.yml`** that skips its qualification steps.
+- **A second publishing workflow**, which would also have needed the PyPI
+  trusted publisher reconfigured outside this repository.
+- **A statement assembled from build output**, or one that names a tier.
+- **Counting an advisory tag on the gate line.**
+
+### Acceptance
+
+- [x] The owner decided the scope — 2026-09-13, on #648.
+- [x] The declaration, its reader and the fail-closed selection —
+      `tests/test_release_channel.py`.
+- [x] The advisory verification, its rehearsal and channel-keyed publication —
+      `tests/test_release_advisory_pipeline.py`, alongside the qualified
+      path's existing invariants in `tests/test_release_pipeline.py`.
+- [x] Cadence reads the declaration — `tests/test_release_channel_cadence.py`.
+- [ ] The first advisory tag publishes through this path; #570 owns its
+      post-publication replay.

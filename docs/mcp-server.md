@@ -10,6 +10,11 @@ pip install "agents-shipgate[mcp]"
 agents-shipgate mcp-serve
 ```
 
+The server is built on the MCP Python SDK 2.x, and the extra requires
+`mcp>=2.0.0,<3`. If another requirement holds the SDK at 1.x, `mcp-serve` stops
+with an error that names the installed version and that range. Installing the
+extra again does not change it; find the requirement that pins the older SDK.
+
 Claude Code registration (`.mcp.json`):
 
 ```json
@@ -27,8 +32,8 @@ Claude Code registration (`.mcp.json`):
 
 | Tool | Input | Output |
 |---|---|---|
-| `shipgate.check` | `{agent, workspace, diff_text, config?, policy?}` | exact `shipgate.agent_boundary_result/v2` |
-| `shipgate.preflight` | `{workspace?, config?, plan?, changed_files?, diff_text?, capability_request?, base_preflight?}` | exact `PreflightResultV3` |
+| `shipgate.check` | `{agent, workspace, diff_text, config?, policy?}` | exact `shipgate.agent_boundary_result/v3` |
+| `shipgate.preflight` | `{workspace?, config?, plan?, changed_files?, diff_text?, capability_request?, base_preflight?}` | exact `PreflightResultV6` (preflight `0.6`) |
 | `shipgate.explain` | `{check_id}` or `{fingerprint, report_path}` | deterministic check/finding explanation JSON |
 | `shipgate.capabilities` | `{config}` or `{base_lock, head_lock}` | capability lock or capability lock diff JSON |
 | `shipgate.handoff` | `{verifier_path, report_path?, verify_run_path?}` | exact `shipgate.agent_handoff/v8` |
@@ -38,7 +43,10 @@ Claude Code registration (`.mcp.json`):
 routing only: prefer passing a `PreflightPlanV1` object in `plan`. It can tell
 an agent to stop before editing protected surfaces, route host/MCP permission
 requests to a human, or gather evidence for a proposed high-risk capability,
-but it is not a second release verdict. The release gate remains
+but it is not a second release verdict. Every permission in its `control` is
+`false`. A plan that names nothing to route returns `planning_only`
+unless host-grant or trust-root drift stops it for a human; it never returns
+`complete`. The release gate remains
 `report.json.release_decision.decision`.
 
 For `shipgate.preflight`, `plan` is mutually exclusive with the direct
@@ -47,10 +55,12 @@ inputs. Send one complete plan object or the applicable direct fields, never
 both; a mixed request is rejected rather than silently preferring one source.
 
 The `diff_text` accepted by `shipgate.check` is detached diagnostic input. It
-is not bound to a checkout state that `verify` can reconstruct, so a result
-that owes verification stops for human routing and authorizes no verify
-command. Re-run `shipgate check` locally against the intended worktree or a
-complete `base`/`head` ref range before following a verification route.
+is not bound to a checkout state that `verify` can reconstruct, so every
+`shipgate.check` result stops for human routing (`human_review_required`),
+authorizes no verify command and grants no permission, including for an empty
+`diff_text` or a diff with no boundary finding. Re-run `shipgate check` locally
+against the intended worktree or a complete `base`/`head` ref range before
+following a verification route or reporting completion.
 
 `shipgate.handoff` is a read-only projection over existing verifier artifacts.
 It never runs `verify`, shells out to git, or writes `agent-handoff.json`; it

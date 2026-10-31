@@ -5,6 +5,7 @@ import json
 import os
 import posixpath
 import stat
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -20,15 +21,21 @@ from agents_shipgate.core.agent_controls import (
 from agents_shipgate.core.agent_controls import (
     verify_command_for as _shared_verify_command_for,
 )
-from agents_shipgate.core.boundary_diff import parse_unified_diff
+from agents_shipgate.core.boundary_diff import _resolve_changed_file_text, parse_unified_diff
 from agents_shipgate.core.errors import ConfigError, InputParseError
 from agents_shipgate.core.globbing import glob_match_ci
 from agents_shipgate.core.host_grants import (
     DEFAULT_BASELINE_FILE,
     INCOMPARABLE_BASELINE_REVIEW,
+    HostStaticParseCache,
     build_host_drift_payload,
     host_audit_inventory,
     load_host_grants_baseline,
+)
+from agents_shipgate.core.instruction_structure import (
+    classify_instruction,
+    instruction_profile,
+    unchanged_instruction_structure,
 )
 from agents_shipgate.core.lenses.effective_policy import (
     build_effective_policy_snapshot,
@@ -40,6 +47,7 @@ from agents_shipgate.core.trust_roots import (
     IdentityBoundReadSession,
     IdentityReadBudget,
     IdentityReadBudgetExceeded,
+    conditional_instruction_edits,
     inspect_lexical_path_identity,
     is_configured_manifest,
     is_portable_repo_path,
@@ -49,23 +57,28 @@ from agents_shipgate.invocation import render_command, retarget_command
 from agents_shipgate.schemas.agent_control import (
     CodingAgentCommandAction,
     HumanControlAction,
+    NoAgentPermissions,
 )
 from agents_shipgate.schemas.preflight import (
+    AnyPreflightResult,
     CapabilityRequestV1,
     HostPermissionRequestV1,
+    PlanningOnlyControl,
     PreflightDriftSummary,
     PreflightNextAction,
     PreflightPlanV1,
     PreflightProtectedSurface,
-    PreflightProtectedSurfaceTouch,
+    PreflightProtectedSurfaceTouchV2,
     PreflightRequiredEvidence,
     PreflightResultV1,
-    PreflightResultV2,
-    PreflightResultV3,
+    PreflightResultV6,
     PreflightSignalV1,
     ProtectedSurfaceScopeType,
     TrustRootGraphV1,
+    TrustRootGraphV2,
     TrustRootNodeV1,
+    TrustRootNodeV2,
+    parse_preflight_result,
 )
 from agents_shipgate.schemas.surfaces import ActionEffect
 
@@ -250,7 +263,8 @@ def forbidden_file_edits() -> tuple[str, ...]:
     patterns = [
         spec.pattern
         for spec in protected_surface_specs()
-        if spec.kind in _FORBIDDEN_EDIT_CLASSES or spec.kind in _CODEX_WHOLE_FILE_CLASSES
+        if spec.kind in (_FORBIDDEN_EDIT_CLASSES - {"agent_instructions"})
+        or spec.kind in _CODEX_WHOLE_FILE_CLASSES
     ]
     return tuple(sorted(set(patterns)))
 
@@ -265,11 +279,9 @@ def build_preflight_result(
     host_permission_requests: list[HostPermissionRequestV1 | dict[str, Any]] | None = None,
     plan: PreflightPlanV1 | dict[str, Any] | None = None,
     diff_text: str | None = None,
-    base_preflight: (
-        PreflightResultV1 | PreflightResultV2 | PreflightResultV3 | dict[str, Any] | None
-    ) = None,
+    base_preflight: AnyPreflightResult | dict[str, Any] | None = None,
     host_baseline: Path | None = None,
-) -> PreflightResultV3:
+) -> PreflightResultV6:
     root = workspace.resolve()
     config_path = _lexical_config_path(
         root,
@@ -316,7 +328,8 @@ def build_preflight_result(
     ]
     verify_command = _verify_command(workspace, config)
     identity_paths = {touch.path for touch in path_identity_touches}
-    classified_touches = classify_protected_touches(changed, config_path, root)
+    classified_touches = classify_protected_touches(changed, config_path, root,
+        selected_paths={node.pattern for node in graph.nodes if node.kind == "host_boundary"})
     touches = [
         *path_identity_touches,
         *(
@@ -338,6 +351,10 @@ def build_preflight_result(
         workspace=root,
         config_path=config_path,
         touches=touches,
+        diff_text=effective_diff_text,
+    )
+    touches = _classify_instruction_touches(
+        workspace=root, config_path=config_path, touches=touches,
         diff_text=effective_diff_text,
     )
     requests = _coerce_capability_requests(
@@ -407,11 +424,14 @@ def build_preflight_result(
         allowed_next_commands=allowed_next_commands,
     )
 
-    return PreflightResultV3(
+    return PreflightResultV6(
         workspace=str(root),
         config=_display_path(config_path, root),
         protected_surfaces=surfaces,
         forbidden_file_edits=list(forbidden_file_edits()),
+        conditional_file_edits=conditional_instruction_edits(
+            workspace=root, config=_display_path(config_path, root),
+        ),
         forbidden_actions=list(FORBIDDEN_SHORTCUTS),
         required_evidence=required_evidence,
         changed_files=changed,
@@ -511,9 +531,7 @@ def _reject_mixed_plan_inputs(
     capability_requests: list[CapabilityRequestV1 | dict[str, Any]] | None,
     host_permission_requests: list[HostPermissionRequestV1 | dict[str, Any]] | None,
     diff_text: str | None,
-    base_preflight: (
-        PreflightResultV1 | PreflightResultV2 | PreflightResultV3 | dict[str, Any] | None
-    ),
+    base_preflight: AnyPreflightResult | dict[str, Any] | None,
 ) -> None:
     """Keep plan and direct-input request shapes mutually exclusive."""
 
@@ -539,7 +557,7 @@ def _reject_mixed_plan_inputs(
         )
 
 
-def build_trust_root_graph(workspace: Path) -> TrustRootGraphV1:
+def build_trust_root_graph(workspace: Path) -> TrustRootGraphV2:
     root = workspace.resolve()
     graph, _unsafe = _build_trust_root_graph(root)
     return graph
@@ -549,7 +567,7 @@ def _build_trust_root_graph(
     root: Path,
     *,
     config_path: Path | None = None,
-) -> tuple[TrustRootGraphV1, list[PreflightProtectedSurfaceTouch]]:
+) -> tuple[TrustRootGraphV2, list[PreflightProtectedSurfaceTouchV2]]:
     budget = IdentityReadBudget(
         max_entries=_MAX_TRUST_ROOT_GRAPH_ENTRIES,
         max_total_bytes=_MAX_TRUST_ROOT_GRAPH_BYTES,
@@ -560,16 +578,31 @@ def _build_trust_root_graph(
         reader=reader,
         max_entries=_MAX_TRUST_ROOT_INVENTORY_ENTRIES,
     )
-    nodes: list[TrustRootNodeV1] = []
-    unsafe: dict[str, PreflightProtectedSurfaceTouch] = {}
+    nodes: list[TrustRootNodeV2] = []
+    unsafe: dict[str, PreflightProtectedSurfaceTouchV2] = {}
     hash_cache: dict[str, str] = {}
+    structure_cache: dict[str, dict] = {}
 
     def file_hashes_for(paths: list[str]) -> dict[str, str]:
         file_hashes: dict[str, str] = {}
         for path in paths:
             if path not in hash_cache:
                 try:
-                    hash_cache[path] = _file_sha256(reader, Path(path))
+                    raw = reader.read_bytes(Path(path), max_bytes=_MAX_TRUST_ROOT_FILE_BYTES)
+                    hash_cache[path] = f"sha256:{hashlib.sha256(raw).hexdigest()}"
+                    spec = _classify(path)
+                    if (
+                        spec is not None and spec.kind in {"agent_instructions", "tool_surface_decl"}
+                        and instruction_profile(path) is not None
+                        and not is_configured_manifest(config_path, path, workspace=root)
+                    ):
+                        try:
+                            text = raw.decode("utf-8")
+                        except UnicodeDecodeError:
+                            text = None
+                        structure = classify_instruction(path, text)
+                        if structure is not None:
+                            structure_cache[path] = structure.projection()
                 except IdentityReadBudgetExceeded as exc:
                     raise ConfigError(
                         "Trust-root graph exceeded its aggregate static "
@@ -577,7 +610,7 @@ def _build_trust_root_graph(
                     ) from exc
                 except (OSError, ValueError, NotImplementedError):
                     hash_cache[path] = "unavailable:path_identity"
-                    unsafe[path] = PreflightProtectedSurfaceTouch(
+                    unsafe[path] = PreflightProtectedSurfaceTouchV2(
                         path=path,
                         kind="path_identity",
                         pattern="exact-non-symlink-single-link-workspace-path",
@@ -603,15 +636,34 @@ def _build_trust_root_graph(
     for spec in sorted(specs, key=lambda item: (item.kind, item.pattern)):
         present_paths = _present_paths(root, candidate_paths, spec.pattern)
         nodes.append(
-            TrustRootNodeV1(
+            TrustRootNodeV2(
                 id=_node_id(spec.kind, spec.pattern),
                 kind=spec.kind,
                 pattern=spec.pattern,
                 scope_type=spec.scope_type,
                 present_paths=present_paths,
                 file_hashes=file_hashes_for(present_paths),
+                instruction_structures={
+                    path: structure_cache[path] for path in present_paths if path in structure_cache
+                },
             )
         )
+    from agents_shipgate.core.host_grants import build_host_boundary_snapshot, public_host_path
+
+    registrations = [path for path in candidate_paths
+        if path.casefold() == ".shipgate/openshell.json"
+        or path.casefold().endswith("/.shipgate/openshell.json")]
+    selected_snapshot = build_host_boundary_snapshot(root) if registrations else None
+    for path in sorted(selected_snapshot.cache.openshell_selected_paths if selected_snapshot else []):
+        if _classify(path) is not None or public_host_path(path) != path:
+            continue
+        captured = selected_snapshot.cache.openshell_input_reads.get(path, {})
+        digest = captured.get("sha256")
+        present = [path] if digest else []
+        nodes.append(TrustRootNodeV2(id=_node_id("host_boundary", path),
+            kind="host_boundary", pattern=path, scope_type="whole_file",
+            present_paths=present, file_hashes={path: "sha256:" + digest} if digest else {}))
+    nodes.sort(key=lambda item: (item.kind, item.pattern))
     if configured_relative and not configured_is_catalogued:
         # The configured manifest is an exact identity, not a glob. Legal Git
         # filenames may themselves contain ``*``, ``?``, ``[]``, or ``\``.
@@ -619,7 +671,7 @@ def _build_trust_root_graph(
             [configured_relative] if configured_relative in candidate_paths else []
         )
         nodes.append(
-            TrustRootNodeV1(
+            TrustRootNodeV2(
                 id=_node_id("manifest", configured_relative),
                 kind="manifest",
                 pattern=configured_relative,
@@ -642,16 +694,26 @@ def _build_trust_root_graph(
         ) from exc
     graph_hash = _stable_hash([node.model_dump(mode="json") for node in nodes])
     return (
-        TrustRootGraphV1(nodes=nodes, graph_hash=graph_hash),
+        TrustRootGraphV2(nodes=nodes, graph_hash=graph_hash),
         sorted(unsafe.values(), key=lambda item: item.path),
     )
+
+
+def _selected_openshell_paths(root: Path) -> set[str]:
+    from agents_shipgate.core.host_grants import build_host_boundary_snapshot, public_host_path
+
+    snapshot = build_host_boundary_snapshot(root)
+    # Redacted locations are labels, never graph locators.
+    return {path for path in snapshot.cache.openshell_selected_paths
+            if public_host_path(path) == path}
 
 
 def classify_protected_touches(
     changed_files: list[str],
     config_path: Path | None = None,
     workspace: Path | None = None,
-) -> list[PreflightProtectedSurfaceTouch]:
+    *, selected_paths: set[str] | None = None,
+) -> list[PreflightProtectedSurfaceTouchV2]:
     """Classify changed paths against the protected-surface catalog.
 
     ``config_path`` covers the manifest this run was pointed at. The catalog
@@ -660,20 +722,22 @@ def classify_protected_touches(
     ``requires_human_review=false`` for a diff that rewrote its own gate.
     """
 
-    touches: list[PreflightProtectedSurfaceTouch] = []
+    touches: list[PreflightProtectedSurfaceTouchV2] = []
+    selected = (selected_paths if selected_paths is not None else
+        _selected_openshell_paths(workspace) if workspace is not None else set())
     seen: set[str] = set()
     for raw in changed_files:
         path = raw.replace("\\", "/")
         if not path or path in seen:
             continue
         seen.add(path)
-        spec = _classify(path) or _configured_manifest_spec(
-            config_path, path, workspace
-        )
+        spec = _configured_manifest_spec(config_path, path, workspace) or _classify(path)
+        if spec is None and path in selected:
+            spec = ProtectedSurfaceSpec(kind="host_boundary", pattern=path, scope_type="whole_file")
         if spec is None:
             continue
         touches.append(
-            PreflightProtectedSurfaceTouch(
+            PreflightProtectedSurfaceTouchV2(
                 path=path,
                 kind=spec.kind,
                 pattern=spec.pattern,
@@ -800,7 +864,7 @@ def required_evidence_for_capability_requests(
 
 
 def signals_for_protected_touches(
-    touches: list[PreflightProtectedSurfaceTouch],
+    touches: list[PreflightProtectedSurfaceTouchV2],
 ) -> list[PreflightSignalV1]:
     """Project protected-surface touches into routed signals."""
 
@@ -820,7 +884,13 @@ def signals_for_protected_touches(
     ]
 
 
-def _protected_touch_reason(touch: PreflightProtectedSurfaceTouch) -> str:
+def _protected_touch_reason(touch: PreflightProtectedSurfaceTouchV2) -> str:
+    if touch.instruction_structure_unchanged:
+        return (
+            f"{touch.path} has complete base/head text with unchanged supported "
+            "instruction structure. The prose edit declares no new permission; "
+            "this comparison does not judge prompt safety or authorize the change."
+        )
     if not touch.requires_human_review:
         return (
             f"{touch.path} contains only an exact append-only proposal for "
@@ -833,7 +903,7 @@ def _protected_touch_reason(touch: PreflightProtectedSurfaceTouch) -> str:
     )
 
 
-def _protected_touch_recommendation(touch: PreflightProtectedSurfaceTouch) -> str:
+def _protected_touch_recommendation(touch: PreflightProtectedSurfaceTouchV2) -> str:
     """State the route, and the non-route that reads like one.
 
     A stop that only says "a human must decide" leaves the coding agent to
@@ -844,6 +914,11 @@ def _protected_touch_recommendation(touch: PreflightProtectedSurfaceTouch) -> st
     not a route, closes both.
     """
 
+    if touch.instruction_structure_unchanged:
+        return (
+            "Apply only the exact planned instruction edit, then run the required "
+            "verifier and follow its current control result."
+        )
     if not touch.requires_human_review:
         return (
             "Apply only the exact planned tool-source addition, then run the "
@@ -860,9 +935,9 @@ def _classify_proposal_safe_manifest_touch(
     *,
     workspace: Path,
     config_path: Path,
-    touches: list[PreflightProtectedSurfaceTouch],
+    touches: list[PreflightProtectedSurfaceTouchV2],
     diff_text: str | None,
-) -> list[PreflightProtectedSurfaceTouch]:
+) -> list[PreflightProtectedSurfaceTouchV2]:
     """Mark one exact coverage-increasing manifest proposal as authoring-safe.
 
     Path-only preflight remains fail-closed.  This exception requires both
@@ -894,6 +969,47 @@ def _classify_proposal_safe_manifest_touch(
         if touch.kind == "manifest" and touch.path == config_display
         else touch
         for touch in touches
+    ]
+
+
+def _classify_instruction_touches(
+    *, workspace: Path, config_path: Path,
+    touches: list[PreflightProtectedSurfaceTouchV2], diff_text: str | None,
+) -> list[PreflightProtectedSurfaceTouchV2]:
+    if not diff_text:
+        return touches
+    records = parse_unified_diff(diff_text)
+    safe: set[str] = set()
+    cache = HostStaticParseCache()
+    for touch in touches:
+        if (
+            touch.kind not in {"agent_instructions", "tool_surface_decl"}
+            or instruction_profile(touch.path) is None
+            or is_configured_manifest(config_path, touch.path, workspace=workspace)
+        ):
+            continue
+        matching = [item for item in records if touch.path in {item.old_path, item.new_path}]
+        if len(matching) != 1:
+            continue
+        item = matching[0]
+        # Both endpoints must be unique. A second record cannot retain the
+        # review obligation for a path that the first record silently cleared.
+        endpoints = {item.old_path, item.new_path} - {None}
+        if any(sum(path in {row.old_path, row.new_path} for row in records) != 1 for path in endpoints):
+            continue
+        resolved = _resolve_changed_file_text(
+            workspace, item, [], cache, preserve_rename_source=True,
+        )
+        if unchanged_instruction_structure(item, resolved):
+            safe.add(touch.path)
+    try:
+        cache.finish()
+    except (OSError, ValueError, NotImplementedError, IdentityReadBudgetExceeded):
+        return touches
+    return [
+        touch.model_copy(update={"requires_human_review": False, "instruction_structure_unchanged": True})
+        if touch.path in safe and touch.kind in {"agent_instructions", "tool_surface_decl"}
+        else touch for touch in touches
     ]
 
 
@@ -1060,6 +1176,28 @@ def signals_for_policy_drift(
     return signals
 
 
+def _expansion_signal_summary(signals: list[Any]) -> str:
+    """Name every kind of expansion signal, with the total and what was folded.
+
+    The drift sorts its signals as strings, and each begins with its kind, so
+    a fixed prefix of the list kept whichever kinds sort first. Five
+    `allow_rule_added` entries pushed `Bash(*)`, a removed deny rule and a new
+    MCP server out of the reason, and nothing said the list was cut (#681).
+    One entry per kind keeps every kind visible without ranking one kind above
+    another; the count per kind says how many were folded.
+    """
+
+    by_kind: dict[str, list[str]] = {}
+    for item in signals:
+        text = str(item)
+        by_kind.setdefault(text.split(": ", 1)[0], []).append(text)
+    parts = []
+    for entries in by_kind.values():
+        folded = len(entries) - 1
+        parts.append(entries[0] + (f" (+{folded} more of this kind)" if folded else ""))
+    return f"Expansion signals ({len(signals)}): " + ", ".join(parts)
+
+
 def signals_for_host_grant_drift(
     host_grant_drift: dict[str, Any] | None,
     *,
@@ -1077,12 +1215,13 @@ def signals_for_host_grant_drift(
     )
     incomparable_reasons = host_grant_drift.get("incomparable_reasons") or []
     if incomparable_reasons:
-        reason += " Reasons: " + ", ".join(
-            str(item) for item in incomparable_reasons[:5]
-        )
+        shown = incomparable_reasons[:5]
+        reason += " Reasons: " + ", ".join(str(item) for item in shown)
+        if len(incomparable_reasons) > len(shown):
+            reason += f" (+{len(incomparable_reasons) - len(shown)} more)"
     expansion = host_grant_drift.get("expansion_signals") or []
     if expansion:
-        reason += " Expansion signals: " + ", ".join(str(item) for item in expansion[:5])
+        reason += " " + _expansion_signal_summary(expansion)
     rerun = None
     if comparable and workspace is not None:
         baseline_path = baseline or DEFAULT_BASELINE_FILE
@@ -1186,15 +1325,15 @@ def _configured_manifest_spec(
 def _normalize_planned_paths(
     root: Path,
     paths: list[str],
-) -> tuple[list[str], list[PreflightProtectedSurfaceTouch]]:
+) -> tuple[list[str], list[PreflightProtectedSurfaceTouchV2]]:
     """Map planned paths to exact entries or route ambiguous writes to humans."""
 
     normalized: set[str] = set()
-    unsafe: dict[str, PreflightProtectedSurfaceTouch] = {}
+    unsafe: dict[str, PreflightProtectedSurfaceTouchV2] = {}
 
     def mark_unsafe(path: str) -> None:
         normalized.add(path)
-        unsafe[path] = PreflightProtectedSurfaceTouch(
+        unsafe[path] = PreflightProtectedSurfaceTouchV2(
             path=path,
             kind="path_identity",
             pattern="exact-non-symlink-single-link-workspace-path",
@@ -1497,19 +1636,17 @@ def _coerce_host_permission_requests(
 
 
 def _coerce_base_preflight(
-    value: (PreflightResultV1 | PreflightResultV2 | PreflightResultV3 | dict[str, Any] | None),
-) -> PreflightResultV1 | PreflightResultV2 | PreflightResultV3 | None:
-    if value is None or isinstance(
-        value, (PreflightResultV1, PreflightResultV2, PreflightResultV3)
-    ):
+    value: AnyPreflightResult | Mapping[str, Any] | None,
+) -> AnyPreflightResult | None:
+    # Every version's model derives from v0.1's, so one check admits them all.
+    if value is None or isinstance(value, PreflightResultV1):
         return value
+    if not isinstance(value, Mapping):
+        raise ConfigError(
+            f"Invalid base preflight result: expected a JSON object, got {type(value).__name__}"
+        )
     try:
-        version = value.get("preflight_schema_version")
-        if version == "0.3":
-            return PreflightResultV3.model_validate(value)
-        if version == "0.2":
-            return PreflightResultV2.model_validate(value)
-        return PreflightResultV1.model_validate(value)
+        return parse_preflight_result(dict(value))
     except ValidationError as exc:
         raise ConfigError(f"Invalid base preflight result: {exc}") from exc
 
@@ -1724,7 +1861,7 @@ def _hash_drift(
 
 def _graph_drift(
     base: TrustRootGraphV1,
-    head: TrustRootGraphV1,
+    head: TrustRootGraphV2,
 ) -> PreflightDriftSummary:
     base_nodes = {node.id: node for node in base.nodes}
     head_nodes = {node.id: node for node in head.nodes}
@@ -1733,8 +1870,8 @@ def _graph_drift(
     modified = sorted(
         node_id
         for node_id in set(base_nodes) & set(head_nodes)
-        if base_nodes[node_id].model_dump(mode="json")
-        != head_nodes[node_id].model_dump(mode="json")
+        if _node_review_projection(base_nodes[node_id])
+        != _node_review_projection(head_nodes[node_id])
     )
     return PreflightDriftSummary(
         changed=bool(added or removed or modified),
@@ -1744,6 +1881,27 @@ def _graph_drift(
         removed=removed,
         modified=modified,
     )
+
+
+def _node_review_projection(node: TrustRootNodeV1) -> dict:
+    """Keep raw graph hashes intact; compare reviewable declarations separately."""
+    payload = node.model_dump(mode="json")
+    if node.kind not in {"agent_instructions", "tool_surface_decl"}:
+        return payload
+    hashes = dict(node.file_hashes)
+    paths = list(node.present_paths)
+    for path, structure in getattr(node, "instruction_structures", {}).items():
+        if path not in hashes or structure.status == "unresolved":
+            continue
+        if structure.status == "guidance":
+            hashes.pop(path)
+            paths = [present for present in paths if present != path]
+        else:
+            hashes[path] = f"structure:{structure.profile}:{structure.sha256}"
+    return {
+        **{key: value for key, value in payload.items() if key != "instruction_structures"},
+        "present_paths": paths, "file_hashes": hashes,
+    }
 
 
 def _first_next_action(
@@ -1777,8 +1935,18 @@ def _first_next_action(
         actor="coding_agent",
         kind="continue",
         command=None,
-        why="No requested protected-surface touch, host drift, or evidence gap was found by preflight.",
+        why=_PLANNING_ONLY_REASON,
     )
+
+
+# The one route on which preflight finds nothing to say (#610).
+_PLANNING_ONLY_REASON = (
+    "The plan names no changed file, capability request or host permission "
+    "request, and preflight found no protected-surface touch, host drift or "
+    "evidence gap to route. Only planning is complete: this result evaluated no "
+    "change and authorizes no edit, commit, push, pull-request update, merge or "
+    "completion."
+)
 
 
 def _derive_preflight_control(
@@ -1788,7 +1956,13 @@ def _derive_preflight_control(
     requires_verify: bool,
     allowed_next_commands: list[str],
 ):
-    """Project preflight signals through the shared control derivation."""
+    """Project preflight signals onto preflight's own control union.
+
+    A human or verify obligation goes through the shared derivation. No
+    obligation is ``planning_only``, never the shared ``complete``: with
+    nothing to route, ``derive_agent_control`` would grant merge and
+    completion for a change no one evaluated (#610).
+    """
 
     reason = first_next_action.why
     if requires_human_review:
@@ -1814,7 +1988,9 @@ def _derive_preflight_control(
             verify_required=True,
             allowed_next_commands=allowed_next_commands,
         )
-    return derive_agent_control(reason=reason)
+    return PlanningOnlyControl(
+        state="planning_only", reason=reason, permissions=NoAgentPermissions()
+    )
 
 
 def _display_path(path: Path, root: Path) -> str:

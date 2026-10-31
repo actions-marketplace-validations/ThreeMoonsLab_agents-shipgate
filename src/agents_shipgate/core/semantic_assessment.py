@@ -7,8 +7,6 @@ from dataclasses import dataclass
 from typing import Any, Literal, cast, get_args
 
 from agents_shipgate.core.action_semantics import (
-    ACTION_EFFECT_RANK,
-    builtin_obligations,
     normalize_declared_strings,
 )
 from agents_shipgate.core.domain import (
@@ -30,8 +28,19 @@ from agents_shipgate.core.domain import (
     Tool,
     ToolIdentityAssessment,
     ToolSemanticAssessment,
+    annotation_hints_are_effect_evidence,
 )
 from agents_shipgate.core.tool_identity import configured_tool_source
+from agents_shipgate.schemas.action_effects import (
+    EFFECT_RISK_RANK as _EFFECT_RANK,
+)
+from agents_shipgate.schemas.action_effects import (
+    RISK_TAG_EFFECTS as _TAG_EFFECTS,
+)
+from agents_shipgate.schemas.action_effects import (
+    declaration_covers,
+    declaration_effects,
+)
 from agents_shipgate.schemas.common import Confidence, ProvenanceKind, confidence_rank
 from agents_shipgate.schemas.manifest import (
     ActionDeclarationConfig,
@@ -42,21 +51,19 @@ from agents_shipgate.schemas.manifest import (
 from agents_shipgate.schemas.manifest.action_surface import CONFIRMED_BASIS_PREFIX
 from agents_shipgate.schemas.surfaces import ActionEffect
 
-_EFFECT_RANK: dict[ActionEffect, int] = {
-    "read": 0,
-    "write": 1,
-    "privileged_data_access": 2,
-    "identity_access": 3,
-    "code_execution": 4,
-    "production_operation": 5,
-    "external_communication": 6,
-    "financial_write": 7,
-    "destructive": 8,
-}
 _EFFECT_VALUES = frozenset(_EFFECT_RANK)
-_MCP_SOURCE_TYPES = frozenset(
+#: The effect claim source for a tool's own outbound HTTP calls (#872).
+REACH_CLAIM_SOURCE = "source_http_call"
+#: The effect claim source for what a tool's own code reaches through a
+#: recognised library beyond HTTP: a database, a process, a file, a cloud SDK
+#: or a message (#913).
+REACH_EFFECT_CLAIM_SOURCE = "source_library_call"
+#: Both sources a tool's reach supports a claim from.
+REACH_CLAIM_SOURCES = frozenset({REACH_CLAIM_SOURCE, REACH_EFFECT_CLAIM_SOURCE})
+MCP_SOURCE_TYPES = frozenset(
     {
         "mcp",
+        "mcp_server_source",
         "codex_config_mcp",
         "codex_plugin_mcp_inventory",
         "n8n_mcp_client_tool",
@@ -69,8 +76,9 @@ _MCP_SOURCE_TYPES = frozenset(
 #: enumerated the surface says so on the tool (see
 #: :data:`agents_shipgate.core.domain.SURFACE_ENUMERATED`), and only a source
 #: type that says nothing is treated as incomplete.
-_AST_ONLY_SOURCE_TYPES = frozenset(
+AST_ONLY_SOURCE_TYPES = frozenset(
     {
+        "mcp_server_source",
         "sdk_function",
         "langchain_function",
         "langchain_structured_tool",
@@ -95,30 +103,6 @@ _PERMISSION_EFFECTS: dict[str, ActionEffect] = {
     "external": "external_communication",
     "financial": "financial_write",
     "production": "production_operation",
-}
-_TAG_EFFECTS: dict[str, ActionEffect] = {
-    "read_only": "read",
-    "write": "write",
-    "writes_data": "write",
-    "filesystem_write": "write",
-    "destructive": "destructive",
-    "irreversible": "destructive",
-    "external_write": "external_communication",
-    "external_communication": "external_communication",
-    "customer_communication": "external_communication",
-    "external_side_effect": "external_communication",
-    "financial_action": "financial_write",
-    "financial_write": "financial_write",
-    "infrastructure_change": "production_operation",
-    "production_operation": "production_operation",
-    "production_ops": "production_operation",
-    "sensitive_data_access": "privileged_data_access",
-    "privileged_data_access": "privileged_data_access",
-    "privileged_data": "privileged_data_access",
-    "secret_access": "privileged_data_access",
-    "code_execution": "code_execution",
-    "identity_access": "identity_access",
-    "unknown_side_effect": "write",
 }
 
 
@@ -164,8 +148,8 @@ def assess_tool_semantics(
     )
     identity = tool.identity_assessment or _compat_identity_assessment(tool)
     binding = tool.binding_assessment or _compat_binding_assessment(tool)
-    surface_complete = _surface_is_complete(tool)
-    extraction_complete = tool.extraction_confidence == "high"
+    surface_complete = surface_is_complete(tool)
+    extraction_complete = extraction_is_complete(tool)
     pass_eligible = (
         identity.pass_eligible
         and binding.pass_eligible
@@ -361,6 +345,39 @@ def _assess_effect(
             )
         )
 
+    # The outbound HTTP calls a static read of the tool's own code followed
+    # (#872), and what it reaches through a recognised library beyond HTTP
+    # (#913): the effect of a call that was made, or — only when every call
+    # was followed and everything it reaches reads — ``read``. The reader
+    # decides which it can support; this is the one place any of them
+    # becomes effect evidence.
+    reach = tool.extraction.get("reach")
+    if isinstance(reach, dict):
+        for item in reach.get("effect_claims") or []:
+            if not isinstance(item, dict) or item.get("effect") not in _EFFECT_VALUES:
+                continue
+            claims.append(
+                _claim(
+                    "effect",
+                    item["effect"],
+                    "high",
+                    "static_declaration",
+                    "protocol_structure",
+                    REACH_EFFECT_CLAIM_SOURCE
+                    if "family" in item or "effects" in item
+                    else REACH_CLAIM_SOURCE,
+                    item.get("at") or pointer,
+                    {
+                        key: item[key]
+                        for key in (
+                            "method", "url", "graphql", "calls", "effects", "family",
+                            "operation", "call", "target",
+                        )
+                        if key in item
+                    },
+                )
+            )
+
     for name in _BOOLEAN_ANNOTATIONS:
         if name in tool.annotations and type(tool.annotations[name]) is not bool:
             issues.append(
@@ -372,7 +389,9 @@ def _assess_effect(
                     pointer,
                 )
             )
-    if tool.annotations.get("readOnlyHint") is True:
+    # A hint read out of the server's own source is a claim, not evidence (#658).
+    hints_are_evidence = annotation_hints_are_effect_evidence(tool)
+    if hints_are_evidence and tool.annotations.get("readOnlyHint") is True:
         claims.append(
             _claim(
                 "effect",
@@ -385,7 +404,7 @@ def _assess_effect(
                 {"readOnlyHint": True},
             )
         )
-    if tool.annotations.get("destructiveHint") is True:
+    if hints_are_evidence and tool.annotations.get("destructiveHint") is True:
         claims.append(
             _claim(
                 "effect",
@@ -512,6 +531,8 @@ def _assess_effect(
             "permission_class",
             "auth_scope",
             "action_scope",
+            REACH_CLAIM_SOURCE,
+            REACH_EFFECT_CLAIM_SOURCE,
         }
         or (claim.policy_eligible and claim.basis == "typed_provider_fact")
     ]
@@ -532,7 +553,7 @@ def _assess_effect(
     ]
     inferred = [claim for claim in claims if claim not in authoritative]
 
-    is_mcp = tool.source_type in _MCP_SOURCE_TYPES or tool.annotations.get("mcp_server") is True
+    is_mcp = tool.source_type in MCP_SOURCE_TYPES or tool.annotations.get("mcp_server") is True
     if is_mcp and not declared and not structural:
         claims.append(
             _claim(
@@ -850,12 +871,29 @@ def _assess_effect(
             )
         )
 
-    if tool.extraction_confidence != "high" or not _surface_is_complete(tool):
+    extraction_complete = extraction_is_complete(tool)
+    surface_complete = surface_is_complete(tool)
+    if not surface_complete:
         issues.append(
             _issue(
                 "incomplete_surface",
                 "effect",
-                "tool surface enumeration is incomplete or not high confidence",
+                "tool surface enumeration is incomplete",
+                "tool_extraction",
+                pointer,
+            )
+        )
+    elif not extraction_complete:
+        enumerated = tool.extraction.get("surface") == SURFACE_ENUMERATED
+        surface = "the enumerated surface" if enumerated else "this surface"
+        issues.append(
+            _issue(
+                "unattested_surface",
+                "effect",
+                (
+                    f"no reviewed tool inventory attests {surface} "
+                    f"(extraction_confidence={tool.extraction_confidence})"
+                ),
                 "tool_extraction",
                 pointer,
             )
@@ -946,45 +984,6 @@ def _source_read_conflict(structural: Sequence[SemanticClaim]) -> tuple[bool, bo
     return (
         any(claim.value == "read" for claim in high),
         any(claim.value != "read" for claim in high),
-    )
-
-
-def declaration_covers(declared: str, inferred: str) -> bool:
-    """Does asserting ``declared`` account for an observation of ``inferred``?
-
-    Two conditions, both necessary.
-
-    *Risk*: the declaration must not rank below the observation under **either**
-    published rank table. They disagree — :data:`_EFFECT_RANK` orders
-    ``privileged_data_access`` above ``write`` and ``ACTION_EFFECT_RANK`` orders
-    it below — and picking a winner would either loosen an existing gate path or
-    leave this comparison contradicting the one
-    ``_non_authoritative_effect_escalation_support`` makes about the same
-    action. Requiring both makes them agree without weakening either.
-
-    *Obligations*: the declaration must oblige at least the controls the
-    observation would. Rank is a total order; obligations are not.
-    ``financial_write`` outranks ``external_communication`` and requires
-    approval, audit, and idempotency — but not confirmation, which is precisely
-    what communicating outward requires. Testing rank alone let a declaration
-    discharge a category it does not cover: the action went pass-eligible with
-    no gap and no external-communication finding, while the external-write risk
-    tag sat untouched in the same report.
-
-    Nothing here decides *policy*. An uncovered observation becomes a reviewed
-    question, never a control a heuristic imposed on its own (#357).
-    """
-
-    if declared == inferred:
-        return True
-    if declared not in _EFFECT_RANK or inferred not in _EFFECT_RANK:
-        return False
-    if _EFFECT_RANK[_as_effect(declared)] < _EFFECT_RANK[_as_effect(inferred)]:
-        return False
-    if ACTION_EFFECT_RANK[_as_effect(declared)] < ACTION_EFFECT_RANK[_as_effect(inferred)]:
-        return False
-    return builtin_obligations(_as_effect(inferred)).issubset(
-        builtin_obligations(_as_effect(declared))
     )
 
 
@@ -2337,7 +2336,31 @@ def _issue(
     )
 
 
-def _surface_is_complete(tool: Tool) -> bool:
+def extraction_is_complete(tool: Tool) -> bool:
+    """Whether the adapter read this tool's own contract with full confidence.
+
+    One line, named once. It is the sole extraction input to pass eligibility
+    here and — negated — the sole definition of ``low_confidence_tool_count``
+    in :mod:`agents_shipgate.ci.release_decision`, so the two surfaces cannot
+    answer the question differently. :mod:`agents_shipgate.inputs.coverage`
+    calls it as well, which is what makes the published determinism boundary a
+    projection of this predicate rather than a second reading of it (#473).
+    """
+
+    return tool.extraction_confidence == "high"
+
+
+#: The ``Tool.annotations`` keys :func:`surface_is_complete` reads. Exported so
+#: a producer that *claims* one of them — the determinism boundary's coverage
+#: cells do — can be checked against the set that actually changes the answer.
+#: A misspelled flag is otherwise inert, and inert here means "the surface is
+#: complete", which is the fail-open direction (#473 review).
+SURFACE_INCOMPLETE_ANNOTATIONS: frozenset[str] = frozenset(
+    {"wildcard_tools", "mcp_wildcard_tools", "mcp_unknown_schema"}
+)
+
+
+def surface_is_complete(tool: Tool) -> bool:
     """Whether this tool's surface is known, not merely reported.
 
     Until #393 an AST source type was disqualified outright. That made
@@ -2354,13 +2377,11 @@ def _surface_is_complete(tool: Tool) -> bool:
     their previous verdict and a newly unresolvable construct fails closed.
     """
 
-    if (
-        tool.annotations.get("wildcard_tools") is True
-        or tool.annotations.get("mcp_wildcard_tools") is True
-        or tool.annotations.get("mcp_unknown_schema") is True
+    if any(
+        tool.annotations.get(key) is True for key in SURFACE_INCOMPLETE_ANNOTATIONS
     ):
         return False
-    if tool.source_type in _AST_ONLY_SOURCE_TYPES:
+    if tool.source_type in AST_ONLY_SOURCE_TYPES:
         return tool.extraction.get("surface") == SURFACE_ENUMERATED
     return True
 
@@ -2453,6 +2474,7 @@ __all__ = [
     "ReviewedAuthority",
     "attach_semantic_assessments",
     "confirmed_basis",
+    "declaration_effects",
     "declared_effect_of",
     "risk_tag_answers_effect",
     "effect_derivation_id",

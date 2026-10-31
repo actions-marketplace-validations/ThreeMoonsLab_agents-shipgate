@@ -1547,7 +1547,8 @@ def test_every_reason_the_ledger_owns_renders_a_phrase():
     Both directions: a token added to a builder without a phrase says nothing
     a reader can act on, and a phrase left behind by a renamed token is dead
     text nobody would notice. Scoped to the vocabularies this package owns —
-    the two report-side builders and the two bundled MCP loaders — because a
+    the two report-side builders, the two bundled MCP loaders and the OpenAPI
+    loader — because a
     third-party adapter may coin any token and the fallback is the right
     answer for it. A new emitter here is meant to fail this test and be added
     deliberately.
@@ -1563,6 +1564,7 @@ def test_every_reason_the_ledger_owns_renders_a_phrase():
     from agents_shipgate.core import surface_exclusions as module
     from agents_shipgate.inputs import mcp as mcp_module
     from agents_shipgate.inputs import mcp_manifest as mcp_manifest_module
+    from agents_shipgate.inputs import openapi as openapi_module
 
     def _module_constants(tree: ast.AST) -> dict[str, str]:
         found: dict[str, str] = {}
@@ -1619,6 +1621,7 @@ def test_every_reason_the_ledger_owns_renders_a_phrase():
             {"_binding_exclusions", "_surface_completeness_exclusions"},
         )
         | _omit_reasons(Path(mcp_module.__file__))
+        | _omit_reasons(Path(openapi_module.__file__))
         | _keyword_reasons(
             Path(mcp_manifest_module.__file__), {"_merge_server_declarations"}
         )
@@ -1913,13 +1916,13 @@ def test_a_second_exclusion_of_one_gap_identity_is_still_new(tmp_path):
 
 
 def test_an_inherited_exclusion_is_not_named_by_a_new_gap_of_another_kind():
-    """One subject, two gap kinds — the clause must follow the ledger.
+    """An attestation gap does not invent an unread surface remainder.
 
-    `samples/conductor_agent` carries both `incomplete_surface` and
+    `samples/conductor_agent` carries both `unattested_surface` and
     `low_confidence_tool` for `lookup_order [conductor_workflows]`, and only
-    the first has a ledger row. Selecting on the subject alone let a new
-    `low_confidence_tool` gap pull in the inherited `surface_not_enumerated`
-    exclusion and print its cause as this diff's doing.
+    explicit enumeration failure belongs in the exclusion ledger. Selecting
+    on low confidence or subject identity must not turn missing reviewed
+    attestation into a claim that some tool was never analysed.
     """
 
     from agents_shipgate.cli.verify.orchestrator import _gap_provenance_note
@@ -1935,7 +1938,11 @@ def test_an_inherited_exclusion_is_not_named_by_a_new_gap_of_another_kind():
         gaps = report.release_decision.evidence_coverage.evidence_gaps
         subject = "lookup_order [conductor_workflows]"
         kinds = {gap.kind for gap in gaps if gap.subject == subject}
-        assert {"incomplete_surface", "low_confidence_tool"} <= kinds, kinds
+        assert {"unattested_surface", "low_confidence_tool"} <= kinds, kinds
+        assert not any(
+            row.stage == "surface_completeness" and row.subject == subject
+            for row in report.surface_exclusions.entries
+        )
 
         # A synthetic base identical to the head but for the low-confidence
         # row, so that gap — and only that gap — is new.
@@ -1952,7 +1959,7 @@ def test_an_inherited_exclusion_is_not_named_by_a_new_gap_of_another_kind():
         note = " ".join(_gap_provenance_note(report=report, base_report=base))
 
     assert "1 of 7 evidence gap(s) are new in this diff." in note
-    # The exclusion is in the base ledger, so nothing about it is new.
+    # No enumeration exclusion exists, so nothing can be misreported as new.
     assert "not fully analysed" not in note
 
 
@@ -2017,3 +2024,132 @@ def test_a_tool_that_lost_its_binding_is_not_claimed_to_have_been_added(tmp_path
     assert "added" not in row.detail
     assert "'find_duplicate [server_mcp]' — not bound to the root agent" in note
     assert "added by this diff" not in note
+
+
+@pytest.mark.parametrize("facts_present", [False, True])
+def test_partial_zero_id_base_survives_public_sanitizer_and_blocks_comparison(tmp_path, facts_present):
+    config = _write_tree(tmp_path / "app", [], [])
+    _scan(config, tmp_path / "base-reports")
+    reference = tmp_path / "base-reports" / "report.json"
+    payload = json.loads(reference.read_text())
+    secret = "ghp_" + "A" * 36
+    payload["binding_surface_facts"]["status"] = "partial"
+    payload["binding_surface_facts"]["pass_eligible"] = False
+    payload["binding_surface_facts"]["issues"] = [dict(
+        kind="partial_binding_evidence", message="Unread source", source="framework_constructor_ownership",
+        source_pointer="agent.py:3?token=" + secret,
+    )]
+    if not facts_present:
+        payload.pop("tool_surface_facts")
+    reference.write_text(json.dumps(payload))
+    report, _ = _scan(config, tmp_path / "head-reports", diff_from=reference)
+    assert report.binding_surface_facts.possible_tool_ids == []
+    assert report.binding_surface_diff.base_comparison_requested and not report.binding_surface_diff.enabled
+    # Without the base's tool facts there is no tool comparison to make; with
+    # them it is made and only what depends on absence is withheld.
+    assert report.tool_surface_diff.enabled is facts_present
+    assert report.tool_surface_diff.finding_deltas.resolved_findings == []
+    assert not any(row.kind == "removed" for row in report.tool_surface_diff.tools)
+    assert report.capability_change is None or not (
+        report.capability_change.removed or report.capability_change.narrowed
+    )
+    assert any("comparison incomplete on base" in note for note in report.tool_surface_diff.notes)
+    assert secret not in report.model_dump_json()
+    gaps = report.release_decision.evidence_coverage.evidence_gaps
+    assert any(gap.source_ref == "--diff-from" and gap.next_action.kind == "provide_source" for gap in gaps)
+    assert report.release_decision.decision == "insufficient_evidence"
+    validate_semantic_consistency(report, _rehydrated_tools(report))
+
+
+def _write_constructor_scan(root, framework, source):
+    root.mkdir(parents=True)
+    (root / "agent.py").write_text(source)
+    (root / "shipgate.yaml").write_text(
+        'version: "0.1"\nproject: {name: comparison}\n'
+        'agent: {name: app, declared_purpose: [test comparison coverage]}\n'
+        'environment: {target: local}\ntool_sources:\n'
+        '  - id: sdk\n    type: ' + framework + '\n    path: agent.py\n'
+    )
+    return root / "shipgate.yaml"
+
+
+def test_zero_id_partial_head_is_gated_with_a_fact_only_base_reference(tmp_path):
+    base_config = _write_tree(tmp_path / "base", [], [])
+    _scan(base_config, tmp_path / "base-reports")
+    reference = tmp_path / "base-reports" / "report.json"
+    payload = json.loads(reference.read_text())
+    payload.pop("binding_surface_facts")
+    reference.write_text(json.dumps(payload))
+    config = _write_constructor_scan(tmp_path / "head", "openai_agents_sdk",
+        "from agents import Agent\nAgent.__init__ = object\nagent = Agent(name='App', tools=[])\n")
+    report, _ = _scan(config, tmp_path / "head-reports", diff_from=reference)
+    assert report.binding_surface_facts.possible_tool_ids == []
+    assert report.binding_surface_diff.base_comparison_requested and not report.binding_surface_diff.enabled
+    assert not any(row.kind == "removed" for row in report.tool_surface_diff.tools)
+    assert any("comparison incomplete on head" in note for note in report.tool_surface_diff.notes)
+    gaps = report.release_decision.evidence_coverage.evidence_gaps
+    assert any(gap.source_ref == "--diff-from" and gap.next_action.kind == "provide_source" for gap in gaps)
+    assert report.release_decision.decision == "insufficient_evidence"
+    validate_semantic_consistency(report, _rehydrated_tools(report))
+
+
+@pytest.mark.parametrize("change", ["runner", "awaited_runner", "genexpr"])
+def test_unread_sdk_head_cannot_report_capabilities_removed_by_scan_diff(tmp_path, change):
+    common = ("from agents import Agent, function_tool\n"
+              "@function_tool\ndef delete() -> str:\n    return 'deleted'\n"
+              "worker = Agent(name='Worker', tools=[delete])\n")
+    before = common + "agent = Agent(name='App', handoffs=[worker])\n"
+    if change == "runner":
+        after = before + "from agents import Runner\nif __name__ == '__main__':\n    Runner.run_sync(agent, 'hello')\n"
+    elif change == "awaited_runner":
+        after = before + (
+            "from agents import Runner\nimport asyncio\n"
+            "async def main():\n"
+            "    result = await Runner.run(agent, 'hello')\n"
+            "    print(result.final_output)\n"
+            "if __name__ == '__main__':\n    asyncio.run(main())\n"
+        )
+    else:
+        after = common + "agent = Agent(name='App', tools=sum(([] for _ in []), []), handoffs=[worker])\n"
+    base = _write_constructor_scan(tmp_path / "base", "openai_agents_sdk", before)
+    head = _write_constructor_scan(tmp_path / "head", "openai_agents_sdk", after)
+    _scan(base, tmp_path / "base-reports")
+    report, _ = _scan(head, tmp_path / "head-reports", diff_from=tmp_path / "base-reports" / "report.json")
+    assert report.binding_surface_facts.status == "partial"
+    assert report.binding_surface_facts.possible_tool_ids
+    assert report.binding_surface_facts.handoff_edges
+    assert report.binding_surface_diff.base_comparison_requested and not report.binding_surface_diff.enabled
+    assert report.binding_surface_diff.removed_handoffs == []
+    assert report.binding_surface_diff.removed_reachable_tool_ids == []
+    # The tool comparison is made and says what it withheld; nothing removed,
+    # narrowed or resolved is claimed from a head that only failed to be read.
+    assert report.tool_surface_diff.enabled
+    assert any("comparison incomplete on head" in note for note in report.tool_surface_diff.notes)
+    assert not any((report.tool_surface_diff.tools, report.tool_surface_diff.high_risk_effects,
+                    report.tool_surface_diff.scopes, report.tool_surface_diff.controls))
+    assert report.tool_surface_diff.finding_deltas.resolved_findings == []
+    assert not (report.capability_change.removed or report.capability_change.narrowed)
+    assert report.release_decision.decision != "passed"
+    gaps = report.release_decision.evidence_coverage.evidence_gaps
+    assert any(gap.source_ref == "--diff-from" for gap in gaps)
+    validate_semantic_consistency(report, _rehydrated_tools(report))
+
+
+def test_adk_unread_parent_preserves_child_candidate_and_freeform_findings(tmp_path):
+    source = ("from google.adk.agents import Agent\n"
+              "def lookup() -> str:\n    return 'ok'\n"
+              "worker = Agent(name='Worker', tools=[lookup])\n"
+              "Agent.__init__ = object\n"
+              "root = Agent(name='Root', sub_agents=[worker])\n")
+    config = _write_constructor_scan(tmp_path / "app", "google_adk", source)
+    report, _ = _scan(config, tmp_path / "reports")
+    graph = report.binding_surface_facts
+    assert graph.root_agent_id is not None and graph.status == "partial"
+    assert graph.possible_tool_ids and graph.unbound_tool_ids == []
+    assert graph.handoff_edges and all(not edge.complete for edge in graph.handoff_edges)
+    # The child was matched to its definition: the constructor gap makes the
+    # edge incomplete, and nothing claims the definition could not be found.
+    assert not any("could not match" in issue.message for issue in graph.issues)
+    assert any(finding.check_id == "SHIP-SCHEMA-FREEFORM-OUTPUT" for finding in report.findings)
+    assert report.release_decision.decision != "passed"
+    validate_semantic_consistency(report, _rehydrated_tools(report))

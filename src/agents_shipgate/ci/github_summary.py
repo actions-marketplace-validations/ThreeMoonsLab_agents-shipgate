@@ -3,12 +3,16 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from agents_shipgate.core.disclaimers import STATIC_VERDICT_DISCLAIMER
+from agents_shipgate.core.disclaimers import (
+    DETERMINISM_BOUNDARY_REFERENCE,
+    STATIC_VERDICT_DISCLAIMER,
+)
 from agents_shipgate.core.findings.subject_rollup import (
     roll_up_findings,
     top_findings_block,
 )
 from agents_shipgate.core.privacy import sanitize_report
+from agents_shipgate.report.declaration_review import declaration_review_lines
 from agents_shipgate.report.human_order import (
     HumanArtifactContext,
     capability_delta_by_subject,
@@ -49,6 +53,16 @@ def write_github_step_summary(
             f"`{_safe_markdown_text(surface.name)}` — "
             f"{_safe_markdown_text(surface.why)}"
         )
+    if report.release_decision is not None:
+        review_lines = declaration_review_lines(
+            report.release_decision.evidence_coverage.semantic_coverage.declaration_review,
+            detail_limit=5,
+        )
+        if review_lines:
+            lines.extend(["", "### Declaration review"])
+            lines.extend(
+                f"- {_safe_markdown_text(line)}" for line in review_lines
+            )
     lines.extend(
         [
             (
@@ -164,6 +178,7 @@ def _decision_lines(report: ReadinessReport) -> list[str]:
             "Improve evidence: "
             f"{_safe_markdown_text(primary_evidence_remediation_text(decision.evidence_coverage))}"
         )
+        lines.append(DETERMINISM_BOUNDARY_REFERENCE)
     if agent_summary and agent_summary.first_recommended_action:
         lines.append(_agent_next_action_line(agent_summary.first_recommended_action))
     fp = decision.fail_policy

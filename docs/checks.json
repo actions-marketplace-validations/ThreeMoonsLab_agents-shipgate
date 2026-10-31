@@ -1357,7 +1357,7 @@
       "autofix_safe": false,
       "category": "codex_boundary",
       "default_severity": "medium",
-      "description": "AGENTS.md removed a Shipgate requirement.",
+      "description": "Deprecated in 1.1.0; retained for historical reports and configuration. New runs emit no findings for this ID.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-codex-boundary-agents-shipgate-requirement-removed",
       "dynamic_default": false,
       "evidence_fields": [
@@ -1365,12 +1365,12 @@
         "deleted",
         "removed_shipgate_lines"
       ],
-      "fires_when": "A changed AGENTS.md/AGENTS.override.md deletes Shipgate command or requirement text without adding a replacement.",
+      "fires_when": "Never on current scans. The published ID remains available; structured settings, hooks, permissions and MCP readers stay active.",
       "floor_severity": "medium",
       "id": "SHIP-CODEX-BOUNDARY-AGENTS-SHIPGATE-REQUIREMENT-REMOVED",
       "mvp_tier": "lifecycle",
-      "rationale": "Agent instructions are not controls; removing gate instructions requires human review because semantic weakening cannot be proven safely.",
-      "recommendation": "Have a human confirm the agent instructions were not weakened.",
+      "rationale": "Prose words do not establish changed authority. Complete parsed instruction structure and unresolved-input review replace word matching.",
+      "recommendation": "Re-run the current verifier for supported structural changes and coverage limitations; historical instruction wording is not a new grant.",
       "requires_human_review": true,
       "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
@@ -1600,18 +1600,18 @@
       "autofix_safe": false,
       "category": "codex_boundary",
       "default_severity": "medium",
-      "description": "A Codex skill gained command-bearing instructions.",
+      "description": "Deprecated in 1.1.0; retained for historical reports and configuration. New runs emit no findings for this ID.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-codex-boundary-skill-command-changed",
       "dynamic_default": false,
       "evidence_fields": [
         "kind"
       ],
-      "fires_when": "A changed .agents/skills/**/SKILL.md adds command-like text.",
+      "fires_when": "Never on current scans. The published ID remains available; structured settings, hooks, permissions and MCP readers stay active.",
       "floor_severity": "medium",
       "id": "SHIP-CODEX-BOUNDARY-SKILL-COMMAND-CHANGED",
       "mvp_tier": "lifecycle",
-      "rationale": "Skills can steer agents into shell commands or helper scripts, so command-bearing changes need review before local automation.",
-      "recommendation": "Review command-bearing skill changes before local automation.",
+      "rationale": "Prose words do not establish changed authority. Complete parsed instruction structure and unresolved-input review replace word matching.",
+      "recommendation": "Re-run the current verifier for supported structural changes and coverage limitations; historical instruction wording is not a new grant.",
       "requires_human_review": true,
       "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
@@ -1869,7 +1869,7 @@
       "evidence_fields": [
         "description_length"
       ],
-      "fires_when": "A tool description is missing or shorter than the minimum.",
+      "fires_when": "A tool description is missing or shorter than the minimum. A description an MCP source reader found but could not resolve, such as an f-string or a template literal with a substitution, is not reported as missing.",
       "floor_severity": null,
       "id": "SHIP-DOC-MISSING-DESCRIPTION",
       "mvp_tier": "hygiene",
@@ -2010,7 +2010,7 @@
         "error",
         "source"
       ],
-      "fires_when": "A changed .mcp.json, .cursor/mcp.json, .vscode/mcp.json, .claude/settings(.local).json, or .github/workflows file cannot be parsed as JSON or YAML, or its content cannot be resolved from the diff.",
+      "fires_when": "A changed .mcp.json, .cursor/mcp.json, .vscode/mcp.json, .claude/settings(.local).json, or .github/workflows file cannot be parsed as JSON or YAML, or its content cannot be resolved from the diff. A settings file that parses but changes a top-level key outside the host-boundary rule allow-list records the key here with evidence kind unknown_host_config_key; a Claude Code setting the host-grant table models is rated by that table instead (#827).",
       "floor_severity": "medium",
       "id": "SHIP-HOST-BOUNDARY-CONFIG-PARSE-FAILED",
       "mvp_tier": "lifecycle",
@@ -2090,14 +2090,22 @@
       "autofix_safe": false,
       "category": "host_boundary",
       "default_severity": "high",
-      "description": "The Claude Code permission allowlist expanded.",
+      "description": "The Claude Code permission allowlist expanded. Also reports proven expansion of an explicitly selected OpenShell policy.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-host-boundary-permission-allow-expanded",
       "dynamic_default": false,
       "evidence_fields": [
+        "direction",
+        "explanation",
         "kind",
-        "rule"
+        "limits",
+        "mode",
+        "narrowed",
+        "rule",
+        "setting",
+        "value",
+        "widened"
       ],
-      "fires_when": "A changed .claude/settings.json or .claude/settings.local.json adds a non-wildcard permissions.allow entry.",
+      "fires_when": "A changed .claude/settings.json or .claude/settings.local.json adds a non-wildcard permissions.allow entry. It also fires when the change sets any other value of a Claude Code setting the host-grant table models - a 'defaultMode' such as 'acceptEdits' or 'dontAsk', an 'enabledMcpjsonServers' entry, 'disableBypassPermissionsMode', 'disableAllHooks', the managed-only switches, or 'false' for the prompt switches - at the rating the table gives the value, which is the rating its grant and host-diff row carry (#827). OpenShell declared filesystem, Landlock or supported network authority expands, including removal of REST enforcement.",
       "floor_severity": "medium",
       "id": "SHIP-HOST-BOUNDARY-PERMISSION-ALLOW-EXPANDED",
       "mvp_tier": "lifecycle",
@@ -2137,9 +2145,12 @@
       "dynamic_default": false,
       "evidence_fields": [
         "kind",
-        "rule"
+        "rule",
+        "mode",
+        "setting",
+        "value"
       ],
-      "fires_when": "A changed .claude/settings.json or .claude/settings.local.json adds an allow rule that is '*', a bare tool name, or a wildcard-shaped rule such as 'Bash(*)' or 'Bash(*:*)'.",
+      "fires_when": "A changed .claude/settings.json or .claude/settings.local.json adds an allow rule that is '*', a bare tool name, or a wildcard-shaped rule such as 'Bash(*)' or 'Bash(*:*)'. An MCP rule naming tools within one server, such as 'mcp__github__get_issue', is scoped; 'mcp__github' and 'mcp__github__*' grant the whole server. It also fires, at critical, when the change sets a Claude Code setting the host-grant table rates critical, one that removes a prompt wholesale - defaultMode set to bypassPermissions (every permission prompt), skipDangerousModePermissionPrompt set to true (the confirmation before that mode) or enableAllProjectMcpServers set to true (every project MCP server's approval) - naming the setting in the evidence (#827).",
       "floor_severity": "high",
       "id": "SHIP-HOST-BOUNDARY-PERMISSION-WILDCARD-ALLOW",
       "mvp_tier": "lifecycle",
@@ -2503,7 +2514,7 @@
         "source_id",
         "env_secret_names"
       ],
-      "fires_when": "A statically parsed MCP server declares secret-like env vars or passes through secret-like host env references.",
+      "fires_when": "A statically parsed MCP server declares secret-like env vars, passes through secret-like host env references, or forwards a secret-like variable by name (`env_vars`, `bearer_token_env_var`, `env_http_headers`, a `headers` reference).",
       "floor_severity": "medium",
       "id": "SHIP-MCP-ENV-SECRET-PASSTHROUGH",
       "mvp_tier": "lifecycle",
@@ -2675,9 +2686,10 @@
         "source_ref",
         "node_id",
         "selection_mode",
-        "explicit_inventory"
+        "explicit_inventory",
+        "excluded_tools"
       ],
-      "fires_when": "An n8n MCP Client Tool uses All or All Except selection and no explicit local inventory is declared.",
+      "fires_when": "An n8n MCP Client Tool uses All or All Except selection (`include` of `all`, the default an export leaves out, or `except`) and no explicit local inventory is declared.",
       "floor_severity": null,
       "id": "SHIP-N8N-MCP-CLIENT-TOOLSET-UNFILTERED",
       "mvp_tier": "adapter",
@@ -2928,19 +2940,19 @@
       "autofix_safe": false,
       "category": "verify",
       "default_severity": "medium",
-      "description": "The PR edits agent-instruction trust roots (AGENTS.md, CLAUDE.md, .cursor/rules, skills, etc.) and Shipgate cannot statically prove the instructions were not weakened.",
+      "description": "Deprecated in 1.1.0; retained for historical reports and configuration. New runs emit no findings for this ID.",
       "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-verify-agent-instructions-weakened",
       "dynamic_default": false,
       "evidence_fields": [
         "kind",
         "changed_instruction_files"
       ],
-      "fires_when": "A VerificationContext is present and a changed file matches an agent-instruction trust-root glob.",
+      "fires_when": "Never on current scans. Historical findings retain their original meaning and metadata; the published ID is not removed or repurposed.",
       "floor_severity": "medium",
       "id": "SHIP-VERIFY-AGENT-INSTRUCTIONS-WEAKENED",
       "mvp_tier": "lifecycle",
-      "rationale": "Prompts are not controls (Principle 3); a static tool cannot judge whether instruction text was weakened, so any change is routed to human review rather than silently trusted.",
-      "recommendation": "A human must review the agent-instruction change and confirm no gate-protecting instruction was removed or softened.",
+      "rationale": "Changed-file membership cannot establish that natural-language instructions weakened a control. Structured permission and execution readers remain active. Complete parsed instruction equality can clear only the exact instruction touch; unknown structure and configured trust roots retain review.",
+      "recommendation": "This is a historical instruction-text finding. Re-run the current verifier for structural findings and remaining review obligations; deprecation of this ID does not itself authorize merge or completion.",
       "requires_human_review": true,
       "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
@@ -3013,6 +3025,73 @@
       "mvp_tier": "lifecycle",
       "rationale": "Removing CI enforcement is the bluntest gate-bypass. Detecting a changed-and-now-absent workflow file makes the removal a release signal even without a base scan.",
       "recommendation": "A human must approve removing Shipgate CI enforcement; do not delete the gate to make CI pass.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "verify",
+      "default_severity": "medium",
+      "description": "Verification is using a local-review, uncommitted, or otherwise Git-unproven manifest rather than a committed repository input.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-verify-local-review-provisional",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "manifest",
+        "manifest_provenance",
+        "ephemeral",
+        "release_authoritative"
+      ],
+      "fires_when": "A VerificationContext identifies the configured manifest provenance as local_review, uncommitted, or unknown. Emits nothing on plain scan or manifests Git proves are committed repository inputs.",
+      "floor_severity": "medium",
+      "id": "SHIP-VERIFY-LOCAL-REVIEW-PROVISIONAL",
+      "mvp_tier": "lifecycle",
+      "rationale": "A locally generated assessment policy is not durable repository policy. Letting structurally valid local declarations produce a passing release artifact would launder local assertions into release authority, so the existing release decision must remain review-required. Git presence alone does not prove human review.",
+      "recommendation": "Treat the result as provisional static assessment only. Adopt shipgate.yaml through init --write, verify that it is present in the evaluated Git tree, and route any resulting human-review requirement before relying on release authority.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "verify",
+      "default_severity": "critical",
+      "description": "Trusted native OpenShell execution found a modeled candidate action outside the independently pinned maximum boundary.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-verify-openshell-boundary-exceeded",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "status",
+        "reason_code",
+        "required"
+      ],
+      "fires_when": "Opt-in local execution returns a validated exceeds_boundary envelope with matching actual exit status and all required domains.",
+      "floor_severity": "critical",
+      "id": "SHIP-VERIFY-OPENSHELL-BOUNDARY-EXCEEDED",
+      "mvp_tier": "lifecycle",
+      "rationale": "A known containment counterexample cannot be treated as a passing release input. Native evidence never approves other review obligations.",
+      "recommendation": "Narrow the candidate and rerun trusted native proof; do not widen the trusted boundary from the candidate PR.",
+      "requires_human_review": true,
+      "requires_human_review_regardless_of_patch": false,
+      "suggested_patch_kind": "manual"
+    },
+    {
+      "autofix_safe": false,
+      "category": "verify",
+      "default_severity": "medium",
+      "description": "Requested native OpenShell containment is unavailable, unsupported, invalid or inconclusive.",
+      "docs_url": "https://github.com/ThreeMoonsLab/agents-shipgate/blob/main/docs/checks.md#ship-verify-openshell-proof-unavailable",
+      "dynamic_default": false,
+      "evidence_fields": [
+        "status",
+        "reason_code",
+        "required"
+      ],
+      "fires_when": "Opt-in execution cannot establish current modeled containment, or required proof has not been supplied. Optional absent proof is reported only as absent.",
+      "floor_severity": "medium",
+      "id": "SHIP-VERIFY-OPENSHELL-PROOF-UNAVAILABLE",
+      "mvp_tier": "lifecycle",
+      "rationale": "A missing or failed proof establishes no containment. Required proof also creates an unsuppressible evidence gap through the existing release decision.",
+      "recommendation": "Repair trusted external inputs or unsupported proof context and rerun verify with the same proof options.",
       "requires_human_review": true,
       "requires_human_review_regardless_of_patch": false,
       "suggested_patch_kind": "manual"
@@ -3097,7 +3176,7 @@
         "trust_root_class",
         "matched_glob"
       ],
-      "fires_when": "A changed file from the verification context matches a trust-root surface glob. Emits nothing on a plain scan (no verification context).",
+      "fires_when": "A changed file from the verification context matches a trust-root surface glob. Emits nothing on a plain scan (no verification context). A host settings file whose only change is a narrowing the permission lattice decides does not fire.",
       "floor_severity": "medium",
       "id": "SHIP-VERIFY-TRUST-ROOT-TOUCHED",
       "mvp_tier": "lifecycle",

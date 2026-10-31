@@ -14,12 +14,25 @@ This value identifies the calling agent and changes only actor/rerun metadata;
 it never selects or disables host coverage. Every recognized changed boundary
 surface is evaluated on every invocation.
 The command writes no repo artifacts by default. It prints one JSON object to
-stdout: `shipgate.agent_boundary_result/v2`.
+stdout: `shipgate.agent_boundary_result/v3`.
 
 `agents-shipgate verify` and `agents-shipgate-reports/report.json` remain the
 full CI and reviewer substrate. Coding agents should use them for committed PR
 verification and reviewer evidence, but their local control loop is
-`shipgate check` plus `shipgate.agent_boundary_result/v2`.
+`shipgate check` plus `shipgate.agent_boundary_result/v3`.
+
+## Review questions
+
+A committed verifier run may bind a standalone
+[`human-review-request.json`](../human-review-request.md). Read it for the
+exact question, full scope and postcondition of the supported human route.
+It is unsigned and grants no merge or completion authority. The current
+`control.next_action` remains the continuation; do not populate
+`HumanControlAction.expects` or treat prose acceptance as verified evidence.
+The [host-neutral decision evaluator](../human-review-decision.md) checks an
+externally signed decision against current evidence and trusted eligibility.
+Its separate `applicable` result grants no authority and changes no control
+artifact. Coding agents cannot supply their own reviewer identity or key trust.
 
 ## Command
 
@@ -44,10 +57,11 @@ shipgate check --agent codex --workspace . --diff - --format agent-boundary-json
 
 A supplied file or stdin diff is detached diagnostic input: it is not bound
 to checkout bytes that `verify` can reconstruct. Shipgate can still report
-boundary findings from it, but when the result owes verification it returns
-`human_review_required` with no allowed command. Re-run the check against the
+boundary findings from it, but every detached result returns
+`human_review_required` with no allowed command and no permission, including
+an empty diff or one with no boundary finding. Re-run the check against the
 intended worktree, or with both `--base` and `--head`, to obtain a replayable
-verification route.
+verification route or completion.
 
 The no-`--diff` form resolves a git diff locally. With no `--base` or `--head`,
 it reads local staged, unstaged, deleted, renamed, and relevant untracked
@@ -59,7 +73,7 @@ for local work or provide both for committed refs. Shipgate never fetches refs.
 
 The stdout object has:
 
-- `schema_version: "shipgate.agent_boundary_result/v2"`
+- `schema_version: "shipgate.agent_boundary_result/v3"`
 - `actor: "codex" | "claude-code" | "cursor"`
 - `input_mode` and `scope`
 - `input_coverage`
@@ -97,7 +111,7 @@ The stdout object has:
 - `audit_id`
 
 Consumers must make decisions from JSON fields, never from prose or Markdown.
-The stable schema is `docs/agent-boundary-result-schema.v2.json`. Operational
+The stable schema is `docs/agent-boundary-result-schema.v3.json`. Operational
 consumers switch only on `control.state`; `decision` is diagnostic context.
 `control.completion_allowed` is true exactly for `complete`, and
 `control.must_stop` is true
@@ -115,9 +129,9 @@ from `verify --preview`, whose project markers are read from the working tree �
 the commit this worktree must have checked out. `expects` names a commit id
 rather than the ref you passed, because the checkout it asks for moves `HEAD`
 and a revision expression would then mean something else.
-An unreadable diff file, detached stdin/file diff that owes verification, or
-worktree/ref state Shipgate cannot bind returns `human_review_required` and
-authorizes no speculative rerun. Unsupported CLI shape errors such as an
+An unreadable diff file, any detached stdin/file diff, or worktree/ref state
+Shipgate cannot bind returns `human_review_required` and authorizes no
+speculative rerun. Unsupported CLI shape errors such as an
 invalid `--agent` or `--format` still exit nonzero before a boundary-result
 object exists.
 
@@ -197,6 +211,19 @@ inputs cannot produce `control.state="complete"`. It does **not** compute the to
 capability delta — that is `verify`'s job, and `release_decision.decision`
 remains the one authoritative capability gate.
 
+Completion also requires an evaluated subject. A detached `--diff` or MCP
+`diff_text` input cannot grant publication, merge or completion authority,
+including when it is empty or has no boundary findings. Run against the intended
+checkout or an available base/head comparison. A clean checkout comparison in
+an unconfigured repository remains a valid negative boundary assessment.
+`mcp audit` likewise grants no authority for an empty or irrelevant diff, or
+when any requested source or policy was unreadable, whatever its diagnostic
+decision says. A source record `check` refuses as structurally incomplete — a
+header-only record, one of two records for the same path, or a record whose
+path cannot be parsed — is unreadable input there too, as is any binary record
+and any rename without hunks that git does not report as 100% similar. A
+recognized, readable empty server map is still an evaluated MCP subject.
+
 Treat `check` as necessary but not sufficient for capability-expanding diffs.
 If a change adds dynamic, undeclared, or otherwise ambiguous tool capability,
 `control.state` is `agent_action_required`; run `verify` and read
@@ -245,7 +272,7 @@ Policy discovery is deterministic:
 
 Coexisting unified and legacy workspace policies, duplicate inconsistent rule
 definitions, invalid explicit policy, and unknown explicit policy fields fail
-closed. Legacy policy discovery is deprecated through `0.16.x` and never
+closed. Legacy policy discovery is deprecated through `1.x` and never
 auto-migrated.
 
 Every result includes:
@@ -270,7 +297,7 @@ look like:
 
 ```json
 {
-  "schema_version": "shipgate.agent_boundary_result/v2",
+  "schema_version": "shipgate.agent_boundary_result/v3",
   "decision": "block",
   "control": {
     "state": "agent_action_required",
@@ -302,7 +329,7 @@ Surface a schema-valid boundary-result object that routes to an upgrade:
 
 ```json
 {
-  "schema_version": "shipgate.agent_boundary_result/v2",
+  "schema_version": "shipgate.agent_boundary_result/v3",
   "decision": "block",
   "control": {
     "state": "agent_action_required",
@@ -361,9 +388,10 @@ Input:
 }
 ```
 
-`shipgate.check` output is exactly `shipgate.agent_boundary_result/v2`.
+`shipgate.check` output is exactly `shipgate.agent_boundary_result/v3`.
 
-`shipgate.preflight` returns `PreflightResultV3`; prefer the `plan` argument
+`shipgate.preflight` returns `PreflightResultV6` (preflight `0.6`, whose
+`control` never authorizes an action); prefer the `plan` argument
 with a `PreflightPlanV1` object for protected-surface routing, high-risk
 capability evidence requests, and host/MCP permission review. `shipgate.explain` returns
 deterministic check/finding explanation JSON. `shipgate.capabilities` returns

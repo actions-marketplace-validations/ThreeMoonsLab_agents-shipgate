@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 import typer
 
@@ -14,7 +13,13 @@ from agents_shipgate.cli._helpers import (
     _parse_fail_on,
 )
 from agents_shipgate.cli.agent_mode import emit_agent_mode_error, is_agent_mode
-from agents_shipgate.cli.current_workspace import live_workspace
+from agents_shipgate.cli.current_workspace import (
+    OutputDirectoryHoldsRepositoryContent,
+    caller_path_spelling,
+    live_workspace,
+    output_directory_remedy,
+    relative_output_notice,
+)
 from agents_shipgate.cli.diagnostics import input_parse_recovery, top_next_actions
 from agents_shipgate.cli.discovery.gitignore_block import REPORTS_DIR_NAME
 from agents_shipgate.cli.workspace_guard import require_workspace
@@ -30,7 +35,10 @@ from agents_shipgate.core.current_control import (
     CurrentControlUnavailable,
     read_current_control,
 )
-from agents_shipgate.core.disclaimers import STATIC_VERDICT_DISCLAIMER
+from agents_shipgate.core.disclaimers import (
+    DETERMINISM_BOUNDARY_REFERENCE,
+    STATIC_VERDICT_DISCLAIMER,
+)
 from agents_shipgate.core.errors import AgentsShipgateError, ConfigError, InputParseError
 from agents_shipgate.core.logging import configure_logging
 from agents_shipgate.report.summary_text import primary_evidence_remediation_text
@@ -92,7 +100,8 @@ def verify(
             "omitted, verify auto-detects the default branch (origin/HEAD, "
             "origin/main, origin/master) if it points at a different commit "
             "than the head. Local main/master are used only when passed "
-            "explicitly; --no-base disables auto-detection."
+            "explicitly or when the repository has no remote. When no base "
+            "is found, verify exits 2; --no-base disables auto-detection."
         ),
     ),
     no_base: bool = typer.Option(
@@ -126,7 +135,16 @@ def verify(
     out: Path | None = typer.Option(
         None,
         "--out",
-        help="Output directory for verifier and scan artifacts.",
+        help=(
+            "Output directory (not a file) for verifier and scan artifacts. A "
+            "relative path resolves against the current directory, not "
+            "--workspace or the Git root. Default: agents-shipgate-reports "
+            "under --workspace. The run leaves it out of the change it decides "
+            "on, so a directory inside the repository must be gitignored, or "
+            "hold nothing but uncommitted Shipgate artifacts and lie outside "
+            "any trust root such as .claude; otherwise verify exits 2 before "
+            "writing."
+        ),
     ),
     format_: str | None = typer.Option(
         None,
@@ -150,12 +168,18 @@ def verify(
     ci_mode: str | None = typer.Option(
         None,
         "--ci-mode",
-        help="advisory or strict. Overrides manifest ci.mode for the head scan.",
+        help=(
+            "advisory or strict. Overrides manifest ci.mode for the head scan; "
+            "without it, the stricter of the base and head manifests applies."
+        ),
     ),
     fail_on: str | None = typer.Option(
         None,
         "--fail-on",
-        help="Comma-separated severities that fail CI.",
+        help=(
+            "Comma-separated severities that fail CI. Without it, the base "
+            "manifest's ci.fail_on also fails CI; the verdict follows the head's."
+        ),
     ),
     baseline: Path | None = typer.Option(
         None,
@@ -170,7 +194,10 @@ def verify(
     diff_from: Path | None = typer.Option(
         None,
         "--diff-from",
-        help="Explicit prior report.json or baseline JSON for head diff.",
+        help=(
+            "Explicit prior report.json or baseline JSON for head diff. A path "
+            "inside the repository is read as committed at the base."
+        ),
     ),
     authorization: Path | None = typer.Option(
         None,
@@ -213,6 +240,8 @@ def verify(
             "(legacy v1 style, available for one minor release cycle)."
         ),
     ),
+    openshell_proof_config: Path | None = typer.Option(None, "--openshell-proof-config", help="Operator-owned external native-prover trust configuration; opt-in execution."),
+    openshell_proof_required: bool = typer.Option(False, "--openshell-proof-required", help="Require current native containment, including when no trust configuration is supplied."),
     verbose: bool = typer.Option(False, "--verbose", help="Show debug details."),
 ) -> None:
     """Run the canonical ongoing-PR verifier around the existing scan engine."""
@@ -229,6 +258,13 @@ def verify(
     try:
         configure_logging(verbose=verbose)
         stdout_format = _resolve_verify_format(format_, json_output=json_output, preview=preview)
+        if openshell_proof_config is not None:
+            from agents_shipgate.core.openshell_native import external_path
+
+            try:
+                external_path(str(openshell_proof_config), workspace.resolve())
+            except ValueError as exc:
+                raise ConfigError(str(exc)) from exc
         if ci_mode and ci_mode not in {"advisory", "strict"}:
             raise ConfigError("--ci-mode must be advisory or strict")
         for label, value in (("--base", base), ("--head", head)):
@@ -241,6 +277,8 @@ def verify(
                 )
         parsed_fail_on = _parse_fail_on(fail_on)
         parsed_pr_comment_style = _parse_pr_comment_style(pr_comment_style)
+        if preview and (openshell_proof_config is not None or openshell_proof_required):
+            raise ConfigError("Native execution cannot be combined with --preview")
         if preview and authorization is not None:
             raise ConfigError("--authorization cannot be combined with --preview")
     except ConfigError as exc:
@@ -260,6 +298,8 @@ def verify(
             ],
         )
         raise typer.Exit(2) from exc
+
+    _notice_moved_relative_out(workspace, out, preview=preview)
 
     try:
         effective_config = config
@@ -297,6 +337,8 @@ def verify(
                 baseline_mode=baseline_mode,
                 diff_from=diff_from,
                 authorization=authorization,
+                openshell_proof_config=openshell_proof_config,
+                openshell_proof_required=openshell_proof_required,
                 policy_packs=policy_packs,
                 plugins_enabled=False if no_plugins else None,
                 strict_plugins=strict_plugins,
@@ -308,7 +350,32 @@ def verify(
             )
     except ConfigError as exc:
         typer.echo(f"Config error: {exc}", err=True)
-        if _unsafe_config_identity_error(exc):
+        if isinstance(exc, OutputDirectoryHoldsRepositoryContent):
+            # Nothing about the manifest is wrong, so the manifest diagnostics
+            # would route this to an edit that cannot clear it (#804). The way
+            # out is the one the refusal message names: never "omit --out"
+            # when the refused directory is the default one.
+            remedy = output_directory_remedy(default=exc.default, kind=exc.refusal.kind)
+            guidance = (
+                f"The default output directory {exc.directory} {exc.refusal}. {remedy}"
+                if exc.default
+                else (
+                    f"Choose an output directory other than {exc.directory}, which "
+                    f"{exc.refusal}. {remedy}"
+                )
+            )
+            flattened = [
+                NextAction(
+                    kind="review",
+                    why=guidance,
+                    expects=(
+                        "verify writes into a directory that holds only Shipgate "
+                        "artifacts, so nothing in the repository is left out of "
+                        "the change set it decides on."
+                    ),
+                )
+            ]
+        elif _unsafe_config_identity_error(exc):
             guidance = (
                 "Review the configured manifest identity and rerun verify only "
                 "after selecting an exact in-workspace, non-symlink path."
@@ -470,6 +537,24 @@ def verify(
     raise typer.Exit(exit_code)
 
 
+def _unevaluated_verdict_word(verifier) -> str:
+    """The human word for a run that produced no release decision.
+
+    "failed" was the catch-all, so a preview that simply did not evaluate a
+    gate — no manifest, nothing to gate — printed "Agents Shipgate verify:
+    failed" directly above "Exit code: 0". Nothing had failed; the machine
+    fields said so already (`execution: "not_run"`,
+    `applicability: "not_evaluated"`), and only the human line disagreed
+    with them (#650).
+    """
+
+    if verifier.head_status == "skipped":
+        return "skipped"
+    if (getattr(verifier, "execution", None) or verifier.head_status) == "not_run":
+        return "not evaluated"
+    return "failed"
+
+
 def _emit_verify_stdout(
     verifier: VerifierArtifact,
     *,
@@ -481,7 +566,7 @@ def _emit_verify_stdout(
     """Write the one stdout document this run promised."""
 
     if stdout_format == "json":
-        typer.echo(json.dumps(verifier.model_dump(mode="json"), indent=2))
+        typer.echo(json.dumps(_caller_resolvable_verifier(verifier), indent=2))
     elif stdout_format == "control":
         typer.echo(
             render_agent_control_envelope(
@@ -492,8 +577,22 @@ def _emit_verify_stdout(
         verdict = (
             verifier.release_decision.decision
             if verifier.release_decision is not None
-            else ("skipped" if verifier.head_status == "skipped" else "failed")
+            else _unevaluated_verdict_word(verifier)
         )
+        if verifier.host_comparison is not None:
+            from agents_shipgate.report.host_comparison import (
+                host_comparison_lines,
+                permission_guidance_lines,
+            )
+            for line in host_comparison_lines(verifier.host_comparison):
+                typer.echo(line)
+            typer.echo("Agents Shipgate verify: advisory: no application release policy configured")
+            if verifier.host_comparison.comparison_status != "comparable" and verifier.control.next_action is not None:
+                typer.echo("Next: " + single_line_text(verifier.control.next_action.why))
+            typer.echo("Static configuration comparison only; no application release or merge authority is granted.")
+            for line in permission_guidance_lines(verifier.host_comparison):
+                typer.echo(line)
+            return
         # Lead with the operational answer. The release verdict below is the
         # gate's word on the change; these lines are the reader's word on what
         # they may do next, and printing the verdict first is what let
@@ -525,7 +624,72 @@ def _emit_verify_stdout(
             for index, part in enumerate(remediation.splitlines() or [""]):
                 prefix = "Improve evidence: " if index == 0 else ""
                 typer.echo(f"{prefix}{single_line_text(part)}")
+            # The remediation names this repository's next step; this names the
+            # boundary that produced the abstention. `verify` is the command
+            # AGENTS.md sends coding agents and reviewers to for PR evidence,
+            # so it is the one surface that most needs the map (#473).
+            typer.echo(DETERMINISM_BOUNDARY_REFERENCE)
         typer.echo(f"Static-verdict boundary: {STATIC_VERDICT_DISCLAIMER}")
+
+
+def _notice_moved_relative_out(workspace: Path, out: Path | None, *, preview: bool) -> None:
+    """Say on stderr when a relative ``--out`` no longer lands where 1.0 put it.
+
+    1.0 joined an explicit relative ``--out`` to the Git root (``--preview``
+    outside Git: to ``--workspace``); it now resolves against the current
+    directory (#818). The switch is announced, not silent: every invocation
+    whose destination moved names both directories. Stdout, the verdict and
+    the exit code are untouched, and a workspace that is not a checkout is left
+    for the run itself to refuse.
+    """
+
+    if out is None or out.is_absolute():
+        return
+    previous_label = "the Git root"
+    try:
+        previous_base = ensure_git_workspace(workspace.resolve())
+    except ConfigError:
+        if not preview:
+            return
+        # Outside Git there is no root to name; the base was the workspace.
+        previous_base = workspace.resolve()
+        previous_label = "--workspace"
+    except Exception:  # noqa: BLE001 - a notice never stops a run; the run reports it.
+        return
+    notice = relative_output_notice(
+        "--out", out, previous_base=previous_base, previous_label=previous_label
+    )
+    if notice is not None:
+        typer.echo(notice, err=True)
+
+
+def _caller_resolvable_verifier(verifier: VerifierArtifact) -> dict:
+    """The verifier as stdout prints it: artifact paths open from the caller.
+
+    ``verifier.json`` records each artifact inside the repository relative to
+    ``workspace`` (the Git root), so the directory stays portable and its bytes
+    do not depend on where the run was typed. A caller anywhere but the Git
+    root could not open those paths from stdout (#818). Here each relative one
+    is spelled relative to the current directory when it lies beneath it, and
+    absolute otherwise; from the Git root that is the same string, so the
+    Action's stdout, and every run's from the repository root, is unchanged.
+    Absolute paths already open from anywhere and are left as recorded.
+    """
+
+    payload = verifier.model_dump(mode="json")
+    root = Path(verifier.workspace)
+
+    def spelled(value: object) -> object:
+        if not isinstance(value, str) or not value or Path(value).is_absolute():
+            return value
+        return caller_path_spelling(root / value)
+
+    artifacts = payload.get("artifacts")
+    if isinstance(artifacts, dict):
+        payload["artifacts"] = {key: spelled(value) for key, value in artifacts.items()}
+    for key in ("head_report_json", "base_report_json"):
+        payload[key] = spelled(payload.get(key))
+    return payload
 
 
 def _warn_if_reports_staged(workspace: Path, out: Path | None) -> None:
@@ -538,9 +702,10 @@ def _warn_if_reports_staged(workspace: Path, out: Path | None) -> None:
     stdout JSON contract. Silent outside a git checkout.
     """
 
-    # verify resolves the reports dir relative to the GIT ROOT (run_verify),
-    # so probe the root, not --workspace: a subdirectory --workspace would
-    # otherwise miss root-level staged reports.
+    # Staged paths are named relative to the GIT ROOT, so probe the root, not
+    # --workspace: a subdirectory --workspace would otherwise miss root-level
+    # staged reports. An explicit --out resolves against the current
+    # directory, as run_verify resolves it (#818).
     try:
         root = ensure_git_workspace(workspace)
     except ConfigError:
@@ -662,7 +827,10 @@ def _verify_envelope(
         current = VerifierArtifact.model_validate_json(captured)
     except ValueError as exc:
         return denied(f"The bound verifier artifact could not be read: {exc}")
-    if (current.request_id, current.decision_id) != (verifier.request_id, verifier.decision_id):
+    if (
+        (current.request_id, current.decision_id) != (verifier.request_id, verifier.decision_id)
+        or current.host_comparison != verifier.host_comparison
+    ):
         return denied(
             "Another run published over this directory while this one was "
             "reporting; the control identity that is current closes a different "
@@ -691,17 +859,10 @@ def _artifact_root(verifier: VerifierArtifact, workspace: Path) -> str | None:
     reports_dir = _reports_dir_from_artifacts(verifier, workspace)
     if reports_dir is None:
         return None
-    try:
-        relative = PurePosixPath(Path(os.path.relpath(reports_dir, Path.cwd())).as_posix())
-    except (OSError, ValueError):
-        # Different drives on Windows, or an unreadable cwd.
-        return reports_dir.as_posix()
     # A relative spelling only when it stays inside the invoking directory.
     # Climbing out of it is correct but neither shorter nor clearer than the
     # absolute path, and it spends the size budget on `../` segments.
-    if relative.parts and relative.parts[0] == "..":
-        return reports_dir.as_posix()
-    return relative.as_posix()
+    return caller_path_spelling(reports_dir)
 
 
 def _reports_dir_from_artifacts(verifier: VerifierArtifact, workspace: Path) -> Path | None:

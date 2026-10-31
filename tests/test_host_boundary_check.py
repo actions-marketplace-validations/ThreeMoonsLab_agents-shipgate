@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from agents_shipgate.checks.host_boundary import run as host_boundary_run
 from agents_shipgate.config.loader import load_manifest
 from agents_shipgate.core.context import ScanContext
@@ -361,7 +363,7 @@ def test_unclassified_settings_change_fails_closed(tmp_path: Path) -> None:
     old_text = json.dumps(
         {
             "permissions": {"allow": ["Bash(*)"], "deny": ["WebFetch"]},
-            "hooks": {"PreToolUse": [{"type": "command", "command": "./pre.sh"}]},
+            "hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": "./pre.sh"}]}]},
             "model": "old",
         },
         indent=2,
@@ -369,7 +371,7 @@ def test_unclassified_settings_change_fails_closed(tmp_path: Path) -> None:
     new_text = json.dumps(
         {
             "permissions": {"allow": ["Bash(*)"], "deny": ["WebFetch"]},
-            "hooks": {"PreToolUse": [{"type": "command", "command": "./pre.sh"}]},
+            "hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": "./pre.sh"}]}]},
             "model": "new",
         },
         indent=2,
@@ -485,6 +487,86 @@ def test_workflow_write_all_blocks(tmp_path: Path) -> None:
     assert finding.severity == "critical"
     assert finding.blocks_release is True
     assert finding.evidence == {"kind": "workflow_write_all", "job": "<top-level>"}
+
+
+def test_credential_shaped_job_and_scope_names_are_redacted_in_evidence(
+    tmp_path: Path,
+) -> None:
+    """#802: evidence publishes a job id and scope by the host-grants label rule.
+
+    `old` publishes only a level GitHub accepts, so an earlier level holding
+    other text is `None` rather than repeated.
+    """
+    job, scope = "ghp_" + "J" * 36, "AKIA" + "S" * 16
+    expanded_job, old_level = "xoxb-" + "E" * 16, "ghp_" + "L" * 36
+    old_text = (
+        "on: push\n"
+        "jobs:\n"
+        f"  {job}:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: make release\n"
+        f"  {expanded_job}:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    permissions:\n"
+        f"      contents: {old_level}\n"
+        "    steps:\n"
+        "      - run: make publish\n"
+        "  token-refresh:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: make refresh\n"
+    )
+    new_text = (
+        old_text.replace(
+            f"  {job}:\n    runs-on: ubuntu-latest\n",
+            f"  {job}:\n    runs-on: ubuntu-latest\n    permissions: write-all\n",
+        ).replace(
+            "  token-refresh:\n    runs-on: ubuntu-latest\n",
+            "  token-refresh:\n    runs-on: ubuntu-latest\n    permissions:\n"
+            f"      {scope}: write\n      secret-scan: write\n",
+        ).replace(f"contents: {old_level}", "contents: write")
+    )
+    _write(tmp_path, ".github/workflows/ci.yml", old_text)
+    diff = _change_diff(".github/workflows/ci.yml", old_text, new_text)
+
+    findings = host_boundary_run(_context(tmp_path, diff))
+
+    assert sorted(
+        (f.check_id, json.dumps(f.evidence, sort_keys=True)) for f in findings
+    ) == sorted(
+        (check_id, json.dumps(evidence, sort_keys=True))
+        for check_id, evidence in (
+            (
+                "SHIP-HOST-BOUNDARY-WORKFLOW-WRITE-ALL",
+                {"kind": "workflow_write_all", "job": "[REDACTED:github_token]"},
+            ),
+            (
+                "SHIP-HOST-BOUNDARY-WORKFLOW-PERMISSIONS-EXPANDED",
+                {
+                    "kind": "workflow_permissions_expanded", "job": "token-refresh",
+                    "scope": "[REDACTED:aws_access_key]", "old": None, "new": "write",
+                },
+            ),
+            (
+                "SHIP-HOST-BOUNDARY-WORKFLOW-PERMISSIONS-EXPANDED",
+                {
+                    "kind": "workflow_permissions_expanded", "job": "[REDACTED:slack_token]",
+                    "scope": "contents", "old": None, "new": "write",
+                },
+            ),
+            (
+                "SHIP-HOST-BOUNDARY-WORKFLOW-PERMISSIONS-EXPANDED",
+                {
+                    "kind": "workflow_permissions_expanded", "job": "token-refresh",
+                    "scope": "secret-scan", "old": None, "new": "write",
+                },
+            ),
+        )
+    )
+    published = json.dumps([f.model_dump(mode="json") for f in findings])
+    for canary in (job, scope, expanded_job, old_level):
+        assert canary not in published
 
 
 def test_pull_request_target_added(tmp_path: Path) -> None:
@@ -639,3 +721,62 @@ def test_nested_mcp_and_claude_settings_are_not_host_grants(tmp_path: Path) -> N
         workspace=tmp_path, diff_text=diff
     )
     assert violations == []
+
+
+@pytest.mark.parametrize(("path", "text", "expected"), [
+    (".claude/settings.json", '{"permissions":{"allow":["Bash(*)"]}}',
+     "SHIP-HOST-BOUNDARY-PERMISSION-WILDCARD-ALLOW"),
+    (".claude/settings.json", '{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"echo audit"}]}]}}',
+     "SHIP-HOST-BOUNDARY-HOOK-CHANGED"),
+    (".mcp.json", '{"mcpServers":{"search":{"command":"npx search-server"}}}',
+     "SHIP-HOST-BOUNDARY-MCP-SERVER-ADDED"),
+    (".claude/settings.json", '{broken',
+     "SHIP-HOST-BOUNDARY-CONFIG-PARSE-FAILED"),
+])
+def test_prose_deprecation_keeps_structured_and_malformed_host_inputs(
+    tmp_path: Path, path: str, text: str, expected: str
+):
+    from agents_shipgate.checks import verify_agent_instructions
+
+    # Prose and structured declarations share a protected directory; excluding
+    # that whole directory would make this regression fail (#516).
+    prose = ".claude/README.md"
+    diff = _new_file_diff(prose, "Use concise review summaries.\n") + _new_file_diff(path, text)
+    context = _context(tmp_path, diff)
+    context.verification.changed_files = [prose, path]
+    assert verify_agent_instructions.run(context) == []
+    assert expected in {finding.check_id for finding in host_boundary_run(context)}
+
+
+@pytest.mark.parametrize(("replacement", "requires_review"), [
+    ("Explain the shell example.\n", False),
+    ("Run !`bash scripts/probe.sh`\n", True),
+])
+def test_prose_deprecation_reviews_declared_skill_execution_not_command_words(
+    tmp_path: Path, replacement: str, requires_review: bool,
+):
+    import difflib
+
+    from agents_shipgate.checks import codex_boundary, verify, verify_agent_instructions
+    from agents_shipgate.core.agent_boundary import assessment_for_scan_context
+
+    path = ".agents/skills/probe/SKILL.md"
+    header = "---\nname: probe\ndescription: Fixture\n---\n"
+    before = header + "Describe the result.\n"
+    _write(tmp_path, path, before)
+    diff = f"diff --git a/{path} b/{path}\n" + "".join(difflib.unified_diff(
+        before.splitlines(True), (header + replacement).splitlines(True),
+        fromfile=f"a/{path}", tofile=f"b/{path}",
+    ))
+    context = _context(tmp_path, diff)
+    context.verification.changed_files = [path]
+    assert verify_agent_instructions.run(context) == []
+    assert codex_boundary.run(context) == []  # Historical word-based ID is retired.
+    findings = verify.run(context)
+    assert bool(findings) is requires_review
+    if requires_review:
+        assert findings[0].check_id == "SHIP-VERIFY-TRUST-ROOT-TOUCHED"
+        assessment = assessment_for_scan_context(context)
+        row = next(row for row in assessment.violations if row.path == path)
+        assert row.evidence["kind"] == "instruction_structure_changed"
+        assert row.evidence["comparison_complete"] is True

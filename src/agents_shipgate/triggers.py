@@ -469,6 +469,7 @@ def evaluate(
     user_requested: bool = False,
     triggers: dict[str, Any] | None = None,
     input_status: str = INPUT_COMPLETE,
+    selected_host_paths: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Evaluate the trigger catalog against a snapshot of repo state.
 
@@ -586,6 +587,13 @@ def evaluate(
                     ),
                 }
             )
+
+    selected_changed = set(paths) & set(selected_host_paths)
+    if selected_changed:
+        matched.append({"id": "TRIGGER-OPENSHELL-SELECTED-INPUT",
+            "action": ACTION_FORCE_RUN, "surface_class": SURFACE_CLASS_HOST_BOUNDARY,
+            "rationale": "An explicitly selected OpenShell input changed.",
+            "command": retarget_command("agents-shipgate verify --preview --json")})
 
     stop_block = triggers.get("stop_conditions") or {}
     stop_payload = {k: v for k, v in stop_block.items() if k != "description"}
@@ -926,7 +934,11 @@ def _verdict_label(result: dict[str, Any]) -> str:
 
 
 def _git_diff_context(
-    revspec: str | None, *, cwd: Path | None = None
+    revspec: str | None,
+    *,
+    cwd: Path | None = None,
+    comparison_ref: str = "HEAD",
+    exclude: Path | None = None,
 ) -> tuple[list[str], str]:
     """Read changed paths and the unified-diff body from ``git diff``.
 
@@ -934,9 +946,11 @@ def _git_diff_context(
 
     - Non-empty (e.g. ``"origin/main...HEAD"``): PR-style diff.
       ``git diff [--name-only] <revspec>``.
-    - Empty string (bare ``--git-diff``): all uncommitted tracked
-      changes against ``HEAD`` — includes BOTH staged and unstaged
-      edits. Untracked file *paths* (newly-`git add`-able files that
+    - Empty string (bare ``--git-diff``): all changes against
+      ``comparison_ref`` (``HEAD`` by default) — includes BOTH staged and
+      unstaged edits. Passing a merge-base commit as ``comparison_ref``
+      makes one comparison that spans committed branch work *and*
+      uncommitted edits, which is what a branch-scoped review needs. Untracked file *paths* (newly-`git add`-able files that
       aren't yet `git add`ed) are appended to the path list via
       ``git ls-files --others --exclude-standard``; their content is
       NOT captured in ``diff_text`` because reading arbitrary unstaged
@@ -944,6 +958,10 @@ def _git_diff_context(
 
     ``cwd`` selects the git working directory; ``None`` uses the
     process cwd.
+
+    ``exclude`` leaves one directory out of a working-tree comparison: the
+    reports directory, so `check` and `verify` agree on what the change is
+    (#1023). A committed range never holds it.
 
     Returns ``([paths], diff_text)``.
     """
@@ -959,7 +977,12 @@ def _git_diff_context(
     return (
         diff_revspec_context(root, revspec)
         if revspec
-        else working_tree_context(root, reject_index_hidden=True)
+        else working_tree_context(
+            root,
+            comparison_ref=comparison_ref,
+            exclude=exclude,
+            reject_index_hidden=True,
+        )
     )
 
 

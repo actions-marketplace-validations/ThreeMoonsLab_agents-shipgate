@@ -104,7 +104,7 @@ baseline summary and do not fail CI.
 | `SHIP-CODEX-BOUNDARY-MCP-AUTO-APPROVE-WRITE` | critical | Codex auto-approves a write or destructive MCP/app tool. |
 | `SHIP-CODEX-BOUNDARY-MCP-AUTO-APPROVE-UNKNOWN` | high | Codex auto-approves an MCP server whose tool surface is not statically enumerable. |
 | `SHIP-CODEX-BOUNDARY-APP-AUTO-APPROVE` | high | Codex app connector tool approval changed to approve. |
-| `SHIP-CODEX-BOUNDARY-AGENTS-SHIPGATE-REQUIREMENT-REMOVED` | medium | AGENTS.md removed a Shipgate requirement. |
+| `SHIP-CODEX-BOUNDARY-AGENTS-SHIPGATE-REQUIREMENT-REMOVED` | medium | Deprecated; historical ID, no current findings. |
 | `SHIP-CODEX-BOUNDARY-CI-GATE-REMOVED` | critical | Shipgate GitHub Action no longer invokes the gate. |
 | `SHIP-CODEX-BOUNDARY-POLICY-WEAKENED` | critical | Codex boundary policy was weakened. |
 | `SHIP-CODEX-BOUNDARY-HOOK-COMMAND-CHANGED` | high | A Codex executable hook changed. |
@@ -116,8 +116,8 @@ baseline summary and do not fail CI.
 | `SHIP-HOST-BOUNDARY-CONFIG-PARSE-FAILED` | medium | A coding-agent host configuration file could not be parsed. |
 | `SHIP-HOST-BOUNDARY-MCP-SERVER-ADDED` | high | A new MCP server was declared for the coding-agent host. |
 | `SHIP-HOST-BOUNDARY-MCP-SERVER-CHANGED` | high | An existing MCP server declaration changed its command, URL, args, or env keys. |
-| `SHIP-HOST-BOUNDARY-PERMISSION-WILDCARD-ALLOW` | critical | A Claude Code allow rule grants a wildcard tool surface. |
-| `SHIP-HOST-BOUNDARY-PERMISSION-ALLOW-EXPANDED` | high | The Claude Code permission allowlist expanded. |
+| `SHIP-HOST-BOUNDARY-PERMISSION-WILDCARD-ALLOW` | critical | A Claude Code allow rule grants a wildcard surface over a tool that can execute, reach the network, or write, or a setting removes a prompt wholesale. |
+| `SHIP-HOST-BOUNDARY-PERMISSION-ALLOW-EXPANDED` | high | The Claude Code permission allowlist expanded, a modelled setting changed at its rating, or a selected OpenShell policy expanded declared authority. |
 | `SHIP-HOST-BOUNDARY-PERMISSION-DENY-REMOVED` | high | A Claude Code permission deny rule was removed. |
 | `SHIP-HOST-BOUNDARY-HOOK-CHANGED` | high | Claude Code hooks changed. |
 | `SHIP-HOST-BOUNDARY-WORKFLOW-WRITE-ALL` | critical | A GitHub workflow grants write-all permissions. |
@@ -157,12 +157,13 @@ baseline summary and do not fail CI.
 | `SHIP-MANIFEST-STALE-RISK-OVERRIDE` | medium | A risk override references a missing tool. |
 | `SHIP-MANIFEST-HIGH-RISK-OWNER-MISSING` | high | A high-risk production or production-like tool lacks owner metadata. |
 | `SHIP-MANIFEST-UNUSED-SCOPE` | medium/high | `permissions.scopes` contains a scope unused by any loaded tool; broad unused scopes are high. |
+| `SHIP-VERIFY-LOCAL-REVIEW-PROVISIONAL` | medium | Verification uses an ephemeral local-review manifest; the result is provisional and cannot carry release authority. |
 | `SHIP-VERIFY-TRUST-ROOT-TOUCHED` | medium | A PR changed a release trust-root file; emitted only when a verification context (changed files) is supplied. |
 | `SHIP-VERIFY-POLICY-WEAKENED` | high | Base-vs-head effective policy weakened (CI mode downgraded, fail-on loosened, a severity override lowered across a tier, or the control pack moved to one that requires less). |
 | `SHIP-VERIFY-POLICY-BASE-ABSENT` | medium | A policy or manifest trust root changed and no base policy could be compared — no base report, a first adoption, or a control pack this build cannot resolve; routed to human review without a weakening claim. |
 | `SHIP-VERIFY-BASELINE-OR-WAIVER-EXPANDED` | high | The PR broadens what the gate forgives — a new suppression, a widened waiver scope, or a larger accepted-debt baseline — versus the base. |
 | `SHIP-VERIFY-CI-GATE-REMOVED` | critical | The PR deletes the Shipgate CI workflow from an opted-in repo, which would stop the release gate from running. |
-| `SHIP-VERIFY-AGENT-INSTRUCTIONS-WEAKENED` | medium | The PR edits agent-instruction trust roots and weakening cannot be statically disproven; routed to human review. |
+| `SHIP-VERIFY-AGENT-INSTRUCTIONS-WEAKENED` | medium | Deprecated; retained for compatibility, with no findings emitted by current scans. |
 | `SHIP-VERIFY-TRIGGER-CATALOG-DRIFT` | medium | The PR changes the trigger catalog that decides when Shipgate runs; routed to human review to rule out gate evasion. |
 | `SHIP-VERIFY-CAPABILITY-SCOPE-BROADENED` | critical | The PR removes or broadens a dynamically-loaded toolkit's least-privilege configuration bound (e.g. a `stripe_agent_toolkit` allowlist), silently expanding the toolkit surface; blocks rather than degrading to insufficient_evidence. |
 | `SHIP-CAP-CONFIG-BINDING-REMOVED` | high | The PR removes the config binding from a dynamic toolkit factory present on both sides of the diff, so the toolkit may fall back to its everything-enabled defaults; routed to human review instead of silent insufficient_evidence parity. |
@@ -190,15 +191,37 @@ A production target depends on lower-confidence extraction, such as SDK AST enri
 
 A tool has no description or a description too short for reliable review. Add a concise capability description.
 
+On `mcp_server_source`, a description written in a form the reader cannot resolve, such as a variable, an f-string or a template literal with a substitution, is recorded as `extraction.description: unresolved` and is not reported as missing (#658).
+
 ### SHIP-DOC-INJECTION-RISK
 
 A tool description contains instruction-override-like language. Rewrite it as neutral metadata.
 Purely heuristic matches default to `medium`; multiple matches on write/high-risk tools are `high`.
 
+The match is a regular expression, so it cannot gate a release, but the
+observation is the point of the check: it is published in `report.findings`,
+`report.md` and SARIF with `support.policy_eligible: false` and
+`agent_action: informational`, beside the `inferred_policy_applicability`
+evidence gap it also records, whose `why` names it ("Tool description contains
+instruction-override-like language."). It is never a blocker or a named review
+item, and the advisory exit code does not change (#1026).
+
 ### SHIP-DOC-SECRET-IN-DESCRIPTION
 
 A tool description contains a secret-like token or credential value. Remove it and rotate the exposed secret.
 Purely heuristic matches default to `medium`; multiple matches on write/high-risk tools are `high`.
+
+The known formats are the shared redaction rules in `core/privacy.py`
+(`SECRET_PATTERNS`): provider keys (OpenAI, AWS access key ids, GitHub,
+Stripe, Slack, Google `AIza`), JWTs, database URLs with credentials, `Bearer`
+credentials, `Basic` tokens that decode to `user:password` (so `Provides Basic
+ReadOnly access` is prose, not a match), and PEM private-key blocks, plus a labeled
+`api_key`/`password`/`secret`/`token` value. It is published like
+`SHIP-DOC-INJECTION-RISK`, with the value redacted everywhere, and follows the
+same publication rule as `SHIP-N8N-SECRET-IN-WORKFLOW-PARAMETER` (#1026). An
+unlabeled AWS secret access key and an `authorization`/`auth` labeled value are
+redacted in every output but do not raise this finding: without a prefix or a
+credential label the shape is too common to report.
 
 ### SHIP-SCHEMA-BROAD-FREE-TEXT
 
@@ -587,9 +610,10 @@ approval changes before local automation.
 
 ### SHIP-CODEX-BOUNDARY-AGENTS-SHIPGATE-REQUIREMENT-REMOVED
 
-`AGENTS.md` or `AGENTS.override.md` removed Shipgate command or requirement
-text without adding a replacement. A human should confirm the agent
-instructions were not weakened.
+Deprecated in 1.1.0. The ID remains available for historical reports and
+configuration; current runs do not judge removed or softened prose. Complete
+parsed structure and unresolved-input review replace the word heuristic.
+Structured host readers remain active (#545, #516).
 
 ### SHIP-CODEX-BOUNDARY-CI-GATE-REMOVED
 
@@ -608,8 +632,10 @@ before relying on them.
 
 ### SHIP-CODEX-BOUNDARY-SKILL-COMMAND-CHANGED
 
-A changed `.agents/skills/**/SKILL.md` adds command-like text. Review
-command-bearing skill changes before local automation.
+Deprecated in 1.1.0. The ID remains readable but current runs emit no command
+claim from prose words. Supported skill frontmatter and preprocessing
+declarations remain in structural comparison; unknown or malformed structure
+remains a coverage limitation (#545, #516).
 
 ### SHIP-AGENT-BOUNDARY-PROTECTED-SURFACE-UNCLASSIFIED
 
@@ -643,6 +669,16 @@ A changed `.mcp.json`, `.cursor/mcp.json`, `.vscode/mcp.json`,
 or its content cannot be resolved from the diff. Fix the malformed host config
 or have a human review the change.
 
+A settings file that parses but changes a top-level key outside the
+host-boundary rule allow-list, such as `outputStyle`, also raises this check,
+with evidence kind `unknown_host_config_key` and the key's name: the file was
+read and the key's meaning is not modelled. A Claude Code setting the host
+inventory models is not an unknown key. `enableAllProjectMcpServers`,
+`skipDangerousModePermissionPrompt`, `enabledMcpjsonServers`,
+`disableAllHooks` and the managed-only switches are rated by the setting table
+and raise `SHIP-HOST-BOUNDARY-PERMISSION-WILDCARD-ALLOW` or
+`SHIP-HOST-BOUNDARY-PERMISSION-ALLOW-EXPANDED` instead (#827).
+
 ### SHIP-HOST-BOUNDARY-MCP-SERVER-ADDED
 
 A changed MCP server declaration file adds a server key that did not exist
@@ -658,18 +694,110 @@ names only.
 
 A changed `.claude/settings.json` or `.claude/settings.local.json` adds an
 allow rule that is `*`, a bare tool name, or a wildcard-shaped rule such as
-`Bash(*)`. Do not allow wildcard tool permissions; scope the rule to specific
-commands.
+`Bash(*)`, **and** the tool it grants can reach beyond reading. Do not allow
+wildcard tool permissions over execution, network access or writes; scope the
+rule to specific commands.
+
+A documented [arbitrary-code launcher prefix](engineering/exec-equivalent-permissions.md)
+followed by ` *` or `:*`, such as `Bash(python3 -c *)` or `Bash(npx *)`,
+also follows this critical/block route (#824), and so does a rule wider than
+one, such as `Bash(python3 *)` or `Bash(npx*)`. Exact commands do not enter
+that tier. This rating does not change rule containment or deny precedence.
+
+An MCP rule that names tools within one server, such as
+`mcp__github__get_issue`, is scoped: it raises
+`SHIP-HOST-BOUNDARY-PERMISSION-ALLOW-EXPANDED`. `mcp__github` and
+`mcp__github__*` grant every tool the server offers and still raise this
+check. Before #816 every MCP rule, being a bare token, reached it.
+
+A file tool's path pattern is a wildcard grant only when it is nothing but
+stars (`*`, `**`, `**/*`): `Edit(**/.env.example)` names `.env.example` files
+and raises `SHIP-HOST-BOUNDARY-PERMISSION-ALLOW-EXPANDED` when it is new
+authority (#969).
+
+A wildcard grant over a read tool — `Read(**)`, `Glob`, `Grep(**)` — raises
+`SHIP-HOST-BOUNDARY-PERMISSION-ALLOW-EXPANDED` instead. It is still an
+expansion and still reviewed, but it is not a release blocker: the agent
+already has the workspace checked out, and turning that read into an
+exfiltration needs a network or write grant, which is its own finding. Before
+v0.17 every wildcard shape reached this check, so the ordinary coding-agent
+configuration blocked the release at `critical` (#657).
+
+A Claude Code setting that removes a prompt wholesale raises this check too,
+at `critical`: `defaultMode: bypassPermissions` skips every permission prompt,
+`skipDangerousModePermissionPrompt: true` skips the confirmation before that
+mode starts, and `enableAllProjectMcpServers: true` approves every MCP server
+the project's `.mcp.json` declares. The rating comes from one table in the
+engine that also rates the setting's `audit --host` grant and its `diff`,
+`verify` and `check` rows, so every surface gives the value one severity
+(#827). `defaultMode` evidence names the `mode`; every other setting's names
+the `setting` and its `value`. Either is the value the setting's
+`audit --host` grant publishes, with credentials redacted, cut to at most 200
+characters. `defaultMode: dontAsk` no longer reaches this
+check: Claude Code documents that it denies whatever no allow rule permits
+rather than running it, so it raises
+`SHIP-HOST-BOUNDARY-PERMISSION-ALLOW-EXPANDED` at `medium`.
 
 ### SHIP-HOST-BOUNDARY-PERMISSION-ALLOW-EXPANDED
 
-A changed Claude Code settings file adds a non-wildcard `permissions.allow`
-entry. Have a human approve the new permission allow rule.
+A changed Claude Code settings file adds a `permissions.allow` entry that is
+either scoped (`Bash(npm test:*)`, `mcp__github__get_issue`) or a wildcard over
+a read-only tool (`Read(**)`). Have a human approve the new permission allow
+rule.
+
+An added rule that an allow rule the file already had covers grants nothing
+new and does not fire (#661). `Bash(npm:*)` and `Bash(npm *)` are two
+spellings of one rule, which also allows the bare `npm`, so replacing either
+with `Bash(npm test:*)` or `Bash(npm test)` does not fire (#816). The space
+before the star is part of the rule, so `Bash(npm run test:*)` does not cover
+`npm run test:unit`: adding that command fires. Claude Code's coverage follows
+the [permission-rule model](host-boundary-support.md#claude-code-permission-rules)
+`diff` reads (#918, #941): an unanchored allow `*`, which Claude Code skips,
+covers nothing, and a command holding shell syntax or an exec wrapper is never
+proven covered. A path-scoped `Write`, `NotebookEdit`, `Glob` or `MultiEdit`
+rule, which Claude Code accepts and never consults, does not fire (#938).
+
+It also fires when a change sets any other value of a Claude Code setting the
+host inventory models, at the rating the engine's setting table gives that
+value — the rating the setting's grant and host-diff row carry (#827):
+
+| Setting and value | Rating | Why |
+| --- | --- | --- |
+| `defaultMode: acceptEdits` | high | accepts file edits without a prompt |
+| `defaultMode: auto` | high | lets Claude Code approve tool calls itself instead of prompting |
+| a `defaultMode` Claude Code does not document | high | what it permits is not established |
+| an `enabledMcpjsonServers` entry | high | approves that project `.mcp.json` server without a prompt |
+| an `enabledMcpjsonServers` entry that names no server (an object, a number, a blank string) | high | what it permits is not established |
+| `defaultMode: dontAsk` | medium | denies every tool call no allow rule already permits, instead of prompting |
+| `defaultMode: plan`, `defaultMode: default` | medium | lets nothing run without a prompt that an allow rule does not already permit |
+| `disableBypassPermissionsMode`, `disableAllHooks`, `allowManagedPermissionRulesOnly`, `allowManagedHooksOnly`, and `false` for `enableAllProjectMcpServers` or `skipDangerousModePermissionPrompt` | medium | changes which prompts, hooks or rules apply without letting anything run without a prompt that an allow rule does not permit |
+
+A rating is of the value, not of the change: whether a value is wider than the
+one it replaced is not modelled, so every value a change sets is reviewed.
+Moving a value between `permissions` and the top level sets it, in either
+direction, and raises this check or `SHIP-HOST-BOUNDARY-PERMISSION-WILDCARD-ALLOW`
+at the value's rating: the host inventory reads a setting from either place,
+but Claude Code documents `defaultMode` under `permissions` and
+`enableAllProjectMcpServers` at the top level, so moving a top-level
+`defaultMode: bypassPermissions` into `permissions` turns the mode on without
+changing its value. Removing a setting raises nothing of its own, as removing
+`defaultMode` never did. A host-boundary policy may raise this rule, and then
+raises these ratings with it; it cannot lower them.
 
 ### SHIP-HOST-BOUNDARY-PERMISSION-DENY-REMOVED
 
 A changed Claude Code settings file drops an entry from `permissions.deny`.
 Have a human confirm the removed deny rule is no longer needed.
+
+It does not fire for a path-scoped `Write(...)` (or `NotebookEdit`, `Glob`,
+`MultiEdit`) rule, which Claude Code accepts and never consults (#938) — a bare
+`Write` deny still fires — for a `!` carve-out, whose removal restricts more,
+or for a rule the list still holds in its other documented spelling
+(`Bash(rm:*)` / `Bash(rm *)`). It also fires, with evidence kind
+`permission_deny_carved_out`, when a `Read(!…)` or `Edit(!…)` deny rule now
+follows an earlier relative-path rule of the same tool the file already
+denied: Claude Code carves the paths it matches out of the rules listed
+before it, so part of that denial is lifted (#974).
 
 ### SHIP-HOST-BOUNDARY-HOOK-CHANGED
 
@@ -815,7 +943,11 @@ inventory.
 ### SHIP-N8N-MCP-CLIENT-TOOLSET-UNFILTERED
 
 An n8n MCP Client Tool exposes `All` or `All Except` tools without a local
-inventory. Select explicit MCP tools or provide a local MCP inventory for
+inventory. The node selects with `include`: `all`, which is n8n's default and
+is left out of an exported workflow, so a node with no `include` exposes every
+tool; `except`, whose `excludeTools` the finding lists as `excluded_tools`; or
+`selected`, which names its `includeTools` and does not fire this check unless
+it names none. Select explicit MCP tools or provide a local MCP inventory for
 release review. The severity is environment-sensitive because the selector is
 easy to narrow before production, while production-like use increases blast
 radius.
@@ -844,6 +976,14 @@ An n8n workflow parameter, node note, `pinData` entry, or `staticData` entry
 contains a secret-like value. Evidence includes only the source reference,
 stable pointer, and secret kind; it never includes the matched secret value or
 a verifier hash for that value.
+
+It matches the same `SECRET_PATTERNS` as `SHIP-DOC-SECRET-IN-DESCRIPTION` and
+follows the same publication rule: `docs/checks/security.yaml` marks both
+`publish_when_policy_ineligible`, so a detected secret is always a visible
+finding in `report.json`, `report.md` and SARIF, never only an evidence gap
+(#1026). Whether such a lexical match may also move the release verdict is
+#1055; this finding keeps the weight it had, and the description finding gains
+none.
 
 ### SHIP-CONDUCTOR-DYNAMIC-TOOL-SURFACE-NOT-ENUMERABLE
 
@@ -940,6 +1080,19 @@ Two sub-kinds, both `low` severity:
 - `resolved_not_pruned` — entry matched no active scan finding. Re-run
   `agents-shipgate baseline save` to drop the entry from the baseline.
 
+### SHIP-VERIFY-LOCAL-REVIEW-PROVISIONAL
+
+`verify` loaded a manifest Git could not prove is a committed repository input.
+The reserved `.agents-shipgate-local-review.yaml` path is always
+`local_review`; another untracked custom path is `uncommitted`; Git inspection
+failure is `unknown`. The finding goes through the ordinary
+`release_decision.decision` engine at review-required severity; it is not a
+second verdict. Verifier notes, the verification plan, and handoff blockers
+record the exact provenance, while the terminal receipt denies merge
+authority. Adopt `shipgate.yaml` through `init --write`, verify it from the
+evaluated Git tree, and follow any resulting human-review route before using
+the policy as release evidence. Git presence alone does not prove human review.
+
 ### SHIP-VERIFY-TRUST-ROOT-TOUCHED
 
 A PR changed a file that defines the release gate's trust spine — the
@@ -958,6 +1111,15 @@ The finding fires only when a verification context (changed files) is
 supplied (`agents-shipgate scan --changed-files ...` or, later, `verify`);
 a plain `scan` emits nothing. It is one ordinary `Finding` at `medium`
 severity routed through `release_decision` — never a second verdict.
+
+A host settings change that can only take authority away does not fire
+(#661). That holds when `.claude/settings.json`, `.claude/settings.local.json`
+or `.cursor/cli.json` changes nothing but its rule lists, every added allow
+rule is subsumed by an allow rule the file already had, and no deny rule, nor
+for Claude Code an ask rule, was removed. `check` records such a change as the
+`host_settings_narrowed` diagnostic. A hook, any other key, a rule list that is
+not a list of rules, or an added rule the permission lattice cannot decide
+still fires.
 
 ### SHIP-VERIFY-POLICY-WEAKENED
 
@@ -1040,13 +1202,18 @@ weakening signal in the family.
 
 ### SHIP-VERIFY-AGENT-INSTRUCTIONS-WEAKENED
 
-Tier B: agent-instruction files (`AGENTS.md`, `CLAUDE.md`, `.claude/`,
-`.cursor/rules/`, `.agents/skills/`, `.codex/`, `SKILL.md`) tell coding
-agents how to behave around the gate. Shipgate is static and makes no NLP
-judgement, so it cannot prove semantic weakening from text — per Principle
-3 ("prompts are not controls"), any verify-mode change to these trust
-roots is routed to human review at `medium`. Deterministic on changed-file
-membership; the human confirms no gate-protecting instruction was removed.
+Deprecated in 1.1.0 (#516). The registered ID, severity metadata and historical
+report compatibility remain for at least one minor version cycle. Current scans
+emit no findings for this ID: a path change does not establish that
+natural-language instructions weakened a control.
+
+Existing structured permission, MCP, CI and hook readers remain active,
+including changes beside prose in the same directory. The local word-based
+instruction and skill emitters are also retired while their IDs remain readable.
+The shared comparison in #545 clears only complete unchanged supported instruction
+structure; unknown or malformed inputs retain explicit coverage/review routes.
+`SHIP-VERIFY-TRUST-ROOT-TOUCHED` remains active for structural trust roots.
+Neither deprecation nor preflight substitutes for a current verifier result.
 
 ### SHIP-VERIFY-TRIGGER-CATALOG-DRIFT
 
@@ -1099,9 +1266,14 @@ a changed file — env- or settings-bound factories never guess a match.
 
 Fires when a statically parsed MCP server passes through secret-like
 environment variables, such as token, password, API key, or credential
-names. Secret pass-through changes the credential boundary available to the
-server, so Shipgate routes the change to human review without exposing raw
-secret values in evidence.
+names. Besides an `env` entry, a server can forward a variable by name: in
+Codex's `env_vars` list or `env_http_headers`, as a `bearer_token_env_var`
+(always counted, since it holds a bearer token), or as a `${NAME}` reference in
+a `headers` value. A forwarded variable counts when its name, or the header
+carrying it, is secret-like. An editor's `${env:NAME}` is read as `NAME`; a
+prompted `${input:…}` names no environment variable. Secret pass-through changes the credential
+boundary available to the server, so Shipgate routes the change to human
+review without exposing raw secret values in evidence.
 
 ### SHIP-MCP-AUTO-APPROVE-SIDE-EFFECT
 
@@ -1127,6 +1299,15 @@ they are human trust-root assertions, not a second observation of the server.
 Likewise, a source that publishes both `readOnlyHint: true` and
 `destructiveHint: true` remains a `conflicting_effect_evidence` semantic gap; this
 check does not relabel that same-source contradiction as independent evidence.
+
+On `mcp_server_source` the published annotation is a literal hint read from the
+server's own Python registration (`annotations=` on a FastMCP decorator). There
+it is only ever the claim under review: it is not effect evidence, so it can
+neither corroborate a read that would suppress a conflict nor lower the tool's
+effect by itself. The source route reads no function body, so a tool whose only
+side-effect evidence is its body — `process_account` calling `_ITEMS.clear()`
+under `readOnlyHint: True` — does not fire; the same body behind a name such as
+`purge_account` does, on the keyword.
 
 Supported structural instances route to review because MCP clients may use these
 advisory hints to reduce confirmation prompts. Inferred-only instances remain
@@ -1303,3 +1484,21 @@ the Conductor finding above. HTTP/custom-worker/A2A/provider-native execution
 is recorded as an unsupported capability and source warning in v1, so partial
 coverage cannot silently produce `passed`. A `HUMAN` task is structural pause
 evidence only; it does not prove reviewer identity or approval.
+
+| `SHIP-VERIFY-OPENSHELL-BOUNDARY-EXCEEDED` | critical | Opt-in trusted native containment found the candidate outside the pinned maximum boundary; narrow it and rerun proof. |
+| `SHIP-VERIFY-OPENSHELL-PROOF-UNAVAILABLE` | medium | Requested native containment is absent, invalid, unsupported or inconclusive; required proof retains an evidence gap. Repair trust inputs and rerun the same request. |
+
+### SHIP-VERIFY-OPENSHELL-BOUNDARY-EXCEEDED
+
+Opt-in trusted native execution found a modeled action outside the independently
+pinned maximum. The critical verify finding is suppression-immune. Narrow the
+candidate and rerun proof; a baseline or proof success cannot approve other
+release obligations. Counterexample wording is excluded from finding identity.
+
+### SHIP-VERIFY-OPENSHELL-PROOF-UNAVAILABLE
+
+Requested modeled containment is absent, invalid, unsupported, inconclusive,
+failed, cancelled or timed out. Required non-success retains an unsuppressible
+evidence gap. Optional missing proof is an absent observation, with no claim of
+containment. Repair external trust inputs and rerun the same verification
+request. See [OpenShell support](openshell-support.md#optional-native-containment).

@@ -753,9 +753,9 @@ def _adoption_instruction(
 def _is_prose_only_evidence_gap(gap: EvidenceGap) -> bool:
     """True when a gap row carries no typed repair the handoff should keep.
 
-    ``low_confidence_tool`` rows and inventory-scaffold ``incomplete_surface``
-    rows are re-derived below from the tool inventory, and a ``source_warning``
-    row is usually a ``review_warning`` with nothing to open. But not always:
+    ``low_confidence_tool`` rows and inventory-scaffold surface rows are
+    re-derived below from the tool inventory, and a ``source_warning`` row is
+    usually a ``review_warning`` with nothing to open. But not always:
     the stale-``--diff-from`` base report produces a ``source_warning`` gap
     carrying ``provide_source``, a path, an expectation, and the exact
     regeneration command. Blanket-skipping the kind threw that away and left
@@ -768,7 +768,7 @@ def _is_prose_only_evidence_gap(gap: EvidenceGap) -> bool:
     if gap.kind == "source_warning":
         return not is_addressable_gap(gap)
     return (
-        gap.kind == "incomplete_surface"
+        gap.kind in {"incomplete_surface", "unattested_surface"}
         and gap.next_action.kind == "declare_tool_inventory"
     )
 
@@ -891,7 +891,8 @@ def _insufficient_evidence_remedies(report: ReadinessReport) -> list[str]:
     # render as visibly distinct lines while saying the same thing.
     seen_skeletons: set[str] = set()
     for group in sorted(
-        group_source_warnings(remaining), key=lambda row: row.unprintable
+        group_source_warnings(remaining, evidence_gaps=decision.evidence_coverage.evidence_gaps),
+        key=lambda row: row.unprintable,
     ):
         if group.skeleton in seen_skeletons:
             continue

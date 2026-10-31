@@ -54,14 +54,19 @@ from __future__ import annotations
 import ast
 import hashlib
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING
 
 from agents_shipgate.core.evidence_actions import (
     _ESCAPE_PATTERN,
     _WHITESPACE_RUN,
+    display_literal,
     has_visible_content,
     one_line,
 )
+
+if TYPE_CHECKING:
+    from agents_shipgate.schemas.report import EvidenceGap
 
 
 # A warning made only of controls and invisible code points renders as
@@ -311,6 +316,26 @@ def duplicate_mcp_server_declaration_warning(
     )
 
 
+def unread_host_mcp_config_warning(
+    path: str, host: str, read_files: Sequence[str]
+) -> str:
+    """Warning for another host's MCP config file a ``codex_config`` source does not read.
+
+    The source reads ``read_files`` and nothing else, so a server declared only
+    in ``path`` is not in the scan. Passing quietly over it read as a scan that
+    had seen every MCP server in the tree (#1025); reading these files is #663.
+    """
+
+    quoted = [f"`{name}`" for name in read_files]
+    read = " and ".join([_join(quoted[:-1]), quoted[-1]] if len(quoted) > 1 else quoted)
+    return (
+        f"{host} MCP config {path!r} was not read: a codex_config entry in "
+        f"shipgate.yaml#tool_sources[] reads only {read}, so an MCP server "
+        "declared only in that file is missing from this scan. Review that "
+        "file's servers before relying on this result."
+    )
+
+
 def ambiguous_inventory_merge_warning(
     inventory_path: str, source_id: str, tools: Sequence[str]
 ) -> str:
@@ -368,7 +393,9 @@ class SourceWarningGroup:
         return visible_skeleton(self.message)
 
 
-def group_source_warnings(warnings: Sequence[str]) -> list[SourceWarningGroup]:
+def group_source_warnings(
+    warnings: Sequence[str], *, evidence_gaps: Sequence[EvidenceGap] = (),
+) -> list[SourceWarningGroup]:
     """Fold the rows of a known mechanism; leave everything else alone.
 
     Order is stable: groups appear in first-warning order, and subjects
@@ -427,7 +454,23 @@ def group_source_warnings(warnings: Sequence[str]) -> list[SourceWarningGroup]:
                 warnings=raw,
             )
         )
-    return groups
+    # Recovery is already a typed, source-joined loader fact. Never infer it
+    # from the prose decoder above or from declaration authorship. Attach it
+    # to the existing warning line; counts and raw warning bytes stay intact.
+    remedies: dict[str, list[str]] = {}
+    for gap in evidence_gaps:
+        if gap.kind == "source_warning" and gap.recovery is not None:
+            remedy = one_line(gap.next_action.expects)
+            if gap.source_ref:
+                remedy += f" Source: {display_literal(gap.source_ref)}."
+            remedies.setdefault(gap.subject, []).append(remedy)
+    return [
+        replace(group, message=" ".join([
+            group.message,
+            *dict.fromkeys(text for warning in group.warnings for text in remedies.get(warning, ())),
+        ]))
+        for group in groups
+    ]
 
 
 @dataclass(frozen=True)
@@ -739,6 +782,7 @@ __all__ = [
     "unbound_inventory_duplicate_warning",
     "unknown_inventory_source_warning",
     "unmatched_binding_member",
+    "unread_host_mcp_config_warning",
     "unresolved_adk_tool_symbols",
     "withdraw_completed_adk_tool_warnings",
     "zero_observation_binding_member",

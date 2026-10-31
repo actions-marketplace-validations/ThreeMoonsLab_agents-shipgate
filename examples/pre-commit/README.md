@@ -13,7 +13,7 @@ In your repo's `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/ThreeMoonsLab/agents-shipgate
-    rev: v0.15.0
+    rev: v1.2.0
     hooks:
       - id: agents-shipgate
 ```
@@ -57,10 +57,10 @@ repos:
             (.*/)?conductor/.*\.json|
             (.*/)?ai/examples/.*\.json|
             (.*/)?\.codex/(config\.toml|hooks\.json|requirements\.toml)|
-            (.*/)?\.claude/(settings(\.local)?\.json|commands(/.*)?)|
+            (.*/)?\.claude/(settings(\.local)?\.json|commands(/.*)?|hooks/hooks\.json)|
             (.*/)?\.cursor/(cli\.json|mcp\.json|rules(/.*)?)|
             (.*/)?\.vscode/mcp\.json|
-            (.*/)?\.shipgate/agent-contract\.json|
+            (.*/)?\.shipgate/(agent-contract|openshell)\.json|
             (.*/)?(AGENTS(\.override)?|CLAUDE)\.md|
             \.(agents|claude)/skills/.*|
             (.*/)?\.codex-plugin(/.*)?|
@@ -113,7 +113,7 @@ Use the `agents-shipgate-strict` hook ID for the strict variant, or override the
 ```yaml
 repos:
   - repo: https://github.com/ThreeMoonsLab/agents-shipgate
-    rev: v0.15.0
+    rev: v1.2.0
     hooks:
       - id: agents-shipgate
         entry: agents-shipgate verify --config shipgate.yaml --ci-mode strict --fail-on critical --format text

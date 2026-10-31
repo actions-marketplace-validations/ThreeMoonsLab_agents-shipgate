@@ -15,6 +15,30 @@
 # docs/checks.md is human-maintained — update it by hand when the
 # user-facing prose (description/rationale/recommendation) changes.
 checks:
+- id: SHIP-VERIFY-LOCAL-REVIEW-PROVISIONAL
+  default_severity: medium
+  floor_severity: medium
+  mvp_tier: lifecycle
+  requires_human_review: true
+  description: Verification is using a local-review, uncommitted, or otherwise
+    Git-unproven manifest rather than a committed repository input.
+  rationale: A locally generated assessment policy is not durable repository
+    policy. Letting structurally valid local declarations produce a passing
+    release artifact would launder local assertions into release authority, so
+    the existing release decision must remain review-required. Git presence
+    alone does not prove human review.
+  fires_when: A VerificationContext identifies the configured manifest provenance
+    as local_review, uncommitted, or unknown. Emits nothing on plain scan or
+    manifests Git proves are committed repository inputs.
+  evidence_fields:
+  - manifest
+  - manifest_provenance
+  - ephemeral
+  - release_authoritative
+  recommendation: Treat the result as provisional static assessment only. Adopt
+    shipgate.yaml through init --write, verify that it is present in the
+    evaluated Git tree, and route any resulting human-review requirement before
+    relying on release authority.
 - id: SHIP-VERIFY-TRUST-ROOT-TOUCHED
   default_severity: medium
   floor_severity: medium
@@ -26,7 +50,9 @@ checks:
     CI pass can weaken the gate instead of fixing the underlying readiness issue
     (reward hacking); touching a trust root must therefore require human review.
   fires_when: A changed file from the verification context matches a trust-root
-    surface glob. Emits nothing on a plain scan (no verification context).
+    surface glob. Emits nothing on a plain scan (no verification context). A host
+    settings file whose only change is a narrowing the permission lattice decides
+    does not fire.
   evidence_fields:
   - changed_file
   - trust_root_class
@@ -121,19 +147,20 @@ checks:
   floor_severity: medium
   mvp_tier: lifecycle
   requires_human_review: true
-  description: The PR edits agent-instruction trust roots (AGENTS.md, CLAUDE.md,
-    .cursor/rules, skills, etc.) and Shipgate cannot statically prove the
-    instructions were not weakened.
-  rationale: Prompts are not controls (Principle 3); a static tool cannot judge
-    whether instruction text was weakened, so any change is routed to human review
-    rather than silently trusted.
-  fires_when: A VerificationContext is present and a changed file matches an
-    agent-instruction trust-root glob.
+  description: Deprecated in 1.1.0; retained for historical reports and
+    configuration. New runs emit no findings for this ID.
+  rationale: Changed-file membership cannot establish that natural-language
+    instructions weakened a control. Structured permission and execution readers
+    remain active. Complete parsed instruction equality can clear only the exact
+    instruction touch; unknown structure and configured trust roots retain review.
+  fires_when: Never on current scans. Historical findings retain their original
+    meaning and metadata; the published ID is not removed or repurposed.
   evidence_fields:
   - kind
   - changed_instruction_files
-  recommendation: A human must review the agent-instruction change and confirm no
-    gate-protecting instruction was removed or softened.
+  recommendation: This is a historical instruction-text finding. Re-run the
+    current verifier for structural findings and remaining review obligations;
+    deprecation of this ID does not itself authorize merge or completion.
 - id: SHIP-VERIFY-TRIGGER-CATALOG-DRIFT
   default_severity: medium
   floor_severity: medium
@@ -236,3 +263,23 @@ checks:
   recommendation: A human must review the removal; restore the config binding or
     an explicit literal allowlist, or declare an explicit local tool inventory
     for the toolkit so the mounted surface is statically enumerable.
+- id: SHIP-VERIFY-OPENSHELL-BOUNDARY-EXCEEDED
+  default_severity: critical
+  floor_severity: critical
+  mvp_tier: lifecycle
+  requires_human_review: true
+  description: Trusted native OpenShell execution found a modeled candidate action outside the independently pinned maximum boundary.
+  rationale: A known containment counterexample cannot be treated as a passing release input. Native evidence never approves other review obligations.
+  fires_when: Opt-in local execution returns a validated exceeds_boundary envelope with matching actual exit status and all required domains.
+  evidence_fields: [status, reason_code, required]
+  recommendation: Narrow the candidate and rerun trusted native proof; do not widen the trusted boundary from the candidate PR.
+- id: SHIP-VERIFY-OPENSHELL-PROOF-UNAVAILABLE
+  default_severity: medium
+  floor_severity: medium
+  mvp_tier: lifecycle
+  requires_human_review: true
+  description: Requested native OpenShell containment is unavailable, unsupported, invalid or inconclusive.
+  rationale: A missing or failed proof establishes no containment. Required proof also creates an unsuppressible evidence gap through the existing release decision.
+  fires_when: Opt-in execution cannot establish current modeled containment, or required proof has not been supplied. Optional absent proof is reported only as absent.
+  evidence_fields: [status, reason_code, required]
+  recommendation: Repair trusted external inputs or unsupported proof context and rerun verify with the same proof options.

@@ -17,9 +17,12 @@ from agents_shipgate.core.lenses.action_surface import (
 )
 from agents_shipgate.core.lenses.tool_surface import ToolSurfaceDiffReference, _stable_hash
 from agents_shipgate.core.privacy import RedactionStats, redact_data, sanitize_model
+from agents_shipgate.schemas.bindings import AgentBindingGraphAssessment
 from agents_shipgate.schemas.codex_plugin import CodexPluginSurface
 from agents_shipgate.schemas.manifest import AgentsShipgateManifest
+from agents_shipgate.schemas.report import Finding
 from agents_shipgate.schemas.surfaces import (
+    ActionDeclarationFacts,
     ActionFact,
     ActionSurfaceFacts,
     ActionSurfaceHashes,
@@ -202,6 +205,16 @@ def _sanitize_diff_reference(
         if reference.action_facts is not None
         else None
     )
+    declaration_facts = (
+        sanitize_model(
+            reference.declaration_facts,
+            ActionDeclarationFacts,
+            stats=stats,
+            path="declaration_review.base.facts",
+        )
+        if reference.declaration_facts is not None
+        else None
+    )
     findings = (
         [
             item.__class__.model_validate(
@@ -223,7 +236,18 @@ def _sanitize_diff_reference(
         report_schema_version=reference.report_schema_version,
         baseline_schema_version=reference.baseline_schema_version,
         action_facts=action_facts,
+        declaration_facts=declaration_facts,
+        binding_facts=(
+            sanitize_model(reference.binding_facts, AgentBindingGraphAssessment,
+                           stats=stats, path="tool_surface_diff.base.binding_facts")
+            if reference.binding_facts is not None else None
+        ),
         findings=findings,
+        finding_evidence=(
+            tuple(sanitize_model(row, Finding, stats=stats, path="tool_surface_diff.base.finding_evidence[]")
+                  for row in reference.finding_evidence)
+            if reference.finding_evidence is not None else None
+        ),
         notes=tuple(
             redact_data(
                 list(reference.notes),

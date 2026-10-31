@@ -1,0 +1,1112 @@
+"""Human projection of host evidence shared by CLI and PR output."""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Callable
+
+from agents_shipgate.core.agent_control_envelope import single_line_text
+from agents_shipgate.core.boundary_registry import (
+    is_claude_plugin_manifest_path,
+    is_claude_plugin_marketplace_path,
+)
+from agents_shipgate.core.capability_diff_rows import (
+    ReviewChange,
+    hook_script_named_by,
+    review_changes,
+    review_question,
+)
+from agents_shipgate.core.host_comparison import reproduce_command
+from agents_shipgate.core.host_grants import _source_kind
+from agents_shipgate.core.mcp_host_selection import UNATTRIBUTED_MCP_HOST
+from agents_shipgate.schemas.host_comparison import (
+    BLOCKING_SOURCE_IDENTITY_NOTES,
+    HostComparison,
+    HostComparisonCoverageItem,
+)
+
+
+def _host_label(host: str) -> str:
+    """A coverage item's host as printed: ``unknown`` names no host (#936)."""
+
+    return "host not established" if host == UNATTRIBUTED_MCP_HOST else single_line_text(host)
+
+
+def presented_changes(comparison: HostComparison) -> list[ReviewChange]:
+    """The changes this comparison presents, as it published them (#795).
+
+    A comparison that carries a ``review`` block is read from it, so the text
+    and every JSON reader of the same artifact say the same thing — including a
+    comparison read back from `verifier.json`, whose rows no longer hold the
+    in-memory view they were built with. A comparison without one, such as the
+    object `check` builds from its own rows, is read through
+    :func:`review_changes`, the function that produced the block.
+
+    A block is used only while it still stands for exactly these rows. Model
+    validation requires that, but a caller may copy a comparison with fewer
+    rows without revalidating, and a block describing rows that are no longer
+    published would print changes this comparison does not carry. Such a copy
+    is read through :func:`review_changes`, as it was before the block existed.
+    """
+
+    if comparison.review is None or sorted(
+        index for change in comparison.review.changes for index in change.row_indexes
+    ) != list(range(len(comparison.rows))):
+        return review_changes(comparison.rows)
+    return [
+        ReviewChange(
+            severity=change.severity,
+            direction=change.direction,
+            subject=change.subject,
+            before=change.before,
+            after=change.after,
+            change=change.change,
+            why=change.why,
+            expands=change.expands,
+            row_indexes=tuple(change.row_indexes),
+        )
+        for change in comparison.review.changes
+    ]
+
+
+def permission_guidance_lines(
+    comparison: HostComparison, *, markdown: bool = False, max_chars: int = 2400,
+) -> list[str]:
+    """Bounded published guidance, after facts, coverage and authority (#839).
+
+    Whole items only: an output bound must never cut a condition off its choice.
+    Older artifacts get a limit, not questions reconstructed from their labels.
+    """
+    if not comparison.rows or comparison.comparison_status == "incomparable":
+        return []
+    review = comparison.review
+    # A comparison that recorded guidance sets the field on every change, `null`
+    # where the change is not a supported shell case; an artifact from before
+    # #839 has no such field. Only that one is a limit worth a line: a fresh
+    # comparison whose permission rows are all non-shell (`allow: Read(src/**)`,
+    # `deny: WebFetch`) has nothing to say here.
+    recorded = review is not None and sorted(
+        index for item in review.changes for index in item.row_indexes
+    ) == list(range(len(comparison.rows))) and all(
+        "guidance" in item.model_fields_set for item in review.changes
+    )
+    if not recorded:
+        if not any(row.disposition for row in comparison.rows):
+            return []
+        line = "Specific permission guidance unavailable: this artifact records no supported raw rule evidence."
+        return [line] if len(line) <= max_chars else []
+    items = [(index + 1, item.guidance) for index, item in enumerate(review.changes)
+             if item.guidance is not None]
+    if not items:
+        return []
+    boundary = (
+        "Conditional review choices only; current control permissions still apply. "
+        "A PR note grants no authority."
+    )
+    lines = ["Permission review guidance:", boundary]
+    shown = 0
+    def omitted(count):
+        return f"{count} guidance item(s) omitted; see review.changes[].guidance in JSON (verifier.json for PR evidence)."
+    for index, guidance in items[:2]:
+        assert guidance is not None
+        block = [f"- Change {index}: " + _text(guidance.source or "evidence unavailable", markdown=markdown)]
+        if guidance.question:
+            block.append("  Question: " + _text(guidance.question, markdown=markdown))
+        block.extend("  Limit: " + _text(value, markdown=markdown) for value in guidance.limitations)
+        block.extend("  Choice: " + _text(value, markdown=markdown) for value in guidance.choices)
+        block.append("  Advisory next actor: " + _text(guidance.next_actor, markdown=markdown))
+        if guidance.verification:
+            block.append("  Verification: " + _text(guidance.verification, markdown=markdown))
+        remainder = len(items) - shown - 1
+        candidate = [*lines, *block, *([omitted(remainder)] if remainder else [])]
+        if len("\n".join(candidate)) > max_chars:
+            break
+        lines.extend(block)
+        shown += 1
+    if shown < len(items):
+        lines.append(omitted(len(items) - shown))
+    if len("\n".join(lines)) <= max_chars:
+        return lines
+    line = omitted(len(items))
+    return [line] if len(line) <= max_chars else []
+
+
+#: The label on the provenance line where the comparison was refused (#812
+#: follow-up). A refused result opens with `Cannot compare against main: …`,
+#: so reading `Compared: base … → working tree …` four lines below it reads as
+#: a contradiction. The two commits are still the inputs this run was handed,
+#: and the reproduction still reads them again, so on that route they are
+#: labelled as what they are.
+REFUSED_REFERENCE_LABEL = "Inputs"
+
+
+def comparison_reference_lines(
+    comparison: HostComparison, *, markdown: bool = False, label: str = "Compared"
+) -> list[str]:
+    """The compared commits, the tool version, and a command that reads the same comparison.
+
+    Only where the comparison names a base commit and its head is a commit or a
+    working tree. A provided diff and `check`'s text name no base commit, so
+    they print no reference rather than one they cannot stand behind. A commit
+    head is checked out first: `diff` reads the working tree.
+
+    ``label`` names what the two commits were to this run. It is `Compared`
+    wherever a comparison happened, and :data:`REFUSED_REFERENCE_LABEL` where
+    one was refused, so the line cannot read as contradicting the headline
+    above it. The commits, the version and the command are the same either way.
+
+    The command is the one :func:`reproduce_command` builds, the same call the
+    published ``review`` block records, so the printed and the published
+    command cannot differ.
+    """
+
+    from agents_shipgate import __version__
+
+    base, head = comparison.base_commit, comparison.head_commit
+    command = reproduce_command(
+        base_commit=base, head_kind=comparison.head_kind, head_commit=head
+    )
+    if command is None:
+        return []
+    if markdown:
+        command = f"`{command}`"
+    if comparison.head_kind == "commit":
+        return [
+            f"{label}: base {base[:8]} → head {head[:8]}, agents-shipgate {__version__}.",
+            f"Reproduce: check out {head}, then run {command}",
+        ]
+    at = f" at HEAD {head[:8]}" if head else ""
+    return [
+        f"{label}: base {base[:8]} → working tree{at}, agents-shipgate {__version__}.",
+        f"Reproduce in that working tree: {command}",
+    ]
+
+
+def _text(value: object, *, markdown: bool) -> str:
+    value = single_line_text(str(value))
+    if markdown:
+        # Inline code with a delimiter longer than any untrusted backtick run.
+        width = max((len(part) for part in re.findall(r"`+", value)), default=0) + 1
+        delimiter = "`" * width
+        return f"{delimiter} {value} {delimiter}"
+    return value
+
+
+COVERAGE_HEADING = "What this run established:"
+
+#: The block's own boundary, printed as its first line (#812 follow-up).
+#:
+#: The heading promises what the run established, and the list answers it
+#: source by source — but only for sources a reader of this entry read. On a
+#: corpus pull request the block listed seventeen items and named neither of
+#: the two files the change added, a hooks wiring file and a pin script, while
+#: showing three bare hook removals: everything printed was true, and a
+#: reviewer reading it as the account of the change would conclude the hooks
+#: were deleted rather than moved. The list cannot enumerate what it does not
+#: read (that is #821), so it states that it does not, wherever it is printed
+#: and however few items survive the cap.
+#:
+#: "read or tried to read", not "read" (review cycle 2): a blocking `unreadable`
+#: or `parse_failed` item is precisely a source this entry could *not* read, and
+#: on a refused comparison every item is one of those — so the shorter wording
+#: was false about the very list it introduces. The schema docstring and the
+#: migration note already said "read, or was refused by"; this is the printed
+#: line saying the same.
+COVERAGE_BOUNDARY = (
+    "only sources this entry read or tried to read are listed, so this is "
+    "not the whole change: a changed file it does not read is absent"
+)
+
+#: The same boundary where the list also names changed inputs this entry does
+#: not read (#821). The line above would then be false about the list it
+#: introduces, so it is replaced, never printed beside this one. The list is
+#: still not the account of the change: the candidate rules are a bounded,
+#: documented list, and any other changed file no reader reads is absent.
+COVERAGE_BOUNDARY_WITH_UNREAD = (
+    "sources this entry read or tried to read are listed, and changed inputs "
+    "a bounded candidate list names that it does not read, so this is not the "
+    "whole change: any other changed file it does not read is absent"
+)
+
+#: Said when the comparison's changed files could not be listed, or were
+#: listed but neither side could then be looked at (#821), so an absent unread
+#: input is not read as there being none.
+UNREAD_NOT_EXAMINED = (
+    "the changed files could not be listed or looked at, so no changed input "
+    "this entry does not read is named"
+)
+
+
+def unread_not_examined_text(count: int) -> str:
+    """The line counting candidates discovery did not examine (#821 review).
+
+    The count has two causes, and the line names both: a candidate past the
+    discovery bound, and one whose rule needed a file it could not use — a
+    changed manifest or marketplace present on a side but not read within its
+    bound, or a manifest a hook file could be named by that was not read or
+    did not parse, while no readable one names it. The published count does
+    not say which, so neither does the line. It used to say "more ... past the
+    discovery bound" for both, with one candidate against a bound of 32.
+    """
+
+    plural = count != 1
+    return (
+        f"{count} changed candidate input{'s' if plural else ''} not examined: "
+        "past the discovery bound, or a file the rule needed was not read or "
+        "did not parse"
+    )
+
+#: A blocking limit is what makes an inventory incomplete, which is the reason
+#: the comparison states (`base_inventory_incomplete`, `head_inventory_incomplete`).
+_SIDE_LIMIT = {
+    "base": "in base, so the base inventory is incomplete",
+    "head": "in head, so the head inventory is incomplete",
+    "both": "in base and head, so neither inventory is complete",
+}
+
+#: The side of a limit a partial comparison is bounded by (#808): the
+#: inventory is still incomplete, and what that costs is the named directory.
+_SIDE_SCOPE = {"base": "in base", "head": "in head", "both": "in base and head"}
+
+
+def partial_scopes(comparison: HostComparison) -> tuple[list[str], bool]:
+    """Directories a partial comparison left uncompared, and whether the cap may hide one (#808).
+
+    Read off the coverage items, the one place the comparison names them.
+    Blocking limits rank first, so an item past the cap can name another
+    directory only when the last item listed is itself a blocking limit.
+    """
+
+    coverage = comparison.coverage
+    if comparison.comparison_status != "partial" or coverage is None:
+        return [], False
+    scopes = sorted(
+        {
+            item.scope
+            for item in coverage.items
+            if item.scope is not None and not _script_scope(item) and not _document_scope(item)
+        }
+    )
+    hidden = bool(coverage.omitted_items) and bool(coverage.items) and (
+        coverage.items[-1].status == "blocking_limit"
+    )
+    return scopes, hidden
+
+
+def _partial_script_scopes(comparison: HostComparison) -> list[str]:
+    """Hook scripts a partial comparison did not compare the bytes of (#702)."""
+
+    coverage = comparison.coverage
+    if comparison.comparison_status != "partial" or coverage is None:
+        return []
+    return sorted({str(item.scope) for item in coverage.items if _script_scope(item)})
+
+
+def _partial_document_scopes(comparison: HostComparison) -> list[str]:
+    """Plain instruction documents a partial comparison did not compare (#973)."""
+
+    coverage = comparison.coverage
+    if comparison.comparison_status != "partial" or coverage is None:
+        return []
+    return sorted({str(item.scope) for item in coverage.items if _document_scope(item)})
+
+
+def _document_scope_text(documents: list[str], *, markdown: bool) -> tuple[str, str]:
+    """What a list of withheld documents is called, and the pronoun for it (#973)."""
+
+    names = ", ".join(_text(document, markdown=markdown) for document in documents)
+    if len(documents) > 1:
+        return (
+            f"{names}, instruction documents longer than this entry reads (a kind it "
+            "treats as guidance, which declares no grant it compares)",
+            "them",
+        )
+    return (
+        f"{names}, an instruction document longer than this entry reads (a kind it "
+        "treats as guidance, which declares no grant it compares)",
+        "it",
+    )
+
+
+def partial_scope_lines(comparison: HostComparison, *, markdown: bool = False) -> list[str]:
+    """What a partial comparison did not compare, and what that makes of its rows (#808).
+
+    Printed right under the headline, before any row, so a reviewer reads the
+    rows as what is known outside the named directories and never as the
+    whole change. A partial result with no row says so without saying "no
+    change": nothing inside the directories was compared.
+    """
+
+    scopes, hidden = partial_scopes(comparison)
+    scripts = _partial_script_scopes(comparison)
+    documents = _partial_document_scopes(comparison)
+    if not scopes and documents:
+        # Only documents, and perhaps hook scripts, were withheld (#973):
+        # every other source was compared.
+        named, it = _document_scope_text(documents, markdown=markdown)
+        if hidden:
+            named += ", and any other source a limit not listed below names"
+            it = "them"
+        lines = [
+            f"Not compared: {named}, so a change to {it} is not shown and nothing "
+            f"is claimed about {it}."
+        ]
+        if scripts:
+            lines.append(
+                "Nor the bytes of "
+                + ", ".join(_text(script, markdown=markdown) for script in scripts)
+                + ", hook scripts this entry could not read on both sides alike."
+            )
+        if comparison.rows:
+            lines.append(
+                "The changes below come only from other sources, so they are not the "
+                "whole change; nothing here is a claim that the change is safe."
+            )
+        else:
+            lines.append(
+                f"No static host-grant change was detected outside {it}. That is not a "
+                "no-change answer for this change, and no verdict is implied."
+            )
+        return lines
+    if not scopes:
+        if not scripts:
+            return []
+        # Only hook scripts were withheld (#702): every grant was compared.
+        names = ", ".join(_text(script, markdown=markdown) for script in scripts)
+        plural = len(scripts) > 1
+        what = "hook scripts" if plural else "a hook script"
+        it = "them" if plural else "it"
+        return [
+            f"Not compared: the bytes of {names}, {what} this entry could not read on both "
+            f"sides alike, so a change to {it} is not shown and nothing is claimed about "
+            f"{it}. Every hook and other grant was compared.",
+            (
+                "The changes below are not the whole change; nothing here is a claim that "
+                "the change is safe."
+                if comparison.rows
+                else "No static host-grant change was detected. That is not a no-change answer "
+                "for this change, and no verdict is implied."
+            ),
+        ]
+    plural = len(scopes) > 1 or hidden
+    names = ", ".join(_text(scope, markdown=markdown) for scope in scopes)
+    it = "them" if plural else "it"
+    if hidden:
+        # The cap reached the limits themselves, so the list may be longer.
+        named = (
+            f"{names}, and any other plugin directory a limit not listed below names; "
+            "this entry could not read them completely"
+        )
+    elif plural:
+        named = f"{names}, plugin directories this entry could not read completely"
+    else:
+        named = f"{names}, a plugin directory this entry could not read completely"
+    lines = [
+        f"Not compared: {named}, so no change inside {it} is shown "
+        f"and nothing is claimed about {it}."
+    ]
+    if documents:
+        lines.append(f"Nor {_document_scope_text(documents, markdown=markdown)[0]}.")
+    if scripts:
+        lines.append(
+            "Nor the bytes of "
+            + ", ".join(_text(script, markdown=markdown) for script in scripts)
+            + ", hook scripts this entry could not read on both sides alike."
+        )
+    if comparison.rows:
+        lines.append(
+            f"The changes below come only from sources outside {it}, so they are not the "
+            "whole change; nothing here is a claim that the change is safe."
+        )
+    else:
+        lines.append(
+            f"No static host-grant change was detected outside {it}. That is not a "
+            "no-change answer for this change, and no verdict is implied."
+        )
+    return lines
+
+
+def _published_only_with_hooks(source: str) -> bool:
+    """A plugin manifest or marketplace, or a source inside one (#812).
+
+    Its inventory artifact exists only while it declares hooks, so one side
+    publishing it does not mean only that side read the file.
+    """
+
+    prefixes = [source, *(source[:index] for index, char in enumerate(source) if char == "#")]
+    return any(
+        is_claude_plugin_manifest_path(path) or is_claude_plugin_marketplace_path(path)
+        for path in prefixes
+    )
+
+
+def _side_text(item: HostComparisonCoverageItem) -> str:
+    if item.side == "both":
+        return "compared"
+    if _published_only_with_hooks(item.source):
+        return f"published by {item.side} only"
+    return f"read in {item.side} only"
+
+
+#: What a zero-row line cannot show: the inventory redacts these values, so no
+#: comparison compares them (#812). `apiKeyHelper` and the endpoint and loader
+#: env entries are compared by digest since #1027, and keys no reader compares
+#: are named in the item's detail, so only redaction is left to name here.
+_REDACTED_VALUES = "(redacted values, such as env values this entry does not model, are not compared)"
+
+#: The same note for a workflow, which holds no `apiKeyHelper`: what its
+#: grant does not compare, and where the unread agent steps are named (#823
+#: review cycle 7). `diff`, `verify` and `check` carry no limit for such a
+#: step, so without this a change that only adds one reads as covered.
+_WORKFLOW_UNREAD_TEXT = (
+    "(text this entry does not read, such as a step's env or an unread agent step, "
+    "is not compared; audit --host names each unread agent step)"
+)
+
+
+#: A script's name, by extension, as hook scripts are commonly spelled (#702).
+_SCRIPT_NAME = re.compile(r"\.(?:sh|bash|zsh|py|js|mjs|cjs|ts|rb|pl|ps1)$", re.IGNORECASE)
+
+
+def _redacted_values_note(source: str) -> str:
+    """The note on what is not compared, only for a file that can hold it (#812 review cycle 5).
+
+    Not for a file the inventory reads as instructions (`AGENTS.md`, a
+    `CLAUDE.md` link to it, a skill or a rule): it holds no `env` value or
+    `apiKeyHelper`, and a docs-only change would print the note on every such
+    file it could not prove unchanged. A workflow's note names what its grant
+    does not read instead (#823). The kind is the one the inventory gives the
+    file's path when it reads it; a path redacted past recognition keeps the
+    note. Nor for a file named as a script, which the inventory reads only as
+    a hook's bytes (#702): no value in it is redacted.
+    """
+
+    kind = _source_kind(source)
+    if kind == "instructions" or _SCRIPT_NAME.search(source):
+        return ""
+    return f" {_WORKFLOW_UNREAD_TEXT if kind == 'workflow' else _REDACTED_VALUES}"
+
+
+#: What each candidate rule names (#821), as the line says it. None of these
+#: says what the file grants or that a host loads it.
+_UNREAD_CANDIDATE_TEXT = {
+    "plugin_mcp_config": "MCP configuration in a plugin directory",
+    "plugin_manifest_mcp_servers": "a plugin manifest's mcpServers",
+    "plugin_manifest_hooks": "a plugin manifest's hooks",
+    "plugin_hook_file": "a hook file a plugin manifest's hooks names",
+    "unparsed_plugin_manifest": (
+        "a plugin manifest or marketplace that did not parse, so its members were not compared"
+    ),
+    "cursor_project_hooks": "Cursor project hooks",
+    "nested_host_settings": (
+        "host settings below the repository root, whose scope (a nested project "
+        "or a user-scope package) is not established"
+    ),
+}
+
+#: A changed input's side as the change it describes: it was published by
+#: neither inventory, so `read in` would be false about it.
+_UNREAD_CHANGE = {"both": "changed", "head": "added", "base": "removed"}
+
+
+def _unread_item_text(item: HostComparisonCoverageItem, *, markdown: bool) -> str:
+    """A changed input this entry does not read, and what is not established about it (#821)."""
+
+    change = _UNREAD_CHANGE[item.side]
+    if item.candidate == "external_plugin_source":
+        named = ""
+        if item.detail:
+            tense = "was" if item.side == "base" else "now"
+            named = f", {tense} {_text(item.detail, markdown=markdown)}"
+        return (
+            f"{change}, not read by this entry: an external plugin source{named}; "
+            "no row, and its content is not fetched"
+        )
+    what = _UNREAD_CANDIDATE_TEXT.get(str(item.candidate), "a candidate input")
+    return f"{change}, not read by this entry: {what}; no row, and loading is not established"
+
+
+def _script_scope(item: HostComparisonCoverageItem) -> bool:
+    """A partial comparison's withheld hook script, whose scope is its own path (#702).
+
+    Its limit is always ``unreadable``; a withheld document's is ``unsupported`` (#973).
+    """
+
+    return (
+        item.status == "blocking_limit"
+        and item.scope is not None
+        and item.scope == item.source
+        and item.limit == "unreadable"
+    )
+
+
+def _document_scope(item: HostComparisonCoverageItem) -> bool:
+    """A partial comparison's withheld plain instruction document, its scope its own path (#973)."""
+
+    return (
+        item.status == "blocking_limit"
+        and item.scope is not None
+        and item.scope == item.source
+        and item.limit == "unsupported"
+    )
+
+
+#: How a blocking limit's identity sentence reads at the end of its line (#973).
+_IDENTITY_CLAUSE = {
+    BLOCKING_SOURCE_IDENTITY_NOTES[False]: "it changed in this change",
+    BLOCKING_SOURCE_IDENTITY_NOTES[True]: "it is byte-identical in base and head",
+    BLOCKING_SOURCE_IDENTITY_NOTES[None]: "whether it changed in this change is not established",
+}
+
+
+def _identity_clause(item: HostComparisonCoverageItem) -> str:
+    """``; <whether it changed>`` for a limit both sides carry, read off its ``detail`` (#973)."""
+
+    detail = item.detail or ""
+    for note, clause in _IDENTITY_CLAUSE.items():
+        if detail.endswith(note):
+            return f"; {clause}"
+    return ""
+
+
+def coverage_item_text(
+    item: HostComparisonCoverageItem, *, markdown: bool = False, named_by_row: bool = False
+) -> str:
+    """One item's finding, in words a reviewer reads without the schema (#812).
+
+    ``named_by_row``: a hook row names this changed script (#702), so its
+    change is shown there rather than nowhere.
+    """
+
+    if item.status == "blocking_limit":
+        changed = _identity_clause(item)
+        if _script_scope(item):
+            return (
+                f"{item.limit} {_SIDE_SCOPE[item.side]}, so this hook script's bytes were "
+                f"not compared; the hook that runs it was{changed}"
+            )
+        if _document_scope(item):
+            # A plain instruction document past the size bound (#973).
+            return (
+                f"{item.limit} {_SIDE_SCOPE[item.side]} (longer than this entry reads), so "
+                f"this document was not compared{changed}"
+            )
+        if item.scope is not None:
+            # A partial comparison (#808): the limit cost that directory only.
+            return (
+                f"{item.limit} {_SIDE_SCOPE[item.side]}, so nothing in "
+                f"{_text(item.scope, markdown=markdown)} was compared{changed}"
+            )
+        return f"{item.limit} {_SIDE_LIMIT[item.side]}{changed}"
+    if item.status == "changed_not_read":
+        return _unread_item_text(item, markdown=markdown)
+    if item.status == "script_not_resolved":
+        where = "" if item.side == "both" else f"in {item.side} only, "
+        return (
+            f"{where}a hook it declares runs a script this entry does not resolve, so a "
+            f"change to that script is not shown: {_text(item.detail or '', markdown=markdown)}"
+        )
+    if item.status == "changed_without_grant_change" and item.detail:
+        # Keys no reader compares changed (#1027): named, never read as no change.
+        change = "changed, not compared" if item.side == "both" else (
+            "declares no grant this entry compares; not compared"
+        )
+        finding = (
+            f"{change} ({_text(item.detail, markdown=markdown)}), so no row"
+            f"{_redacted_values_note(item.source)}"
+        )
+    elif item.status == "changed_without_grant_change":
+        # One side only is an added or removed file: it declares no compared grant.
+        change = (
+            "changed, but no grant this entry compares changed"
+            if item.side == "both"
+            else "declares no grant this entry compares"
+        )
+        finding = f"{change}, so no row{_redacted_values_note(item.source)}"
+    elif item.status == "changed_without_rows" and item.detail:
+        finding = f"changed, not compared ({_text(item.detail, markdown=markdown)}), so no row"
+    elif item.status == "unchanged_not_proven":
+        finding = (
+            "no grant this entry compares changed, but the file was not proven "
+            f"unchanged{_redacted_values_note(item.source)}"
+        )
+    elif item.status == "changed_without_rows" and named_by_row:
+        finding = "changed; the row of the hook that runs it names this script"
+    elif item.status == "changed_without_rows":
+        finding = "changed, but no row is attributed to this path"
+    elif item.rows:
+        finding = f"{item.rows} row{'s' if item.rows != 1 else ''}"
+    elif item.side == "both":
+        # Only a file whose bytes were proven identical on both sides.
+        finding = "no change in what this entry reads"
+    else:
+        # Only an instruction file the engine reads as guidance: it declares
+        # no grant, so it gives no row on the one side that has it.
+        finding = "declares no grant this entry compares, so no row"
+    return f"{_side_text(item)}; {finding}"
+
+
+#: The headline of a comparable comparison with no row and no source that changed.
+NO_CHANGE_HEADLINE = "No static host-grant changes detected. No verdict is implied."
+#: The same headline where `verify` and the PR comment print it.
+NO_CHANGE_COVERED_HEADLINE = (
+    "No static host-grant changes detected in the covered comparison. No verdict is implied."
+)
+#: The source kinds a "changed, not compared" headline names (#1027): host
+#: settings, MCP configuration and hook files. A workflow names what it does
+#: not compare on its own coverage line, and an instruction document is
+#: guidance, not a setting.
+_SETTINGS_SOURCE_KINDS = frozenset({"config", "mcp", "hooks", "requirements"})
+#: How many changed sources that headline names before counting.
+_NOT_COMPARED_NAMES = 3
+
+
+def not_compared_headline(comparison: HostComparison, *, markdown: bool = False) -> str | None:
+    """The headline of a comparable comparison with no row in which a host settings file changed (#1027).
+
+    A settings file can change with no row: in keys no reader of this entry
+    compares, in a value the inventory redacts, or in a way the published
+    data does not attribute to a grant. "No static host-grant changes
+    detected" read as no change there, and a code-execution edit to
+    `.claude/settings.json` was presented as a no-op. So such a file is named
+    as changed, not compared, with the keys its coverage item names. ``None``
+    where no settings file changed, a row exists, or coverage was not
+    recorded: the no-change headline is then the answer it always was.
+    """
+
+    if comparison.comparison_status != "comparable" or comparison.rows or comparison.coverage is None:
+        return None
+    changed = [
+        item
+        for item in comparison.coverage.items
+        if item.status in {"changed_without_grant_change", "changed_without_rows"}
+        and _source_kind(item.source) in _SETTINGS_SOURCE_KINDS
+        # A hook script's change is its hook's row (#702), never a setting.
+        and not _SCRIPT_NAME.search(item.source)
+    ]
+    if not changed:
+        return None
+    named = [
+        _text(item.source, markdown=markdown)
+        + (f" ({_text(item.detail, markdown=markdown)})" if item.detail else "")
+        for item in changed[:_NOT_COMPARED_NAMES]
+    ]
+    more = len(changed) - _NOT_COMPARED_NAMES
+    return (
+        "Changed, not compared: "
+        + "; ".join(named)
+        + (f"; and {more} more" if more > 0 else "")
+        + ". No host-grant row describes this change. No verdict is implied."
+    )
+
+
+#: How many sources compared with no change the text names before counting.
+_QUIET_NAMES = 3
+
+#: The most characters the block takes in a PR comment, whose human summary
+#: is bounded as a whole. It gets at most this much of the room the comment's
+#: other lines leave, never more: see :func:`coverage_budget`.
+MARKDOWN_COVERAGE_MAX_CHARS = 2000
+
+
+def _quiet(item: HostComparisonCoverageItem) -> bool:
+    """Proven byte-identical on both sides: the one kind the text collapses."""
+
+    return item.status == "compared" and not item.rows and item.side == "both"
+
+
+def coverage_lines(
+    comparison: HostComparison,
+    *,
+    markdown: bool = False,
+    bullet: str = "- ",
+    max_chars: int | None = None,
+) -> list[str]:
+    """The "What this run established" block (#812).
+
+    The heading, then :data:`COVERAGE_BOUNDARY`, which says what the list
+    cannot be read as — :data:`COVERAGE_BOUNDARY_WITH_UNREAD` instead while the
+    list names a changed input this entry does not read (#821) — and, when the
+    search for those could not run, or left a candidate unexamined, a line
+    saying so.
+    Then one line per item a reviewer must read, in the comparator's order — a
+    blocking limit, most actionable kind first, a changed input this entry does
+    not read, a change no row describes, a source only one side published, a
+    source not proven unchanged, a source with rows — then one line naming the sources proven
+    unchanged, the first three by name and the rest as a count. Coverage items
+    are a prefix of that order, so when the last one listed is such a source,
+    every item the cap omitted is one too; otherwise the omitted count is
+    stated as items not listed, ranked below the ones above it.
+
+    With ``max_chars``, the block, heading, boundary, count and closing blank
+    line included, is at most that many characters joined: it lists the longest
+    prefix of those lines that fits, naming fewer sources proven unchanged
+    before it drops that line, and counts the rest, as ``N items not listed``
+    when it lists none. The heading and the boundary are never dropped to make
+    room for an item: when not even they and that count fit, the block is
+    nothing.
+
+    Nothing when coverage was not recorded (a legacy verifier, `check`, a
+    comparison that read no inventory), or when a refused comparison names no
+    source. Every path is repository text passed through the same one-line
+    rendering as the rows. In Markdown the list is closed with a blank line,
+    so a following line cannot continue its last item.
+    """
+
+    coverage = comparison.coverage
+    if coverage is None:
+        return []
+
+    def fits(block: list[str]) -> bool:
+        return max_chars is None or len("\n".join(block)) <= max_chars
+
+    # The boundary, and what the search for unread inputs could not do, are
+    # the lines the list is read under (#812 follow-up, #821): never dropped
+    # to make room for an item.
+    boundary = [
+        f"{bullet}"
+        + (COVERAGE_BOUNDARY if coverage.read_sources_only else COVERAGE_BOUNDARY_WITH_UNREAD)
+    ]
+    if coverage.unread_candidates == "not_examined":
+        boundary.append(f"{bullet}{UNREAD_NOT_EXAMINED}")
+    if coverage.unread_candidates_not_examined:
+        boundary.append(
+            f"{bullet}{unread_not_examined_text(coverage.unread_candidates_not_examined)}"
+        )
+    if not coverage.items and not coverage.omitted_items:
+        if comparison.comparison_status != "comparable":
+            return []
+        empty = [
+            f"{COVERAGE_HEADING} no host configuration source was compared.",
+            *boundary,
+            *([""] if markdown else []),
+        ]
+        return empty if fits(empty) else []
+
+    item_lines = [
+        f"{bullet}{_text(item.source, markdown=markdown)} "
+        f"({', '.join(_host_label(host) for host in item.hosts)}): "
+        f"{coverage_item_text(item, markdown=markdown, named_by_row=any(hook_script_named_by(row, item.source) for row in comparison.rows))}"
+        for item in coverage.items
+        if not _quiet(item)
+    ]
+    quiet = [item for item in coverage.items if _quiet(item)]
+    # Quiet items sort last: when the last item is one, every omitted item is too.
+    last_quiet = bool(coverage.items) and _quiet(coverage.items[-1])
+    quiet_total = len(quiet) + (coverage.omitted_items if last_quiet else 0)
+    total = len(item_lines) + len(quiet) + coverage.omitted_items
+
+    def quiet_line(count: int) -> str:
+        names = ", ".join(_text(item.source, markdown=markdown) for item in quiet[:count])
+        more = quiet_total - count
+        return f"{bullet}compared with no change in what this entry reads: {names}" + (
+            f" and {more} more" if more else ""
+        )
+
+    def block(listed: list[str], items: int) -> list[str]:
+        lines = [COVERAGE_HEADING, *boundary, *listed]
+        unlisted = total - items
+        if unlisted:
+            # Items, not sources: one source can be several items (by host, side or limit).
+            plural = "s" if unlisted != 1 else ""
+            # Said in the text, not left to a JSON integer: a reviewer reading
+            # a capped list must be able to see that it is capped, and that
+            # the comparator ranked what it kept (#812 follow-up).
+            lines.append(
+                f"{bullet}{unlisted} more item{plural} not listed, each ranked below those above"
+                if listed
+                else f"{bullet}{unlisted} item{plural} not listed"
+            )
+        if markdown:
+            lines.append("")
+        return lines
+
+    # Longest first, in order: every item line and the quiet line naming three,
+    # two or one source, then ever shorter prefixes of the item lines alone.
+    candidates = [
+        block([*item_lines, quiet_line(count)], len(item_lines) + quiet_total)
+        for count in range(min(len(quiet), _QUIET_NAMES), 0, -1)
+    ] + [block(item_lines[:count], count) for count in range(len(item_lines), -1, -1)]
+    return next((candidate for candidate in candidates if fits(candidate)), [])
+
+
+#: The fewest characters a bounded surface cuts an entry to (#819 review,
+#: cycle 6): a shorter prefix names too little of the change to read. Under
+#: it, ``entry_max_chars`` prints an entry longer than the bound in its
+#: shortest form instead (:func:`_shortest_form`), and ``0`` every entry that
+#: has one.
+ENTRY_MIN_CHARS = 60
+
+#: Printed once after the rows when a bounded surface shortened an entry,
+#: never after each one: one pointer per entry cost more than the entries it
+#: saved room for (#819 review, cycle 6).
+ENTRIES_SHORTENED = "Some entries are shortened here to fit; `verifier.json` holds each entry whole."
+
+
+def entry_text(change: ReviewChange) -> str:
+    """An entry as one line reads it whole: the field-level difference, or ``before → after``."""
+
+    return change.change if change.change is not None else f"{change.before} → {change.after}"
+
+
+def _shortest_form(
+    comparison: HostComparison, change: ReviewChange, text: Callable[[object], str]
+) -> str | None:
+    """The shortest form a bounded surface may print an entry in, rendered by ``text`` (#819 review, cycle 6).
+
+    A field-level difference is cut after the name it opens with,
+    ``PreToolUse: …`` or ``docs: …``; an added or removed grant is its row's
+    own ``before → after``, ``(absent) → PreToolUse``. Neither is longer than
+    the entry ``1.1.0`` printed for the same row, of any kind: a hook's read
+    ``PreToolUse → PreToolUse`` and an MCP server's ``docs:`` and at least one
+    difference. ``None`` for a joined change and a permission rule, whose
+    entries name a disposition and read exactly as ``1.1.0`` printed them.
+    The surface prints the form only where it is the shorter.
+    """
+
+    if len(change.row_indexes) != 1 or not 0 <= change.row_indexes[0] < len(comparison.rows):
+        return None
+    row = comparison.rows[change.row_indexes[0]]
+    if row.disposition is not None:
+        return None
+    if change.change is not None:
+        return text(change.change[: len(row.after) + 2] + "…")
+    return f"{text(row.before)} → {text(row.after)}"
+
+
+def with_entries_in_room(
+    comparison: HostComparison,
+    lines_for: Callable[[int, int | None, bool], list[str]],
+    room: int,
+) -> list[str]:
+    """A bounded Markdown surface's lines, each entry as long as the room allows (#819 review, cycles 4 and 6).
+
+    ``lines_for(coverage_max_chars, entry_max_chars, entry_note)`` renders
+    every line of the surface (:func:`host_comparison_lines`); ``room`` is how
+    many characters they may take joined. The lines ``1.1.0`` printed come
+    first: the coverage block gets the room the other lines leave with every
+    entry in its shortest form (:func:`coverage_budget`), at least the room
+    ``1.1.0``'s lines left it, and the entries get only what is left after
+    it. The first of these at which every line fits is used, each bound found
+    by bisection, since a narrower one never lengthens the surface:
+
+    1. every entry whole;
+    2. every entry longer than the widest bound of at least
+       :data:`ENTRY_MIN_CHARS` at which they fit cut to it, ending in ``…``;
+    3. every entry longer than the widest bound under that at which they fit
+       printed in its shortest form (:func:`_shortest_form`), longest first,
+       down to every entry that has one;
+    4. the same without the line after the rows.
+
+    The second and third print :data:`ENTRIES_SHORTENED` once after the rows.
+    In its shortest form no entry is longer than the one ``1.1.0`` printed,
+    and a permission rule's and a joined change's are the ones it printed,
+    so wherever ``1.1.0``'s own lines fit the fourth prints every one of
+    them: the row headings, the coverage block, the review question, the
+    reproduction and whatever the surface prints after them. When not even
+    it fits, it is returned, and the surface's own bound cuts it, as it cut
+    ``1.1.0``'s.
+    """
+
+    coverage = coverage_budget(
+        comparison,
+        lambda coverage_max_chars: lines_for(coverage_max_chars, 0, False),
+        room,
+    )
+
+    def fitting(entry_max_chars: int | None, entry_note: bool = True) -> list[str] | None:
+        lines = lines_for(coverage, entry_max_chars, entry_note)
+        return lines if len("\n".join(lines)) <= room else None
+
+    def widest_fitting(low: int, high: int, entry_note: bool = True) -> list[str] | None:
+        # The narrowest bound first: where not even it fits, no wider one does.
+        best = fitting(low, entry_note) if low <= high else None
+        low += 1
+        while best is not None and low <= high:
+            middle = (low + high) // 2
+            candidate = fitting(middle, entry_note)
+            if candidate is None:
+                high = middle - 1
+            else:
+                best, low = candidate, middle + 1
+        return best
+
+    widest = max((len(entry_text(change)) for change in presented_changes(comparison)), default=0)
+    shortest = min(ENTRY_MIN_CHARS, widest) - 1
+    return (
+        fitting(None)
+        or widest_fitting(ENTRY_MIN_CHARS, widest - 1)
+        or widest_fitting(0, shortest)
+        or widest_fitting(0, shortest, entry_note=False)
+        or lines_for(coverage, 0, False)
+    )
+
+
+def coverage_budget(
+    comparison: HostComparison, lines_for: Callable[[int], list[str]], room: int
+) -> int:
+    """The bound a bounded Markdown surface gives its coverage block: the room left (#812).
+
+    ``lines_for(max_chars)`` renders every line of the surface, the coverage
+    block bounded to ``max_chars`` (``0`` leaves it out); ``room`` is how many
+    characters those lines may take joined. The block gets what the other
+    lines leave, at most :data:`MARKDOWN_COVERAGE_MAX_CHARS`, so every line the
+    surface shows without it — the entries, the review question and
+    reproduction, and the advisory, next action and evidence after them — it
+    still shows with it (review cycle 5). The heading and the boundary line are
+    never dropped to make room for an item: when not even they and a count fit,
+    the block is left out (``0``); whatever the other lines alone overflow is
+    theirs, as without coverage.
+    """
+
+    without = lines_for(0)
+    spare = room - len("\n".join(without))
+    widest = coverage_lines(comparison, markdown=True, max_chars=MARKDOWN_COVERAGE_MAX_CHARS)
+    if spare <= 0 or not widest:
+        return 0
+    # The blank line that sets the block apart costs the same whatever it lists.
+    separators = (
+        len("\n".join(lines_for(MARKDOWN_COVERAGE_MAX_CHARS)))
+        - len("\n".join(without))
+        - len("\n".join(widest))
+    )
+    budget = min(MARKDOWN_COVERAGE_MAX_CHARS, spare - separators)
+    return budget if budget > 0 and len("\n".join(lines_for(budget))) <= room else 0
+
+
+def host_comparison_lines(
+    comparison: HostComparison,
+    *,
+    markdown: bool = False,
+    coverage_max_chars: int | None = None,
+    entry_max_chars: int | None = None,
+    entry_note: bool = True,
+    guidance_max_chars: int = 0,
+) -> list[str]:
+    """The host comparison a reviewer reads, coverage block included.
+
+    ``coverage_max_chars`` bounds the block as :func:`coverage_lines` does;
+    ``None`` lists every item. A bounded surface passes the room its other
+    lines leave, through :func:`coverage_budget`. ``entry_max_chars``
+    bounds each entry's ``before → after`` or field-level difference: ``None``
+    prints every entry whole; a bound of at least :data:`ENTRY_MIN_CHARS`
+    cuts a longer entry to that many characters, ending in ``…``; a smaller
+    one prints a longer entry in its shortest form (:func:`_shortest_form`),
+    so ``0`` prints every entry that has one that way. Where any entry was
+    shortened, one line after the rows says so and names ``verifier.json``
+    (:data:`ENTRIES_SHORTENED`), unless ``entry_note`` is false. A bounded
+    surface picks the bound through :func:`with_entries_in_room`.
+    """
+
+    def text(value):
+        return _text(value, markdown=markdown)
+
+    coverage = coverage_lines(comparison, markdown=markdown, max_chars=coverage_max_chars)
+    partial = comparison.comparison_status == "partial"
+    if comparison.comparison_status != "comparable" and not partial:
+        lines = [
+            "Host capability comparison unavailable: "
+            + text("; ".join(comparison.incomparable_reasons)),
+            *coverage,
+        ]
+        # A refused comparison is the result a reviewer is most likely to want
+        # to rerun themselves, so it names what it read and how to read it
+        # again, exactly as a result with changes does (#812 follow-up). It
+        # asks no review question: there is no change to ask about, and
+        # nothing here was compared, so the commits are labelled as the inputs
+        # they are.
+        tail = comparison_reference_lines(
+            comparison, markdown=markdown, label=REFUSED_REFERENCE_LABEL
+        )
+        if tail:
+            if markdown and lines[-1] != "":
+                # The block ends with a blank of its own where it has items.
+                # Where it names no source it is nothing, and the headline
+                # would otherwise run into these lines as one paragraph
+                # (review cycle 4).
+                lines.append("")
+            lines.extend(tail)
+        return lines
+    changes = presented_changes(comparison)
+    if partial:
+        # What was not compared leads (#808): the rows below it are what is
+        # known outside those directories, never the whole change, and a
+        # partial result with no row is never a no-change answer.
+        lines = [
+            "Host capability comparison partial: "
+            + text("; ".join(comparison.incomparable_reasons)),
+            *partial_scope_lines(comparison, markdown=markdown),
+        ]
+        if changes:
+            if markdown:
+                # Its own paragraph: the rows heading would otherwise read as
+                # the end of the sentence saying they are not the whole change.
+                lines.append("")
+            lines.append("Repository-declared host capability changes:")
+    else:
+        lines = ["Repository-declared host capability changes:"]
+    if not changes and not partial:
+        lines.append(
+            not_compared_headline(comparison, markdown=markdown) or NO_CHANGE_COVERED_HEADLINE
+        )
+    # A bound of at least ENTRY_MIN_CHARS cuts a longer entry; a smaller one
+    # prints it in its shortest form (#819 review, cycle 6).
+    cut_to = entry_max_chars if entry_max_chars is not None and entry_max_chars >= ENTRY_MIN_CHARS else None
+    shortest_past = entry_max_chars if cut_to is None else None
+    shortened = False
+    for change in changes:
+        # The same mark `diff` prints: the engine called this change a widening.
+        marker = "⚠ " if change.expands else ""
+        whole = entry_text(change)
+        transition = (
+            text(change.change)
+            if change.change is not None
+            else f"{text(change.before)} → {text(change.after)}"
+        )
+        shortest = (
+            _shortest_form(comparison, change, text)
+            if shortest_past is not None and len(whole) > shortest_past
+            else None
+        )
+        if shortest is not None and len(shortest) < len(transition):
+            transition, shortened = shortest, True
+        elif cut_to is not None and len(whole) > cut_to:
+            transition, shortened = text(whole[: cut_to - 1] + "…"), True
+        lines.extend(
+            [
+                f"- {marker}{text(change.severity)} / {text(change.direction)} — {text(change.subject)}",
+                f"  {transition}",
+                f"  {text(change.why)}",
+            ]
+        )
+    if shortened and entry_note:
+        # Its own paragraph: it would otherwise continue the last row's item.
+        lines.extend([*([""] if markdown else []), ENTRIES_SHORTENED])
+    if coverage and markdown and changes:
+        # Ends the row list: the heading would otherwise continue its last item.
+        lines.append("")
+    lines.extend(coverage)
+    if comparison.unchanged_limits:
+        lines.append(
+            "Not compared: unchanged in this change and not read, so no claim is made about them:"
+        )
+        for limit in comparison.unchanged_limits:
+            lines.append(f"- {text(limit.host)} {text(limit.source)} — {text(limit.limit)}")
+    # The question is asked only where there is a change to ask about; the
+    # compared commits and the command that reads them again are printed
+    # wherever the comparison names them, a zero-row result included (#812
+    # follow-up): that is the result whose provenance a reviewer cannot
+    # otherwise check.
+    tail = [
+        *([review_question(changes)] if changes else []),
+        *comparison_reference_lines(comparison, markdown=markdown),
+    ]
+    if tail:
+        if markdown and lines[-1] != "":
+            # Ends the list: a following line would otherwise continue its last item.
+            lines.append("")
+        lines.extend(tail)
+    guidance = permission_guidance_lines(comparison, markdown=markdown, max_chars=guidance_max_chars)
+    if guidance:
+        lines.extend(["", *guidance])
+    return lines

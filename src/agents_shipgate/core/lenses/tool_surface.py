@@ -12,10 +12,14 @@ from agents_shipgate.core.artifact_models import (
     AnthropicArtifacts,
     OpenAIApiArtifacts,
 )
-from agents_shipgate.core.domain import Tool, ToolkitScopeBound
+from agents_shipgate.core.binding_comparison import binding_comparison_limits
+from agents_shipgate.core.domain import AgentRemoteBinding, Tool, ToolkitScopeBound
 from agents_shipgate.core.errors import InputParseError
 from agents_shipgate.core.findings.identity import _canonicalize_for_fingerprint
+from agents_shipgate.core.guard_dependencies import compare_guard_dependencies
 from agents_shipgate.core.heuristics import is_broad_scope
+from agents_shipgate.core.lenses.finding_comparison import finding_comparison_notes
+from agents_shipgate.core.remote_bindings import remote_binding_facts
 from agents_shipgate.core.risk_hints import HIGH_RISK_TAGS, risk_tags
 from agents_shipgate.core.static_inputs import read_static_input_text
 from agents_shipgate.core.tool_identity import ToolSelectorIndex
@@ -23,6 +27,7 @@ from agents_shipgate.core.toolkit_scope import toolkit_bound_facts
 from agents_shipgate.schemas.baseline import BaselineFile
 from agents_shipgate.schemas.bindings import AgentBindingGraphAssessment
 from agents_shipgate.schemas.capability_change import EffectivePolicy
+from agents_shipgate.schemas.guard_dependencies import GuardDependencyEvidence
 from agents_shipgate.schemas.manifest import (
     AgentsShipgateManifest,
     PolicyToolEntry,
@@ -31,7 +36,12 @@ from agents_shipgate.schemas.report import (
     Finding,
     ReadinessReport,
 )
+from agents_shipgate.schemas.report_compatibility import (
+    ReportSchemaCompatibilityError,
+    require_supported_report_schema,
+)
 from agents_shipgate.schemas.surfaces import (
+    ActionDeclarationFacts,
     ActionSurfaceFacts,
     ToolSurfaceControlChange,
     ToolSurfaceControlFact,
@@ -56,7 +66,6 @@ from agents_shipgate.schemas.surfaces import (
 )
 
 _METADATA_FIELDS = {"owner", "description", "auth_scopes", "extraction_confidence"}
-_SEMANTIC_DIFF_REPORT_SCHEMA_VERSION = "0.30"
 _REGENERATE_DIFF_BASE_COMMAND = "agents-shipgate scan -c shipgate.yaml --format json"
 
 
@@ -68,6 +77,7 @@ class ToolSurfaceDiffReference:
     report_schema_version: str | None = None
     baseline_schema_version: str | None = None
     action_facts: ActionSurfaceFacts | None = None
+    declaration_facts: ActionDeclarationFacts | None = None
     findings: list[ToolSurfaceFindingDeltaItem] | None = None
     notes: tuple[str, ...] = ()
     action_notes: tuple[str, ...] = ()
@@ -78,6 +88,10 @@ class ToolSurfaceDiffReference:
     # report that predates the block.
     effective_policy: EffectivePolicy | None = None
     binding_facts: AgentBindingGraphAssessment | None = None
+    # In-memory only. Legacy finding delta rows deliberately omit evidence;
+    # retaining the full base rows allows a diagnostic comparison without
+    # changing finding fingerprints or inventing dependency completeness.
+    finding_evidence: tuple[Finding, ...] | None = None
 
 
 def build_tool_surface_facts(
@@ -87,38 +101,59 @@ def build_tool_surface_facts(
     api_artifacts: OpenAIApiArtifacts | None,
     anthropic_artifacts: AnthropicArtifacts | None,
     toolkit_bounds: list[ToolkitScopeBound] | tuple[ToolkitScopeBound, ...] = (),
+    remote_bindings: list[AgentRemoteBinding] | tuple[AgentRemoteBinding, ...] = (),
+    guard_dependencies: list[GuardDependencyEvidence] | tuple[GuardDependencyEvidence, ...] = (),
 ) -> ToolSurfaceFacts:
     del findings  # Reserved for future evidence projections.
     return ToolSurfaceFacts(
         tools=_tool_facts(tools),
+        guard_dependencies=list(guard_dependencies),
         scopes=_scope_facts(manifest, tools),
         controls=_control_facts(manifest, tools, api_artifacts, anthropic_artifacts),
-        policies=_policy_facts_with_toolkit_bounds(
-            manifest, api_artifacts, anthropic_artifacts, toolkit_bounds
+        policies=_policy_facts_with_carried_bounds(
+            manifest,
+            api_artifacts,
+            anthropic_artifacts,
+            toolkit_bounds,
+            remote_bindings,
         ),
     )
 
 
-def _policy_facts_with_toolkit_bounds(
+def _policy_facts_with_carried_bounds(
     manifest: AgentsShipgateManifest,
     api_artifacts: OpenAIApiArtifacts | None,
     anthropic_artifacts: AnthropicArtifacts | None,
     toolkit_bounds: list[ToolkitScopeBound] | tuple[ToolkitScopeBound, ...],
+    remote_bindings: list[AgentRemoteBinding] | tuple[AgentRemoteBinding, ...] = (),
 ) -> list[ToolSurfacePolicyFact]:
-    """Manifest/artifact policy facts plus carried toolkit scope bounds.
+    """Manifest/artifact policy facts plus the carried non-manifest bounds.
 
-    A dynamically-loaded toolkit's least-privilege allowlist rides as a
-    ``toolkit_scope_bound`` policy fact (see ``core.toolkit_scope``) so the
-    base report carries it for the capability-scope diff. Merged into the
-    policy fact list and re-sorted by ``(kind, key)`` for byte-stable
-    output; the gentle ``policy_drift`` diff path then reads
-    bound-vs-unbound as a broadening without misclassifying it as a scope
-    *grant* removal.
+    Two surfaces ride here because both answer a question the base side can
+    only be asked through the serialized base ``report.json``, and
+    ``ToolSurfacePolicyFact.kind`` is a free string, so neither needs a
+    ``report_schema_version`` bump:
+
+    * A dynamically-loaded toolkit's least-privilege allowlist rides as a
+      ``toolkit_scope_bound`` fact (see ``core.toolkit_scope``). The gentle
+      ``policy_drift`` diff path then reads bound-vs-unbound as a broadening
+      without misclassifying it as a scope *grant* removal.
+    * An agent's remote binding rides as four ``remote_binding.*`` facts, one
+      per axis (see ``core.remote_bindings``), so an endpoint-only,
+      credential-reference-only or filter-only change is its own delta and a
+      supplied leaf inventory cannot conceal any of them (#538).
+
+    Merged into the policy fact list and re-sorted by ``(kind, key)`` for
+    byte-stable output.
     """
     facts = _policy_facts(manifest, api_artifacts, anthropic_artifacts)
-    if not toolkit_bounds:
+    if not toolkit_bounds and not remote_bindings:
         return facts
-    merged = [*facts, *toolkit_bound_facts(list(toolkit_bounds))]
+    merged = [
+        *facts,
+        *toolkit_bound_facts(list(toolkit_bounds)),
+        *remote_binding_facts(list(remote_bindings)),
+    ]
     return sorted(merged, key=lambda item: (item.kind, item.key))
 
 
@@ -184,13 +219,31 @@ def compute_tool_surface_diff(
     findings: list[Finding],
     *,
     reference: ToolSurfaceDiffReference | None = None,
+    head_binding_facts: AgentBindingGraphAssessment | None = None,
 ) -> ToolSurfaceDiff:
+    # Coverage limits constrain a requested comparison. A fresh scan with
+    # no base/reference has no absence or resolution claim to withhold.
+    #
+    # An incomplete binding graph on either side means a tool, scope, effect
+    # or finding missing from the head may only be unread there. Everything
+    # that depends on absence is withheld (removed and narrowed rows, the
+    # control rows of a tool whose only evidence is its absence, resolved
+    # findings). What presence proves is still reported: an added tool, a
+    # changed row or a removed control is never hidden, because a possible
+    # widening must reach the reviewer even when the graph is partial.
+    limits = binding_comparison_limits(
+        head_binding_facts, reference.binding_facts if reference else None,
+        absence_only=True,
+    ) if base is not None or reference is not None else []
+
     if base is None:
         finding_deltas = (
             _finding_deltas(findings, reference.findings)
             if reference
             else ToolSurfaceFindingDeltas()
         )
+        if limits:
+            finding_deltas = _without_resolved(finding_deltas)
         diff_base = _diff_base(reference)
         notes = list(reference.notes) if reference else []
         if not notes:
@@ -209,19 +262,38 @@ def compute_tool_surface_diff(
             )
         return ToolSurfaceDiff(
             enabled=False,
+            guard_comparisons=compare_guard_dependencies(current.guard_dependencies, []),
             base=diff_base,
             summary=_summary_from_diff_parts(finding_deltas=finding_deltas),
             finding_deltas=finding_deltas,
-            notes=notes,
+            notes=[
+                *notes,
+                *(finding_comparison_notes(findings, reference.finding_evidence) if reference else ()),
+                *limits,
+            ],
         )
 
     tool_changes = _diff_tools(current.tools, base.tools)
     high_risk_effects = _diff_high_risk_effects(current.tools, base.tools)
     scopes = _diff_scopes(current.scopes, base.scopes)
     controls = _diff_controls(current.controls, base.controls)
-    metadata_changes = _metadata_changes(tool_changes)
     policy_drift = _diff_policies(current.policies, base.policies)
     finding_deltas = _finding_deltas(findings, reference.findings if reference else None)
+    if limits:
+        gone = [row for row in tool_changes if row.kind == "removed"]
+        absent_ids = {row.tool_id for row in gone if row.tool_id}
+        absent_names = {row.name for row in gone}  # For a control that names no tool id.
+        tool_changes = [row for row in tool_changes if row.kind != "removed"]
+        high_risk_effects = [row for row in high_risk_effects if row.kind != "removed"]
+        scopes = [row for row in scopes if row.kind != "removed"]
+        controls = [
+            row for row in controls
+            if row.kind != "added"
+            and not (row.tool_id in absent_ids if row.tool_id else row.tool in absent_names)
+        ]
+        policy_drift = [row for row in policy_drift if row.kind != "removed"]
+        finding_deltas = _without_resolved(finding_deltas)
+    metadata_changes = _metadata_changes(tool_changes)
     summary = _summary_from_diff_parts(
         tool_changes=tool_changes,
         high_risk_effects=high_risk_effects,
@@ -231,11 +303,14 @@ def compute_tool_surface_diff(
         policy_drift=policy_drift,
         finding_deltas=finding_deltas,
     )
-    notes = ["Tool renames are reported as one removed tool plus one added tool."]
+    notes = finding_comparison_notes(findings, reference.finding_evidence if reference else None)
+    notes.append("Tool renames are reported as one removed tool plus one added tool.")
     if reference:
         notes.extend(reference.notes)
+    notes.extend(limits)
     return ToolSurfaceDiff(
         enabled=True,
+        guard_comparisons=compare_guard_dependencies(current.guard_dependencies, base.guard_dependencies),
         base=_diff_base(reference),
         summary=summary,
         tools=tool_changes,
@@ -881,6 +956,11 @@ def _finding_deltas(
     )
 
 
+def _without_resolved(deltas: ToolSurfaceFindingDeltas) -> ToolSurfaceFindingDeltas:
+    """A finding missing from the head may only be unread there, not fixed."""
+    return deltas.model_copy(update={"resolved_findings": []})
+
+
 def _finding_item(finding: Finding) -> ToolSurfaceFindingDeltaItem | None:
     if finding.suppressed:
         return None
@@ -901,22 +981,31 @@ def _reference_from_report_payload(
     payload: dict[str, Any],
     display_path: str,
 ) -> ToolSurfaceDiffReference:
-    source_version = payload.get("report_schema_version")
-    if _report_schema_precedes_semantic_diff(source_version):
-        raise InputParseError(
-            f"Reference report {display_path} uses report schema {source_version}, "
-            f"which predates report schema {_SEMANTIC_DIFF_REPORT_SCHEMA_VERSION} "
-            "semantic evidence and is not comparable with --diff-from. "
-            "Regenerate the base report from its source workspace with "
-            f"`{_REGENERATE_DIFF_BASE_COMMAND}`, then rerun the head scan using "
-            "the regenerated report."
+    # The old gate here was "predates 0.30 semantic evidence". The 1.0 freeze
+    # replaces it with the shared boundary (#569): a base written before the
+    # freeze is refused outright rather than compared field-by-field against a
+    # head whose blocks it never recorded. The route is the same one it always
+    # was -- regenerate the base from its own workspace -- so this narrows what
+    # is accepted without narrowing what a reader can do about it.
+    try:
+        require_supported_report_schema(
+            payload.get("report_schema_version"),
+            subject=f"Reference report {display_path}",
+            regenerate_command=_REGENERATE_DIFF_BASE_COMMAND,
         )
+    except ReportSchemaCompatibilityError as exc:
+        raise InputParseError(str(exc)) from exc
     try:
         report = ReadinessReport.model_validate(payload)
     except ValidationError as exc:
         raise InputParseError(f"Invalid diff report {display_path}: {exc}") from exc
     facts = report.tool_surface_facts if "tool_surface_facts" in payload else None
     action_facts = report.action_surface_facts if "action_surface_facts" in payload else None
+    declaration_facts = (
+        report.action_declaration_facts
+        if "action_declaration_facts" in payload
+        else None
+    )
     notes: list[str] = []
     action_notes: list[str] = []
     if facts is None:
@@ -934,38 +1023,26 @@ def _reference_from_report_payload(
         facts=facts,
         report_schema_version=report.report_schema_version,
         action_facts=action_facts,
+        declaration_facts=declaration_facts,
         findings=[
             item
             for item in (_finding_item(finding) for finding in report.findings)
             if item is not None
         ],
+        finding_evidence=tuple(report.findings),
         notes=tuple(notes),
         action_notes=tuple(action_notes),
         # Present on v0.22+ base reports; None for older bases (the
         # weakening checks degrade safely when it is absent).
         effective_policy=report.effective_policy,
+        # The v0.31 version check this used to carry became vacuous at the 1.0
+        # freeze: every accepted base is 1.x, and every 1.x is at or above the
+        # version that introduced the block. Presence in the payload is the
+        # question that still discriminates (#569).
         binding_facts=(
-            report.binding_surface_facts
-            if "binding_surface_facts" in payload
-            and _schema_version_at_least(report.report_schema_version, "0.31")
-            else None
+            report.binding_surface_facts if "binding_surface_facts" in payload else None
         ),
     )
-
-
-def _report_schema_precedes_semantic_diff(value: Any) -> bool:
-    return not _schema_version_at_least(value, _SEMANTIC_DIFF_REPORT_SCHEMA_VERSION)
-
-
-def _schema_version_at_least(value: Any, minimum_value: str) -> bool:
-    if not isinstance(value, str):
-        return False
-    try:
-        current = tuple(int(part) for part in value.split("."))
-        minimum = tuple(int(part) for part in minimum_value.split("."))
-    except ValueError:
-        return False
-    return current >= minimum
 
 
 def _reference_from_baseline_payload(

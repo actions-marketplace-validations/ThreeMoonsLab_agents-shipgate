@@ -5,6 +5,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import shutil
+import sys
+import tomllib
+import types
 from pathlib import Path
 
 import pytest
@@ -18,8 +21,25 @@ from agents_shipgate.mcp_server import (
     shipgate_handoff,
     shipgate_preflight,
 )
+from tests.plugin_marker_fixture import install_marker_adapter_plugin
 
 _HAS_MCP_SDK = importlib.util.find_spec("mcp") is not None
+
+
+def _has_mcp_server_api() -> bool:
+    """Whether the installed SDK carries the 2.x ``MCPServer`` the server needs.
+
+    An SDK 1.x environment has ``mcp`` but not this module. Building the server
+    there must fail with a version diagnostic, not register tools.
+    """
+
+    try:
+        return importlib.util.find_spec("mcp.server.mcpserver") is not None
+    except ModuleNotFoundError:
+        return False
+
+
+_HAS_MCP_SERVER_API = _has_mcp_server_api()
 
 
 def _snapshot(root: Path) -> list[str]:
@@ -48,7 +68,7 @@ index 0000000..1111111
 
     after = _snapshot(tmp_path)
     assert after == before
-    assert payload["schema_version"] == "shipgate.agent_boundary_result/v2"
+    assert payload["schema_version"] == "shipgate.agent_boundary_result/v3"
     assert payload["agent"] == "cursor"
     assert payload["actor"] == "cursor"
     assert payload["affected_hosts"] == ["codex"]
@@ -101,7 +121,7 @@ def test_mcp_preflight_handler_is_read_only(tmp_path: Path) -> None:
         ),
     )
 
-    assert payload["preflight_schema_version"] == "0.3"
+    assert payload["preflight_schema_version"] == "0.6"
     assert payload["requires_human_review"] is True
     assert payload["requires_verify"] is True
     assert payload["control"]["state"] == "human_review_required"
@@ -159,7 +179,7 @@ def test_mcp_preflight_accepts_plan_without_writes(tmp_path: Path) -> None:
         },
     )
 
-    assert payload["preflight_schema_version"] == "0.3"
+    assert payload["preflight_schema_version"] == "0.6"
     assert payload["first_next_action"]["actor"] == "human"
     assert payload["control"]["state"] == "human_review_required"
     assert any(signal["kind"] == "least_privilege" for signal in payload["signals"])
@@ -229,6 +249,36 @@ def test_mcp_capabilities_handler_does_not_write_reports(tmp_path: Path) -> None
 
     assert payload["capability_lock_schema_version"] == "0.8"
     assert _snapshot(workspace) == before
+
+
+def test_mcp_capabilities_loads_adapter_plugins_only_on_the_opt_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The read-only `shipgate.capabilities` tool runs no plugin by default.
+
+    Its default `no_plugins=False` reached the lock builder as an explicit
+    `plugins_enabled=True`, so an agent host that auto-approves a read-only
+    tool imported every installed adapter plugin with the opt-in unset, where
+    `scan` and `verify` imported none (#1020).
+    """
+
+    marker = install_marker_adapter_plugin(tmp_path, monkeypatch)
+    workspace = tmp_path / "wk"
+    shutil.copytree("samples/clean_read_only_agent", workspace)
+
+    payload = shipgate_capabilities(config=str(workspace / "shipgate.yaml"))
+
+    assert not marker.exists(), "an adapter plugin was imported without the opt-in"
+    assert payload["source"]["plugins_enabled"] is False
+
+    monkeypatch.setenv("AGENTS_SHIPGATE_ENABLE_PLUGINS", "1")
+    payload = shipgate_capabilities(config=str(workspace / "shipgate.yaml"), no_plugins=True)
+    assert not marker.exists(), "no_plugins must win over the opt-in"
+    assert payload["source"]["plugins_enabled"] is False
+
+    payload = shipgate_capabilities(config=str(workspace / "shipgate.yaml"))
+    assert marker.exists(), "the fake plugin must be discoverable once opted in"
+    assert payload["source"]["plugins_enabled"] is True
 
 
 def test_mcp_handoff_handler_is_read_only(tmp_path: Path) -> None:
@@ -310,7 +360,7 @@ def test_mcp_handoff_handler_is_read_only(tmp_path: Path) -> None:
 
     payload = shipgate_handoff(verifier_path=str(output_dir / "verifier.json"))
 
-    assert payload["schema_version"] == "shipgate.agent_handoff/v8"
+    assert payload["schema_version"] == "shipgate.agent_handoff/v9"
     assert payload["gate"]["merge_verdict"] == "mergeable"
     assert payload["control"]["state"] == "complete"
     assert _snapshot(tmp_path) == before
@@ -322,7 +372,44 @@ def test_build_server_without_sdk_raises_config_error() -> None:
         build_server()
 
 
-@pytest.mark.skipif(not _HAS_MCP_SDK, reason="requires the optional mcp extra")
+def test_an_sdk_without_mcpserver_is_named_as_a_version_problem(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#713: reinstalling the extra cannot repair an SDK that lacks the API.
+
+    ``mcp`` imports but ``mcp.server.mcpserver`` does not, which is the shape of
+    an SDK 1.x environment. The diagnostic names the version problem and the
+    required range instead of repeating the install instruction.
+    """
+
+    if not _HAS_MCP_SDK:
+        monkeypatch.setitem(sys.modules, "mcp", types.ModuleType("mcp"))
+    monkeypatch.setitem(sys.modules, "mcp.server.mcpserver", None)
+
+    with pytest.raises(ConfigError) as caught:
+        build_server()
+
+    message = str(caught.value)
+    assert "mcp>=2.0.0,<3" in message
+    assert "MCPServer" in message
+    assert 'pip install --upgrade "agents-shipgate[mcp]"' in message
+    assert "requires the optional [mcp] extra" not in message
+
+
+def test_the_sdk_range_the_server_names_is_the_range_the_extra_declares() -> None:
+    from agents_shipgate.mcp_server.server import MCP_SDK_REQUIREMENT
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    extra = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"][
+        "optional-dependencies"
+    ]["mcp"]
+
+    assert extra == [MCP_SDK_REQUIREMENT]
+
+
+@pytest.mark.skipif(
+    not _HAS_MCP_SERVER_API, reason="requires the optional mcp extra (SDK 2.x)"
+)
 def test_build_server_registers_read_only_tools() -> None:
     server = build_server()
 
@@ -340,8 +427,8 @@ def test_build_server_registers_read_only_tools() -> None:
     # machine-readable contract, not just the server prose instructions.
     for tool in listed:
         assert tool.annotations is not None, tool.name
-        assert tool.annotations.readOnlyHint is True, tool.name
-        assert tool.annotations.openWorldHint is False, tool.name
+        assert tool.annotations.read_only_hint is True, tool.name
+        assert tool.annotations.open_world_hint is False, tool.name
 
 
 def _write_json(path: Path, payload: dict) -> None:

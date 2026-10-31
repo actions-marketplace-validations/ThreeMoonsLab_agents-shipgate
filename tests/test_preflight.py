@@ -33,7 +33,7 @@ from agents_shipgate.schemas.preflight import (
     CapabilityRequestV1,
     PreflightResultV1,
     PreflightResultV2,
-    PreflightResultV3,
+    PreflightResultV6,
 )
 
 runner = CliRunner()
@@ -125,7 +125,8 @@ def test_preflight_routes_protected_surface_touches_to_human(tmp_path: Path) -> 
     assert by_path[".github/workflows/agents-shipgate.yml"].kind == "ci_gate"
     assert by_path[".codex/config.toml"].kind == "codex_config"
     assert "**/shipgate.yaml" not in forbidden_file_edits()
-    assert any("AGENTS.md" in pattern for pattern in result.forbidden_file_edits)
+    assert not any("AGENTS.md" in pattern for pattern in result.forbidden_file_edits)
+    assert any("AGENTS.md" in pattern for rule in result.conditional_file_edits for pattern in rule.patterns)
     assert any(".codex/config.toml" in pattern for pattern in result.forbidden_file_edits)
 
 
@@ -1040,7 +1041,7 @@ def test_trust_root_graph_records_recursive_pattern_files(
 def test_base_preflight_reports_trust_root_graph_drift(tmp_path: Path) -> None:
     root = _workspace(tmp_path)
     base = build_preflight_result(workspace=root)
-    (root / "AGENTS.md").write_text("Run Shipgate before completion.\n", encoding="utf-8")
+    (root / ".codex/config.toml").write_text("sandbox_mode = 'danger-full-access'\n", encoding="utf-8")
 
     head = build_preflight_result(workspace=root, base_preflight=base)
 
@@ -1078,12 +1079,15 @@ def test_base_preflight_accepts_legacy_v1_payload(tmp_path: Path) -> None:
         if field in PreflightResultV1.model_fields
     }
     base_payload["preflight_schema_version"] = "0.1"
+    base_payload["trust_root_graph"]["schema_version"] = "0.1"
+    for node in base_payload["trust_root_graph"]["nodes"]:
+        node.pop("instruction_structures", None)
     legacy_base = PreflightResultV1.model_validate(base_payload)
 
     (root / "AGENTS.md").write_text("Run Shipgate before completion.\n", encoding="utf-8")
     head = build_preflight_result(workspace=root, base_preflight=legacy_base)
 
-    assert head.preflight_schema_version == "0.3"
+    assert head.preflight_schema_version == "0.6"
     assert head.trust_root_graph_diff is not None
     assert head.trust_root_graph_diff.changed is True
 
@@ -1123,7 +1127,7 @@ def test_preflight_plan_routes_multiple_capability_and_host_requests(
         },
     )
 
-    assert result.preflight_schema_version == "0.3"
+    assert result.preflight_schema_version == "0.6"
     assert result.requires_human_review is True
     assert result.requires_verify is True
     assert result.plan_summary["capability_request_count"] == 2
@@ -1168,7 +1172,7 @@ def test_cli_preflight_json_changed_files_and_diff(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["preflight_schema_version"] == "0.3"
+    assert payload["preflight_schema_version"] == "0.6"
     assert payload["requires_human_review"] is True
     assert payload["requires_verify"] is True
     assert payload["control"]["state"] == "human_review_required"
@@ -1216,7 +1220,7 @@ def test_cli_preflight_uses_diff_semantics_for_safe_manifest_proposal(
         {
             "path": "shipgate.yaml",
             "kind": "manifest",
-            "pattern": "**/shipgate.yaml",
+            "pattern": "shipgate.yaml",
             "scope_type": "key_level",
             "requires_human_review": False,
         }
@@ -1282,7 +1286,7 @@ def test_cli_preflight_plan_stdin_routes_clean_docs_to_verify(tmp_path: Path) ->
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["preflight_schema_version"] == "0.3"
+    assert payload["preflight_schema_version"] == "0.6"
     assert payload["requires_human_review"] is False
     assert payload["first_next_action"]["kind"] == "verify"
     _assert_verify_command(payload["allowed_next_commands"][0], root, "shipgate.yaml")
@@ -1310,14 +1314,15 @@ def test_cli_preflight_plan_empty_stdin_is_empty_plan(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["preflight_schema_version"] == "0.3"
+    assert payload["preflight_schema_version"] == "0.6"
     assert payload["changed_files"] == []
     assert payload["requires_human_review"] is False
     assert payload["requires_verify"] is False
     assert payload["first_next_action"]["kind"] == "continue"
-    assert payload["control"]["state"] == "complete"
-    assert payload["control"]["completion_allowed"] is True
+    assert payload["control"]["state"] == "planning_only"
+    assert payload["control"]["completion_allowed"] is False
     assert payload["control"]["must_stop"] is False
+    assert not any(payload["control"]["permissions"].values())
 
 
 def test_base_preflight_accepts_frozen_v2_payload(tmp_path: Path) -> None:
@@ -1329,6 +1334,11 @@ def test_base_preflight_accepts_frozen_v2_payload(tmp_path: Path) -> None:
         if field in PreflightResultV2.model_fields
     }
     payload["preflight_schema_version"] = "0.2"
+    payload["trust_root_graph"]["schema_version"] = "0.1"
+    for node in payload["trust_root_graph"]["nodes"]:
+        node.pop("instruction_structures", None)
+    for touch in payload["protected_surface_touches"]:
+        touch.pop("instruction_structure_unchanged", None)
     legacy = PreflightResultV2.model_validate(payload)
 
     head = build_preflight_result(
@@ -1337,9 +1347,10 @@ def test_base_preflight_accepts_frozen_v2_payload(tmp_path: Path) -> None:
         base_preflight=legacy,
     )
 
-    assert isinstance(head, PreflightResultV3)
-    assert head.preflight_schema_version == "0.3"
-    assert head.control.state == "agent_action_required"
+    assert isinstance(head, PreflightResultV6)
+    assert head.preflight_schema_version == "0.6"
+    assert head.control.state == "human_review_required"
+    assert head.trust_root_graph_diff.changed  # legacy captured no instruction structure
 
 
 def test_preflight_legacy_projection_cannot_contradict_control_in_model_or_schema(
@@ -1353,9 +1364,9 @@ def test_preflight_legacy_projection_cannot_contradict_control_in_model_or_schem
         "why": "Contradict complete control.",
     }
     with pytest.raises(ValidationError):
-        PreflightResultV3.model_validate(payload)
+        PreflightResultV6.model_validate(payload)
     schema = json.loads(
-        (Path(__file__).resolve().parent.parent / "docs/preflight-schema.v0.4.json").read_text(
+        (Path(__file__).resolve().parent.parent / "docs/preflight-schema.v0.6.json").read_text(
             encoding="utf-8"
         )
     )
@@ -1581,3 +1592,63 @@ def test_high_risk_capability_without_evidence_does_not_pass(tmp_path: Path) -> 
         "SHIP-POLICY-APPROVAL-MISSING",
         "SHIP-SIDEFX-IDEMPOTENCY-MISSING",
     } & active_check_ids
+
+
+def test_host_drift_reason_names_every_expansion_kind_and_what_it_folded() -> None:
+    """#681: the reason printed the first five signals of a list sorted by
+    kind, so five `allow_rule_added` entries hid `Bash(*)`, the removed deny
+    rule, the new MCP server, the permission mode and the workflow write, and
+    said nothing about the cut."""
+    from agents_shipgate.core.preflight import signals_for_host_grant_drift
+
+    folded = [f"allow_rule_added: claude-code:Bash(npm run {name})" for name in "abcde"]
+    distinct = [
+        "deny_rule_removed: claude-code:WebFetch",
+        "mcp_server_added: claude-code:postgres",
+        "permission_mode_added: claude-code:.claude/settings.json",
+        "wildcard_allow_added: claude-code:Bash(*)",
+        "workflow_write_changed: .github/workflows/ci.yml",
+    ]
+    [signal] = signals_for_host_grant_drift(
+        {
+            "comparison_status": "comparable",
+            "has_drift": True,
+            "expansion_signals": sorted(folded + distinct),
+        }
+    )
+
+    assert "Expansion signals (10): " in signal.reason
+    for entry in distinct:
+        assert entry in signal.reason
+    assert f"{folded[0]} (+4 more of this kind)" in signal.reason
+    assert all(entry not in signal.reason for entry in folded[1:])
+
+
+def test_host_drift_reason_marks_a_lone_signal_as_complete() -> None:
+    from agents_shipgate.core.preflight import signals_for_host_grant_drift
+
+    [signal] = signals_for_host_grant_drift(
+        {
+            "comparison_status": "comparable",
+            "has_drift": True,
+            "expansion_signals": ["mcp_server_added: claude-code:postgres"],
+        }
+    )
+
+    assert signal.reason.endswith(
+        "Expansion signals (1): mcp_server_added: claude-code:postgres"
+    )
+
+
+def test_host_drift_reason_says_how_many_incomparable_reasons_it_left_out() -> None:
+    from agents_shipgate.core.preflight import signals_for_host_grant_drift
+
+    [signal] = signals_for_host_grant_drift(
+        {
+            "comparison_status": "incomparable",
+            "incomparable_reasons": [f"reason_{index}" for index in range(7)],
+        }
+    )
+
+    assert "reason_4 (+2 more)" in signal.reason
+    assert "reason_5" not in signal.reason

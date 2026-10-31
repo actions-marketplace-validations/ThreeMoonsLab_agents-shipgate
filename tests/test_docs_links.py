@@ -31,13 +31,32 @@ def _current_report_schema_version() -> str:
     return str(ReadinessReport.model_fields["report_schema_version"].default)
 
 
+def _report_schema_versions() -> list[tuple[int, ...]]:
+    """Every published report schema version, ordered oldest first."""
+
+    versions = []
+    for path in DOCS_DIR.glob("report-schema.v*.json"):
+        raw = path.name[len("report-schema.v") : -len(".json")]
+        try:
+            versions.append(tuple(int(part) for part in raw.split(".")))
+        except ValueError:  # pragma: no cover - a filename we do not publish
+            continue
+    return sorted(versions)
+
+
 def _previous_report_schema_version() -> str:
-    """The next-most-recent schema version, expected to remain linked
-    from the index as a frozen reference. Derived as ``current - 1``
-    on the minor."""
-    current = _current_report_schema_version()
-    major, minor = current.split(".")
-    return f"{major}.{int(minor) - 1}"
+    """The published version immediately below the current one.
+
+    Derived from the published set rather than as ``current - 1`` on the
+    minor. Arithmetic on the minor works only inside one major: at the 1.0
+    freeze it computed ``1.-1``, a file that has never existed, and the
+    frozen-reference guard would have asserted its absence forever.
+    """
+
+    current = tuple(int(part) for part in _current_report_schema_version().split("."))
+    older = [version for version in _report_schema_versions() if version < current]
+    assert older, f"no published report schema precedes {current}"
+    return ".".join(str(part) for part in older[-1])
 
 AGENT_FACING_DOCS = (
     "agent-recipes.md",
@@ -142,8 +161,11 @@ def test_no_doc_falsely_advertises_an_older_schema_as_current():
     an adjacent stale "current" claim about v0.N. The marker must now
     lie *between* the older mention and the nearest "current"."""
     current = _current_report_schema_version()
-    older_minor = re.compile(r"report-schema\.v0\.(?P<minor>\d+)\.json")
-    current_minor = int(current.split(".")[1])
+    # Matches any published major, not only ``v0.``. Scoped to ``v0.`` this
+    # became vacuous at the 1.0 freeze: ``int("1.0".split(".")[1])`` is 0, so
+    # every mention compared ">= 0" and the guard stopped guarding.
+    older_minor = re.compile(r"report-schema\.v(?P<version>\d+\.\d+)\.json")
+    current_version = tuple(int(part) for part in current.split("."))
     markers = ("frozen", "legacy", "older", "pre-v")
 
     scan_paths = sorted(DOCS_DIR.rglob("*.md")) + [
@@ -158,8 +180,8 @@ def test_no_doc_falsely_advertises_an_older_schema_as_current():
             if "current" not in lower:
                 continue
             for match in older_minor.finditer(line):
-                mentioned = int(match.group("minor"))
-                if mentioned >= current_minor:
+                mentioned = tuple(int(part) for part in match.group("version").split("."))
+                if mentioned >= current_version:
                     continue
                 # The frozen/legacy marker only excuses the mention when
                 # it sits BETWEEN the mention and a "current" on the same
@@ -180,7 +202,7 @@ def test_no_doc_falsely_advertises_an_older_schema_as_current():
                     index = lower.find("current", index + 1)
                 if not excused:
                     failures.append(
-                        f"{relpath}: report-schema.v0.{mentioned}.json "
+                        f"{relpath}: report-schema.v{match.group('version')}.json "
                         "on a line claiming 'current' without a "
                         "frozen/legacy/older marker between them"
                     )
@@ -220,18 +242,31 @@ def test_current_schema_trackers_name_the_current_schema_file():
     )
 
 
-def test_trust_model_documents_bounded_git_discovery_exception():
-    """The trust model must keep the local git subprocess exception explicit.
+def test_trust_model_documents_its_process_boundaries():
+    """The trust model names its process boundaries rather than denying them.
 
-    Discovery can use git to avoid private/cache/generated workspace noise, but
-    the no-user-code/no-network boundary still holds.
+    It used to say Shipgate shells out only for bounded `git` discovery in
+    `detect` and auto-init, and this test pinned that sentence while `verify`,
+    `bootstrap`, `authorization execute` and the native prover all started
+    processes (#1020). The list itself is checked against the source by
+    `tests/test_adapter_static_only.py::test_trust_model_lists_every_process_boundary`;
+    this pins the claims a reader acts on.
     """
     text = (DOCS_DIR / "trust-model.md").read_text(encoding="utf-8")
-    assert "- shell out to subprocesses;" not in text
-    assert "bounded local `git` discovery" in text
+    assert "- shell out to subprocesses" not in text
+    assert "except for bounded local `git` discovery" not in text
+    assert "[Process Boundaries](#process-boundaries)" in text
+    assert "\n## Process Boundaries\n" in text
+    # Discovery's Git use keeps its own, narrower statement.
     assert "`rev-parse` and `ls-files`" in text
     assert "does not contact remotes" in text
     assert "run framework CLIs" in text
+    # bootstrap's child CLI and the one network-capable process are named.
+    assert "`<sys.executable> -P -m agents_shipgate`" in text
+    assert "network-capable" in text
+    # The plugin opt-in covers the read-only MCP tool and capability export.
+    assert "`shipgate.capabilities`" in text
+    assert "`capability export`" in text
 
 
 def test_target_repo_snippets_pin_advisory_agent_contract():
@@ -252,23 +287,48 @@ def test_target_repo_snippets_pin_advisory_agent_contract():
 
 
 def test_readme_onboarding_copy_pins_agent_contract():
+    """The onboarding copy still exists, and the README still reaches it.
+
+    #498 turned the README into a landing page and moved the paste-into-an-agent
+    prompt and the adoption walkthrough into the docs they belong to. What this
+    test protects is unchanged — that a reader arriving at the README can get to
+    the contract, the demo and the boundary — so it now checks the landing page
+    for the route and the destination for the copy, rather than requiring one
+    file to hold both.
+    """
+
     text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     assert "The deterministic merge gate for AI-generated agent capability changes" in text
     assert "5-minute" in text
-    assert "Copy this into your coding agent" in text
     assert "https://github.com/marketplace/actions/agents-shipgate" in text
-    assert "Sample reports" in text
     assert "release_decision.decision" in text
-    assert "agents-shipgate-reports/report.json" in text
     assert "agents-shipgate contract --json" in text
-    assert "apply-patches" in text
-    assert "--confidence high --apply" in text
-    assert "auto-assert action effect, action authority" in text
-    assert "confirmation" in text
-    assert "idempotency" in text
-    assert "broad-scope" in text
-    assert "prohibited-action" in text
     assert "agents-shipgate-reports/" in text
+
+    # Every destination the landing page hands a reader must be linked from it.
+    for destination in (
+        "docs/quickstart.md",
+        "docs/target-repo-agent-snippets.md",
+        "docs/agent-contract-current.md",
+        "docs/agent-autofix-boundary.md",
+        "samples/README.md",
+    ):
+        assert destination in text, (
+            f"README.md no longer links {destination}; the landing page is only "
+            "an entry point if its exits are reachable."
+        )
+
+    snippets = (DOCS_DIR / "target-repo-agent-snippets.md").read_text(encoding="utf-8")
+    assert "Paste Into A Coding Agent" in snippets
+    assert "auto-assert action effect, action authority" in snippets
+    for boundary in ("confirmation", "idempotency", "broad-scope", "prohibited-action"):
+        assert boundary in snippets
+
+    quickstart = (DOCS_DIR / "quickstart.md").read_text(encoding="utf-8")
+    assert "agents-shipgate-reports/report.json" in quickstart
+    assert "apply-patches" in quickstart
+    assert "--confidence high --apply" in quickstart
+    assert "samples/ai_generated_refund_pr" in quickstart
 
 
 def test_target_repo_cursor_globs_cover_shipgate_discovery_names():

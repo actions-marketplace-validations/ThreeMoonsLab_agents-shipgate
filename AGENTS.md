@@ -8,9 +8,10 @@ Authoritative instructions for AI coding agents (Claude Code, Codex, Cursor, Aid
 
 ## What this project is
 
-The deterministic merge gate for AI-generated agent capability changes. Reads `shipgate.yaml` plus tool sources (MCP exports, OpenAPI specs, OpenAI Agents SDK Python files, Anthropic Messages API tool/prompt artifacts, Google ADK Python/config files, LangChain/LangGraph Python files, CrewAI Python files, OpenAI API artifacts, Codex repo config, Codex plugin packages and marketplaces, n8n workflow JSON/stubs, Conductor OSS workflow JSON) and produces deterministic findings. Local-first and static by default — no agent execution, tool calls, LLM calls, or network access.
+The deterministic merge gate for AI-generated agent capability changes. Reads `shipgate.yaml` plus tool sources (MCP exports, MCP server source (TypeScript/Go registration idioms), OpenAPI specs, OpenAI Agents SDK Python files, Anthropic Messages API tool/prompt artifacts, Google ADK Python/config files, LangChain/LangGraph Python files, CrewAI Python files, OpenAI API artifacts, Codex repo config, Codex plugin packages and marketplaces, n8n workflow JSON/stubs, Conductor OSS workflow JSON) and produces deterministic findings. Local-first and static by default — no agent execution, tool calls, LLM calls, or network access.
 
-- **Inputs:** MCP · OpenAPI · OpenAI Agents SDK · Anthropic Messages API · Google ADK · LangChain/LangGraph · CrewAI · OpenAI API · Codex config · Codex plugin · n8n · Conductor OSS workflow JSON
+- **Host-configuration review:** `agents-shipgate diff` shows what a change does to declared coding-agent configuration — `.claude/settings.json`, `.mcp.json`, hooks, Codex, Cursor and VS Code MCP config, GitHub workflow permissions — with no `shipgate.yaml`, saved baseline or skill. It compares against the base already in Git history, names recognized sources it could not read, and implies no verdict. A no-change answer covers only what both sides read. It names a changed input a bounded candidate list recognises but no reader reads — a plugin's `mcp.json`, `.cursor/hooks.json`, a nested `.claude/settings.json`, an external marketplace source — as `added`, `removed` or `changed, not read by this entry`, and says nothing about the other [surfaces `diff` does not read](docs/host-boundary-support.md#known-unread-surfaces), such as hook scripts, composite actions and subagent hooks; see **Run (canonical)** and [`docs/host-boundary-support.md`](docs/host-boundary-support.md) for what it reads.
+- **Inputs:** MCP · MCP server source · OpenAPI · OpenAI Agents SDK · Anthropic Messages API · Google ADK · LangChain/LangGraph · CrewAI · OpenAI API · Codex config · Codex plugin · n8n · Conductor OSS workflow JSON
 - **Outputs:** Markdown · JSON · SARIF
 - **Trust:** Static-by-default. No agent execution, tool calls, LLM calls, or network access.
 - **Marketing site:** [threemoonslab.com](https://threemoonslab.com/) — human-readable companion pages. **If you are an agent working inside this repo, use the in-tree [`.well-known/agents-shipgate.json`](.well-known/agents-shipgate.json) (current `main` contract, may be ahead of the site's released copy) for schema-version and gating-signal decisions.**
@@ -73,6 +74,21 @@ agents-shipgate scan -c shipgate.yaml
 
 Reports land at `agents-shipgate-reports/report.{md,json}`.
 
+**What did this change do to the agent's authority?** — one row per host
+grant, no manifest and no committed baseline required:
+
+```bash
+shipgate diff --workspace .
+```
+
+It compares the detected default branch's merge base with the working tree,
+materialising the base tree and reading it with the same host readers, then
+handing both inventories to the comparator `audit --host --drift` already
+uses. Rows carry before, after, direction, why it matters and the engine's
+severity; `⚠` marks the changes the engine called expansions of authority.
+`--json` emits the same rows. It publishes no verdict: static configuration
+is what the files permit, not what the agent did.
+
 **Local control for coding agents** — before reporting an agent-capability
 change complete, run the local control loop and parse stdout JSON:
 
@@ -85,6 +101,17 @@ shipgate check --agent cursor --workspace . --format agent-boundary-json
 `--agent` identifies the caller; it never selects host coverage. Every
 recognized changed Codex, Claude Code, Cursor, VS Code MCP, shared trust-root,
 and GitHub workflow surface is evaluated on every run.
+
+**What a flagless run compares.** The detected default branch's merge base
+against the working tree, so committed branch work and uncommitted edits are
+one comparison. `subject.base` names the ref that was used. `--base` and
+`--head` are independent: `--base <ref>` compares that ref's merge base with
+the working tree, `--head <ref>` compares the detected base against it, and
+both together are the committed `base...head` range. `--base HEAD` restricts
+the run to uncommitted changes. On the default branch, where there is no
+other base, the working-tree comparison is the whole answer. Where no base
+can be detected at all — no remote, no `main` or `master` — the run stops and
+names `--base` rather than reporting a pass it did not establish.
 
 Read the single stdout object as `shipgate.agent_boundary_result/v1`. Switch on
 `control.state`; inspect `input_coverage`, `host_coverage`, `affected_hosts`,
@@ -115,7 +142,11 @@ agents-shipgate preflight --capability-request request.json --json
 
 Switch on `control.state`. If it is `human_review_required`, stop and route the
 change to a human. If it is `agent_action_required`, perform only the exact
-coding-agent route in `control.next_action`. The plan form accepts `changed_files[]`,
+coding-agent route in `control.next_action`. If it is `planning_only` (preflight
+`0.6`, contract v42), the plan named nothing for preflight to route — an empty
+plan, for example. Only planning completed: every `control.permissions` value
+is `false`. Preflight never authorizes merge or completion, and never returns
+`complete`. The plan form accepts `changed_files[]`,
 `diff_text`, `capability_requests[]`, `host_permission_requests[]`, and
 `context.{agent,task}`; prefer it whenever the agent can describe the planned
 change as one JSON object. Protected surfaces include
@@ -124,6 +155,18 @@ change as one JSON object. Protected surfaces include
 suppressions, Codex hooks/config, Codex plugin manifests, `.mcp.json`,
 `.app.json`, and `SKILL.md`. Preflight is a routing/projection surface only;
 `release_decision.decision` remains the release gate.
+
+Contract v32 makes instruction protection conditional on parsed structure.
+For a prose edit, supply the complete proposed `diff_text` to preflight; a
+path-only plan still routes to review. Only an explicit
+`protected_surface_touches[].instruction_structure_unchanged: true` on that
+exact path proves the supported structure did not change. Unknown/malformed
+frontmatter, inline preprocessing changes, registration moves and configured
+manifest/policy edits retain their review route. This does not judge prompt
+safety or grant edit/merge authority. Verifier v0.17 and handoff v9 publish
+`conditional_file_edits` separately from unconditional `forbidden_file_edits`;
+follow current `control` as before. See the
+[instruction structure boundary](docs/engineering/instruction-structure-boundary.md).
 
 **PR / reviewer evidence** — for committed PR/CI refs, run the deterministic
 verifier on the diff. Make the base ref available first because `verify` never
@@ -263,7 +306,15 @@ agents-shipgate bootstrap --json
   read at all when the parse was cut short. Stop only when the whole published
   stop condition holds: `is_agent_project: false` **and** `suggested_sources`
   empty **and** `codex_plugin_candidates` empty **and**
-  `python_parse_truncated: false`. `python_parse_truncated: true` means the
+  `host_boundary_candidates` empty **and** `host_discovery_incomplete_paths`
+  empty **and** `python_parse_truncated: false`. Host candidates are filenames
+  only: follow `control.next_action` to `audit --host`; no manifest is needed
+  and no grants have been verified. A path the census could not see through —
+  a link it does not follow, a directory it could not read — can conceal nested
+  host configuration, so an incomplete host census is never a terminal
+  negative. It is not a failed classification either: the framework, source
+  and scope answers stand beside it.
+  `python_parse_truncated: true` means the
   Python parse stopped at `max_python_files`, so the negative describes the
   files that were read rather than the repository — re-run with
   `--max-python-files <workspace_signals.python_file_total>`, which is a bound
@@ -357,7 +408,7 @@ Config error: Config file not found: missing.yaml
 {"error": "config_error", "message": "...", "next_action": "agents-shipgate detect --workspace . --json", "next_actions": [{"kind": "command", "command": "agents-shipgate detect --workspace . --json", "why": "..."}, {"kind": "command", "command": "agents-shipgate init --workspace . --write", "why": "..."}]}
 ```
 
-The full set of error kinds emitted in agent mode: `config_error`, `config_already_exists`, `input_parse_error`, `unknown_check_id`, `unknown_fingerprint`, `other_error`, `internal_error`, `malformed_patch`, `environment_error`. `unknown_fingerprint` is emitted by `explain-finding` when the fingerprint doesn't match any entry in the supplied report; the payload includes `suggestion` (a close-match fingerprint, when one exists) and `source_report`. `environment_error` is the one kind emitted before Agents Shipgate is running — the interpreter is unsupported, or it cannot import the package or its dependencies — so it carries the `environment` block described below instead of a `control` envelope.
+The full set of error kinds emitted in agent mode: `config_error`, `config_already_exists`, `input_parse_error`, `unknown_check_id`, `unknown_fingerprint`, `other_error`, `internal_error`, `malformed_patch`, `environment_error`, `objects_missing`. `unknown_fingerprint` is emitted by `explain-finding` when the fingerprint doesn't match any entry in the supplied report; the payload includes `suggestion` (a close-match fingerprint, when one exists) and `source_report`. `environment_error` is the one kind emitted before Agents Shipgate is running — the interpreter is unsupported, or it cannot import the package or its dependencies — so it carries the `environment` block described below instead of a `control` envelope. `objects_missing` is `diff` refusing, with exit `2`, a partial clone (`git clone --filter=...`) that never fetched the base tree's objects; its `next_actions` are the `git fetch --refetch --no-filter <remote>` commands that hydrate the clone, one per promisor remote its configuration names, or one `review` when no remote can be named. Shipgate never runs that fetch itself.
 
 The machine-readable catalog of error kinds — exit codes, typical causes, additional fields per kind, recovery hints — lives at [`docs/errors.json`](docs/errors.json). Pre-fetch it once and pattern-match the `error` field instead of re-deriving the recovery vocabulary from this prose.
 
@@ -467,7 +518,7 @@ describe: it carries `next_action`/`next_actions` only. Error lines from
 through their control pointer (`agents-shipgate agent control`), and `check`
 through `--format agent-control-json`.
 
-Every emitted command names the entry point that started the running process, so it is runnable where it was produced: a console-script run emits `agents-shipgate …`, and a `python -m agents_shipgate` run emits `<sys.executable> -m agents_shipgate …`. Set `AGENTS_SHIPGATE_CLI` to name the entry point explicitly; it wins over detection. **On `next_actions[]`, run `[*executable, *args]` (contract v23+) rather than parsing `command`** — it needs no shell and is computed from `command`, so it cannot disagree with it; it is omitted, never `null`, when the command has no faithful argv form. The operational control contracts (`control.next_action`, `allowed_next_commands`, verifier repairs) carry the string only: recover argv there with `shlex.split(command)`, which is exact on every platform because every emitted command is POSIX-rendered. Never use `shell=True`, and do not paste `command` into `cmd.exe` or PowerShell. Durable artifacts (`report.json`, `packet.*`) stay canonical so that same inputs still produce the same report. See [docs/diagnostics.md](docs/diagnostics.md#invocation-policy).
+Every emitted command names the entry point that started the running process, so it is runnable where it was produced: a console-script run emits `agents-shipgate …`, and a `python -m agents_shipgate` run emits `<sys.executable> -P -m agents_shipgate …`. Set `AGENTS_SHIPGATE_CLI` to name the entry point explicitly; it wins over detection. **On `next_actions[]`, run `[*executable, *args]` (contract v23+) rather than parsing `command`** — it needs no shell and is computed from `command`, so it cannot disagree with it; it is omitted, never `null`, when the command has no faithful argv form. The operational control contracts (`control.next_action`, `allowed_next_commands`, verifier repairs) carry the string only: recover argv there with `shlex.split(command)`, which is exact on every platform because every emitted command is POSIX-rendered. Never use `shell=True`, and do not paste `command` into `cmd.exe` or PowerShell. Durable artifacts (`report.json`, `packet.*`) stay canonical so that same inputs still produce the same report. See [docs/diagnostics.md](docs/diagnostics.md#invocation-policy).
 
 ### Doctor behavior change for unresolved tool_sources
 
@@ -475,7 +526,8 @@ When a required `tool_sources[].path` does not resolve under the manifest direct
 
 - `agents-shipgate doctor --json` exits **0** with a `SHIP-DIAG-MISSING-SOURCE-FILE` diagnostic and an `unresolved_sources: [{id, declared_path, line, reason}]` field in the payload, so an agent can route to a fix without parsing the error message. `reason` is `"missing"` or `"outside_manifest_dir"`.
 - `agents-shipgate doctor` (no `--json`) prints the same `unresolved_sources` + diagnostic block in human-readable form and **exits 3**, preserving the pre-feature loud failure for interactive users.
-- `agents-shipgate scan` is unchanged — it still raises `InputParseError(3)` regardless of `--json`. Once you're past doctor, missing sources are real scan failures.
+- `agents-shipgate scan` is unchanged — it still raises `InputParseError(3)` regardless of `--json`. Once you're past doctor, missing sources are real scan failures. One precondition enforces this for every source type before any adapter runs, off the resolver doctor uses, so the answer does not depend on which reader the source would have gone to. `optional: true` sources are not covered: they keep their source warning and recovery evidence, and the scan completes.
+- `verify` applies the same precondition to each tree it scans. A base commit whose manifest declares a path that tree does not contain yields `base_status: "scan_failed"` with the reason in `base_notes` and no capability delta; the head gate is unchanged.
 
 ### Missing vs invalid manifests
 
@@ -490,6 +542,7 @@ When a required `tool_sources[].path` does not resolve under the manifest direct
 
 Use it when the user is:
 
+- Reviewing a pull request that changes a coding agent's declared configuration (`.claude/settings.json`, `.mcp.json`, hooks, Codex, Cursor or VS Code MCP config, GitHub workflow permissions): run `agents-shipgate diff`, which needs no `shipgate.yaml`, baseline or skill
 - Writing or modifying an AI agent that calls tools (MCP servers, OpenAPI APIs, `@function_tool`-decorated Python, Google ADK, LangChain/LangGraph, CrewAI, n8n, Conductor OSS)
 - Publishing or modifying a Codex plugin package or marketplace entry that declares skills, apps, MCP servers, or hooks
 - Adding a new tool, scope, or policy to an existing agent
@@ -508,6 +561,7 @@ Do NOT use it for:
 | Trigger in this PR | Run Shipgate? |
 |---|---|
 | Adds/changes MCP exports, OpenAPI specs, or `tools/*openai*tools*.json` | Yes |
+| Adds/changes an MCP tool registration written in TypeScript, Go or Python source (`static toolName`, `.registerTool(`, `MustTool(`, `NewTool(`, `mcp.Tool{`, `@mcp.tool`) | Yes |
 | Adds/changes Codex repo config, hooks, or permission profiles | Yes |
 | Adds/changes coding-agent host config, hooks, permissions, MCP servers, or workflows | Yes |
 | Adds/changes Codex plugin manifests, marketplace files, `.app.json`, `.mcp.json`, or `SKILL.md` files | Yes |
@@ -522,7 +576,7 @@ Do NOT use it for:
 
 One known gap in the Google ADK row: an edit that *modifies* a tools list on the `Agent` alias (rather than `LlmAgent`) is not matched, because a bare `Agent(..., tools=[...])` hunk with no ADK import in it cannot be distinguished from CrewAI's by diff text alone. `LlmAgent` changes and whole-file additions in either spelling are covered.
 
-`prompts/` and `policies/` in that row match at any depth and case-insensitively: an edit under `services/foo/policies/` or `enterprise/lib/captain/Prompts/` routes exactly like a repo-root one. That is parity with the verifier, whose trust-root classification has always read those two surfaces as `**/policies/**` and `**/prompts/**` and has always tolerated the case variant a case-insensitive filesystem resolves to the canonical name. The catalog's `glob` and `none_match_glob` predicates match the same way, so a path cannot be a trust root to the verifier and a `no_match` to the router; the Tier B checks (`SHIP-VERIFY-POLICY-WEAKENED`, `SHIP-VERIFY-CI-GATE-REMOVED`, agent-instruction weakening, trigger-catalog drift) select their changed files the same way too, so a case variant cannot be a trust root in Tier A and invisible to the specialized check that carries the severity. `every_file_matches` is deliberately the exception and stays case-sensitive: it is the docs-only rule's own classifier, and `skip_shipgate` beats `run_shipgate`, so folding it would read `src/TEST_agent.py` — a production module on a case-sensitive filesystem — as a test file and skip a PR that adds a tool beside it. The rule is to fold the predicates that can only add evaluation, never the one that can subtract it. The three surfaces that copy this routing — the pre-commit `files:` regex, the `.cursor/rules/agents-shipgate.mdc` activation globs, and the documented copy-paste hook snippets — follow, so a nested governance edit also activates the host instructions and stages the local hook.
+`prompts/` and `policies/` in that row match at any depth and case-insensitively: an edit under `services/foo/policies/` or `enterprise/lib/captain/Prompts/` routes exactly like a repo-root one. That is parity with the verifier, whose trust-root classification has always read those two surfaces as `**/policies/**` and `**/prompts/**` and has always tolerated the case variant a case-insensitive filesystem resolves to the canonical name. The catalog's `glob` and `none_match_glob` predicates match the same way, so a path cannot be a trust root to the verifier and a `no_match` to the router; the Tier B checks (`SHIP-VERIFY-POLICY-WEAKENED`, `SHIP-VERIFY-CI-GATE-REMOVED`, the retained non-emitting agent-instruction weakening ID, trigger-catalog drift) select their changed files the same way too, so a case variant cannot be a trust root in Tier A and invisible to the specialized check that carries the severity. `every_file_matches` is deliberately the exception and stays case-sensitive: it is the docs-only rule's own classifier, and `skip_shipgate` beats `run_shipgate`, so folding it would read `src/TEST_agent.py` — a production module on a case-sensitive filesystem — as a test file and skip a PR that adds a tool beside it. The rule is to fold the predicates that can only add evaluation, never the one that can subtract it. The three surfaces that copy this routing — the pre-commit `files:` regex, the `.cursor/rules/agents-shipgate.mdc` activation globs, and the documented copy-paste hook snippets — follow, so a nested governance edit also activates the host instructions and stages the local hook.
 
 `shipgate.yaml` matches at any depth for the same reason. A monorepo keeps one manifest per project directory, so an edit to `services/refund/shipgate.yaml` — the file that declares that project's agent, purpose, and tool surface — routes exactly like a root-level one; a root-only rule reported it as `no_match`. A nested manifest is also an opt-in: `verify --preview` treats the changed project's own `shipgate.yaml` as the repo-already-adopted signal and routes verification to that manifest rather than to a root one governing a different boundary.
 
@@ -548,13 +602,24 @@ The command emits a stable JSON verdict: `should_run` (alias of `run_shipgate`),
 - `agents-shipgate detect --json` returns `is_agent_project: false`, AND
 - `suggested_sources` is empty (no MCP/OpenAPI hits flowing in as `mcp` or `openapi`), AND
 - `codex_plugin_candidates` is empty (no Codex plugin package or marketplace hits), AND
+- `host_boundary_candidates` is empty (no recognized host config paths), AND
+- `host_discovery_incomplete_paths` is empty (no unresolved traversal that can hide host config), AND
 - `python_parse_truncated` is `false` — every negative above is a claim about the whole workspace, and a run whose Python parse stopped at its cap read only part of one, AND (this is the raw parse bit, not `agent_scope_truncated`: that one additionally requires more than one candidate scope, so a single-scope workspace whose only agent sits past the cap leaves it false)
 - no `shipgate.yaml` already exists in the workspace, AND
 - the user did not explicitly request a scan.
 
 A `detect` payload that does not carry every one of those keys leaves the block unevaluable: `trigger` reports `stop_conditions_evaluated: false` and infers no stop. Re-run `detect` with the current CLI rather than reading an absent key as `false`.
 
-Otherwise proceed to `init`. MCP/OpenAPI tool-surface repos and Codex plugin package repos register as `is_agent_project: false` because they have no Python framework imports — but they are valid Shipgate targets. MCP/OpenAPI hits surface as `suggested_sources`; Codex plugin hits surface as `codex_plugin_candidates`. The trigger table above is the authoritative go/no-go.
+Otherwise follow `control.next_action`. Host-only repositories route to
+`audit --host` without a manifest; `host_boundary_candidates[].file_type`
+describes only the observed pathname, never parsed permission evidence.
+Configuration paths that are directories, and unrecognized links that could
+conceal nested configuration, route to inspection. `init` (including `--ci`
+and agent-instruction options) and `bootstrap` hand off without writing setup
+files on this host-only route. Explicit `init --minimal` retains its template
+behavior. MCP/OpenAPI tool-surface and Codex plugin repositories still use
+`init`; their candidates never become host grants. The trigger table above is
+the authoritative go/no-go.
 
 ---
 
@@ -564,12 +629,22 @@ Otherwise proceed to `init`. MCP/OpenAPI tool-surface repos and Codex plugin pac
 
 ```bash
 pipx install agents-shipgate
-agents-shipgate init --workspace . --write
-# edit shipgate.yaml to replace any CHANGE_ME values
+agents-shipgate init --workspace . --write --json
+# resolve the placeholders init reports, by owner (below), then:
 agents-shipgate scan -c shipgate.yaml
 ```
 
-`init` writes a manifest with `CHANGE_ME` placeholders for `agent.name` and `agent.declared_purpose`. Replace them by reading the agent's prompt or main file.
+`init --json` reports the placeholders two ways, and only one of them routes. **`placeholders[]` is a location list** — each entry is `path`, `current` and `line`, and carries no owner. **`control.next_action.actor` routes the turn**, not individual fields:
+
+- `actor: "human"` — *any* human-owned value is still unresolved. `permissions.edit` is `false`: surface the whole thing and stop. Do not edit the manifest, and do not split the array.
+- `actor: "coding_agent"` — every human-owned value has been supplied and only fields you own are left. `why` names the one to replace.
+
+**Never infer ownership from absence in `why`.** That sentence is fitted to the envelope's prose budget: with seven unresolved declarations it names three paths and then `and 4 more in placeholders[]`, and the four it dropped are human-owned too. It tells you where to start, not what is yours. The rule behind the split:
+
+- **You own** what you can read out of the repository — `agent.name`, `project.name`, the `tool_sources[]` rows. Escalating these stops a turn for work you own.
+- **A person owns** every *declaration*: purpose, prohibited actions, effect, authority, binding, approval, confirmation, idempotency, safeguards, accepted debt and its owner/reason/expiry, and the manifest blocks that are declarations end to end (`action_surface`, `permissions`, `policies`, `agent_bindings`, `tool_identity`, `checks`, `baseline`, `human_ack`, `risk_overrides`, `validation`, `organization`). While one is unresolved, `init` returns `control.next_action.actor: "human"` and `permissions.edit: false`. These values must be supplied by a human, because Shipgate never invents a declaration nobody made — a purpose or authority claim you lifted out of a prompt or README is a declaration nobody made, and the engine will treat it as evidence.
+
+Those names are examples of the rule, not the rule. `placeholders[]` is authoritative; when it disagrees with this list, it is right.
 
 ### Task 2 · Read findings programmatically
 
@@ -593,7 +668,7 @@ restate version archaeology here):
 - Audit envelopes: `release_decision.contribution_rules[]`, `policy_audit`,
   `privacy_audit`, `heuristics_filter` — explanatory, never a second gate
 
-The current schema is [`docs/report-schema.v0.42.json`](docs/report-schema.v0.42.json). Emitted reports carry `report_schema_version: "0.42"`; `surface_exclusions` records every subject a stage removed from the analysed surface and whether the release decision saw it, typed predicate support prevents heuristic evidence from being upgraded by policy severity or block metadata, and verify-native reports bind the content-addressed request and decision. A `passed` result requires a complete static binding graph from its entry points plus complete, conflict-free identity, effect, authority, and applicable-policy evidence for every reachable action. Every release decision explicitly carries `static_analysis_only: true`, `runtime_behavior_verified: false`, and `static_verdict_disclaimer`; packet §1 mirrors them. Binding, semantic, and policy-applicability gaps are not Findings and cannot be suppressed or baselined. See [`docs/passed-verdict-contract.md`](docs/passed-verdict-contract.md), [`docs/verification-reproducibility.md`](docs/verification-reproducibility.md), and [`docs/agent-contract-current.md`](docs/agent-contract-current.md). v0.41 remains frozen at [`docs/report-schema.v0.41.json`](docs/report-schema.v0.41.json).
+The current schema is [`docs/report-schema.v1.0.json`](docs/report-schema.v1.0.json), frozen at `1.0`, superseding `0.43`. Emitted reports carry `report_schema_version: "1.0"`; `surface_exclusions` records every subject a stage removed from the analysed surface and whether the release decision saw it, typed predicate support prevents heuristic evidence from being upgraded by policy severity or block metadata, and verify-native reports bind the content-addressed request and decision. A `passed` result requires a complete static binding graph from its entry points plus complete, conflict-free identity, effect, authority, and applicable-policy evidence for every reachable action. Every release decision explicitly carries `static_analysis_only: true`, `runtime_behavior_verified: false`, and `static_verdict_disclaimer`; packet §1 mirrors them. Binding, semantic, and policy-applicability gaps are not Findings and cannot be suppressed or baselined. See [`docs/passed-verdict-contract.md`](docs/passed-verdict-contract.md), [`docs/verification-reproducibility.md`](docs/verification-reproducibility.md), and [`docs/agent-contract-current.md`](docs/agent-contract-current.md). v0.43, the last pre-freeze version, remains frozen at [`docs/report-schema.v0.43.json`](docs/report-schema.v0.43.json). `1.x` is additive-only over `1.0`; a change that cannot be expressed additively needs `2.0`. Historical `0.x` reports stay published for reading archived artifacts, but are no longer accepted as engine input — see [`docs/report-1-0-contract.md`](docs/report-1-0-contract.md).
 
 **Release gating signal**: prefer `release_decision.decision` (`"blocked" | "review_required" | "insufficient_evidence" | "passed"`) over `summary.status`. The new field is **baseline-aware** — a baseline-matched critical surfaces in `release_decision.review_items` (accepted debt), not `release_decision.blockers`. `summary.status` stays baseline-blind for v0.7 compatibility, so a baseline-matched-only critical produces both `summary.status = "release_blockers_detected"` AND `release_decision.decision = "review_required"` (intentional divergence — see [STABILITY.md](STABILITY.md#release_decisiondecision-vs-summarystatus)). `insufficient_evidence` (added v0.14) signals that the scan saw too many low-confidence tools or source-loader warnings to be trustworthy; consumers that switch on the enum must fall back to `review_required` for unknown future values.
 
@@ -673,9 +748,13 @@ validation and [`docs/manifest-v0.1.md`](docs/manifest-v0.1.md) for prose.
 ### Where is the report schema?
 
 Parse `agents-shipgate-reports/report.json` and validate against
-[`docs/report-schema.v0.42.json`](docs/report-schema.v0.42.json) (current).
-Older reports (`report_schema_version: "0.10"`) validate against the
-frozen [`docs/report-schema.v0.10.json`](docs/report-schema.v0.10.json).
+[`docs/report-schema.v1.0.json`](docs/report-schema.v1.0.json) (current, frozen at `1.0`; it supersedes `0.43`).
+Every published schema stays published, so an archived report
+(`report_schema_version: "0.10"`) still validates against the frozen
+[`docs/report-schema.v0.10.json`](docs/report-schema.v0.10.json) — but a
+pre-freeze report is no longer accepted as *input* to this engine. It is
+refused by name with a regeneration route rather than reinterpreted under the
+current model's defaults; see [`docs/report-1-0-contract.md`](docs/report-1-0-contract.md).
 Do not scrape Markdown when JSON is available.
 
 ### How do I add a new check?
@@ -711,7 +790,8 @@ For the short, current statement of "which fields to read", see [`docs/agent-con
 | What | Path | Stable |
 |---|---|---|
 | Manifest schema | [`docs/manifest-v0.1.json`](docs/manifest-v0.1.json) | `0.1` |
-| Report schema (current) | [`docs/report-schema.v0.42.json`](docs/report-schema.v0.42.json) | `0.42` |
+| Report schema (current) | [`docs/report-schema.v1.0.json`](docs/report-schema.v1.0.json) | `1.0` |
+| Report schema (v0.43 frozen reference) | [`docs/report-schema.v0.43.json`](docs/report-schema.v0.43.json) | `0.43` |
 | Report schema (v0.38 frozen reference) | [`docs/report-schema.v0.38.json`](docs/report-schema.v0.38.json) | `0.38` |
 | Report schema (v0.37 frozen reference) | [`docs/report-schema.v0.37.json`](docs/report-schema.v0.37.json) | `0.37` |
 | Report schema (v0.34 frozen reference) | [`docs/report-schema.v0.34.json`](docs/report-schema.v0.34.json) | `0.34` |
@@ -751,17 +831,19 @@ For the short, current statement of "which fields to read", see [`docs/agent-con
 | Report schema (v0.8 frozen reference) | [`docs/report-schema.v0.8.json`](docs/report-schema.v0.8.json) | `0.8` |
 | Report schema (v0.7 frozen reference) | [`docs/report-schema.v0.7.json`](docs/report-schema.v0.7.json) | `0.7` |
 | Report schema (v0.6 frozen reference) | [`docs/report-schema.v0.6.json`](docs/report-schema.v0.6.json) | `0.6` |
-| Packet schema (Release Evidence Packet, latest) | [`docs/packet-schema.v0.17.json`](docs/packet-schema.v0.17.json) | `0.17` |
-| Agent result schema (current) | [`docs/agent-result-schema.v2.json`](docs/agent-result-schema.v2.json) | `agent_result_v2` |
-| Verifier schema (current) | [`docs/verifier-schema.v0.5.json`](docs/verifier-schema.v0.5.json) | `0.5` |
-| Agent handoff schema (current) | [`docs/agent-handoff-schema.v5.json`](docs/agent-handoff-schema.v5.json) | `shipgate.agent_handoff/v5` |
-| Preflight schema (current) | [`docs/preflight-schema.v0.3.json`](docs/preflight-schema.v0.3.json) | `0.3` |
-| Host-grants inventory schema | [`docs/host-grants-inventory-schema.v0.2.json`](docs/host-grants-inventory-schema.v0.2.json) | `0.2` |
-| Host-grants baseline schema | [`docs/host-grants-baseline-schema.v0.2.json`](docs/host-grants-baseline-schema.v0.2.json) | `0.2` |
-| Host-grants drift schema | [`docs/host-grants-drift-schema.v0.2.json`](docs/host-grants-drift-schema.v0.2.json) | `0.2` |
+| Packet schema (Release Evidence Packet, latest) | [`docs/packet-schema.v0.18.json`](docs/packet-schema.v0.18.json) | `0.18` |
+| Agent result schema (current) | [`docs/agent-result-schema.v3.json`](docs/agent-result-schema.v3.json) | `agent_result_v3` |
+| Verifier schema (current) | [`docs/verifier-schema.v0.21.json`](docs/verifier-schema.v0.21.json) | `0.21` |
+| Agent handoff schema (current) | [`docs/agent-handoff-schema.v9.json`](docs/agent-handoff-schema.v9.json) | `shipgate.agent_handoff/v9` |
+| Preflight schema (current) | [`docs/preflight-schema.v0.6.json`](docs/preflight-schema.v0.6.json) | `0.6` |
+| Host-grants inventory schema | [`docs/host-grants-inventory-schema.v0.7.json`](docs/host-grants-inventory-schema.v0.7.json) | `0.7` |
+| Host-grants baseline schema | [`docs/host-grants-baseline-schema.v0.7.json`](docs/host-grants-baseline-schema.v0.7.json) | `0.7` |
+| Host-grants drift schema | [`docs/host-grants-drift-schema.v0.7.json`](docs/host-grants-drift-schema.v0.7.json) | `0.7` |
 | Capability standard | [`docs/capability-standard.md`](docs/capability-standard.md) | `0.5` |
 | Capability lock schema | [`docs/capability-lock-schema.v0.8.json`](docs/capability-lock-schema.v0.8.json) | `0.8` |
 | Capability lock diff schema | [`docs/capability-lock-diff-schema.v0.9.json`](docs/capability-lock-diff-schema.v0.9.json) | `0.9` |
+| Capability payload schema (frozen) | [`docs/capability-payload-schema.v1.json`](docs/capability-payload-schema.v1.json) | `shipgate.capability_payload/v1` |
+| Capability delta attestation (frozen) | [`docs/capability-delta-attestation-schema.v1.json`](docs/capability-delta-attestation-schema.v1.json) | `shipgate.capability_delta_attestation/v1` |
 | Governance benchmark catalog schema | [`docs/governance-benchmark-catalog-schema.v0.2.json`](docs/governance-benchmark-catalog-schema.v0.2.json) | `0.2` |
 | Governance benchmark result schema | [`docs/governance-benchmark-result-schema.v0.2.json`](docs/governance-benchmark-result-schema.v0.2.json) | `0.2` |
 | Check catalog | [`docs/checks.json`](docs/checks.json) | regenerated each release |
@@ -821,7 +903,7 @@ NOT prove. Use `--no-packet` / `--packet-format` on `scan`, and
 `agents-shipgate evidence-packet --from <packet.json|report.json>` to
 re-render. The full packet contract (fixed sections, disclaimers,
 `evidence_matrix` rules) lives in
-[STABILITY.md §Release Evidence Packet](STABILITY.md#release-evidence-packet-v017)
+[STABILITY.md §Release Evidence Packet](STABILITY.md#release-evidence-packet-v018)
 and [`docs/agent-contract-current.md`](docs/agent-contract-current.md#read-these-for-release-review).
 
 Exit codes (stable):

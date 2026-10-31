@@ -36,14 +36,16 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ParamSpec, TypeVar
+from typing import Literal, ParamSpec, TypeVar
 
 from agents_shipgate.core.errors import AgentsShipgateError
+from agents_shipgate.core.privacy import redact_text
 from agents_shipgate.core.verification_identity import (
     plan_worktree_overlay_paths,
     read_regular_file_beneath,
     worktree_overlay,
 )
+from agents_shipgate.core.verification_input_currency import validate_current_plan_inputs
 from agents_shipgate.schemas.agent_control import (
     AgentControl,
     FullAgentPermissions,
@@ -141,9 +143,20 @@ class CurrentControlUnavailable(AgentsShipgateError):
         *,
         path: Path | None = None,
         artifacts: dict[str, bytes] | None = None,
+        reports_dir_refusal: str | None = None,
+        cause: LiveWorkspaceCause | None = None,
     ) -> None:
         self.reason = reason
         self.path = path
+        #: Set when the refusal is that the live workspace could not be
+        #: observed, or not all of it: why, already at the front of the
+        #: message, and the class a caller routes its recovery on (#813).
+        self.cause = cause
+        #: Set when the refusal is that the reports directory itself holds
+        #: repository content (#804). No rerun into that directory can publish
+        #: a current pointer, so a caller naming a recovery must not route back
+        #: into it.
+        self.reports_dir_refusal = reports_dir_refusal
         #: The artifacts this pass had already hash-validated against the
         #: pointer before the refusal. Present only where the refusal is about
         #: currency rather than integrity — a superseded pointer is still a
@@ -284,6 +297,7 @@ def _receipt_binding_refusal(
     *,
     request_id: str | None,
     decision_id: str | None,
+    receipt_bytes: bytes | None = None,
 ) -> str | None:
     """Return why completion must be refused, or ``None`` when it may stand."""
 
@@ -294,7 +308,11 @@ def _receipt_binding_refusal(
             "so completion authority cannot be established."
         )
     try:
-        receipt = _load_receipt(out_dir, ref)
+        receipt = (
+            _load_receipt(out_dir, ref)
+            if receipt_bytes is None
+            else VerificationReceipt.model_validate_json(receipt_bytes)
+        )
     except ValueError as exc:
         return f"The bound terminal receipt could not be read: {exc}"
     if receipt.request_id != request_id or receipt.decision_id != decision_id:
@@ -449,6 +467,89 @@ def workspace_identity_from_plan(plan: VerificationPlan) -> CurrentControlWorksp
     )
 
 
+#: What a failure to observe the live workspace says about the way out of it,
+#: which is all a caller routes its recovery on (#813):
+#:
+#: * ``repository_configuration`` — Git configuration the static worktree
+#:   readers refuse to run under: executable ``filter.*`` drivers, ``filter=``
+#:   attributes on tracked paths, repository-local ``diff.*`` configuration, a
+#:   non-empty ``.git/info/attributes``. It describes the repository rather
+#:   than the change, so no re-run, with or without ``--head``, answers
+#:   differently while it is in place.
+#: * ``reports_directory`` — the reports directory being read holds repository
+#:   content, so no pointer published there can be current (#804).
+#: * ``resource_limit`` — the uncommitted change exceeded a static read bound,
+#:   or Git did not finish in time.
+#: * ``other`` — anything else, including a workspace that is not a readable
+#:   Git checkout.
+LiveWorkspaceCauseKind = Literal[
+    "repository_configuration", "reports_directory", "resource_limit", "other"
+]
+
+#: The most text taken from a failure into a cause, in UTF-8 bytes. A cause
+#: leads its refusal, and ``verify --format control`` caps that refusal at 400
+#: bytes, so the cause must leave room for the sentence saying what it withholds.
+MAX_LIVE_WORKSPACE_CAUSE_BYTES = 280
+_CAUSE_TRUNCATION_MARKER = "…"
+
+
+def published_cause_text(text: str) -> str:
+    """``text`` as a refusal may carry it: redacted, then capped.
+
+    The input is a Shipgate-authored sentence, but the keys and paths it names
+    come from the repository, and a file name can be shaped like a credential
+    (the class of #802). Redaction runs before the cap, so a cut can never
+    leave the unredacted prefix of a token behind. Never raw exception text
+    from outside Shipgate, and never file content: the producer classifies
+    first and passes only its own sentence.
+    """
+
+    redacted = (redact_text(text) or "").strip()
+    encoded = redacted.encode("utf-8")
+    if len(encoded) <= MAX_LIVE_WORKSPACE_CAUSE_BYTES:
+        return redacted
+    keep = MAX_LIVE_WORKSPACE_CAUSE_BYTES - len(_CAUSE_TRUNCATION_MARKER.encode("utf-8"))
+    return encoded[:keep].decode("utf-8", errors="ignore").rstrip() + _CAUSE_TRUNCATION_MARKER
+
+
+@dataclass(frozen=True)
+class LiveWorkspaceCause:
+    """Why the live workspace, or its uncommitted change set, could not be read.
+
+    The currency refusals used to say only that something could not be
+    determined, and every one of them routed back to the same ``verify``
+    command — which, in a repository whose Git configuration the worktree
+    readers refuse, refused the same way forever (#813). A cause is what the
+    reader who hit the failure knew about it, classified so a caller can route
+    on ``kind`` without parsing prose.
+    """
+
+    kind: LiveWorkspaceCauseKind
+    #: Complete sentences naming what failed — a configuration key or a path,
+    #: never a configuration value or file content — without any remediation,
+    #: built through :func:`published_cause_text`.
+    text: str
+
+
+@dataclass(frozen=True)
+class LiveWorkspaceUnavailable:
+    """A live-workspace resolver's answer when it could not observe the workspace.
+
+    Distinct from ``None`` on purpose. ``read_current_control(live=None)`` is
+    a caller that did not ask for currency, and completion alone is withheld
+    from it. A resolver that was asked and failed has shown nothing about the
+    workspace, so every pointer that binds a Git identity is refused, whatever
+    its state: returning a ``review_publishable`` pointer — with commit, push
+    and update_pr — unchecked because ``.git`` could not be read was the same
+    fail-open as reporting no drift (#813). A pointer that binds no Git
+    identity (a ``scan``, or a ``--preview`` run outside Git) had nothing to
+    compare in the first place, and is still returned when it does not
+    authorize completion.
+    """
+
+    cause: LiveWorkspaceCause
+
+
 @dataclass(frozen=True)
 class LiveWorkspace:
     """The repository as it stands right now, for comparison with the pointer.
@@ -464,17 +565,32 @@ class LiveWorkspace:
     # The paths that differ from HEAD right now. ``None`` means the caller could
     # not determine them, which is treated as unverified rather than unchanged.
     changed_paths: tuple[str, ...] | None = None
+    # Why ``changed_paths`` is ``None``, when the caller knows. Each refusal
+    # that an unread change set produces leads with it (#813).
+    changed_paths_cause: LiveWorkspaceCause | None = None
     # Ref resolvers, supplied by the CLI because the Git helpers live there. The
     # pointer names its own base, so it cannot be resolved before the read.
     resolve_commit: Callable[[str], str | None] | None = None
     resolve_merge_base: Callable[[str, str], str | None] | None = None
+    # Why the reports directory being read may not be left out of the change
+    # set: it holds repository content, so a pointer published there decided
+    # without that content and every check of it would skip that content too.
+    # The text completes a sentence whose subject is the directory. ``None``
+    # means the directory holds only Shipgate artifacts, or lies outside the
+    # repository (#804).
+    reports_dir_refusal: str | None = None
+    # The same question counting what a named commit held there as well: the
+    # merge base a pointer records is the tree its run diffed against, and a
+    # file it held that HEAD no longer does is a deletion that run hid. Supplied
+    # by the CLI; it must not raise.
+    reports_dir_refusal_against: Callable[[str], str | None] | None = None
 
 
 @dataclass(frozen=True)
 class CurrentControlRead:
     """A pointer that was validated against the artifacts it binds.
 
-    ``artifacts`` holds the exact bytes of the keys the caller asked to capture,
+    ``artifacts`` holds the exact bytes of the pointer-bound keys the caller asked to capture,
     taken from the same validated pass that hashed them. A caller that reopens a
     bound artifact afterwards is making a second, unsynchronized read: a run
     republishing in between would let it combine this pointer's identity with a
@@ -489,7 +605,12 @@ class CurrentControlRead:
 def read_current_control(
     out_dir: Path,
     *,
-    live: LiveWorkspace | Callable[[], LiveWorkspace | None] | None = None,
+    live: (
+        LiveWorkspace
+        | LiveWorkspaceUnavailable
+        | Callable[[], LiveWorkspace | LiveWorkspaceUnavailable | None]
+        | None
+    ) = None,
     capture: Collection[str] = (),
     attempts: int = 3,
 ) -> CurrentControlRead:
@@ -501,12 +622,23 @@ def read_current_control(
     while this read is in flight makes the read fail rather than return a
     pointer describing one generation and artifacts from another.
 
+    The validated set is exactly ``pointer.artifacts``, not the larger closure
+    embedded in the terminal receipt. ``capture`` selects which validated bytes
+    are returned; it neither narrows validation nor adds receipt-only artifacts.
+    A requested key absent from the pointer is absent from ``artifacts`` too.
+    Consumers of receipt-only artifacts must additionally call
+    ``load_validated_receipt_artifacts``, compare its receipt with the captured
+    ``verification_receipt``, and consume the returned bytes, never reopen files.
+
     Byte consistency is not generation consistency.  A pointer whose artifacts
     all still hash correctly can still describe a workspace that has since
     moved — one commit is enough — so ``live`` is compared against the bound
     ``workspace_identity`` and any drift refuses the read.  Completion
     authority is never returned without that comparison: passing ``live=None``
     means "not verified", which downgrades to a refusal rather than a pass.
+    A resolver that was asked and could not observe the workspace answers
+    :class:`LiveWorkspaceUnavailable` instead, which refuses every pointer that
+    binds a Git identity, whatever its state, and leads the refusal with why.
 
     ``live`` should be a *callable*, and a pre-built snapshot is accepted only
     for callers that cannot produce one.  A snapshot taken before this function
@@ -535,14 +667,21 @@ def read_current_control(
         ),
         path=out_dir,
     )
-    observe: Callable[[], LiveWorkspace | None] = (
+    observe: Callable[[], LiveWorkspace | LiveWorkspaceUnavailable | None] = (
         live if callable(live) else (lambda: live)  # type: ignore[return-value]
     )
     last: CurrentControlUnavailable | None = None
     for _ in range(max(1, attempts)):
         pointer = _load_pointer(out_dir, path)
         try:
-            captured = _validate_bound_artifacts(out_dir, pointer, capture=capture)
+            # Currency checks must parse the same plan and receipt bytes that
+            # this pass validated, including on the final observation. Reopening
+            # them could compare live inputs against another generation's plan.
+            validated = _validate_bound_artifacts(
+                out_dir,
+                pointer,
+                capture=set(capture) | {"verification_plan", "verifier", RECEIPT_ARTIFACT_KEY},
+            )
         except CurrentControlUnavailable as mismatch:
             # A run that republished mid-read moves the pointer too. Retry that
             # case; a mismatch under a pointer that did not move is a real
@@ -551,9 +690,10 @@ def read_current_control(
                 raise
             last = mismatch
             continue
+        captured = {key: data for key, data in validated.items() if key in capture}
         observed = observe()
         try:
-            _validate_control_currency(out_dir, pointer, observed)
+            _validate_control_currency(out_dir, pointer, observed, artifacts=validated)
         except CurrentControlUnavailable as stale:
             # The set validated; only its currency did not. Hand the captured
             # bytes on so the caller can recover the producing run's own exact
@@ -565,12 +705,23 @@ def read_current_control(
         if confirmation.current_control_id != pointer.current_control_id:
             last = moved
             continue
-        # The workspace is re-observed after the pointer is confirmed, and both
-        # observations must agree. Checking the pointer alone left a window in
-        # which HEAD advanced between the comparison and the return.
-        if _workspace_fingerprint(observe()) != _workspace_fingerprint(observed):
+        # HEAD and path names alone miss edits to an already-dirty file and
+        # movement of the comparison base. Apply exactly the same complete
+        # currency checks again, against the same validated evidence bytes.
+        confirmed = observe()
+        try:
+            _validate_control_currency(out_dir, pointer, confirmed, artifacts=validated)
+        except CurrentControlUnavailable as stale:
+            stale.artifacts = dict(captured)
+            raise
+        if _workspace_fingerprint(confirmed) != _workspace_fingerprint(observed):
             workspace_moved.artifacts = dict(captured)
             last = workspace_moved
+            continue
+        # Currency checks perform live reads too. A publication during that
+        # final observation must not return the superseded pointer.
+        if _load_pointer(out_dir, path).current_control_id != pointer.current_control_id:
+            last = moved
             continue
         # `captured` was read in the same pass that hashed it, and neither the
         # pointer nor the workspace moved since. Returning the bytes is what
@@ -584,16 +735,23 @@ def read_current_control(
     )
 
 
-def _workspace_fingerprint(live: LiveWorkspace | None) -> tuple[object, ...]:
-    """What must not change between the currency check and the return.
+def _workspace_fingerprint(
+    live: LiveWorkspace | LiveWorkspaceUnavailable | None,
+) -> tuple[object, ...]:
+    """Additional context that must agree across complete currency checks.
 
-    ``None`` fingerprints distinctly from any resolved workspace, so a
-    workspace that becomes unresolvable mid-read is drift rather than a match.
+    ``None`` and an unavailable workspace fingerprint distinctly from any
+    resolved workspace, so a workspace that becomes unresolvable mid-read is
+    drift rather than a match. This is not a substitute for validating base and
+    overlay currency.
     """
 
     if live is None:
         return (None,)
+    if isinstance(live, LiveWorkspaceUnavailable):
+        return ("unavailable", live.cause.kind)
     return (
+        live.root,
         live.repository,
         live.head_commit_sha,
         live.head_tree_sha,
@@ -673,9 +831,53 @@ def _load_pointer(out_dir: Path, path: Path) -> CurrentControlPointer:
 def _validate_control_currency(
     out_dir: Path,
     pointer: CurrentControlPointer,
-    live: LiveWorkspace | None,
+    live: LiveWorkspace | LiveWorkspaceUnavailable | None,
+    *,
+    artifacts: Mapping[str, bytes],
 ) -> None:
     """Refuse a pointer whose evidence no longer describes this workspace."""
+
+    resolved = live if isinstance(live, LiveWorkspace) else None
+    reports_dir_refusal = resolved.reports_dir_refusal if resolved is not None else None
+    merge_base = pointer.workspace_identity.merge_base_sha
+    if (
+        reports_dir_refusal is None
+        and resolved is not None
+        and resolved.reports_dir_refusal_against is not None
+        and merge_base is not None
+        # An archived-head decision diffed the merge base against that head in
+        # full, directory included, so a removal beneath it was in its own
+        # change set and hid nothing. Only a worktree decision excluded it.
+        and pointer.workspace_identity.snapshot_kind != "committed_tree"
+    ):
+        reports_dir_refusal = resolved.reports_dir_refusal_against(merge_base)
+    if reports_dir_refusal is not None:
+        # First, and for every state. The run that published here left this
+        # directory out of the change it decided on, and every check below
+        # would leave it out again, so none of them can show that the content
+        # it holds is unchanged — or that the decision ever saw it (#804).
+        # The refusal names example paths from the repository, which may be
+        # shaped like credentials, so it is published like any other cause.
+        published = published_cause_text(reports_dir_refusal)
+        cause = LiveWorkspaceCause(
+            kind="reports_directory",
+            text=f"The reports directory {out_dir} {published}.",
+        )
+        raise CurrentControlUnavailable(
+            "workspace_unverifiable",
+            (
+                f"{cause.text} "
+                "A Shipgate run leaves its reports directory out of the change "
+                "set it decides on, so that content is outside this decision "
+                "and outside every check that it is still current. Re-run "
+                "verification into a directory that is gitignored, outside "
+                "the repository, or holds nothing but Shipgate artifacts "
+                "outside any trust root."
+            ),
+            path=out_dir,
+            reports_dir_refusal=published,
+            cause=cause,
+        )
 
     grants_authority = pointer.control.state == "complete"
     if grants_authority:
@@ -684,11 +886,16 @@ def _validate_control_currency(
             pointer.artifacts,
             request_id=pointer.request_id,
             decision_id=pointer.decision_id,
+            receipt_bytes=artifacts.get(RECEIPT_ARTIFACT_KEY),
         )
         if refusal is not None:
             raise CurrentControlUnavailable("receipt_mismatch", refusal, path=out_dir)
 
     identity = pointer.workspace_identity
+    if isinstance(live, LiveWorkspaceUnavailable):
+        _refuse_unobserved(out_dir, identity, live.cause, grants_authority=grants_authority)
+        # Nothing Git-bound to compare: a `scan`, or a preview run outside Git.
+        return
     if live is None:
         if grants_authority:
             raise CurrentControlUnavailable(
@@ -729,11 +936,172 @@ def _validate_control_currency(
             ),
             path=out_dir,
         )
-    _validate_base_currency(out_dir, identity, live, required=grants_authority)
+    _validate_base_currency(out_dir, identity, live)
     if identity.snapshot_kind == "worktree_overlay":
-        _validate_worktree_currency(out_dir, pointer, live, required=grants_authority)
+        _validate_worktree_currency(
+            out_dir, pointer, live, required=grants_authority, artifacts=artifacts
+        )
+        _validate_hook_script_currency(out_dir, live, artifacts)
     elif identity.snapshot_kind == "committed_tree":
-        _require_clean_worktree(out_dir, live, required=grants_authority)
+        _require_clean_worktree(out_dir, live)
+    if "verification_plan" in artifacts:
+        try:
+            plan = VerificationPlan.model_validate_json(artifacts["verification_plan"])
+            plan_parent = Path(pointer.artifacts["verification_plan"].path).parent
+            validate_current_plan_inputs(
+                plan, root=live.root, artifacts_root=out_dir / plan_parent
+            )
+        except (ValueError, OSError) as exc:
+            raise CurrentControlUnavailable(
+                "workspace_unverifiable",
+                f"The recorded source and dependency inputs are no longer current: {exc}",
+                path=out_dir,
+            ) from exc
+
+
+def _validate_hook_script_currency(
+    out_dir: Path, live: LiveWorkspace, artifacts: Mapping[str, bytes],
+) -> None:
+    """Re-read every consumed script, including paths Git's overlay ignores."""
+    raw = artifacts.get("verifier")
+    if raw is None:
+        return
+    from agents_shipgate.core.hook_script_capture import capture_hook_script
+    from agents_shipgate.core.host_grants import HostStaticParseCache
+    from agents_shipgate.schemas.verification_identity import VerificationBlob
+
+    try:
+        verifier = json.loads(raw)
+        comparison = verifier.get("host_comparison") if isinstance(verifier, dict) else None
+        if not isinstance(comparison, dict):
+            return
+        if comparison.get("input_script_unconfirmable_paths"):
+            raise ValueError("a selected hook script could not be captured")
+        absent_paths = comparison.get("input_script_absent_paths", [])
+        snapshot = None
+        if absent_paths:
+            from agents_shipgate.core.static_inputs import StaticInputSnapshot
+
+            snapshot = StaticInputSnapshot(live.root)
+            for path in absent_paths:
+                relative = Path(path)
+                if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+                    raise ValueError("invalid hook script absence path")
+                if not snapshot.bind_dependency_absence(live.root / relative):
+                    raise ValueError("a missing hook script dependency appeared")
+        cache = HostStaticParseCache()
+        reader = cache.reader_for(live.root)
+        for item in comparison.get("input_script_blobs", []):
+            bound = VerificationBlob.model_validate(item)
+            if bound.source == "generated":
+                from agents_shipgate.core.openshell_inputs import capture_openshell_input
+
+                observed = capture_openshell_input(reader, bound.path, absent_paths=set())
+                if observed.get("source") != "generated":
+                    raise ValueError("selected link no longer has its captured type")
+            elif bound.source == "worktree":
+                observed = capture_hook_script(reader, bound.path)
+            else:
+                raise ValueError("invalid live dependency source")
+            if (
+                observed.get("limit") is not None
+                or "sha256:" + str(observed.get("sha256")) != bound.sha256
+                or observed.get("size_bytes") != bound.size_bytes
+            ):
+                raise ValueError("selected hook script bytes no longer match the captured dependency")
+        cache.finish()
+        if snapshot is not None:
+            snapshot.finish()
+    except (ValueError, OSError, NotImplementedError) as exc:
+        raise CurrentControlUnavailable(
+            "workspace_unverifiable",
+            "The recorded hook script dependency inputs are no longer current; re-run verification.",
+            path=out_dir,
+        ) from exc
+
+
+def _refuse_unobserved(
+    out_dir: Path,
+    identity: CurrentControlWorkspaceIdentity,
+    cause: LiveWorkspaceCause,
+    *,
+    grants_authority: bool,
+) -> None:
+    """Refuse a pointer the live workspace could not be observed for, leading with why.
+
+    Completion is refused whatever the pointer binds, as it is when no
+    workspace is supplied at all. Every other state is refused when the pointer
+    binds a Git identity: those are the pointers the currency checks exist for,
+    and returning one because the look failed handed out its route — and a
+    ``review_publishable`` pointer's commit, push and update_pr — on the
+    strength of a comparison that never ran (#813). A pointer binding none of
+    it (a ``scan``, a ``--preview`` outside Git) returns as before.
+    """
+
+    if grants_authority:
+        raise CurrentControlUnavailable(
+            "workspace_unverified",
+            (
+                f"{cause.text} This pointer authorizes completion, but the live "
+                "workspace could not be observed, so it could not be confirmed "
+                "that the decision still describes it."
+            ),
+            path=out_dir,
+            cause=cause,
+        )
+    if _binds_git_identity(identity):
+        raise CurrentControlUnavailable(
+            "workspace_unverifiable",
+            (
+                f"{cause.text} The live workspace could not be observed, so it "
+                "cannot be shown that this pointer still describes the "
+                "repository it was published against."
+            ),
+            path=out_dir,
+            cause=cause,
+        )
+
+
+def _binds_git_identity(identity: CurrentControlWorkspaceIdentity) -> bool:
+    """Whether the pointer names Git state a live comparison would check.
+
+    Not ``repository`` or ``head_ref``: a run outside Git still records a
+    ``local:<name>`` repository and ``HEAD``, and has nothing to compare.
+    """
+
+    return any(
+        value is not None
+        for value in (
+            identity.head_commit_sha,
+            identity.head_tree_sha,
+            identity.base_commit_sha,
+            identity.merge_base_sha,
+            identity.worktree_overlay_sha256,
+            identity.snapshot_kind,
+        )
+    )
+
+
+def _unread_change_set(
+    out_dir: Path, live: LiveWorkspace, describes: str
+) -> CurrentControlUnavailable:
+    """The refusal for a change set that could not be read, with its cause first.
+
+    ``describes`` completes "it cannot be shown that ...". The cause leads
+    because ``verify --format control`` caps the refusal at 400 bytes, and the
+    sentence after it is the same for every cause.
+    """
+
+    detail = (
+        "The current set of uncommitted changes could not be determined, so it "
+        f"cannot be shown that {describes}."
+    )
+    cause = live.changed_paths_cause
+    if cause is not None:
+        detail = f"{cause.text} {detail}"
+    return CurrentControlUnavailable(
+        "workspace_unverifiable", detail, path=out_dir, cause=cause
+    )
 
 
 def _validate_worktree_currency(
@@ -742,6 +1110,7 @@ def _validate_worktree_currency(
     live: LiveWorkspace,
     *,
     required: bool,
+    artifacts: Mapping[str, bytes],
 ) -> None:
     """Confirm the working tree is still the one a worktree decision saw.
 
@@ -759,6 +1128,9 @@ def _validate_worktree_currency(
     not the uncommitted set: a local run with a base carries the union of
     ``base...HEAD`` and the worktree, so requiring equality would refuse a clean
     workspace the instant the run that produced it finished.
+
+    Neither test may be skipped because the live set could not be read.
+    ``required`` narrows only the case where the pointer binds no plan at all.
     """
 
     ref = pointer.artifacts.get("verification_plan")
@@ -784,13 +1156,7 @@ def _validate_worktree_currency(
         _validate_live_overlay(out_dir, pointer, live)
         return
     try:
-        data = read_regular_file_beneath(
-            out_dir,
-            ref.path,
-            max_size=MAX_BOUND_ARTIFACT_BYTES,
-            label="current control plan",
-        )
-        plan = VerificationPlan.model_validate_json(data)
+        plan = VerificationPlan.model_validate_json(artifacts["verification_plan"])
         # Not `inputs.changed_paths`: since #336 that is the merge-base-
         # relative evaluated set, while the overlay this pointer was
         # published against is HEAD-relative and recorded separately.
@@ -814,17 +1180,9 @@ def _validate_worktree_currency(
             path=out_dir,
         )
     if live.changed_paths is None:
-        if required:
-            raise CurrentControlUnavailable(
-                "workspace_unverifiable",
-                (
-                    "This pointer authorizes completion of a worktree "
-                    "verification, but the current set of uncommitted changes "
-                    "could not be determined."
-                ),
-                path=out_dir,
-            )
-        return
+        raise _unread_change_set(
+            out_dir, live, "this worktree verification still describes the workspace"
+        )
     unseen = sorted(set(live.changed_paths) - set(decided_paths))
     if unseen:
         raise CurrentControlUnavailable(
@@ -837,30 +1195,56 @@ def _validate_worktree_currency(
 def _validate_live_overlay(
     out_dir: Path, pointer: CurrentControlPointer, live: LiveWorkspace
 ) -> None:
-    """Compare a plan-less worktree pointer against the tree as it stands."""
+    """Compare a plan-less worktree pointer against the tree as it stands.
+
+    A plan-less pointer records no path set, so this comparison *is* its whole
+    currency test: there is no second check that a skip here falls back on.
+    Returning on a failure to look therefore reported a preview as current over
+    a tree nobody had read — which is exactly what a writer and a reader
+    disagreeing about the reports-directory exclusion produced (#575 review
+    cycle 2). Unreadable is unknown, and unknown withholds the answer.
+    """
 
     if live.changed_paths is None:
-        # Unreadable is unknown, not drifted. This pointer authorizes nothing,
-        # so it keeps its route rather than being denied on a failure to look.
-        return
+        raise _unread_change_set(
+            out_dir, live, "this answer still describes the working tree it was read from"
+        )
     try:
         rows = worktree_overlay(live.root, list(live.changed_paths))
-    except (ValueError, OSError):
-        return
+    except (ValueError, OSError) as exc:
+        raise CurrentControlUnavailable(
+            "workspace_unverifiable",
+            f"The working tree this answer was read from could not be recomputed: {exc}",
+            path=out_dir,
+        ) from exc
     observed = content_id(rows) if rows else None
     if observed != pointer.workspace_identity.worktree_overlay_sha256:
+        # The pointer records a digest, not the paths behind it, so what can be
+        # named is the tree as it stands. "The paths it was read from no longer
+        # have their content" was false for the commonest drift — a tracked edit
+        # or a new file after a preview of a clean tree — which a configured
+        # preview reaches here too since it stopped binding its plan (#807).
+        # The names come from the repository and may be shaped like
+        # credentials (the class of #802), so they are redacted as a cause is.
+        paths = sorted(live.changed_paths)
+        if paths:
+            shown = redact_text(", ".join(paths[:3])) or ""
+            if len(paths) > 3:
+                shown += f", and {len(paths) - 3} more"
+            now = f"it now differs from HEAD at {len(paths)} path(s) ({shown})"
+        else:
+            now = "nothing differs from HEAD now"
         raise CurrentControlUnavailable(
             "workspace_changed",
             (
-                "The working tree changed since this answer was published: the "
-                "uncommitted paths it was read from no longer have the content "
-                "they had. Re-run it."
+                f"The working tree changed since this answer was published: {now}, "
+                "which is not the uncommitted state it was read from. Re-run it."
             ),
             path=out_dir,
         )
 
 
-def _require_clean_worktree(out_dir: Path, live: LiveWorkspace, *, required: bool) -> None:
+def _require_clean_worktree(out_dir: Path, live: LiveWorkspace) -> None:
     """A committed-tree decision says nothing about uncommitted work.
 
     ``verify --head <ref>`` evaluates an archived commit, so its evidence stops
@@ -871,23 +1255,17 @@ def _require_clean_worktree(out_dir: Path, live: LiveWorkspace, *, required: boo
     can clear it — the clearing route is a local worktree verification, which is
     what the refusal has to say.
 
-    ``required`` narrows only the *undeterminable* case: a change set we could
-    not read is unknown rather than known-drifted, so it blocks authority but
-    does not deny a caller its route.
+    An *undeterminable* change set is not scoped to completion either. It used
+    to be: a change set that could not be read blocked authority but still
+    handed back the route. But the route is the operative half of a non-
+    completion pointer, and handing it out on the strength of a look that never
+    happened is the same fail-open as reporting no drift (#575 review cycle 2).
     """
 
     if live.changed_paths is None:
-        if required:
-            raise CurrentControlUnavailable(
-                "workspace_unverifiable",
-                (
-                    "This pointer authorizes completion of a committed-tree "
-                    "verification, but the current set of uncommitted changes "
-                    "could not be determined."
-                ),
-                path=out_dir,
-            )
-        return
+        raise _unread_change_set(
+            out_dir, live, "this committed-tree verification still describes the workspace"
+        )
     if live.changed_paths:
         raise CurrentControlUnavailable(
             "workspace_changed",
@@ -905,8 +1283,6 @@ def _validate_base_currency(
     out_dir: Path,
     identity: CurrentControlWorkspaceIdentity,
     live: LiveWorkspace,
-    *,
-    required: bool,
 ) -> None:
     """Confirm the other end of the range still resolves where it did.
 
@@ -914,22 +1290,23 @@ def _validate_base_currency(
     the base — a merge, or a fetch moving ``origin/main`` — can empty the range
     entirely without touching HEAD or the working tree, which leaves every
     HEAD-based check satisfied while the evidence underneath has gone.
+
+    A live workspace that carries no resolver cannot answer the question, and an
+    unanswered currency test denies the pointer rather than passing it, for
+    every state — the same rule the uncommitted change set now follows.
     """
 
     if identity.base_ref is None or identity.base_commit_sha is None:
         return
     if live.resolve_commit is None:
-        if required:
-            raise CurrentControlUnavailable(
-                "workspace_unverifiable",
-                (
-                    "This pointer authorizes completion of a verification "
-                    f"against {identity.base_ref!r}, but that ref could not be "
-                    "resolved to compare against."
-                ),
-                path=out_dir,
-            )
-        return
+        raise CurrentControlUnavailable(
+            "workspace_unverifiable",
+            (
+                f"This pointer was published against {identity.base_ref!r}, but "
+                "that ref could not be resolved to compare against."
+            ),
+            path=out_dir,
+        )
     observed = live.resolve_commit(identity.base_ref)
     if observed != identity.base_commit_sha:
         raise CurrentControlUnavailable(
@@ -1123,6 +1500,10 @@ __all__ = [
     "CurrentControlPublishError",
     "CurrentControlRead",
     "LiveWorkspace",
+    "LiveWorkspaceCause",
+    "LiveWorkspaceCauseKind",
+    "LiveWorkspaceUnavailable",
+    "MAX_LIVE_WORKSPACE_CAUSE_BYTES",
     "CurrentControlUnavailable",
     "begin_current_control",
     "bind_current_control_artifacts",
@@ -1133,6 +1514,7 @@ __all__ = [
     "owns_current_control",
     "project_agent_control",
     "publish_current_control",
+    "published_cause_text",
     "read_current_control",
     "workspace_identity_from_plan",
 ]

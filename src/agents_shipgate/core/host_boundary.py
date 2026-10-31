@@ -39,6 +39,15 @@ from agents_shipgate.core.boundary_registry import (
     boundary_adapters_for_path,
     is_agent_boundary_path,
 )
+from agents_shipgate.core.claude_permission_rules import (
+    carve_out_predecessors,
+    carve_out_widens,
+    covering_rule,
+    every_path_pattern,
+    is_carve_out,
+    same_spelling,
+    unconsulted_path_rule,
+)
 from agents_shipgate.core.codex_boundary import (
     _DECISION_RANK,
     _RISK_BY_ACTION,
@@ -46,6 +55,22 @@ from agents_shipgate.core.codex_boundary import (
     DEFAULT_POLICY_VERSION,
     _dedupe_violations,
     _display_path,
+)
+from agents_shipgate.core.host_settings import (
+    CLAUDE_SCALAR_SETTINGS,
+    claude_setting_values,
+    rate_claude_setting,
+    read_at_top_level,
+    setting_value_text,
+)
+from agents_shipgate.core.jsonc import is_vscode_mcp_path, loads_jsonc
+from agents_shipgate.core.permission_lattice import (
+    PATH_TOOLS,
+    exec_equivalent_argument,
+    names_tools_within_one_mcp_server,
+    same_grant,
+    subsumes,
+    whole_tool_risk,
 )
 from agents_shipgate.core.trust_roots import read_absolute_identity_bound_text
 from agents_shipgate.schemas.agent_result_v1 import (
@@ -217,20 +242,51 @@ def evaluate_host_boundary(
             )
         return resolved_text_cache[path]
 
-    def add(rule_id: str, *, path: str | None, evidence: dict[str, Any]) -> None:
+    def add(
+        rule_id: str,
+        *,
+        path: str | None,
+        evidence: dict[str, Any],
+        rating: AgentResultRiskLevel | None = None,
+    ) -> None:
         rule = policy.rules.get(rule_id) or DEFAULT_RULES[rule_id]
         violations.append(
             AgentResultViolatedRule(
                 id=rule.id,
                 check_id=rule.check_id,
                 action=rule.action,  # type: ignore[arg-type]
-                risk_level=rule.risk_level,
+                risk_level=_rated_risk(rule, rating),
                 title=rule.title,
                 path=path,
                 evidence=evidence,
                 recommendation=rule.recommendation,
             )
         )
+
+    def note_narrowing(
+        diff_file: DiffFile, resolved: ResolvedFileText, raised: int, *, cursor: bool
+    ) -> None:
+        # A settings change that raised nothing, read cleanly, and only takes
+        # authority away has been evaluated completely, so neither the
+        # protected-surface fallback nor the trust-root touch needs a human
+        # for it (#661). The diagnostic keeps it on the record.
+        if len(violations) != raised or any(
+            item.path == diff_file.path and item.level != "info" for item in diagnostics
+        ):
+            return
+        if settings_change_only_narrows(resolved, cursor=cursor):
+            diagnostics.append(
+                AgentResultDiagnostic(
+                    level="info",
+                    code=HOST_SETTINGS_NARROWED,
+                    message=(
+                        "This host settings change only narrows permissions: every "
+                        "added allow rule is covered by a rule the file already had, "
+                        "and no deny or ask rule was removed. It needs no human review."
+                    ),
+                    path=diff_file.path,
+                )
+            )
 
     for diff_file in diff_files:
         path = diff_file.path
@@ -242,15 +298,38 @@ def evaluate_host_boundary(
             _evaluate_mcp_file(diff_file, resolved, add)
         if _is_claude_settings_path(normalized):
             resolved = resolve(diff_file)
+            raised = len(violations)
             _evaluate_claude_settings(diff_file, resolved, add)
+            note_narrowing(diff_file, resolved, raised, cursor=False)
         if _is_cursor_settings_path(normalized):
             resolved = resolve(diff_file)
+            raised = len(violations)
             _evaluate_cursor_settings(diff_file, resolved, add)
+            note_narrowing(diff_file, resolved, raised, cursor=True)
         if _is_workflow_path(normalized):
             resolved = resolve(diff_file)
             _evaluate_workflow(diff_file, resolved, add)
 
     return _dedupe_violations(violations), diagnostics
+
+
+def _rated_risk(
+    rule: HostBoundaryRule, rating: AgentResultRiskLevel | None
+) -> AgentResultRiskLevel:
+    """A violation's risk: the rule's, or the setting table's rating (#827).
+
+    A modelled Claude Code setting carries the rating its grant and row carry,
+    so `check` and `diff` rate one value alike. A policy may still only raise:
+    where it raised the rule above the engine default, the higher of the two
+    applies.
+    """
+
+    if rating is None:
+        return rule.risk_level
+    default = DEFAULT_RULES[rule.id].risk_level if rule.id in DEFAULT_RULES else rule.risk_level
+    if _RISK_RANK[rule.risk_level] > _RISK_RANK[default]:
+        return max(rating, rule.risk_level, key=_RISK_RANK.__getitem__)
+    return rating
 
 
 def load_host_boundary_policy(
@@ -470,33 +549,53 @@ def _evaluate_claude_settings(diff_file, resolved, add) -> None:
             "plugins",
             "sandbox",
             "statusLine",
+            # A setting the grant reader models is rated, not unknown (#827).
+            # One also set under `permissions` is not read at the top level,
+            # by the reader or here, so it stays an unknown key.
+            *(
+                str(key)
+                for key in (new_data if isinstance(new_data, dict) else {})
+                if read_at_top_level(new_data, str(key))
+            ),
         },
         add=add,
     )
     permissions = _dict_value(new_data, "permissions")
     old_permissions = _dict_value(old_data, "permissions")
     _evaluate_unknown_permission_keys(old_permissions, permissions, path, add)
-    _evaluate_permission_mode(old_permissions, permissions, path, add)
+    _evaluate_claude_setting_values(old_data, new_data, path, add)
     old_allow = set(_string_entries(old_permissions.get("allow")))
     for rule in sorted(set(_string_entries(permissions.get("allow"))) - old_allow):
-        if _is_wildcard_allow(rule):
-            add(
-                "HOST-PERMISSION-WILDCARD-ALLOW",
-                path=path,
-                evidence={"kind": "permission_wildcard_allow", "rule": _safe_rule(rule)},
-            )
-        else:
-            add(
-                "HOST-PERMISSION-ALLOW-EXPANDED",
-                path=path,
-                evidence={"kind": "permission_allow_expanded", "rule": _safe_rule(rule)},
-            )
-    new_deny = set(_string_entries(permissions.get("deny")))
-    for rule in sorted(set(_string_entries(old_permissions.get("deny"))) - new_deny):
+        if not _claude_allow_widens(rule, old_allow):
+            continue
+        rule_id = _allow_rule_id(rule)
+        add(
+            rule_id,
+            path=path,
+            evidence={
+                "kind": (
+                    "permission_wildcard_allow"
+                    if rule_id == "HOST-PERMISSION-WILDCARD-ALLOW"
+                    else "permission_allow_expanded"
+                ),
+                "rule": _safe_rule(rule),
+            },
+        )
+    old_deny = _string_entries(old_permissions.get("deny"))
+    new_deny = _string_entries(permissions.get("deny"))
+    for rule in _claude_removed_restrictions(old_deny, new_deny):
         add(
             "HOST-PERMISSION-DENY-REMOVED",
             path=path,
             evidence={"kind": "permission_deny_removed", "rule": _safe_rule(rule)},
+        )
+    for rule in _claude_widening_carve_outs(old_deny, new_deny):
+        # A `!` rule now excepting paths from a deny rule the file already
+        # had removes part of that denial, however it is spelled (#974).
+        add(
+            "HOST-PERMISSION-DENY-REMOVED",
+            path=path,
+            evidence={"kind": "permission_deny_carved_out", "rule": _safe_rule(rule)},
         )
     hooks = new_data.get("hooks") if isinstance(new_data, dict) else None
     old_hooks = old_data.get("hooks") if isinstance(old_data, dict) else None
@@ -560,10 +659,10 @@ def _evaluate_cursor_settings(diff_file, resolved, add) -> None:
             old_values.extend(_string_entries(old_data.get(category)))
         if key == "allow":
             for rule in sorted(set(values) - set(old_values)):
+                if not _widens_allow(rule, old_values):
+                    continue
                 add(
-                    "HOST-PERMISSION-WILDCARD-ALLOW"
-                    if _is_wildcard_allow(rule)
-                    else "HOST-PERMISSION-ALLOW-EXPANDED",
+                    _allow_rule_id(rule),
                     path=path,
                     evidence={
                         "kind": "cursor_permission_allow_expanded",
@@ -582,27 +681,95 @@ def _evaluate_cursor_settings(diff_file, resolved, add) -> None:
                 )
 
 
-def _evaluate_permission_mode(old_permissions, permissions, path: str, add) -> None:
-    old_mode = old_permissions.get("defaultMode")
-    new_mode = permissions.get("defaultMode")
-    if new_mode == old_mode:
-        return
-    if new_mode in {"bypassPermissions", "dontAsk"}:
+def _evaluate_claude_setting_values(old_data, new_data, path: str, add) -> None:
+    """One violation per modelled setting value the change sets, at its rating (#827).
+
+    The rating is the one the grant and its row carry (``core.host_settings``):
+    a ``critical`` value raises the wildcard rule, and any other value the
+    allowlist rule at its own rating, so ``dontAsk`` is reviewed at
+    ``medium`` rather than blocked, and ``enableAllProjectMcpServers: true``
+    blocks rather than reading as a key that could not be parsed. A value the
+    change leaves as it was raises nothing, and neither does a removal, as a
+    removed ``defaultMode`` never did. ``defaultMode`` keeps the ``mode``
+    evidence it always published, so its findings keep their fingerprints;
+    every other setting names itself and its value. Either value is the one
+    the grant publishes, redacted and bounded (`_setting_evidence_text`).
+
+    Two sides compare by where the value is read as well as by its setting,
+    so a value that moves between ``permissions`` and the top level is a
+    value the change sets, in either direction, and raises at its rating.
+    The reader accepts a scalar setting in either place, but Claude Code
+    documents each in one of them (``defaultMode`` under ``permissions``,
+    ``enableAllProjectMcpServers`` at the top level), so moving a
+    ``bypassPermissions`` copy the base kept at the top level into
+    ``permissions`` turns the mode on without changing its value.
+    """
+
+    old_values = {
+        (item.container, item.key): item.value for item in claude_setting_values(old_data)
+    }
+    for item in claude_setting_values(new_data):
+        compared = (item.container, item.key)
+        if compared in old_values and _canonical_json(old_values[compared]) == _canonical_json(
+            item.value
+        ):
+            continue
+        rating = rate_claude_setting(item.setting, item.value)
+        critical = rating.risk == "critical"
+        evidence: dict[str, Any] = {
+            "kind": "permission_mode_expanded" if critical else "permission_mode_changed"
+        }
+        if item.setting == "defaultMode":
+            evidence["mode"] = _setting_evidence_text(item.setting, item.value)
+        else:
+            evidence["setting"] = item.setting
+            evidence["value"] = _setting_evidence_text(item.setting, item.value)
         add(
-            "HOST-PERMISSION-WILDCARD-ALLOW",
+            "HOST-PERMISSION-WILDCARD-ALLOW" if critical else "HOST-PERMISSION-ALLOW-EXPANDED",
             path=path,
-            evidence={"kind": "permission_mode_expanded", "mode": new_mode},
+            evidence=evidence,
+            rating=rating.risk,  # type: ignore[arg-type]
         )
-    elif new_mode is not None:
-        add(
-            "HOST-PERMISSION-ALLOW-EXPANDED",
-            path=path,
-            evidence={"kind": "permission_mode_changed", "mode": str(new_mode)},
-        )
+
+
+#: The longest setting value a violation's evidence publishes. A documented
+#: value is a word or a server name; a longer one is a shape Claude Code does
+#: not document, and its whole redacted value is its grant's (`audit --host`).
+_MAX_SETTING_EVIDENCE_CHARS = 200
+
+
+def _setting_evidence_text(setting: str, value: Any) -> str:
+    """A setting value as ``check`` evidence publishes it: its grant's, redacted and bounded.
+
+    The grant redacts a value before it renders it (``_setting_grant``).
+    Rendering first put an object's credentials inside one string, where the
+    evidence sanitizer's key-based redaction cannot see them, so an
+    ``enabledMcpjsonServers`` object holding an ``env`` token published the
+    token in ``check`` alone. The same redactor runs here first, with the same
+    parent key, and the text is bounded only after it, so truncation never
+    exposes part of a secret. ``defaultMode`` is rendered as its grant's
+    ``value`` is, the way its ``mode`` evidence always was, so a documented
+    mode keeps its fingerprint; every other setting is spelled as its row
+    spells it.
+    """
+
+    # Imported here: host_grants imports this module.
+    from agents_shipgate.core.host_grants import _redact_secret_values
+
+    redacted = _redact_secret_values(value, parent_key=setting)
+    if setting == "defaultMode" and not isinstance(redacted, (dict, list)):
+        text = str(redacted)
+    else:
+        text = setting_value_text(setting, redacted)
+    if len(text) > _MAX_SETTING_EVIDENCE_CHARS:
+        text = text[: _MAX_SETTING_EVIDENCE_CHARS - 1] + "…"
+    return text
 
 
 def _evaluate_unknown_permission_keys(old_permissions, permissions, path: str, add) -> None:
-    passive = {"allow", "ask", "deny", "defaultMode"}
+    # A modelled setting under `permissions` is rated by
+    # `_evaluate_claude_setting_values`, not reported as a boundary change.
+    passive = {"allow", "ask", "deny", *CLAUDE_SCALAR_SETTINGS}
     for key in sorted(set(permissions) - passive):
         if _canonical_json(permissions.get(key)) == _canonical_json(
             old_permissions.get(key)
@@ -646,6 +813,154 @@ def _string_entries(value: Any) -> list[str]:
     return [item for item in value if isinstance(item, str) and item.strip()]
 
 
+def _widens_allow(rule: str, old_rules) -> bool:
+    """Whether an added allow rule grants anything the old list did not (#661).
+
+    Rules are compared by text, so tightening `Bash(*)` to `Bash(git status)`
+    arrives as an addition, and set difference alone called it an expanded
+    allowlist. In an adopted repository that sent every narrowing to a human.
+    An added rule that an old rule already subsumes grants nothing new. The
+    drift reader and the audit table already read direction from this lattice
+    (#657); the boundary check now does too. Only a decided ``True`` excuses a
+    rule, so a pair the lattice cannot decide stays an expansion. So does an
+    old rule that is the same grant spelled another way: `subsumes` answers
+    ``False`` for `Bash(npx:*)` against `Bash(npx *)`, and without this the
+    respelling blocked as a new launcher grant (#824).
+    """
+
+    return not any(
+        subsumes(old, rule) is True or same_grant(old, rule) for old in old_rules
+    )
+
+
+def _claude_allow_widens(rule: str, old_allow) -> bool:
+    """Whether an added Claude Code allow rule may allow something the file did not.
+
+    The rule model's answer (``core.claude_permission_rules``), which the drift
+    comparator reads too: a path-scoped rule Claude Code never consults allows
+    nothing (#938), and one an allow rule the file already had matches entirely
+    adds nothing (#941, #969). Unlike the Cursor reading, an allow rule
+    Claude Code skips, such as an unanchored ``*``, covers nothing.
+    """
+
+    return not unconsulted_path_rule(rule) and covering_rule(rule, old_allow) is None
+
+
+def _claude_removed_restrictions(old_rules: list[str], new_rules: list[str]) -> list[str]:
+    """Claude Code deny or ask rules whose removal lifts a restriction (#938, #974, #918).
+
+    Not one: a path-scoped rule Claude Code never consults, a `!` carve-out
+    (removing one restricts more), or a rule the list still holds spelled
+    another way. The rule model is ``core.claude_permission_rules``, which the
+    drift comparator reads too.
+    """
+
+    kept = set(new_rules)
+    return sorted(
+        rule for rule in set(old_rules) - kept
+        if not (
+            unconsulted_path_rule(rule)
+            or is_carve_out(rule)
+            or any(same_spelling(rule, other) for other in kept)
+        )
+    )
+
+
+def _claude_widening_carve_outs(old_rules: list[str], new_rules: list[str]) -> list[str]:
+    """`!` rules that now except paths from a rule the same list held before (#974)."""
+
+    before = carve_out_predecessors(old_rules)
+    return sorted(
+        rule
+        for rule, follows in carve_out_predecessors(new_rules).items()
+        if carve_out_widens(follows, before.get(rule), old_rules)
+    )
+
+
+HOST_SETTINGS_NARROWED = "host_settings_narrowed"
+_CURSOR_RULE_CATEGORIES = ("shell", "read", "write")
+
+
+def settings_change_only_narrows(resolved: ResolvedFileText, *, cursor: bool) -> bool:
+    """Whether a host settings change can only take authority away (#661).
+
+    True when the old and new JSON agree on everything except the rule lists,
+    every added allow rule is subsumed by an old allow rule (a decided lattice
+    ``True``), and no deny rule, nor for Claude Code an ask rule, was removed.
+    Anything else is not a narrowing: a hook or any other key that changed, a
+    rule list that is not a list of rule strings, a deleted or unresolved
+    file, or an added rule the lattice cannot decide.
+    """
+
+    if resolved.new_text is None or resolved.source == "diff_deleted_file":
+        return False
+    try:
+        new_data = json.loads(resolved.new_text)
+        old_data = json.loads(resolved.old_text) if resolved.old_text else {}
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(old_data, dict) or not isinstance(new_data, dict):
+        return False
+    keys = ("allow", "deny") if cursor else ("allow", "ask", "deny")
+    old_rules = _rule_lists(old_data, keys)
+    new_rules = _rule_lists(new_data, keys)
+    if old_rules is None or new_rules is None:
+        return False
+    if _canonical_json(_without_rule_lists(old_data, keys)) != _canonical_json(
+        _without_rule_lists(new_data, keys)
+    ):
+        return False
+    old_allow = list(old_rules["allow"])
+    if cursor:
+        # The Cursor evaluator reads top-level category arrays as allow rules
+        # too; they are unchanged here, so they cover exactly as they did.
+        for category in _CURSOR_RULE_CATEGORIES:
+            old_allow.extend(_string_entries(old_data.get(category)))
+    if any(
+        _widens_allow(rule, old_allow) if cursor else _claude_allow_widens(rule, old_allow)
+        for rule in set(new_rules["allow"]) - set(old_rules["allow"])
+    ):
+        return False
+    if cursor:
+        return all(set(old_rules[key]) <= set(new_rules[key]) for key in keys if key != "allow")
+    return not any(
+        _claude_removed_restrictions(old_rules[key], new_rules[key])
+        or _claude_widening_carve_outs(old_rules[key], new_rules[key])
+        for key in keys if key != "allow"
+    )
+
+
+def _rule_lists(data: dict[str, Any], keys: tuple[str, ...]) -> dict[str, list[str]] | None:
+    permissions = data.get("permissions", {})
+    if not isinstance(permissions, dict):
+        return None
+    lists: dict[str, list[str]] = {}
+    for key in keys:
+        value = permissions.get(key, [])
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) and item.strip() for item in value
+        ):
+            return None
+        lists[key] = value
+    return lists
+
+
+def _without_rule_lists(data: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+    stripped = dict(data)
+    permissions = stripped.pop("permissions", None)
+    if isinstance(permissions, dict):
+        rest = {key: value for key, value in permissions.items() if key not in keys}
+        if rest:
+            stripped["permissions"] = rest
+    return stripped
+
+
+def is_host_settings_path(path: str) -> bool:
+    """A host settings file whose permission rules the lattice reads."""
+
+    return _is_claude_settings_path(path) or _is_cursor_settings_path(path)
+
+
 def _is_wildcard_allow(rule: str) -> bool:
     """Classify wildcard-shaped allow rules (whole-tool grants).
 
@@ -653,20 +968,65 @@ def _is_wildcard_allow(rule: str) -> bool:
     that *starts* with ``*`` (``Bash(*)``, ``Bash(*:*)``). A scoped
     prefix rule like ``Bash(npm test:*)`` is the recommended narrow form
     and is NOT wildcard-shaped — the ``*`` only widens within an explicit
-    command prefix.
+    command prefix. Nor is an MCP rule naming tools within one server
+    (``mcp__github__get_issue``): it is a bare token, but not a whole
+    tool surface. ``mcp__github`` and ``mcp__github__*`` still are (#816).
+
+    A file tool's argument is a gitignore path pattern, where a leading ``*``
+    stays inside the path segments the rest of the pattern names:
+    ``Edit(**/.env.example)`` matches files named ``.env.example``, not
+    every file (#969; https://code.claude.com/docs/en/permissions#read-and-edit).
+    Only a pattern made of nothing but ``*`` and ``/`` (``*``, ``**``,
+    ``**/*``, ``/**``), after an optional ``./``, is every path.
     """
     stripped = rule.strip()
     if stripped == "*":
         return True
     open_paren = stripped.find("(")
     if open_paren == -1:
-        # A bare tool name ("Bash", "WebFetch") allows the whole tool.
-        return True
+        # A bare tool name ("Bash", "WebFetch") allows the whole tool. Every
+        # MCP rule is spelled as a bare token too, and one naming a single
+        # tool was rated `high`, worded "matches every target of this kind",
+        # and blocked through the wildcard check (#816).
+        return not names_tools_within_one_mcp_server(stripped)
     argument = stripped[open_paren + 1 :].lstrip()
+    if stripped[:open_paren].strip() in PATH_TOOLS:
+        return every_path_pattern(argument.rstrip(")").strip())
     return argument.startswith("*")
 
 
+def _allow_rule_id(rule: str) -> str:
+    """Which finding a newly-added allow rule earns.
+
+    `_is_wildcard_allow` answers *whether* a rule grants a whole tool, not
+    *what that tool reaches*, and the blocking rule was wired straight to
+    it. So adding `Read(**)` — the ordinary configuration for a coding
+    agent that already has the workspace checked out — blocked the
+    release at `critical`, exactly as `Bash(*)` does. A gate that stops
+    the release over reading files is one a team turns off, and a gate
+    that is off catches no `Bash(*)` either.
+
+    The tool class is the discriminator, taken from the same lattice the
+    audit table uses so the gate and the table cannot drift apart (#657).
+    """
+
+    if exec_equivalent_argument(rule) is not None:
+        return "HOST-PERMISSION-WILDCARD-ALLOW"
+    if not _is_wildcard_allow(rule):
+        return "HOST-PERMISSION-ALLOW-EXPANDED"
+    _, risk = whole_tool_risk(rule)
+    # Still an expansion, still reviewed — just not a release blocker.
+    return (
+        "HOST-PERMISSION-ALLOW-EXPANDED"
+        if risk == "low"
+        else "HOST-PERMISSION-WILDCARD-ALLOW"
+    )
+
+
 def _safe_rule(rule: str) -> str:
+    if (argument := exec_equivalent_argument(rule)) is not None:
+        # Table text only: the argument is sliced from a launcher entry.
+        return f"Bash({argument})"
     stripped = rule.strip()
     open_paren = stripped.find("(")
     if open_paren == -1:
@@ -675,7 +1035,8 @@ def _safe_rule(rule: str) -> str:
     argument = stripped[open_paren + 1 :].rstrip(")").strip()
     if argument == "*":
         return f"{tool}(*)"
-    if argument.startswith("*"):
+    if argument.startswith("*") and _is_wildcard_allow(stripped):
+        # `Edit(**/.env.example)` is a scoped path, not a wildcard (#969).
         return f"{tool}(<wildcard>)"
     return f"{tool}(<redacted-arguments>)"
 
@@ -801,6 +1162,21 @@ def _evaluate_workflow_permissions(
         _compare_permissions(old_perms, new_perms, job_label, path, add)
 
 
+def _workflow_label(value: Any) -> str:
+    """A job id or permission scope name as evidence may publish it (#802).
+
+    The raw text still decides which jobs and scopes compare; only the
+    evidence is redacted, by the rule host grants publish every job label with.
+    Two jobs whose ids redact alike may then raise identical violations, which
+    dedupe into one: the rule, path and decision they carry are the same.
+    """
+
+    # Imported here: host_grants imports this module.
+    from agents_shipgate.core.host_grants import published_workflow_label
+
+    return published_workflow_label(str(value))
+
+
 def _compare_permissions(
     old_perms: Any,
     new_perms: Any,
@@ -817,7 +1193,7 @@ def _compare_permissions(
             add(
                 "HOST-WORKFLOW-WRITE-ALL",
                 path=path,
-                evidence={"kind": "workflow_write_all", "job": job},
+                evidence={"kind": "workflow_write_all", "job": _workflow_label(job)},
             )
         return
     if not isinstance(new_perms, dict):
@@ -834,8 +1210,8 @@ def _compare_permissions(
             path=path,
             evidence={
                 "kind": "workflow_permissions_expanded",
-                "job": job,
-                "scope": str(scope),
+                "job": _workflow_label(job),
+                "scope": _workflow_label(scope),
                 "old": old_value,
                 "new": str(value).strip(),
             },
@@ -846,10 +1222,23 @@ def _is_write(value: Any) -> bool:
     return isinstance(value, str) and value.strip() == "write"
 
 
+#: The access levels GitHub accepts for one permission scope.
+_SCOPE_LEVELS = frozenset({"read", "write", "none"})
+
+
 def _scope_value(old_perms: Any, scope: Any) -> str | None:
+    """The earlier level of ``scope``, as evidence may publish it.
+
+    Only a level GitHub accepts is published. Any other text, which GitHub
+    rejects, is ``None``, as a non-string level is, so evidence never repeats
+    free text from the declaration (#802).
+    """
     if isinstance(old_perms, dict):
         value = old_perms.get(scope)
-        return value.strip() if isinstance(value, str) else None
+        if not isinstance(value, str):
+            return None
+        stripped = value.strip()
+        return stripped if stripped in _SCOPE_LEVELS else None
     if isinstance(old_perms, str):
         stripped = old_perms.strip()
         if stripped == "write-all":
@@ -870,6 +1259,8 @@ def _parse_json_pair(resolved, path: str, add) -> tuple[Any, Any] | None:
     content cannot be resolved.
     """
 
+    # VS Code reads `mcp.json` as JSON with comments (#659).
+    loads = loads_jsonc if is_vscode_mcp_path(path) else json.loads
     if resolved.new_text is None:
         add(
             "HOST-CONFIG-PARSE-FAILED",
@@ -884,7 +1275,7 @@ def _parse_json_pair(resolved, path: str, add) -> tuple[Any, Any] | None:
         new_data = {}
     else:
         try:
-            new_data = json.loads(resolved.new_text)
+            new_data = loads(resolved.new_text)
         except json.JSONDecodeError as exc:
             add(
                 "HOST-CONFIG-PARSE-FAILED",
@@ -896,7 +1287,7 @@ def _parse_json_pair(resolved, path: str, add) -> tuple[Any, Any] | None:
         old_data: Any = {}
     else:
         try:
-            old_data = json.loads(resolved.old_text)
+            old_data = loads(resolved.old_text)
         except json.JSONDecodeError as exc:
             add(
                 "HOST-CONFIG-PARSE-FAILED",

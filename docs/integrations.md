@@ -2,6 +2,23 @@
 
 ## GitHub Actions
 
+### Host-only advisory PR review (no manifest)
+
+A repository whose pull requests change coding-agent host configuration needs
+no `shipgate.yaml` for PR review. Use
+[`examples/github-actions/14-host-only-advisory-pr.yml`](../examples/github-actions/14-host-only-advisory-pr.yml):
+the Action compares each PR with its base branch in Git history and posts one
+comment that later pushes update. What it finds never fails the job, and
+missing base history shows in the comment as `Host capability comparison
+unavailable`. The job does fail on a setup or execution error — the install, a
+non-zero CLI exit such as an invalid `shipgate.yaml` added by the PR, or a
+comment API error other than a missing permission. The
+[examples README](../examples/github-actions/README.md#host-only-advisory-pr-review)
+covers those, permissions, forks, pinning and what each comment means. The
+recipes below apply to a repository with a `shipgate.yaml`.
+
+### With a manifest
+
 The public Marketplace action installs from its tagged source by default; set
 `shipgate_version` when you want the action to install a pinned PyPI package
 version.
@@ -23,12 +40,12 @@ jobs:
         with:
           fetch-depth: 0
       - id: agents-shipgate
-        uses: ThreeMoonsLab/agents-shipgate@v0.15.0
+        uses: ThreeMoonsLab/agents-shipgate@v1.2.0
         with:
           config: shipgate.yaml
           ci_mode: advisory
           diff_base: target
-          shipgate_version: '0.15.0'
+          shipgate_version: '1.2.0'
 ```
 
 To post PR comments, set:
@@ -100,8 +117,14 @@ Action outputs:
 The action runs `agents-shipgate verify`, which writes Markdown, JSON, SARIF,
 packet JSON, verifier JSON, verify-run JSON, and PR-comment Markdown
 artifacts. It intentionally emits `packet.json` only for the packet;
-`pr-comment.md` is the human PR surface. Read `agent-handoff.json` first for
-the compact agent handoff, `verifier.json` for detailed control context,
+`pr-comment.md` is the human PR surface. Run
+`agents-shipgate agent control --workspace .` first and require it to succeed:
+it validates `current-control.json` against every artifact it binds and against
+the live repository, and exits `4` (`workspace_changed`) once HEAD or the
+working tree has moved since the decision. Reading the pointer file directly
+does not check that — it returns the old state until verification is re-run.
+Then read `current-control.json`, `agent-handoff.json` for the compact
+agent handoff, `verifier.json` for detailed control context,
 `verify-run.json` for reproducibility metadata, and
 `report.json.release_decision.decision` for the gate. Capability diffs and
 `capability_review.top_changes` are supporting/provisional review context.
@@ -114,6 +137,34 @@ rule IDs as SARIF `ruleId` values when present, so the first upgrade run can
 close/reopen existing GitHub code-scanning alerts whose identity was previously
 the built-in Shipgate check ID.
 
+After adoption, choose an explicit merge policy in the workflow rather than
+leaving advisory mode load-bearing.
+[`07-block-on-blocked-verdict.yml`](../examples/github-actions/07-block-on-blocked-verdict.yml)
+blocks only when `merge_verdict == 'blocked'`;
+[`08-require-mergeable.yml`](../examples/github-actions/08-require-mergeable.yml)
+requires `can_merge_without_human == true`;
+[`11-fail-on-insufficient-evidence.yml`](../examples/github-actions/11-fail-on-insufficient-evidence.yml)
+fails only on `insufficient_evidence`. Strict, baseline, SARIF, Check Run and
+multi-config recipes are in
+[`examples/github-actions/`](../examples/github-actions/); the full input and
+output catalog is [`action.yml`](../action.yml).
+
+CI is advisory by default. Strict mode exits `20` only on unsuppressed critical
+findings, so on an existing project it fails on the backlog the first time it
+runs. Record that backlog as a baseline, then gate on what is new:
+
+```bash
+# 1. see what strict would do today — expect exit 20 if there is any backlog
+agents-shipgate scan --config shipgate.yaml --ci-mode strict
+# 2. accept the current findings as the baseline
+agents-shipgate baseline save --config shipgate.yaml --out .agents-shipgate/baseline.json
+# 3. strict from here: fails only on findings the baseline does not carry
+agents-shipgate scan --config shipgate.yaml --baseline .agents-shipgate/baseline.json --ci-mode strict
+```
+
+Severity and failure thresholds are configurable in the manifest
+(`checks.severity_overrides`, `ci.fail_on`) — see [`baseline.md`](baseline.md).
+
 For source-only testing in this repository:
 
 ```yaml
@@ -123,7 +174,7 @@ For source-only testing in this repository:
 - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
   with:
     python-version: "3.12"
-- run: python -m pip install -e ".[dev]"
+- run: python -P -m pip install -e ".[dev]"
 - run: agents-shipgate verify --workspace . --config shipgate.yaml --base origin/main --head HEAD --ci-mode advisory --format json
 ```
 
@@ -166,13 +217,81 @@ exact remaining command, and `human_review_required` lets the turn end with a
 hand-off notice — a Stop-hook block forces the agent to keep working, which is
 the opposite of what `must_stop` means.
 
+Without a configured manifest, when every changed file is host configuration —
+`.claude/settings.json`, `.mcp.json`, `.cursor/mcp.json`, `.codex/config.toml`,
+`.vscode/mcp.json` or a GitHub workflow — the Stop hook runs
+`agents-shipgate diff` instead of advising you to initialize a manifest. It
+stays quiet when no row widens what the agent can do and none is of unknown
+direction. An edit the engine cannot order, such as a hook command or MCP
+argument edit, or a setting no documented rule ranks, is not called a widening
+but is named under its own heading, never silently dropped (#820). A workflow step moved to
+a different action reference, such as a pinned SHA to `@main`, is a
+non-widening row, so the hook stays quiet about it; `diff` and the PR comment
+still show it. The same holds for an agent launch in a workflow whose settings
+change without gaining a documented widening rule, for a checkout's ref, and
+for an edit to an argument input the audit does not read, which is compared by
+a digest, named in the row and named as a limit in `audit --host`. A `run:`
+that mentions an agent CLI and that the audit does not read is different: it
+gives no row in `diff` or the PR comment, whatever is edited, and is named only
+as a limit in `audit --host`. An agent launch that gains a rule, such as a plain `claude_args`
+gaining `--dangerously-skip-permissions` on any of its lines, widens, and the
+hook announces it (#823), unless the launch may be a step of that job the audit
+did not read, rewritten, or the job's launch held before a `${{ }}` expression
+or an unread argument input the rule is read from, or the rule moved in from a
+job the launch left, as a renamed job's does.
+It names each widening
+row once, and repeats the announcement only when the change or its rows change.
+A missing base ref, an incomparable inventory or unparsed output is never
+quiet. When host configuration changes beside other files, the Stop hook
+still compares the host configuration that way and advises on the other files
+separately, in one message. The PostToolUse hook never nudges on host
+configuration edits, with or without a manifest, because the Stop hook compares
+them. Instruction files, skills, commands, rules and policies keep the route
+above, and a repository with a manifest always runs `verify`. The hook reads
+configuration, not the agent's runtime permissions.
+
+Within one Claude Code session, the hooks do not repeat an advisory the agent
+has already seen. Each changed path remembers the last verdict the hooks
+reached for it and the verdicts already announced. An edit that brings no new
+verdict for any path it names stays quiet, even though it is evaluated again.
+A new path, a different verdict, a different base or manifest, or a new session
+is announced. So is every result that could not read its input. This is
+presentation only: CI and `verify` evaluate the whole change regardless.
+
 These hooks are advisory local feedback. Local setup failures such as a
 missing CLI or unavailable base ref are surfaced as context, and verifier
 output the hook cannot parse is surfaced as an explicit warning rather than
-treated as a pass. They are not a
+treated as a pass. A `verify` that exits with anything other than `0` or `20`
+is surfaced as context naming the exit, and does not block the Stop. That
+includes exit `2` when the default `agents-shipgate-reports` is refused because
+it holds repository content, such as committed files or stray notes beside the
+reports: a change that would otherwise soft-block on `agent_action_required`
+ends the turn with that context instead, so resolve the refusal it names (see
+[troubleshooting](troubleshooting.md)). They are not a
 trust boundary and not a replacement for CI. CI should continue to run the
 GitHub Action or an equivalent `agents-shipgate verify` command, and CI's
 `report.json.release_decision.decision` remains authoritative.
+
+## CI installation trust
+
+The following recipes use `python -P` to keep the checkout off Python's implicit
+module search path during installation (Python 3.12 or newer). Use a trusted
+Python executable and installed CLI on `PATH`, and do not supply a checkout
+through `PYTHONPATH`. `-P` does not neutralize an attacker-controlled pipeline,
+explicit imports, environment variables, or an editable package's build backend.
+The source-only editable-install example above is for trusted source testing.
+
+- **GitLab:** use a protected/parent pipeline definition from a trusted source
+  when scanning an untrusted checkout; a merge-request-controlled job can alter
+  its own commands.
+- **CircleCI:** keep the configuration and any setup/continuation configuration
+  trusted when analyzing untrusted changes; checkout isolation alone does not
+  authenticate the job definition.
+- **Jenkins:** use a trusted Jenkinsfile or shared library for the scan stage;
+  do not execute a proposed Jenkinsfile as the authority for its own review.
+
+These examples document the installation boundary; they do not claim a hosted
+security test on GitLab, CircleCI or Jenkins.
 
 ## GitLab CI
 
@@ -189,7 +308,7 @@ agents-shipgate:
   stage: test
   image: python:3.12
   script:
-    - python -m pip install --pre "agents-shipgate==0.15.0"
+    - python -P -m pip install --pre "agents-shipgate==1.2.0"
     - agents-shipgate scan --config shipgate.yaml --ci-mode advisory --format markdown,json,sarif
   artifacts:
     when: always
@@ -221,7 +340,7 @@ jobs:
       - image: cimg/python:3.12
     steps:
       - checkout
-      - run: python -m pip install --pre "agents-shipgate==0.15.0"
+      - run: python -P -m pip install --pre "agents-shipgate==1.2.0"
       - run: agents-shipgate scan --config shipgate.yaml --ci-mode advisory --format markdown,json,sarif
       - store_artifacts:
           path: agents-shipgate-reports
@@ -233,7 +352,7 @@ jobs:
 ```groovy
 stage('Agents Shipgate') {
   steps {
-    sh 'python -m pip install agents-shipgate'
+    sh 'python -P -m pip install agents-shipgate'
     sh 'agents-shipgate scan --config shipgate.yaml --ci-mode advisory'
     archiveArtifacts artifacts: 'agents-shipgate-reports/**', allowEmptyArchive: true
   }
@@ -267,7 +386,7 @@ pip install 'agents-shipgate[mcp]'
 ```
 
 Tools: `shipgate.check` (caller-provided diff to
-`shipgate.agent_boundary_result/v2`),
+`shipgate.agent_boundary_result/v3`),
 `shipgate.preflight` (protected surfaces, required evidence, and policy/trust
 root hashes), `shipgate.explain` (check id or `fp_...` fingerprint), and
 `shipgate.capabilities` (capability lock export or diff). The server is
@@ -284,7 +403,7 @@ Run Agents Shipgate locally on every commit that touches a tool-surface artifact
 # .pre-commit-config.yaml
 repos:
   - repo: https://github.com/ThreeMoonsLab/agents-shipgate
-    rev: v0.15.0
+    rev: v1.2.0
     hooks:
       - id: agents-shipgate
 ```
@@ -314,10 +433,10 @@ repos:
             (.*/)?conductor/.*\.json|
             (.*/)?ai/examples/.*\.json|
             (.*/)?\.codex/(config\.toml|hooks\.json|requirements\.toml)|
-            (.*/)?\.claude/(settings(\.local)?\.json|commands(/.*)?)|
+            (.*/)?\.claude/(settings(\.local)?\.json|commands(/.*)?|hooks/hooks\.json)|
             (.*/)?\.cursor/(cli\.json|mcp\.json|rules(/.*)?)|
             (.*/)?\.vscode/mcp\.json|
-            (.*/)?\.shipgate/agent-contract\.json|
+            (.*/)?\.shipgate/(agent-contract|openshell)\.json|
             (.*/)?(AGENTS(\.override)?|CLAUDE)\.md|
             \.(agents|claude)/skills/.*|
             (.*/)?\.codex-plugin(/.*)?|

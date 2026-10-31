@@ -13,6 +13,8 @@ from typing import Any, Literal
 import yaml
 
 from agents_shipgate import __version__
+from agents_shipgate.published_release import ReleaseEngine, contract_floor_prose
+from agents_shipgate.release_source import release_engine
 from agents_shipgate.schemas.contract import MINIMUM_CONTROL_CONTRACT_VERSION
 
 DEFAULT_CONFIG_RELATIVE_PATH = ".agents-shipgate/adoption-kit.yaml"
@@ -189,8 +191,10 @@ def render_adoption_kit(
     override_root = config.target_overrides.get(target) if config else None
     override_files = _read_override_files(override_root) if override_root else {}
     merged_files = {**bundled_files, **override_files}
+    # One engine per render, so no two files in a kit can name different builds.
+    engine = release_engine()
     root_files = {
-        rel: _render_template(text)
+        rel: _render_template(text, engine)
         for rel, text in sorted(merged_files.items(), key=lambda item: item[0])
     }
     files = {
@@ -446,15 +450,36 @@ def _read_metadata(spec: KitTarget) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
-def _render_template(text: str) -> str:
+def _render_template(text: str, engine: ReleaseEngine | None = None) -> str:
     # Rendered, never hand-written. The runner pin and the contract floor a
-    # prompt demands have to come from the same build that emitted the prompt,
-    # or they drift apart: the kits shipped a floor of 14/15 against a pinned
-    # runner that reports contract 10, so an agent following them literally
-    # could never satisfy the check it was told to gate on.
+    # prompt demands have to be decided together, or they drift apart: the kits
+    # once shipped a floor of 14/15 against a pinned runner that reports
+    # contract 10, so an agent following them literally could never satisfy the
+    # check it was told to gate on.
+    #
+    # Binding the pin to ``__version__`` was the first attempt at that, and it
+    # traded one broken prompt for another: the pin then named the *emitting*
+    # build, which for the whole interval between releases is a version no
+    # index carries, so the very first command in the prompt failed to resolve
+    # (#506). The pin names the newest published release, and
+    # ``contract_floor_prose`` states — in the prompt, beside the pin — whether
+    # that release reports the floor. When it does not, the honest output is to
+    # say so; it is never to pin a build that cannot be fetched.
+    #
+    # Hand-written pins were the third attempt's hole: the bundled CI recipes
+    # carried literal release pins, and a pinned floor was judged against the
+    # published constants a final wheel is necessarily built *beside*, so the
+    # released 1.0.0 told adopters to install 0.15.0 and that no release reports
+    # contract 21 (#781). Every pin and the floor now come from one engine,
+    # selected by the same rule ``init --ci`` uses.
+    engine = engine or release_engine()
+    floor = contract_floor_prose(MINIMUM_CONTROL_CONTRACT_VERSION, engine)
     context = {
-        "shipgate_version": __version__,
+        "shipgate_version": engine.package_version,
+        "shipgate_action_ref": engine.action_ref,
         "minimum_control_contract_version": MINIMUM_CONTROL_CONTRACT_VERSION,
+        "contract_floor_notice": floor.notice,
+        "contract_floor_source": floor.source,
     }
 
     def replace(match: re.Match[str]) -> str:

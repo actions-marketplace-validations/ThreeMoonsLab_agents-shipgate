@@ -1,100 +1,73 @@
 # Quickstart
 
-A 60-second introduction to agents-shipgate for developers and AI coding agents.
+Three ways in, depending on what the pull request in front of you changes:
 
-## Verify-first quickstart
+- **What a coding agent may do** — `.claude/settings.json`, `.mcp.json`,
+  `.codex/`, `.cursor/` or VS Code MCP configuration. Start at
+  [Review a host-configuration change](#review-a-host-configuration-change):
+  one command, no manifest.
+- **A tool surface your repository builds** — MCP or OpenAPI exports,
+  framework tool definitions. Follow
+  [One review, end to end](#one-review-end-to-end), on a sample committed to
+  this repository.
+- **Application-agent wiring without a manifest** — who receives a tool,
+  what its interface or implementation changed, and where the read stops.
+  Start at [Application route in one YAML block](#application-route-in-one-yaml-block-source-only).
 
-After installing the CLI (see [Install](#install)), start from one of three
-prominent flows.
+By the end you should be able to say four things about the change under
+review, from the artifacts alone:
 
-### Local Boundary Check
+1. what capability it added, widened or removed;
+2. why the top result matters;
+3. what the run did **not** establish; and
+4. what happens next, and who is allowed to do it.
 
-Coding agents run `shipgate check` before reporting an agent-capability change
-complete. Parse the stdout `shipgate.agent_boundary_result/v2` object:
+The target is about 10 minutes. That is a target used to size this guide, not
+a measured result — observed times are recorded in
+[`design-partner-pilot-results.md`](design-partner-pilot-results.md).
 
-```bash
-shipgate check --agent codex --workspace . --format agent-boundary-json
-shipgate check --agent claude-code --workspace . --format agent-boundary-json
-shipgate check --agent cursor --workspace . --format agent-boundary-json
-```
+Nothing here asks you to author a policy first. If you are reviewing a
+coding-agent host boundary rather than building a tool surface, you never need
+a manifest at all.
 
-The `--agent` value is caller identity, not a coverage selector. Every
-recognized changed host boundary is evaluated on every invocation.
+## Which build you get
 
-Switch on `control.state`; follow `control.next_action`,
-`control.allowed_next_commands`, and `control.human_review`. Treat `decision`
-as diagnostic context only, and do not infer control from prose. Only
-`control.state=complete` permits task completion; `agent_action_required`
-authorizes only the stated coding-agent route, `review_publishable` keeps
-commit/push/PR updates authorized while denying merge and completion, and
-`human_review_required`
-requires the agent to stop.
+Read this before you install. Agents Shipgate is published through more than
+one channel, and they do not all implement the same runtime contract. The
+newest published release is **`v1.2.0`**, which implements **runtime contract
+`41`**, including the agent-control envelope that later sections describe. It
+ships on the advisory channel and makes no qualification claim. An older
+install may still be the previous release, `v1.1.0` (contract `40`), which has
+no `diff --application` and prints the change answer in
+[Read the answer](#3-read-the-answer) without its review guidance; `v1.0.0`
+(contract `39`), whose `diff` answers are flatter than the ones that section
+quotes; or `v0.15.0` (contract `10`), which predates that envelope and renders
+several steps below differently. `pipx upgrade agents-shipgate` replaces any
+of them.
 
-When `check` discovers an undeclared deployed tool surface, a coding agent may
-prepare the narrow coverage proposal itself: append a built-in `tool_sources`
-row with a contained existing path, leaving all existing rows and other
-manifest values unchanged. Run preflight with the concrete diff, then follow
-its exact verify command. This is proposal authorship, not approval; custom
-adapters, trust/optional declarations, semantic or authority claims, and any
-broader manifest change remain human-routed, and the concrete protected diff
-still needs human review before merge.
+| Channel | How you get it | Runtime contract | Has `control.*` / `current-control.json` | Accepts `check --format agent-boundary-json` | Qualification |
+| --- | --- | --- | --- | --- | --- |
+| Published release `v1.2.0` | `pipx install agents-shipgate` | 41 | Yes | Yes | **None.** Declared `advisory` in `.github/release-channels.json`; see [`release-evidence-policy-decision.md`](release-evidence-policy-decision.md) § Amendment 5 |
+| Unqualified preview | `gh release download preview-<version> --repo ThreeMoonsLab/agents-shipgate --pattern '*.whl'`, then `pip install ./<wheel>` | that of the source commit it was cut from | Yes | Yes | **None**, by construction — no adjudicated corpus, no qualification artifact, nothing signed. See [`release-evidence-policy-decision.md`](release-evidence-policy-decision.md) § Amendment 2 |
+| Source checkout | `git clone`, then `./shipgate …` from the checkout | that of the checkout | Yes | Yes | Not a distributed build |
 
-### PR And Local Verification
+Pick one channel and stay on it for the whole walkthrough. **Every command in
+[One review, end to end](#one-review-end-to-end) runs on the published
+release, and reaches the same verdict there** — `blocked`, `can merge without
+human: false`, exit `0`. The verdict excerpts in that walkthrough are from a source checkout, and the
+published release renders those same lines —
+a test fails if a step quotes output only one channel produces without saying
+which.
 
-For local pre-commit work, omit `--base` and `--head` so uncommitted edits are
-scanned:
-
-```bash
-agents-shipgate verify --workspace . --config shipgate.yaml \
-  --ci-mode advisory --format json
-```
-
-For committed PR/CI refs, make the base ref available first, then pass base and
-head:
-
-```bash
-agents-shipgate verify --workspace . --config shipgate.yaml \
-  --ci-mode advisory --format json --base origin/main --head HEAD
-```
-
-If a repo is not configured yet, use the verify flow's preview entry point:
-
-```bash
-agents-shipgate verify --preview --json
-```
-
-The short `shipgate verify` alias remains invokable for compatibility, but
-agent-facing PR-gate guidance uses `agents-shipgate verify`.
-
-Read `agents-shipgate-reports/agent-handoff.json` first and lead with
-`control.state`, `gate.merge_verdict`, `gate.can_merge_without_human`,
-`next_action`, `fix_task`, and `capability_review.top_changes`. Then read
-`agents-shipgate-reports/report.json`; the release gate remains
-`release_decision.decision`.
-
-### Host-Grant Audit
-
-Before changing local MCP servers, Codex/Claude/Cursor permission rules,
-hooks, workflow scopes, or other host grants, capture the host inventory:
+Whatever you install, ask it what it is before you trust a field name:
 
 ```bash
-shipgate audit --host --json --out agents-shipgate-reports/host-grants.json
+agents-shipgate --version
+agents-shipgate contract --json
 ```
 
-This defaults to deterministic repository-declared static grants. Add
-`--scope local-static` only for an explicit local user/managed-file audit;
-inspect `host_coverage`, `issues`, and `excluded_scopes` before relying on it.
-
-## Supporting zero-install relevance check
-
-Coding agents reading a fresh repo can answer "is this an agent project?" in one fetch, no install needed:
-
-```bash
-curl -sSL https://raw.githubusercontent.com/ThreeMoonsLab/agents-shipgate/main/tools/shipgate-detect.py \
-  | python3 - --workspace . --json
-```
-
-If `is_agent_project: true` (or `suggested_sources` / `codex_plugin_candidates` is non-empty), continue with the install below. If `is_agent_project: false`, `suggested_sources: []`, `codex_plugin_candidates: []`, **and `python_parse_truncated: false`**, Shipgate is not the right tool for this repo. (`python_parse_truncated: true` means the Python parse stopped at its cap, so that negative describes the files that were read rather than the repository — re-run with `--max-python-files <workspace_signals.python_file_total>` before concluding anything.) See [`docs/zero-install.md`](zero-install.md) for `uvx` and GitHub Action alternatives that also avoid a local install.
+`contract --json` prints the `contract_version` the installed build actually
+implements. Do not assume the floor this documentation was written against.
 
 ## Install
 
@@ -102,7 +75,8 @@ If `is_agent_project: true` (or `suggested_sources` / `codex_plugin_candidates` 
 pipx install agents-shipgate
 ```
 
-Alternatives if `pipx` is unavailable:
+`pipx upgrade agents-shipgate` refreshes a stale copy — a plain install is a
+no-op when an older build is already there. Alternatives:
 
 ```bash
 python -m pip install agents-shipgate     # global pip
@@ -111,54 +85,920 @@ uvx agents-shipgate --help                 # one-shot via uv, no permanent insta
 python -m agents_shipgate --help           # run from a pip install without PATH
 ```
 
-The CLI binary is `agents-shipgate`; a short alias `shipgate` is also installed.
-Agents Shipgate currently requires Python 3.12 or newer. If your project uses
-an older runtime, install the CLI with `pipx` or `uv` using a Python 3.12+
-interpreter instead of installing it into the project environment.
+The CLI binary is `agents-shipgate`; a short alias `shipgate` is also
+installed. Agents Shipgate requires Python 3.12 or newer. If your project uses
+an older runtime, install the CLI with `pipx` or `uv` against a 3.12+
+interpreter rather than into the project environment — your agent project does
+not need Python 3.12 itself.
 
-## Demo fixture (60 seconds)
+## Application route in one YAML block (source only)
 
-Run the verify-native fixture used for the public verifier story:
+Use this for a pull request that changes an application's agent/tool wiring.
+It needs no `shipgate.yaml`, policy or saved baseline. This Action input is
+**not in the published `v1.2.0` Action**. Replace `v<NEW>` below with the full
+reviewed commit SHA that contains this input. Leave `shipgate_version` empty
+so the Action installs the CLI from that same source.
+
+```yaml
+name: Application agent review
+on: pull_request
+permissions:
+  contents: read
+  pull-requests: write
+concurrency:
+  group: application-review-${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  application:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - uses: ThreeMoonsLab/agents-shipgate@v<NEW>
+        with:
+          application: "true"
+          pr_comment: "true"
+```
+
+The Action compares the merge-base of the PR base and head SHAs with the PR
+head SHA. It derives the application scope from that change. Set
+`application_scope` to a repository-relative directory to choose one scope.
+For a non-PR run, supply both `base_ref` and `head_ref`. All commits and full
+objects must already be local. The Action never fetches; a shallow or partial
+checkout produces a refusal with a fix, rather than a no-change answer.
+
+The sticky comment starts with the CLI's reviewer findings and states where
+reading stopped. The `agents-shipgate-application-review` workflow artifact
+carries `application-comparison.json`
+and the complete text. `application_status`, `application_json`, and
+`application_markdown` expose that result to later steps. Each run writes a
+new directory under `output_dir`; a refusal cannot reuse an earlier result.
+The job summary always carries the review. On a fork, the read-only token
+may prevent the PR comment; the comment step writes a publication note and
+the review to the summary. Keep the `pull_request` event.
+
+Findings are advisory. Execution refusals fail the job. Set
+`application_fail_on: "partial,not_established"` only if your workflow should
+fail on those comparison statuses. These statuses concern source coverage;
+they are not merge verdicts. Verifier options, such as `baseline`,
+`fail_on_merge_verdicts`, `attestation` and `check_run`, are refused in this
+mode. Verifier decision and control outputs remain empty.
+
+A real comparison input is [MIS_TALENT PR #7](https://github.com/Tiendat2703/MIS_TALENT/pull/7).
+Its base is `420f570c9b800d54b9d3c0b2857339b2eb12445c` and its head is
+`da7034ae6ea4fc492ceb969a759a7d156e435d56`. The source reader reports its
+binding limitations; a partial comparison does not establish the application's
+full tool surface. This link names the input, not a released-build score or
+an existing Action deployment.
+
+## Review a host-configuration change
+
+Use this when a pull request changes what a coding agent may do and you want
+to know what changed before deciding anything. No manifest, policy, saved
+baseline, skill or account is involved, and nothing is written to the
+repository.
+
+For worked examples, see the [three host-review cards](examples/host-review/README.md):
+a shell-rule widening, an added remote MCP declaration and a workflow token
+permission change, with exact inputs and captured released-build output.
+
+### 1. Make the base branch visible to Git
+
+`diff` reads history from your clone and never fetches. Check out the PR, and
+update the remote-tracking ref for its base branch:
+
+```bash
+git fetch origin
+git switch <pr-branch>
+```
+
+### 2. Run it
+
+```bash
+agents-shipgate diff
+```
+
+With no `--base`, `diff` compares your working tree with its merge base on
+`origin/HEAD`, `origin/main` or `origin/master`, the first that exists; a local
+`main` or `master` is used only in a repository with no remote. The header names the base
+it chose. **If the PR targets another branch, name it** —
+`agents-shipgate diff --base origin/<pr-base>` — or the comparison is against
+the default branch instead. In a clone of a fork, `origin` is the fork and its
+`main` may be stale: `git fetch upstream`, then
+`agents-shipgate diff --base upstream/<pr-base>`. `--json` prints the same rows
+as data.
+
+### 3. Read the answer
+
+**Source-tree examples, not yet released:** the answers below are from this
+repository's source tree, run in a clone. The published `1.2.0` prints the
+same answers, except that its note on the added MCP server in the change
+example reads `launch source is mutable`. This tree says instead that the
+server's `npx` package spec has no exact version, and that the static read does
+not establish whether `npx` resolves a local project dependency or falls back
+to the registry or its cache, as
+[npm documents](https://docs.npmjs.com/cli/v11/commands/npm-exec#description)
+(#933). The note changes neither severity nor the widening count. On
+the remote's `main`, `.claude/settings.json` allows `Bash(npm test:*)` and denies `Bash(rm -rf:*)`,
+and `.mcp.json` configures one server, `docs`. The PR branch allows
+`Bash(npm *)`, drops the denial, and adds a `billing` server.
+
+**Changes.** One entry per grant that differs, or per replaced rule. A
+permission rule is named with its disposition (`allow`, `deny` or `ask`); an
+allow rule the engine decided another replaced is one entry with its before and
+after, `widened` or `narrowed`, as is the same rule moved from one disposition
+to another (`moved`); `--json` keeps those as their removal and addition rows,
+and publishes the joined change, its direction, the counters printed below and
+this question in `review`, so a script reads what you read. An MCP
+server is named with the command name or redacted URL and the env and header
+key names its declaration publishes; the command's path and arguments are not
+shown, so an edit confined to them says so. (Since `1.2.0`, #819: a package
+specification among the arguments, such as `example-mcp-server@1.2.3`, is
+named, and an edit to any other argument reads `launch arguments changed` with
+before and after digests; no argument text is printed. A hook is named with its
+matcher, its timeout, and its command's executable name and digest, never the
+command's text.) A URL is printed only as its scheme
+and host with the path redacted; one the tool cannot reduce to that form, such
+as `${SLACK_MCP_BASE}/hooks/…`, reads `url not shown`. `⚠` marks an entry that
+widens what the agent may do:
+
+```text
+Agent capability diff  origin/main (5d1b9e23) -> working tree
+
+⚠ high    added    claude-code .mcp.json
+                  billing (command name npx; env keys BILLING_TOKEN)
+                  an MCP tool surface the agent may call has changed; package spec has no exact version; launch resolution not established: npx may resolve a local project dependency or fall back to the registry/cache
+
+⚠ medium  widened  claude-code .claude/settings.json
+                  allow: Bash(npm test:*) → allow: Bash(npm *)
+                  the new rule matches everything the old rule matched; runs without a prompt
+
+⚠ low     removed  claude-code .claude/settings.json
+                  deny: Bash(rm -rf:*) → gone
+                  removes a denial the agent was subject to
+
+3 change(s) from 4 rows, 3 widening what the agent may do (⚠).
+Static configuration only: this is what the files permit, not what the agent did. No verdict is implied.
+
+What this run established:
+  only sources this entry read or tried to read are listed, so this is not the whole change: a changed file it does not read is absent
+  .claude/settings.json (claude-code): compared; 3 rows
+  .mcp.json (claude-code): compared; 1 row
+
+Review question: Does the team intend these 3 declared capability changes (from 4 rows)?
+Compared: base 5d1b9e23 → working tree at HEAD 58d2ac0c, agents-shipgate 1.2.0.
+Reproduce in that working tree: agents-shipgate diff --base 5d1b9e236525699910f4d93e334d2f4425927062
+Permission review guidance:
+Conditional review choices only; current control permissions still apply. A PR note grants no authority.
+- Change 2: .claude/settings.json
+  Question: Does this task need the command matches of Bash(npm *) beyond Bash(npm test:*)?
+  Limit: These are repository declarations. Runtime access, credentials, other permission layers and task intent are not established.
+  Choice: If intentional, record the rationale in the existing PR discussion; the declaration delta remains visible.
+  Choice: If another scope is intended, the declaration owner chooses it at the named source. The previous value is a reference, not an automatically safe fix.
+  Choice: If disputed, preserve the compared refs and evidence for triage; do not suppress the finding or rewrite policy to clear it.
+  Advisory next actor: declaration owner to be assigned
+  Verification: Compare the resulting declarations against the original base; a rerun establishes a declaration delta, not intent or runtime access.
+- Change 3: .claude/settings.json
+  Question: Should this source remove the deny declaration Bash(rm -rf:*) for this task?
+  Limit: These are repository declarations. Runtime access, credentials, other permission layers and task intent are not established.
+  Choice: If intentional, record the rationale in the existing PR discussion; the declaration delta remains visible.
+  Choice: If another scope is intended, the declaration owner chooses it at the named source. The previous value is a reference, not an automatically safe fix.
+  Choice: If disputed, preserve the compared refs and evidence for triage; do not suppress the finding or rewrite policy to clear it.
+  Advisory next actor: declaration owner to be assigned
+  Verification: Compare the resulting declarations against the original base; a rerun establishes a declaration delta, not intent or runtime access.
+```
+
+From this alone a reviewer can name the change (`allow: Bash(npm test:*)`
+replaced by the broader `allow: Bash(npm *)`, a lost `rm -rf` denial, a new
+`billing` server launched by a command named `npx` and given a
+`BILLING_TOKEN`), the evidence
+(the file and entry each change names, and the compared commits), the limit
+(static configuration, not observed behaviour), which sources the rows came
+from, and the question to answer.
+The intent decision is theirs: record why the change is intended, choose the
+declaration's scope, or preserve disputed evidence for triage. The previous
+rule is a reference, not an automatically safe fix. The `Reproduce` line reads the same
+comparison again. The version on the `Compared` line records the build that
+produced this output, not a version to install; another version may word the
+entries differently. `verify`'s text and its PR comment end their entries with
+the same question and lines; when they compared a head commit, the `Reproduce`
+line says to check that commit out first. `check` and a provided diff name no base commit, so they
+print the question without those lines. Every other answer below ends with the
+same two lines, the first labelled `Inputs:` where the comparison was refused,
+since that run compared nothing: a result with no change and a refusal are the
+ones a reviewer can least check from the output, so they say where they came
+from too. Among those answers only the question is conditional — there is no
+change to ask about.
+
+**No change.** On a branch from `main` that only edits `README.md`:
+
+```text
+Agent capability diff  origin/main (5d1b9e23) -> working tree
+
+No static host-grant changes detected. No verdict is implied.
+
+What this run established:
+  only sources this entry read or tried to read are listed, so this is not the whole change: a changed file it does not read is absent
+  compared with no change in what this entry reads: .claude/settings.json, .mcp.json
+
+Compared: base 5d1b9e23 → working tree at HEAD 0e87a139, agents-shipgate 1.2.0.
+Reproduce in that working tree: agents-shipgate diff --base 5d1b9e236525699910f4d93e334d2f4425927062
+```
+
+That answer covers the sources both sides read, within the
+[support matrix](host-boundary-support.md), and `What this run established`
+names them. Its first line is the block's own boundary: here it lists only
+sources this entry read or tried to read, so a changed file it does not read is
+absent and the list is never the whole account of the change. It says nothing
+about the [surfaces `diff` does not read](host-boundary-support.md#known-unread-surfaces);
+since `1.2.0`, it names the changed ones a
+bounded candidate list recognises (see below).
+
+A zero-row answer is not always "no change". A file is listed as compared
+with no change only when its bytes are proven identical on both sides. When a
+settings file changed and no grant this entry compares changed — here a
+`LOG_LEVEL` value under `env` in `.claude/settings.json`, an entry this entry
+does not model, and an MCP server's `env` value would read the same — there is
+still no row: the answer opens with `Changed, not compared:
+.claude/settings.json. No host-grant row describes this change. No verdict is
+implied.` instead of the no-change line, and the block says the file changed
+instead of listing it as unchanged:
+
+```text
+What this run established:
+  only sources this entry read or tried to read are listed, so this is not the whole change: a changed file it does not read is absent
+  .claude/settings.json (claude-code): compared; changed, but no grant this entry compares changed, so no row (redacted values, such as env values this entry does not model, are not compared)
+```
+
+That line says only that no compared grant changed. It does not say which
+fields did: a reordered rule reads the same, and the values the inventory
+redacts are never compared, so read the file. A key no reader compares, such
+as `outputStyle` or an unknown one, is named instead: `compared; changed, not
+compared (keys this entry does not compare: outputStyle), so no row`. An `env`
+entry that redirects requests or loads code (`ANTHROPIC_BASE_URL`,
+`NODE_OPTIONS`) and a setting Claude Code runs as a command (`statusLine`,
+`apiKeyHelper`) are rows since #1027
+([commands and env](host-boundary-support.md#claude-code-commands-and-env)). Where the bytes can be neither
+proven identical nor shown to differ, such as a settings file read through a
+link, or a checkout that wrote it with `CRLF` line endings (`eol=crlf`, or
+`core.autocrlf=true` on Windows) while Git reports it unchanged, the line reads
+`no grant this entry compares changed, but the file was not proven unchanged`
+instead. Any other changed file with no row reads `changed, but no row is
+attributed to this path`: a plugin manifest whose `hooks` reference was added,
+retargeted or removed, whose rows are on the hook files it selects, or a
+settings link retargeted to another file.
+
+A source only one side read is named with its side, `read in base only` for a
+deleted file and `read in head only` for a new or untracked one such as
+`.claude/settings.local.json`, or for a hook file only the head's plugin
+configuration selects. A plugin manifest or marketplace is published only
+while it declares hooks, so it reads `published by head only` instead.
+
+**Since `1.2.0`.** A changed file this entry does not
+read is named when a
+[bounded candidate rule](host-boundary-support.md#changed-inputs-named-but-not-read)
+recognises it as plausibly agent configuration: a pull request that adds
+`plugins/demo/mcp.json` beside `plugins/demo/.cursor-plugin/plugin.json`
+prints `plugins/demo/mcp.json (cursor): added, not read by this entry: MCP
+configuration in a plugin directory; no row, and loading is not established`,
+and one that moves a marketplace plugin's pinned `sha` names the source it now
+points at, never fetched. The block's first line then reads `sources this
+entry read or tried to read are listed, and changed inputs a bounded candidate
+list names that it does not read, so this is not the whole change: any other
+changed file it does not read is absent`. The candidates come from the change
+itself, so an unchanged one is never named, and ordinary documentation never
+is. Such an item ranks right after the blocking limits below. A file neither
+read nor recognised is not in the block, so its absence says nothing about that
+file.
+
+Where more items were computed than the block prints, its last line reads
+`N more items not listed, each ranked below those above`: blocking limits come
+first, by kind — `unreadable`, `parse_failed`, `unresolved_precedence`, then
+`unsupported`, `dynamic_source_excluded`, `remote_source_excluded` — then
+changes no row describes, then what the entries already show. That order ranks
+kinds, not items, and it is order rather than severity: `unsupported` carries
+both a file this entry merely does not accept and one whose own text would not
+parse, so an item behind the count may still be one to repair.
+
+**Not compared.** A source the change did not touch, but that `diff` cannot
+read on either side, is listed before the answer rather than silently counted
+as unchanged. Here `main` already carries a truncated `.cursor/mcp.json`, and
+the PR only edits `README.md`:
+
+```text
+Agent capability diff  origin/main (69e257e6) -> working tree
+
+Not compared: unchanged in this change and not read, so no claim is made about them:
+  cursor .cursor/mcp.json — parse_failed
+
+No static host-grant changes detected. No verdict is implied.
+
+What this run established:
+  only sources this entry read or tried to read are listed, so this is not the whole change: a changed file it does not read is absent
+  compared with no change in what this entry reads: .claude/settings.json
+
+Compared: base 69e257e6 → working tree at HEAD bf9208f8, agents-shipgate 1.2.0.
+Reproduce in that working tree: agents-shipgate diff --base 69e257e6db955633bae234960f76d771174d13de
+```
+
+The no-change answer covers only the other sources; `--json` lists the skipped
+ones in `unchanged_limits`. The same list can precede changed rows.
+
+**Cannot compare.** When a side of the change cannot be read — here the PR
+leaves `.mcp.json` as truncated JSON:
+
+```text
+Cannot compare against origin/main: head_inventory_incomplete
+This is an input limit, not a finding about the change. Nothing below is a claim that the change is safe.
+
+What this run established:
+  only sources this entry read or tried to read are listed, so this is not the whole change: a changed file it does not read is absent
+  .mcp.json (claude-code): parse_failed in head, so the head inventory is incomplete
+
+Inputs: base 5d1b9e23 → working tree at HEAD 96079310, agents-shipgate 1.2.0.
+Reproduce in that working tree: agents-shipgate diff --base 5d1b9e236525699910f4d93e334d2f4425927062
+```
+
+This is not a pass. The block names each source that left an inventory
+incomplete, its kind and its side; `--json` lists them in `coverage`. `--json` reports it as `comparison_status: "incomparable"`
+with the same `incomparable_reasons`. Repair the named side and run it again;
+never read the missing rows as no change.
+
+**Since `1.2.0`: a partial comparison.** When the only
+inputs that cannot be read are plugin directories — here the PR leaves
+`plugins/demo/.claude-plugin/plugin.json` as `{not json` and also drops the
+`deny` rule from `.claude/settings.json` — `diff` no longer refuses the
+settings change beside it. It opens with `Partial comparison against
+origin/main (<sha>) -> working tree: head_inventory_incomplete` and, before
+any entry, `Not compared: plugins/demo, a plugin directory this entry could
+not read completely, so no change inside it is shown and nothing is claimed
+about it.`, then shows the removed denial, and the block names
+`plugins/demo/.claude-plugin/plugin.json (claude-code): parse_failed in head,
+so nothing in plugins/demo was compared`. `--json` reports
+`comparison_status: "partial"` with the same `incomparable_reasons`, the
+entries and the directory as `scope` on that item. That is only where the
+plugin's references stop inside its directory and nothing outside it depends
+on it; any other input the change leaves unreadable still gives
+`Cannot compare`, as above
+([Partial comparisons](host-boundary-support.md#partial-comparisons)). It is
+not a pass either, and a partial answer with no entry says `That is not a
+no-change answer for this change` instead of `No static host-grant changes
+detected.`
+
+Every one of these exits `0`: the exit code says the comparison ran, not that
+the change may merge.
+
+### When no base can be detected
+
+When none of `origin/HEAD`, `origin/main` or `origin/master` exists — a
+single-branch clone of the PR branch, or a checkout with no `origin/HEAD` whose
+default branch is named neither `main` nor `master` — `diff` stops rather than
+guessing, and exits `2`:
+
+```text
+Invalid value for --base: No base ref could be detected. Pass --base <ref>
+explicitly (use --base HEAD for uncommitted changes only).
+```
+
+Fetch the base branch into its remote-tracking ref and name it:
+
+```bash
+git fetch origin main:refs/remotes/origin/main
+agents-shipgate diff --base origin/main
+```
+
+In a single-branch clone a plain `git fetch origin main` updates only
+`FETCH_HEAD`, and `--base origin/main` is then refused as not available
+locally. `--base HEAD` compares uncommitted edits with the last commit only; it
+does not review a PR's commits. A shallow clone whose history does not reach
+the merge base is refused with a `git fetch --unshallow` instruction; one deep
+enough to contain it compares normally. A partial clone (`git clone
+--filter=blob:none`) that never fetched the base's files is refused the same
+way, exit `2`, naming `git fetch --refetch --no-filter origin`; `diff` never
+fetches them itself, and `git fetch --refetch origin` alone keeps the clone's
+filter and fetches none of them.
+
+### Next
+
+- Run it again on the next PR that touches these files. The second use is the
+  one that tells you whether this is worth keeping.
+- To get the same comparison on every PR without a manifest, add
+  [`examples/github-actions/14-host-only-advisory-pr.yml`](../examples/github-actions/14-host-only-advisory-pr.yml);
+  [its notes](../examples/github-actions/README.md#host-only-advisory-pr-review)
+  cover permissions, forks and what fails the job.
+- [Route H](#route-h--no-manifest) adds a snapshot audit and an optional
+  committed baseline for jobs that need one.
+- If the repository builds its own tool surface, continue with
+  [One review, end to end](#one-review-end-to-end).
+
+## Does this repository need Shipgate?
+
+One fetch, no install, stdlib only:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/ThreeMoonsLab/agents-shipgate/main/tools/shipgate-detect.py \
+  | python3 - --workspace . --json
+```
+
+Continue when `is_agent_project: true`, or when `suggested_sources`,
+`codex_plugin_candidates` or `host_boundary_candidates` is non-empty, or the
+workspace already has a `shipgate.yaml`.
+
+If `is_agent_project: false`, `suggested_sources: []`,
+`codex_plugin_candidates: []`, `host_boundary_candidates: []`,
+`host_discovery_incomplete_paths: []`, **and `python_parse_truncated: false`**, this is
+not the right tool for this repository. `python_parse_truncated: true` means the
+Python parse stopped at its cap, so that negative describes the files that were
+read rather than the repository — re-run with
+`--max-python-files <workspace_signals.python_file_total>` before concluding
+anything. [`zero-install.md`](zero-install.md) covers the `uvx` and GitHub
+Action variants that also avoid a local install.
+
+If `host_boundary_candidates` is non-empty, the repository has recognized
+host configuration paths. For a **host-only** repository with no manifest,
+builder or plugin candidates, and complete discovery, no manifest is needed:
+review a change with
+[`agents-shipgate diff`](#review-a-host-configuration-change), and take a
+snapshot with [Route H](#route-h--no-manifest)'s
+`agents-shipgate audit --host --workspace . --json`, the route discovery names.
+Mixed builder/host repositories retain agent setup; an existing manifest
+retains its doctor route. Follow the emitted typed `control.next_action`:
+incomplete discovery and unresolved project scope take precedence over setup
+or host review. Detection reads filenames, not permissions. Invalid contents remain
+audit inputs; a config path that is a directory requires inspection first.
+`host_discovery_incomplete_paths` lists paths discovery could not see
+through — a link to a directory that it does not follow, or a directory it
+could not read. A link to a file conceals nothing and is not listed. Inspect
+them before interpreting an empty candidate list; the rest of the
+classification still stands.
+
+The published release `v1.2.0` (runtime contract 41) emits these host
+discovery fields, as did `v1.1.0` (contract 40) and `v1.0.0` (contract 39), the
+first release with `agents-shipgate diff`. On an older install such as `v0.15.0`, absence of the
+fields is not an empty answer, and [Review a host-configuration change](#review-a-host-configuration-change)
+is not available either: upgrade first.
+
+## One review, end to end
+
+### 1. The change under review
+
+[`samples/ai_generated_refund_pr`](../samples/ai_generated_refund_pr/) is a
+committed two-commit history. The base is a support agent that can only search
+a knowledge base. The head commit — the kind a coding agent opens — adds a
+refund tool to the MCP export:
+
+```diff
+   { "name": "support.search_kb",
+     "annotations": { "readOnlyHint": true, "idempotentHint": true },
+     "auth": { "type": "oauth2", "scopes": ["support:kb:read"] } },
++  { "name": "stripe.create_refund",
++    "annotations": { "readOnlyHint": false, "destructiveHint": true },
++    "auth": { "type": "oauth2", "scopes": ["stripe:*"] } }
+```
+
+The manifest beside it still declares one scope, `support:kb:read`, and no
+approval policy for the new tool.
+
+### 2. Run it
 
 ```bash
 agents-shipgate fixture run ai_generated_refund_pr
 ```
 
-The fixture builds a temporary base/head git history where the head commit adds
-`stripe.create_refund`. It writes `verifier.json`, `report.json`, and
-`pr-comment.md`; the expected merge verdict is `blocked`.
+The fixture builds the base/head git history in a temporary directory and runs
+`verify` across it. Nothing in your own repository is touched — not even a
+report directory:
 
-The older static scan fixture is still useful when you want a 5-minute path to
-confirm the CLI works and inspect a real Tool-Use Readiness Report before
-touching your own repo:
-
-```bash
-uvx agents-shipgate fixture run support_refund_agent
+```text
+Fixture: ai_generated_refund_pr
+Mode: verify
+Merge verdict: blocked
+Decision: blocked
+Can merge without human: false
+Reports: /tmp/shipgate-fixture-ai_generated_refund_pr-<random>/ai_generated_refund_pr/reports
+Verifier: …/reports/verifier.json
+PR comment: …/reports/pr-comment.md
+Static-verdict boundary: This verdict covers deterministic static evidence
+only. Agents Shipgate did not execute the agent or prove runtime behavior,
+tool routing, credential enforcement, or safety.
 ```
 
-If `uvx` is unavailable, install once with `pipx` and run:
+**The `Reports:` line names the directory it wrote**; every path below is
+relative to it. `--out <dir>` puts them somewhere you choose instead. A
+relative `--out` resolves against your shell's current directory, as it does
+for `verify`, `scan` and `audit --host`, and `Reports:` then prints the
+absolute directory.
 
-```bash
-pipx install agents-shipgate
-agents-shipgate fixture run support_refund_agent
+### 3. What changed
+
+Open `pr-comment.md` — the same text the GitHub Action posts on a pull
+request. The published `v1.2.0` release leads with the capability delta,
+by subject. The current source tree still reports what was added or changed
+when agent binding coverage is incomplete, withholds what was removed or
+narrowed, and names that limit:
+
+```text
+- Capability delta (analysed surface): 2 subjects across 6 changes (+1 added, 2 modified, -0 removed)
+- Top capability changes by subject:
+  - `stripe.create_refund`: added action — blocks release; added tool — blocks
+    release; broadened action destructive — high-risk effect destructive added;
+    blocks release; …
+  - `support.search_kb`: broadened action (support:kb:read -> support:kb:read) —
+    Capability binding_hash changed without a proven direction; review required
 ```
 
-The fixture intentionally fails several checks, so you can see what a real
-finding list looks like. It is a demo path, not the main PR verification flow.
+That is the answer to "what did this capability change": one tool added, one
+existing tool whose binding moved. You did not have to read the identity model
+to get it — the subject is the tool you would open.
 
-## Read the first result
+### 4. Why the top result matters
 
-For PR verification, read `agent-handoff.json.gate.merge_verdict` first:
+`report.md` in that same directory orders findings by subject, most urgent
+first:
 
-| Merge verdict | Meaning | Next action |
+```text
+Decision: blocked
+Reason: 4 active findings block release.
+
+Blockers (4):
+- CRITICAL SHIP-POLICY-APPROVAL-MISSING — stripe.create_refund lacks a declared approval policy
+- CRITICAL SHIP-ACTION-DESTRUCTIVE-ROLLBACK-MISSING — stripe.create_refund has destructive capability without required controls
+- CRITICAL SHIP-ACTION-FINANCIAL-WRITE-CONTROL-MISSING — stripe.create_refund has financial write capability without required controls
+- CRITICAL SHIP-ACTION-WILDCARD-SCOPE — stripe.create_refund declares a broad action scope
+```
+
+The top blocker is not "a new tool appeared". It is that a tool which moves
+real money can be called with no declared approval gate, under a `stripe:*`
+scope the manifest never granted. Match on the check ID, not the sentence.
+Each finding names the evidence it rests on —
+in this fixture, the MCP export at `tools.json#/tools/1`. Run
+`agents-shipgate explain SHIP-POLICY-APPROVAL-MISSING` for the check's own
+description, or see [`checks.md`](checks.md) for the catalog.
+
+### 5. What the run did not establish
+
+On current `main`, capability summaries distinguish conservative effect
+projections from their static evidence. A provisional `write` and unknown
+effect evidence are compatible answers; see [effect projections and
+evidence](effect-evidence.md) for the existing JSON fields and review meaning.
+
+`report.md` carries its own coverage limit, and that limit is part of the
+answer. The published `v1.2.0` release renders this excerpt; the current
+source tree can report different reachability and pass-eligibility counts
+when binding coverage is incomplete. Read the counts from the run you made:
+
+```text
+Evidence coverage: static (2/2 catalog tools reachable; 1 semantic review
+concern(s); 2/2 actions pass-eligible; human review recommended)
+```
+
+The same boundary is repeated in `pr-comment.md`:
+
+```text
+- Static-verdict boundary: This verdict covers deterministic static evidence
+  only. Agents Shipgate did not execute the agent or prove runtime behavior,
+  tool routing, credential enforcement, or safety.
+```
+
+Nothing here proves the refund tool behaves as described at runtime, that the
+credential is really scoped, or that a human is really in the loop. It proves
+what the declared and statically discoverable surface says, and it names the
+one semantic concern it could not close.
+
+When static extraction cannot enumerate a tool surface at all — a toolkit
+factory, a config-bound allowlist, tools assembled at runtime — the release
+decision is `insufficient_evidence` rather than a guess. That is the intended
+failure mode. It routes to a person; it does not claim the agent is unsafe.
+
+### 6. Exit zero is not merge permission
+
+Ask the shell what the run returned:
+
+```bash
+agents-shipgate fixture run ai_generated_refund_pr > /dev/null; echo $?
+```
+
+```text
+0
+```
+
+`report.md` says why:
+
+```text
+Fail policy: ci_mode=advisory, fail_on=[none], new_findings_only=false, would_fail_ci=false (exit 0)
+```
+
+Advisory mode never fails the job. The verdict is `blocked` anyway. **Exit
+status is a CI policy choice; the verdict is the answer.** A gate wired to the
+process exit code, in advisory mode, gates on nothing. [Advisory
+CI](#advisory-ci) below is where you make the verdict load-bearing.
+
+### 7. The next action, and who owns it
+
+`verifier.json` carries `fix_task`. One of its five instructions — an
+evidence-gap line — and the `allowed_repairs[]` array beside them are elided
+here:
+
+```json
+{
+  "actor": "human",
+  "safe_to_attempt": false,
+  "instructions": [
+    "4 active findings block release.",
+    "Declare an approval policy for stripe.create_refund or remove this tool from the release.",
+    "Declare approval.required, confirmation policy, and safeguards.rollback for this destructive action.",
+    "Declare approval.required, safeguards.audit_log, and safeguards.idempotency for this financial write action."
+  ]
+}
+```
+
+`actor: "human"` is the operative field, and `safe_to_attempt: false` says the
+same thing to a machine. Every instruction is a declaration about approval,
+control or safety — a claim only a person can make. A coding agent may report
+this, and may not resolve it.
+
+On a build that implements contract `21` or newer, the same answer arrives as
+an explicit state machine. **Validate the pointer before you read anything it
+binds** — `current-control.json` is an ordinary file and goes stale silently.
+Run it against the workspace and report directory the fixture printed, not
+against your own:
+
+```bash
+cd /tmp/shipgate-fixture-ai_generated_refund_pr-<random>/ai_generated_refund_pr
+agents-shipgate agent control --workspace . --reports-dir reports
+```
+
+The first path is the `Fixture copy left at` line from step 2; `reports` is the
+last segment of its `Reports:` line. Both flags matter: the fixture's history
+lives in that copy, and its artifacts are under `reports/`, not the default
+`agents-shipgate-reports/`. Run it from your own directory instead and it exits
+`3` with `Current control is unavailable (missing)` — or, worse, validates an
+unrelated run you happen to have lying there.
+
+It exits `0` here and returns the compact `shipgate.agent_control/v1`
+envelope, whose fields are top-level:
+
+```text
+"control_state": "human_review_required",
+"next_actor": "human",
+"decision": "blocked",
+"permissions": { … all false … }
+```
+
+That command checks the pointer against every artifact it binds and against
+the live repository, and exits `4` when the workspace has moved since the
+decision (`workspace_changed`, naming the commit the pointer was published
+against). Reading the file directly cannot tell you that — after an unrelated
+commit it still reports the old state. Only once `agent control` succeeds do
+you read `current-control.json` — whose own spelling is nested, `control.state`
+rather than `control_state` — and then `agent-handoff.json` (`control.state`,
+then `gate.merge_verdict`).
+
+**Where a human-review route still lets an agent work.** Contract v20 separates
+two states. `human_review_required` is a full stop. `review_publishable` means
+the agent may still commit, push and update the pull request so the review can
+happen — merge and completion stay denied. Updating a pull request is not
+merging it.
+
+**There is no in-repo approval mechanism.** A comment, a `human_ack` added by
+the same change, or an acknowledgement in conversation does not clear a
+human-review route. A trusted coding host can sign an external authorization
+for one exact command; that protocol is described in
+[`agent-contract-current.md`](agent-contract-current.md#trusted-human-authorization-for-one-exact-command),
+Agents Shipgate ships no signing or approval command, and it does not turn the
+verdict into a pass.
+
+## Two kinds of fix
+
+Findings split cleanly, and the split is in the artifact rather than in your
+judgement.
+
+### Mechanical — an agent may do it
+
+Reversible, containment-checked, and safe to run without further approval:
+
+```bash
+agents-shipgate apply-patches \
+  --from agents-shipgate-reports/report.json \
+  --confidence high --apply
+```
+
+At `--confidence high` this fires on exactly three stale-manifest removals
+(`SHIP-MANIFEST-STALE-{SUPPRESSION,POLICY,RISK-OVERRIDE}`) and refuses to
+mutate anything outside the manifest's directory. It is dry-run by default.
+Scope-coverage appends require an explicit `--confidence medium` and a reviewer.
+Adding advisory CI and adding `agents-shipgate-reports/` to `.gitignore` are
+mechanical too.
+
+### Human-owned — declarations
+
+An agent must never supply, infer or auto-assert an action's **effect**, its
+**authority**, its **bindings**, the agent's **purpose**, or an approval,
+confirmation, idempotency, broad-scope, or prohibited-action claim — including
+by reading them out of a prompt, a README, or a docstring. Prose is not
+evidence of authority. `agent.declared_purpose` and every value like it must be
+supplied by a human, because Shipgate never invents a declaration nobody made;
+`init --json` and `fix_task` mark each one with `actor: "human"`, naming the
+fields and lines. The counterpart matters as much: `agent.name` and the
+`tool_sources[]` rows are facts in the repository, and an agent that escalates
+those to a person has stopped a turn for nothing.
+
+[`agent-autofix-boundary.md`](agent-autofix-boundary.md) is the full boundary,
+with the check-ID mapping and the exact phrasing an agent should hand to a
+reviewer. [`autofix-policy.md`](autofix-policy.md) is the mechanical filter
+behind `apply-patches`.
+
+## Run it on your own repository
+
+Two routes. Pick by what the repository is, not by which looks lighter.
+
+### Route H — no manifest
+
+For any repository that declares what its **coding agents** may do: `.mcp.json`,
+`.claude/settings.json`, `.codex/`, `.cursor/`, hooks, workflow scopes. There is
+no manifest and no policy authoring.
+
+To review a change, [`agents-shipgate diff`](#review-a-host-configuration-change)
+compares against Git history directly and needs no baseline. The commands below
+serve two other jobs: a snapshot of what the repository grants today, and a
+committed baseline for drift that lands outside PR review.
+
+```bash
+shipgate audit --host --json --out agents-shipgate-reports/host-grants.json
+```
+
+The default audit is deterministic `repository` scope. Use `--scope
+local-static` only when you explicitly want supported user and file-based
+managed configuration included. Both modes publish per-host coverage and
+excluded sources; neither proves session or runtime authority. Inspect
+`host_coverage`, `issues` and `excluded_scopes` before relying on the result,
+and see the [static host-boundary support matrix](host-boundary-support.md).
+
+To check drift against an acknowledged state rather than a PR's base, record a
+baseline once, on the default branch, then check drift per change:
+
+```bash
+shipgate audit --host --save-baseline      # then commit .agents-shipgate/
+shipgate audit --host --drift --json --out shipgate-drift.json
+```
+
+**Never `--save-baseline` from the changed checkout to get past a missing
+baseline.** That acknowledges the very expansion under review, and the drift
+then reports nothing.
+
+Before a coding agent reports an agent-capability change complete, it runs the
+local boundary check:
+
+```bash
+shipgate check --agent codex --workspace . --format agent-boundary-json
+shipgate check --agent claude-code --workspace . --format agent-boundary-json
+shipgate check --agent cursor --workspace . --format agent-boundary-json
+```
+
+The `--agent` value is caller identity, not a coverage selector: every
+recognized changed host boundary is evaluated on every invocation. Parse the
+stdout `shipgate.agent_boundary_result/v3` object, switch on `control.state`,
+and follow `control.next_action`, `control.allowed_next_commands` and
+`control.human_review`. Treat `decision` as diagnostic context, never as the
+control signal, and never infer control from prose. `check` is necessary but
+not sufficient for a capability-expanding diff: if a change adds dynamic,
+undeclared or otherwise ambiguous tool capability, do not read
+`decision="allow"` as merge readiness — run `verify` and read
+`release_decision.decision`.
+
+### Route A — a repository that builds a tool surface
+
+For repositories that define and declare a tool surface in-repo: MCP or OpenAPI
+exports, framework tool definitions, a Codex plugin package.
+
+```bash
+agents-shipgate verify --preview --json                  # what would be read, before anything is written
+agents-shipgate detect --json                            # classify the workspace
+agents-shipgate init --write --ci --json                 # manifest + advisory workflow
+```
+
+`init --write --ci` produces a schema-valid `shipgate.yaml` with
+framework-specific `tool_sources` populated, plus a GitHub Actions workflow.
+Then verify the change:
+
+```bash
+# local, uncommitted work — omit --base/--head so working-tree edits are scanned
+agents-shipgate verify --workspace . --config shipgate.yaml \
+  --ci-mode advisory --format json
+
+# committed PR/CI refs — make the base ref available first; verify never fetches
+agents-shipgate verify --workspace . --config shipgate.yaml \
+  --ci-mode advisory --format json --base origin/main --head HEAD
+```
+
+The short `shipgate verify` alias remains invokable for compatibility;
+agent-facing PR-gate guidance uses `agents-shipgate verify`.
+
+**`init` reports what it could not infer, and routes the whole turn.**
+Two fields, and only one of them decides. `placeholders[]` is a *location*
+list — each entry is `path`, `current` and `line`, with no owner on it.
+`control.next_action.actor` routes the next step rather than assigning
+ownership to individual fields. A human-owned placeholder normally selects
+`"human"` with `permissions.edit: false`, and `why` names where to start, like
+
+```text
+In ./shipgate.yaml: line 13 (agent.declared_purpose[0]) must be supplied by a
+human. These fields declare what this agent is for and what it is permitted to
+do; Shipgate never invents them, and a value a coding agent supplied is a
+declaration nobody made.
+```
+
+**That sentence is a starting point, not a partition.** It is fitted to the
+envelope's prose budget: with seven unresolved declarations it names three
+paths and then `and 4 more in placeholders[]`, and the four it dropped are
+human-owned as well. While `actor` is `"human"`, surface the required review
+and stop. When it is `"coding_agent"`, perform only the exact
+`control.next_action`, using its `kind`, `path` or `command`, then rerun the
+stated check. A blocking setup repair can take precedence while human-owned
+declarations remain unresolved. An agent route does not prove every remaining
+placeholder belongs to the agent.
+
+Underneath the routing, the ownership split is real in both directions:
+
+- **A coding agent owns** the facts it can read out of the repository:
+  `agent.name`, `project.name`, and the `tool_sources[]` rows. Sending these to
+  a person stops a turn for work the agent owns.
+- **A person owns** every declaration: purpose, prohibited actions, effect,
+  authority, binding, approval, confirmation, idempotency, safeguards, accepted
+  debt and its owner/reason/expiry, and the blocks that are declarations end to
+  end (`action_surface`, `permissions`, `policies`, `agent_bindings`,
+  `tool_identity`, `checks`, `baseline`, `human_ack`, `risk_overrides`,
+  `validation`, `organization`). These values must be supplied by a human —
+  Shipgate never invents a declaration nobody made. Their review route remains
+  due after any blocking setup repair and returns `control.next_action.actor:
+  "human"` with `permissions.edit: false`.
+
+Those names illustrate the rule; `control.next_action.actor` is what decides a
+given turn, and it is the field to act on. Neither list nor prose overrides it.
+
+Do not let a coding agent fill a human-owned value from a prompt, the main
+agent file or the repository README. A purpose or authority claim lifted out of
+prose is not a guess to be corrected later; the engine will treat it as
+evidence, which is exactly the gap this tool exists to catch.
+
+**When discovery reads no tool surface at all.** `init --json` reports
+`tool_surface_origin`: `"detected"` when every source in the manifest was read
+out of the workspace, `"scaffold"` when none was, and `null` when this run's
+render reached neither disk nor the payload. On `"scaffold"` the `tool_sources`
+block is a placeholder — `id`, `type` and `path` are all `CHANGE_ME`, all three
+are in `placeholders[]`, and `manifest_message` says nothing was inferred. That
+can happen when registration depends on a server factory that static
+discovery cannot resolve.
+
+**A scaffold says discovery could not read a surface — not that there is none,
+and not that you are on Route H.** This checkout detects a direct
+`server = FastMCP(...)` with `@server.tool` functions, including under an import
+package. A server created through `app = create_server()` with `@app.tool`
+functions still returns `"scaffold"`: the static reader cannot resolve that
+factory. `audit --host` reviews coding-host configuration and never reads those
+tools. Switching routes there
+stops reviewing the capability you came to review. Stay on Route A and give
+`verify` something it can read — an exported MCP tool list, an OpenAPI spec, or
+a local tool inventory (see [Choose your first
+source](#choose-your-first-source)) — or report that static extraction cannot
+reach this surface. Switch to Route H only when the thing you actually want
+reviewed is the coding-host configuration.
+
+### If the first real repository stalls
+
+| Symptom | Next action |
+| --- | --- |
+| `detect` says `is_agent_project: false`, but `suggested_sources` includes MCP or OpenAPI files | Proceed to `init`. MCP/OpenAPI-only repos are valid tool-surface targets even without Python framework detection. |
+| `detect` says `is_agent_project: false`, but `codex_plugin_candidates` is non-empty | Proceed to `init`. Codex plugin repos are valid static plugin-surface targets. |
+| `doctor` shows zero tools | Check `tool_sources[].path`, MCP `tools[]`, OpenAPI `paths`, optional source warnings, and dynamic ADK/MCP toolsets. |
+| Tools are created by factories, wrappers, or dynamic toolsets | Provide an explicit MCP export, OpenAPI spec, local tool inventory artifact, or a broader OpenAI SDK source directory when tools are static but split across files. |
+| `init --write --json` returns `placeholders[]` entries | Switch on `control.next_action.actor`, not the array. `"human"` means surface all of them and stop — `why` names where to start and says when it elided more. See [Route A](#route-a--a-repository-that-builds-a-tool-surface). |
+| Install fails in a Python 3.10/3.11 project | Install the CLI outside the project env with `pipx` or `uv` using Python 3.12+. |
+| Reports appear in `git status` | Add `agents-shipgate-reports/` to `.gitignore`; reports are local release-review artifacts. |
+
+### Choose your first source
+
+Point the manifest at the clearest tool boundary you already have:
+
+| Source | Use when | Manifest path |
 | --- | --- | --- |
-| `blocked` | Active, unaccepted blockers exist. | Fix blockers or remove the risky capability. |
-| `insufficient_evidence` | Static evidence is too weak to gate release confidently. | Add better sources and rerun; do not auto-merge. |
-| `human_review_required` | A person must review accepted debt, trust-root changes, or authority-bearing gaps. | Surface the required review; a coding agent must not self-approve it. It may still commit, push, and update the PR — `control.state` is `review_publishable` and `control.permissions.merge` is false. |
-| `mergeable` | No active blocker or review signal was found. | Keep verifier/report artifacts with the PR record. |
-| `unknown` | Verify could not produce a reliable head scan or diff context. | Fix the setup, fetch the base ref, or rerun with usable inputs. |
+| OpenAI Agents SDK Python | Tools are defined with `@function_tool` in local Python files. | `tool_sources[].type: openai_agents_sdk`; `path` may be one Python file or a directory |
+| MCP export | You can export the MCP server's tool list to JSON. | `tool_sources[].type: mcp` |
+| MCP server source | This checkout can read the static TypeScript, Go or Python registration shape, including direct FastMCP `@server.tool` decorators. | `tool_sources[].type: mcp_server_source` |
+| OpenAPI spec | The agent calls HTTP APIs described by OpenAPI 3.x. | `tool_sources[].type: openapi` |
+| Codex plugin package | The repo contains `.codex-plugin/plugin.json` or `.agents/plugins/marketplace.json`. | `tool_sources[].type: codex_plugin` |
 
-Then read `report.json.release_decision.decision`, the source-of-truth gate:
+Google ADK, LangChain/LangGraph, CrewAI, n8n workflow JSON, Conductor OSS
+workflow JSON, Anthropic Messages API artifacts, and simple OpenAI API
+artifacts are supported inputs too. Start with the tool surface closest to the
+release boundary. Framework-by-framework minimal manifests are in
+[`minimal-real-configs.md`](minimal-real-configs.md); agent-driven recipes are
+in [`agent-recipes.md`](agent-recipes.md).
+
+## Verdict reference
+
+The release gate is `report.json` → `release_decision.decision`:
 
 | Decision | Meaning | Next action |
 | --- | --- | --- |
@@ -167,116 +1007,58 @@ Then read `report.json.release_decision.decision`, the source-of-truth gate:
 | `review_required` | Human review is needed for accepted debt or evidence gaps below the blocked threshold. | Review the listed items before promotion. |
 | `passed` | No active blocker or review signal was found. | Keep the report artifact with the PR/release record. |
 
-## First adoption helper
+`merge_verdict` is the PR-facing projection of that decision, on `verifier.json`
+and `agent-handoff.json`:
 
-`bootstrap` remains useful for first-time adoption when you want a single
-command to detect, configure, scan, and auto-apply safe mechanical fixes:
-
-```bash
-agents-shipgate bootstrap --json
-```
-
-The expanded form is:
-
-```bash
-agents-shipgate detect --json                                              # 1. classify
-agents-shipgate init --write --ci --json                                   # 2. manifest + workflow
-# 2b. Replace any CHANGE_ME placeholders before scanning (see below)
-agents-shipgate scan -c shipgate.yaml --suggest-patches --format json      # 3. scan + suggest
-agents-shipgate apply-patches \
-    --from agents-shipgate-reports/report.json \
-    --confidence high --apply                                              # 4. apply safe fixes
-```
-
-`detect` reports whether the workspace looks like an agent project and which
-framework(s) are present. `init --write --ci` produces a schema-valid
-`shipgate.yaml` (with framework-specific `tool_sources` populated) and an
-optional GitHub Actions workflow.
-
-### If The First Real Repo Stalls
-
-Use this decision tree before reading the full manifest schema:
-
-| Symptom | Next action |
-| --- | --- |
-| `detect` says `is_agent_project: false`, but `suggested_sources` includes MCP or OpenAPI files | Proceed to `init`. MCP/OpenAPI-only repos are valid tool-surface targets even without Python framework detection. |
-| `detect` says `is_agent_project: false`, but `codex_plugin_candidates` is non-empty | Proceed to `init`. Codex plugin repos are valid static plugin-surface targets even without Python framework detection. |
-| `doctor` shows zero tools | Check `tool_sources[].path`, MCP `tools[]`, OpenAPI `paths`, optional source warnings, and dynamic ADK/MCP toolsets. |
-| Tools are created by factories, wrappers, or dynamic ADK/MCP toolsets | Provide an explicit MCP export, OpenAPI spec, local tool inventory artifact, or a broader OpenAI SDK source directory when tools are static but split across files. |
-| `init --write --json` reports `CHANGE_ME` placeholders | Replace `agent.name` and `agent.declared_purpose` from the prompt, main agent file, or repo README before scanning. |
-| Install fails in a Python 3.10/3.11 project | Install the CLI outside the project env with `pipx` or `uv` using Python 3.12+. |
-| Reports appear in `git status` | Add `agents-shipgate-reports/` to `.gitignore`; reports are local release-review artifacts. |
-
-### Choose Your First Source
-
-For a first real scan, point the manifest at the clearest tool boundary you
-already have:
-
-| Source | Use when | Manifest path |
+| Merge verdict | Meaning | Next action |
 | --- | --- | --- |
-| OpenAI Agents SDK Python | Tools are defined with `@function_tool` in local Python files. | `tool_sources[].type: openai_agents_sdk`; `path` may be one Python file or a directory of files |
-| MCP export | You can export the MCP server's tool list to JSON. | `tool_sources[].type: mcp` |
-| OpenAPI spec | The agent calls HTTP APIs described by OpenAPI 3.x. | `tool_sources[].type: openapi` |
-| Codex plugin package | The repo contains `.codex-plugin/plugin.json` or `.agents/plugins/marketplace.json`. | `tool_sources[].type: codex_plugin` |
+| `blocked` | Active, unaccepted blockers exist. | Fix blockers or remove the risky capability. |
+| `insufficient_evidence` | Static evidence is too weak to gate release confidently. | Add better sources and rerun; do not auto-merge. |
+| `human_review_required` | A person must review accepted debt, trust-root changes, or authority-bearing gaps. | Surface the required review; a coding agent must not self-approve it. |
+| `mergeable` | No active blocker or review signal was found. | Keep verifier/report artifacts with the PR record. |
+| `unknown` | Verify could not produce a reliable head scan or diff context. | Fix the setup, fetch the base ref, or rerun with usable inputs. |
 
-Google ADK, LangChain/LangGraph, CrewAI, n8n workflow JSON, Conductor OSS workflow JSON, Anthropic Messages
-API artifacts, and simple OpenAI API artifacts are also supported inputs, but
-the fastest path is
-to start with the tool surface closest to the release boundary.
+Common review signals: missing confirmation, missing idempotency evidence,
+broad-scope permissions, prohibited-action policy gaps, and trust-root changes
+such as weakened CI or manifest policy.
 
-**Replace placeholders before scanning.** `init --write --json` returns a
-`placeholders[]` array enumerating every value the template could not infer.
-On a fresh workspace the array typically contains both:
+## The second use
 
-- `agent.name: CHANGE_ME` — the agent's role (no strong `Agent(name="…")`
-  literal was found).
-- `agent.declared_purpose[]: CHANGE_ME` — a one-line description of what
-  the agent should do (auto-init can't infer this; the schema requires
-  a non-empty value).
+The first run is setup. The second is the one that tells you whether this is
+worth keeping.
 
-Walk `placeholders[]`, edit each one in `shipgate.yaml`, then re-run
-`scan`. Skipping this step leaves an invalid adoption artifact — the
-manifest validates but downstream consumers see meaningless defaults.
+### The next capability-changing PR
 
-**When discovery reads no tool surface at all.** `init --json` reports
-`tool_surface_origin`: `"detected"` when every source in the manifest was read
-out of the workspace, `"scaffold"` when none was, and `null` when this run's
-render reached neither disk nor the payload — `skipped_existing` and
-`refused_unresolved_scope`, where the manifest at `path` is not this render's
-to describe. The paragraph below is about the runs that report one of the
-first two. On `"scaffold"` the
-`tool_sources` block is a placeholder for you to complete — `id`, `type`, and
-`path` are all `CHANGE_ME`, all three are in `placeholders[]`, and the manifest
-comment names the built-in `type` values (an installed third-party adapter's
-own source type is equally valid). Nothing there was inferred, and
-`manifest_message` says so. This is the common outcome for an MCP server whose
-tools are registered in code rather than exported to a file (#431): in the
-default mode, running `detect` on the same workspace will say it found no agent
-framework, prompts, or tool surface, and it is right — the manifest is a
-starting point, not a description. Under `--minimal` a scaffold means something
-narrower — that mode never runs framework detection — and its summary says so
-rather than claiming discovery found nothing.
-
-`scan --suggest-patches` attaches a Patch object to every active finding.
-`apply-patches --confidence high` mutates only the safe stale-manifest
-removals — scope-coverage appends require an explicit `--confidence medium`.
-
-For agent-specific guidance and decision rules, see
-[`agent-recipes.md`](agent-recipes.md). For framework-by-framework minimal
-manifests, see [`minimal-real-configs.md`](minimal-real-configs.md).
-
-Reports land at `agents-shipgate-reports/report.md` and `report.json`
-(the default formats). To also write SARIF for GitHub's code-scanning UI:
+Nothing from the first run has to be redone. On the next change that touches
+tools, prompts, scopes, policy or the gate itself, run the same command with
+the PR's refs:
 
 ```bash
-agents-shipgate scan -c shipgate.yaml --format markdown,json,sarif
+agents-shipgate verify --workspace . --config shipgate.yaml \
+  --ci-mode advisory --format json --base origin/main --head HEAD
 ```
 
-The bundled GitHub Action emits all three formats by default.
+On Route H, run `agents-shipgate diff` again on the next PR; where you keep a
+committed baseline, `shipgate audit --host --drift` checks against it, and
+`shipgate check` is the coding agent's local boundary check. Not every PR needs a
+run — [`triggers.json`](triggers.json) is the machine-readable rule set for
+deciding, and `verify --preview --json` answers it for one workspace.
 
-## GitHub Action
+### Advisory CI
 
-Drop this into `.github/workflows/shipgate.yml`:
+**Host-only repository — no `shipgate.yaml`?** Use
+[`examples/github-actions/14-host-only-advisory-pr.yml`](../examples/github-actions/14-host-only-advisory-pr.yml)
+instead of the block below. It runs the comparison `agents-shipgate diff`
+makes on every PR and keeps one comment up to date. What it finds never fails
+the job, and missing base history shows as `Host capability comparison
+unavailable`;
+[its notes](../examples/github-actions/README.md#host-only-advisory-pr-review)
+cover the setup errors that do fail it, permissions, forks, pinning and what
+each comment means.
+
+With a manifest, drop this into `.github/workflows/agents-shipgate.yml`. It runs
+on every PR, posts the verdict as a comment, uploads artifacts, and does not fail
+the job on the verdict (setup and execution errors still fail it):
 
 ```yaml
 name: Agents Shipgate
@@ -296,21 +1078,19 @@ jobs:
         with:
           fetch-depth: 0
       - id: shipgate
-        uses: ThreeMoonsLab/agents-shipgate@v0.15.0
+        uses: ThreeMoonsLab/agents-shipgate@v1.2.0
         with:
           config: shipgate.yaml
           ci_mode: advisory
           diff_base: target
           pr_comment: "true"
-          shipgate_version: "0.15.0"
+          shipgate_version: "1.2.0"
 ```
 
-Advisory mode never fails CI — it posts the merge verdict, capability changes,
-required next action, and report links as a PR comment.
-Switch to `ci_mode: strict` with a baseline file once your team has
-triaged existing findings.
-
-After adoption, choose an explicit policy:
+The action delegates to `verify` and never fetches — keep `fetch-depth: 0`.
+Advisory mode is where you start, not where you stop: as § 6 showed, an
+advisory job exits zero on a `blocked` verdict. Make the verdict load-bearing
+with an explicit policy step:
 
 ```yaml
 - name: Block only blocked verdicts
@@ -324,10 +1104,57 @@ After adoption, choose an explicit policy:
   run: exit 1
 ```
 
+GitLab, CircleCI, Jenkins and pre-commit equivalents, the full output catalog,
+and the other merge policies are in [`integrations.md`](integrations.md) and
+[`examples/github-actions/`](../examples/github-actions/).
+
+### Baseline and strict mode
+
+Strict mode exits `20` on unsuppressed critical findings. On an existing
+project, save a baseline first so strict CI fails only on *new* findings:
+
+```bash
+agents-shipgate baseline save --config shipgate.yaml --out .agents-shipgate/baseline.json
+agents-shipgate scan --config shipgate.yaml --baseline .agents-shipgate/baseline.json --ci-mode strict
+```
+
+[`baseline.md`](baseline.md) covers baseline lifecycle, suppression hygiene and
+noise triage.
+
+## Temporary external repository review
+
+Assessing someone else's repository without adopting Shipgate into it is an
+explicit opt-in. Point preview at the reserved manifest so it emits the
+local-review setup route instead of the durable `init --write` route:
+
+```bash
+agents-shipgate verify --preview --workspace . \
+  --config .agents-shipgate-local-review.yaml --json
+agents-shipgate init --workspace . --local-review --json
+agents-shipgate verify --workspace . \
+  --config .agents-shipgate-local-review.yaml \
+  --base origin/main --head HEAD --json
+```
+
+`--local-review` writes an ephemeral manifest at the workspace root so its
+relative source paths still resolve, and privately excludes that file plus
+`agents-shipgate-reports/` through `.git/info/exclude`. Tracked project files
+stay untouched and generated reports stay out of `git status`. The JSON result
+enumerates every effect plus an executable cleanup command;
+`init --local-review --undo --json` removes those local setup effects while
+preserving reports.
+
+Verification marks the reserved manifest as `local_review` and always keeps the
+result provisional. The same fail-safe applies to any differently named
+uncommitted or Git-unproven manifest: `passed`, `mergeable`, and
+human-authorization evidence all require a manifest that Git proves is present
+in the evaluated repository tree. Git presence alone does not prove human
+review. Durable adoption remains `init --write`.
+
 ## Export feedback
 
-For a design-partner review or false-positive report, export the small redacted
-feedback artifact from the verifier:
+For a design-partner review or a false-positive report, export the small
+redacted feedback artifact:
 
 ```bash
 agents-shipgate feedback export \
@@ -343,10 +1170,12 @@ evidence.
 ## Next
 
 - [`agent-recipes.md`](agent-recipes.md) — copy-pasteable AI-agent workflows for verify-first PRs and first adoption
+- [`agent-autofix-boundary.md`](agent-autofix-boundary.md) — what an agent may fix, and what it must never assert
 - [`minimal-real-configs.md`](minimal-real-configs.md) — framework-by-framework minimal manifest references
 - [`manifest-v0.1.md`](manifest-v0.1.md) — manifest schema in prose form
 - [`checks.md`](checks.md) — what the scanner looks for
-- [`category.md`](category.md) — what an "agent release gate" is
+- [`mental-model.md`](mental-model.md) — the five-minute version of the decision model
+- [`category.md`](category.md) — what an "agent release gate" is, and what it is not
 - [`faq.md`](faq.md) — common questions
-- [`concepts.md`](concepts.md) — tool-use readiness in depth
+- [`troubleshooting.md`](troubleshooting.md) — when a run does not do what you expected
 - [`glossary.md`](glossary.md) — category vocabulary

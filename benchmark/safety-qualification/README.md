@@ -1,6 +1,7 @@
 # Evidence-Backed Pass Safety Qualification
 
-This directory is the runbook for the `0.16.0b7` safety qualification.
+This directory is the runbook for release safety qualification: the optional
+`0.x` track and the separate human-labeled `1.0` beta track.
 The repository does **not** ship fabricated human labels or a passing result.
 Until a real frozen corpus and its verifier receipts exist,
 `safety-qualification.json` must not be published as qualified.
@@ -33,21 +34,56 @@ The runner consumes four independently content-addressed inputs:
 Receipt entries must point to real `verify` artifacts. Each receipt needs
 successful base and head tree-bound runs plus content-addressed
 `verifier_json` and `report_json` artifacts. The report must use the schema
-`required_report_schema_version` pins (`0.42` today, identical in both
-policies and asserted equal to what the engine emits by
-`test_the_qualification_gate_demands_the_schema_the_engine_emits`),
+`required_report_schema_version` pins (`1.0` today for the `beta` policy,
+asserted equal to what the engine emits by
+`test_the_qualification_gate_demands_the_schema_the_engine_emits`; the retired
+`pre_1_0` policy keeps its historical `0.43` pin so artifacts already scored
+against it are still named correctly),
 contain binding and semantic coverage, and agree with the verifier receipt. Missing,
 failed, unknown, hash-mismatched, or fallback receipts fail closed; the runner
 never substitutes a cold-start scan result.
 
+The scorer hashes and parses the same captured bytes for every consumed
+input. It does not reopen a path after accepting its digest. Detached receipt
+files and separate `artifact_root` directories remain supported beneath the
+receipt index directory; archive paths cannot traverse symlinks or escape
+that directory. Artifact byte lengths must also match the receipt.
+
+Reads are bounded: 4 MiB per receipt, 64 MiB per report, verifier, verify-run,
+corpus, index or policy file, and 256 MiB per wheel. Wheel `METADATA` has a
+separate 4 MiB decompressed limit. Unreadable or oversized top-level inputs
+are configuration errors (exit 2); invalid receipt evidence produces a named
+`invalid_verifier_receipt` failure and cannot be scored. These bounds do not
+change either qualification policy.
+
 ## What to build first
 
-[`strata-inventory.csv`](strata-inventory.csv) maps the known candidate pool onto
-the 28 profile × decision cells, so mining aims at the empty ones; how to read
+[`strata-inventory.csv`](strata-inventory.csv) records the pre-1.0 sourcing pool;
+the current policy has 21 profile × decision cells. How to read
 and maintain it is in [`strata-inventory.md`](strata-inventory.md). It is a
 sourcing plan, not evidence: it carries no label, no verdict and no receipt, and
 it is **not** an admissible rater input — it names a target decision for every
 slot, so a rater session that has read it produces no admissible label.
+
+The dated Cut A/B/C records describe historical work, not a frozen-data
+handoff. Verify the actual corpus, admissibility and hashes before using any
+private data; neither a closed issue nor ignored local files prove completion.
+For `1.0`, [#512](https://github.com/ThreeMoonsLab/agents-shipgate/issues/512)
+starts separate beta sourcing and human labeling in parallel with engineering.
+Its [beta source inventory](beta-strata-inventory.md) records pinned candidates,
+known exposure and the remaining per-cell gaps against the production policy.
+It is a separate sourcing register, not human labels or a frozen beta corpus;
+do not give it to raters. The pending guide output-contract correction in #520
+must be resolved before human labeling starts.
+No `0.x` publication is required first. Freeze the final source, workflow,
+policy and exact wheel after selected repairs and
+[#569](https://github.com/ThreeMoonsLab/agents-shipgate/issues/569)'s report
+compatibility work. Beta receipts and the unsigned qualifying result feed
+[#509](https://github.com/ThreeMoonsLab/agents-shipgate/issues/509)'s independent
+signing, then [#510](https://github.com/ThreeMoonsLab/agents-shipgate/issues/510)'s
+same-candidate positive rehearsal. A candidate change requires new bound
+evidence. Coordinate active pre-1.0 retirement before that final wheel freeze;
+the historical format's readability never makes it eligible for a `1.x` tag.
 
 ## Which policy to build for
 
@@ -57,49 +93,96 @@ the other.**
 
 | Wheel version | Policy | Tier | Cases |
 |---|---|---|---|
-| `0.x` (epoch 0, major 0) | pre-1.0 | `pre_1_0` | 56 |
-| `1.0` and later | production | `beta` | 100 |
+| `0.x` (epoch 0, major 0) | pre-1.0 | `pre_1_0` | 38 |
+| `1.0` and later | production | `beta` | 80 |
 
 A `0.x` release may also publish on a production-policy artifact — more
 evidence than the tag requires is never rejected — but nothing goes the other
 way. The route, the numbers and the rationale were approved by a named
 product/security owner in
 [`docs/release-evidence-policy-decision.md`](../../docs/release-evidence-policy-decision.md)
-(issue #341).
+(issue #341), and amended on 2026-09-04 by
+[#520](https://github.com/ThreeMoonsLab/agents-shipgate/issues/520) — see
+§ Amendment 3 there for why no case targets `insufficient_evidence` and why
+four `blocked` cells hold one case.
 
-### Production acceptance policy (`beta`, 100 cases)
+### Current policy contract
 
-- 100 cases with exact declared MCP/OpenAPI, OpenAI Agents SDK,
+This table is checked against both policy implementations. Report `1.0` is
+the current frozen schema (#569). The `pre_1_0` row is historical: issuance of
+that tier is retired, so its pin stays at the `0.43` its artifacts actually
+carry — re-pinning it would rename every existing one to the unnamed `test`
+tier. No schema reference is advanced merely to prepare a release.
+
+| Requirement | `pre_1_0` | `beta` |
+|---|---|---|
+| Cases | 38 | 80 |
+| Strata | 21 | 21 |
+| Expected passed / review_required / blocked | 14 / 14 / 10 | 30 / 20 / 30 |
+| Qualifying origins, minimum | 16 | 32 |
+| Safe passes, minimum | 13 / 14 | 27 / 30 |
+| Review exact, minimum | 14 / 14 | 19 / 20 |
+| Blocked exact, minimum | 10 / 10 | 30 / 30 |
+| Unsafe auto-passes, maximum | 0 / 24 | 0 / 50 |
+| Cohen's kappa, minimum | 0.80 | 0.80 |
+| Holdout per stratum, minimum fraction | 0.20 | 0.20 |
+| Report schema | `0.43` | `1.0` |
+
+The holdout count is `ceil(stratum_count × 0.20)` independently in every
+stratum. Zero unsafe auto-passes also holds per profile. Neither policy asks
+for expected `insufficient_evidence` labels: an actual IE is a miss against
+the case's expected outcome. Missing or invalid receipts remain failures.
+Beta requires two blind human primary labels from the two independent
+disciplines and independent adjudication of disagreements. The separate
+pre-1.0 labeling protocol is limited to Amendment 1's conditions.
+
+Current envelopes: corpus `shipgate.safety_corpus/v4`, receipt index
+`shipgate.safety_receipt_index/v4`, result `shipgate.safety_qualification/v6`.
+
+### Production acceptance policy (`beta`, 80 cases)
+
+- 80 cases with exact declared MCP/OpenAPI, OpenAI Agents SDK,
   LangChain/CrewAI, Google ADK, n8n, multi-agent/handoff, and coding-agent strata:
-  30 `passed`, 20 `review_required`, 20 `insufficient_evidence`, 30 `blocked`.
-- At least 40 real-history, rejected/reverted, or design-partner cases.
+  30 `passed`, 20 `review_required`, 30 `blocked`.
+- At least 32 real-history, rejected/reverted, or design-partner cases (40%).
 - Cohen's κ ≥ 0.80 across the two independent primary labels.
 - At least 20% holdout in every profile/outcome stratum. Because cases are
   indivisible, the minimum is `ceil(stratum_size × 0.20)`.
-- Unsafe auto-pass `0/70`; blocked exact `30/30`; safe pass at least `27/30`;
-  exact review at least `19/20`; exact insufficient-evidence at least `19/20`.
+- Unsafe auto-pass `0/50`; blocked exact `30/30`; safe pass at least `27/30`;
+  exact review at least `19/20`.
+- **No case targets `insufficient_evidence`.** The value stays in the enum and
+  the verifier still emits it, but it says the reader failed rather than what a
+  correct gate should do, so it is never a case's expected decision — and it is
+  scored as a miss against whatever that case did expect.
 - Zero per-profile unsafe pass and zero invalid or missing receipts.
 
-### Pre-1.0 acceptance policy (`pre_1_0`, 56 cases)
+### Pre-1.0 acceptance policy (`pre_1_0`, 38 cases)
 
-Less coverage, identical strictness. Same seven profiles, same four outcomes,
-**exactly two cases in each of the 28 strata** — not the production weighting
-scaled down, which would empty the smallest cells.
+Less coverage, identical strictness. Same seven profiles, same three target
+outcomes: **two cases in 17 strata and one in four approved blocked strata**.
 
-- 56 cases: 14 `passed`, 14 `review_required`, 14 `insufficient_evidence`,
-  14 `blocked`, two per profile/outcome pair.
-- At least 23 real-history, rejected/reverted, or design-partner cases — the
+- 38 cases: 14 `passed`, 14 `review_required`, 10 `blocked`.
+- Four `blocked` cells hold **one** case, not two: `openai_agents_sdk`,
+  `langchain_crewai`, `google_adk` and `coding_agent_trust_roots`. No second
+  real case exists for them, and a cell filled with constructions measures our
+  imagination rather than the world —
+  [`strata-inventory.md`](strata-inventory.md) § Why four cells hold one case
+  and not two has the per-cell evidence. **This is where the corpus is short,
+  and mining a second real `blocked` case for any of those four profiles is
+  what would raise the count back to two.**
+- At least 16 real-history, rejected/reverted, or design-partner cases — the
   same 40% share the production policy demands.
 - Cohen's κ ≥ 0.80. **Unchanged.**
 - At least 20% holdout per stratum. **Unchanged** — at two cases per stratum
   that is `ceil(2 × 0.20) = 1` holdout, leaving room for one tuning case. The
   floor is a *minimum*: marking both cases holdout is accepted, because holdout
   evidence was never tuned on and more of it is stronger. Nothing requires a
-  tuning case, which would be a ceiling on holdout.
-- Unsafe auto-pass `0/42`; blocked exact `14/14`; safe pass at least `13/14`;
-  exact review `14/14`; exact insufficient-evidence `14/14`. These are the
-  production *rates* rounded up, so the smaller corpus has **less** tolerance
-  for error, not more.
+  tuning case, which would be a ceiling on holdout. In the four one-case cells
+  `ceil(1 × 0.20) = 1`, so that case must be the holdout and the cell has no
+  tuning case at all.
+- Unsafe auto-pass `0/24`; blocked exact `10/10`; safe pass at least `13/14`;
+  exact review `14/14`. These are the production *rates* rounded up, so the
+  smaller corpus has **less** tolerance for error, not more.
 - Zero per-profile unsafe pass and zero invalid or missing receipts.
   **Unchanged.**
 
@@ -124,9 +207,11 @@ own cases — the standard-library sealing gate included. A corpus with the righ
 floor, fails at both. Every case needs a unique, non-blank id and a terminal
 verifier decision: an absent decision is a missing case, not a low score.
 
-The result envelope is `shipgate.safety_qualification/v5`, and a `pre_1_0`
-artifact may not claim an earlier one — those readers admit `beta` and `test`
-only. Both gates also check the artifact's declared `requirements` block
+The current result envelope is `shipgate.safety_qualification/v6`. Historical
+v5 results also admit `pre_1_0`; the supported legacy v1/v2/v4 envelopes admit
+`beta` and `test` only,
+so a pre-1.0 artifact cannot claim those older envelopes. Both gates also
+check the artifact's declared `requirements` block
 field-for-field against the approved policy, including
 `required_report_schema_version`, which nothing in `cases` can attest.
 
@@ -134,7 +219,7 @@ field-for-field against the approved policy, including
 
 ```bash
 PYTHONPATH=src python scripts/run_safety_qualification.py \
-  --wheel dist/agents_shipgate-0.16.0b7-py3-none-any.whl \
+  --wheel dist/agents_shipgate-0.16.0-py3-none-any.whl \
   --corpus /secure/frozen-corpus.json \
   --receipts /secure/receipt-index.json \
   --policy /secure/qualification-policy/ \
@@ -146,7 +231,7 @@ failures. Exit `1` means a complete artifact was emitted with sorted
 `failures[]`. Input/schema errors — including asking for a policy the version
 does not admit — exit `2` before scoring.
 
-`production_qualified` keeps meaning "met the 100-case bar": a passing
+`production_qualified` keeps meaning "met the production bar": a passing
 `pre_1_0` artifact reports it `false`, and both release gates reject an
 artifact that claims otherwise.
 
@@ -163,9 +248,11 @@ sigstore sign --bundle safety-qualification.sigstore.json safety-qualification.j
 ```
 
 Release promotion consumes the signed result and the same wheel through
-protected `pypi` environment variables. See
+repository-scope location variables. Signer identity and OIDC issuer live in
+reviewed `.github/release-trust-roots.json`; the protected `pypi` environment
+controls publication. See
 [`docs/distribution.md`](../../docs/distribution.md#protected-qualification-inputs)
-for the exact six-variable contract. The tag workflow verifies the signer, a
+for the exact variable contract. The tag workflow verifies the signer, a
 qualification tier the version admits, tag/version, and wheel digest before it
 can publish.
 
@@ -174,13 +261,17 @@ qualification result as trust inputs. It does not cryptographically prove that
 the signer is organizationally independent of the tag pusher, re-run the
 underlying receipts during promotion, or prove that labelers were blind; those
 properties depend on protected-environment governance and benchmark-owner
-process. Repository administrators must lock signer-variable changes behind
-reviewers who are independent of the release initiator.
+process. Repository administrators must protect trust-root changes and the
+publication environment with reviewers independent of the release initiator;
+the existence of workflow YAML alone does not establish that boundary.
 
-The origin minimum — `minimum_qualified_origins = 40` under the production
-policy, `23` under the pre-1.0 one — accepts a combined
+The origin minimum — `minimum_qualified_origins = 32` under the production
+policy, `16` under the pre-1.0 one — accepts a combined
 count of real-history, rejected/reverted, and design-partner cases. It does not
 enforce a four-week observation window or three distinct design partners.
 Those remain external beta rollout stop conditions and must be reviewed from
 the rollout record before promoting affected profiles; do not describe them as
 properties enforced by `safety-qualification.json`.
+The [pilot product ladder](../../docs/design-partner-pilot-results.md) is a
+third decision about first and repeated user value; it substitutes for neither
+the machine qualification nor the four-week/three-partner rollout condition.

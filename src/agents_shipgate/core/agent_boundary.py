@@ -25,11 +25,14 @@ from agents_shipgate.core.boundary_registry import (
     BOUNDARY_ADAPTERS,
     boundary_hosts_for_path,
     is_agent_boundary_path,
+    is_enabled_plugin_hook_source,
 )
+from agents_shipgate.core.boundary_rules import GENERIC_BOUNDARY_RULES as _GENERIC_RULES
 from agents_shipgate.core.codex_boundary import (
     DEFAULT_RULES as CODEX_DEFAULT_RULES,
 )
 from agents_shipgate.core.codex_boundary import (
+    UNEVALUATED_SUBJECT_REASON,
     CodexBoundaryPolicy,
     _affected_files_for,
     _agent_repair_instructions,
@@ -40,12 +43,14 @@ from agents_shipgate.core.codex_boundary import (
     _next_action_for,
     _pending_review_for,
     _repair_for,
+    _repair_for_control,
     _required_reviewers_for,
     _risk_for,
     _violation_fingerprint,
     detect_command_for,
     evaluate_codex_boundary_result,
     load_codex_boundary_policy,
+    parse_failure_kind_was_read,
     preview_command_for,
     verify_command_for,
     violations_within_agent_actionable_band,
@@ -54,14 +59,19 @@ from agents_shipgate.core.host_boundary import (
     DEFAULT_POLICY_PATH as LEGACY_HOST_POLICY_PATH,
 )
 from agents_shipgate.core.host_boundary import (
+    HOST_SETTINGS_NARROWED,
     HostBoundaryPolicy,
     evaluate_host_boundary,
     load_host_boundary_policy,
 )
 from agents_shipgate.core.host_grants import (
+    EnabledPluginHookFiles,
     HostBoundarySnapshot,
     build_host_boundary_snapshot,
+    hook_dependency_issues,
 )
+from agents_shipgate.core.host_input_failure import safe_failure_text
+from agents_shipgate.core.mcp_host_selection import UNATTRIBUTED_MCP_HOST, is_mcp_config_path
 from agents_shipgate.core.trust_roots import (
     is_configured_manifest,
     is_portable_repo_path,
@@ -108,6 +118,10 @@ class AgentBoundaryAssessment:
     completion_eligible: bool
     host_snapshot: HostBoundarySnapshot
     legacy_result: AgentResultV2
+    instruction_structure_unchanged: frozenset[str] = frozenset()
+    host_settings_narrowed: frozenset[str] = frozenset()
+    openshell_paths: frozenset[str] = frozenset()
+    openshell_safe_paths: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -120,50 +134,6 @@ class _PolicySet:
     issues: tuple[str, ...]
 
 
-@dataclass(frozen=True)
-class _GenericBoundaryRule:
-    id: str
-    check_id: str
-    title: str
-    action: str
-    risk_level: str
-    recommendation: str
-
-
-_GENERIC_RULES = {
-    "PROTECTED-SURFACE-UNCLASSIFIED": _GenericBoundaryRule(
-        id="BOUNDARY-PROTECTED-SURFACE-UNCLASSIFIED",
-        check_id="SHIP-AGENT-BOUNDARY-PROTECTED-SURFACE-UNCLASSIFIED",
-        title="Protected coding-agent surface lacks a safe static classification",
-        action="require_review",
-        risk_level="medium",
-        recommendation="Have a human review the protected boundary change.",
-    ),
-    "EXPERIMENTAL-SURFACE-CHANGED": _GenericBoundaryRule(
-        id="BOUNDARY-EXPERIMENTAL-SURFACE-CHANGED",
-        check_id="SHIP-AGENT-BOUNDARY-EXPERIMENTAL-SURFACE-CHANGED",
-        title="Experimental coding-agent boundary surface changed",
-        action="require_review",
-        risk_level="high",
-        recommendation="Have a human review the experimental boundary surface.",
-    ),
-    "STATIC-REQUIREMENTS-CHANGED": _GenericBoundaryRule(
-        id="BOUNDARY-STATIC-REQUIREMENTS-CHANGED",
-        check_id="SHIP-AGENT-BOUNDARY-STATIC-REQUIREMENTS-CHANGED",
-        title="Static host requirements changed",
-        action="require_review",
-        risk_level="high",
-        recommendation="Have a human review the static host requirements change.",
-    ),
-    "INPUT-INCOMPLETE": _GenericBoundaryRule(
-        id="BOUNDARY-INPUT-INCOMPLETE",
-        check_id="SHIP-AGENT-BOUNDARY-INPUT-INCOMPLETE",
-        title="Boundary input is incomplete",
-        action="require_review",
-        risk_level="medium",
-        recommendation="Provide a complete, coherent boundary diff and rerun the check.",
-    ),
-}
 
 
 def evaluate_agent_boundary(
@@ -187,7 +157,16 @@ def evaluate_agent_boundary(
     head: str | None = None,
     verification_replayable: bool = False,
     base_manifest_absent: bool | None = None,
+    enabled_plugin_hooks: EnabledPluginHookFiles | None = None,
 ) -> AgentBoundaryAssessment:
+    """Assess one change against every registered boundary adapter.
+
+    ``enabled_plugin_hooks`` names, on the sides of the change the caller
+    could read, the files that hold hooks of a plugin the repository's
+    project settings enable (#809). ``None`` reads them from
+    ``host_snapshot``, the workspace tree.
+    """
+
     # The command this assessment authorizes must evaluate the target that was
     # actually checked, not the default manifest in the current directory.
     verify_command = verify_command_for(
@@ -220,19 +199,113 @@ def evaluate_agent_boundary(
             ),
         }
     )
+    plugin_hooks = (
+        EnabledPluginHookFiles.of(host_snapshot)
+        if enabled_plugin_hooks is None
+        else enabled_plugin_hooks
+    )
+    # A changed hook declaration of a plugin the project settings enable is
+    # a hook the host loads, routed like a settings layer (#809).
+    plugin_hook_paths = frozenset(
+        path.replace("\\", "/")
+        for path in changed_files
+        if is_enabled_plugin_hook_source(path, plugin_hooks.sources)
+    )
+    from agents_shipgate.core.openshell_boundary import (
+        OpenShellBoundaryEvidence,
+        assess_openshell_boundary,
+    )
+
+    openshell = plugin_hooks.openshell or OpenShellBoundaryEvidence(
+        paths=frozenset(host_snapshot.cache.openshell_selected_paths),
+        after=host_snapshot.inventory,
+    )
+    openshell_paths = openshell.paths & frozenset(changed_files)
+    script_hosts: dict[str, list[str]] = {}
+    changed_set = set(changed_files)
+    for host, path in sorted(plugin_hooks.scripts):
+        if path in changed_set:
+            script_hosts.setdefault(path, []).append(host)
+    # A changed hook file such a plugin selects under a name the reader does
+    # not follow, or in a directory the walk skips, holds hooks the host
+    # loads and nothing here read (#809). That is input this check could not
+    # read, never a change it may allow.
+    unread_folded = {path.casefold() for path in plugin_hooks.unread}
+    plugin_unread_paths = frozenset(
+        path.replace("\\", "/")
+        for path in changed_files
+        if path.replace("\\", "/").casefold() in unread_folded
+        and path.replace("\\", "/") not in plugin_hook_paths
+    )
+    plugin_unread_folded = {path.casefold() for path in plugin_unread_paths}
+    # The hosts the inventory published each changed `.mcp.json` under, on a
+    # side the caller read (#936). Routing stays the registry's; only the
+    # host a result names follows what selects the file.
+    mcp_attribution: dict[str, set[str]] = {}
+    for host, path in plugin_hooks.mcp_hosts:
+        mcp_attribution.setdefault(path.casefold(), set()).add(host)
+    mcp_hosts = {
+        path: frozenset(mcp_attribution[path.casefold()])
+        for path in changed_files
+        if is_mcp_config_path(path) and path.casefold() in mcp_attribution
+    }
+    script_issues = hook_dependency_issues(host_snapshot.inventory)
+
+    def counted(item: dict[str, Any]) -> bool:
+        if (item.get("host") == "openshell" and plugin_hooks.openshell is not None
+                and str(item.get("source") or "") in plugin_hooks.openshell.paths):
+            return False  # The explicitly compared sides supply these issues below.
+        source = str(item.get("source") or "").replace("\\", "/")
+        if str(item.get("issue_id")) in script_issues:
+            # A selected hook script this check could not read (#702) is its
+            # own input only when the change touches it, which it also
+            # routes; an untouched one leaves the decision as 1.0.0 had it.
+            return bool(item.get("blocking")) and script_issues[str(item["issue_id"])][1] in changed_set
+        if str(item.get("issue_id")) not in host_snapshot.plugin_reference_issue_ids:
+            return bool(item.get("blocking"))
+        # A plugin manifest, marketplace or plugin-selected hook file is not a
+        # surface this boundary routes, and its result cannot name a limit, so
+        # an unread plugin reference leaves the check decision as 1.0.0 had it
+        # (#714). Its host comparison still refuses when only one side carries
+        # the limit, and `diff` and `verify` keep every limit. A changed hook
+        # declaration of an enabled plugin is routed, and a changed hook file
+        # it selects is one this check could not read (#809), so a limit on
+        # either is this check's own input.
+        if source.casefold() in plugin_unread_folded:
+            return True
+        return bool(item.get("blocking")) and source in plugin_hook_paths
+
+    inventory_issues = [
+        BoundaryInputIssue(
+            code=f"host_inventory_{item.get('kind', 'unresolved')}",
+            path=str(item.get("source") or ""),
+            message=str(
+                item.get("message")
+                or "A repository host-boundary source could not be inventoried."
+            ),
+            recovery=host_snapshot.input_failures.get(str(item.get("issue_id"))),
+        )
+        for item in host_snapshot.inventory.get("issues", [])
+        if counted(item)
+    ]
+    named = {issue.path.replace("\\", "/").casefold() for issue in inventory_issues}
     input_issues = [
         *(input_issues or []),
+        *inventory_issues,
+        # Only the other side of the change shows the plugin selected this
+        # file, for one deleted with its reference: the same limit, from there.
         *[
             BoundaryInputIssue(
-                code=f"host_inventory_{item.get('kind', 'unresolved')}",
-                path=str(item.get("source") or ""),
-                message=str(
-                    item.get("message")
-                    or "A repository host-boundary source could not be inventoried."
+                code="host_inventory_unsupported",
+                path=path,
+                message=(
+                    "A plugin this repository's project settings enable selects this hook "
+                    "file on a compared side, and the static reader does not follow its "
+                    "name or directory, so its hooks were not read."
                 ),
             )
-            for item in host_snapshot.inventory.get("issues", [])
-            if item.get("blocking")
+            for path in sorted(plugin_unread_paths)
+            if path.casefold() not in named
         ],
         *_structural_diff_issues(
             workspace=workspace,
@@ -242,6 +315,7 @@ def evaluate_agent_boundary(
     ]
     policies = _load_policy_set(workspace=workspace, explicit=policy_path)
     resolved_text_cache = {}
+    instruction_structure_unchanged: set[str] = set()
 
     legacy = evaluate_codex_boundary_result(
         workspace=workspace,
@@ -264,7 +338,15 @@ def evaluate_agent_boundary(
         verification_replayable=verification_replayable,
         discovery_replayable=input_mode != "git_range",
         manifest_label=_manifest_label(config_path, workspace),
+        instruction_structure_unchanged=instruction_structure_unchanged,
     )
+    instruction_structure_unchanged = {
+        path for path in instruction_structure_unchanged
+        if not input_issues
+        and trust_root_class_for(path) in {"agent_instructions", "tool_surface_decl"}
+        and not is_configured_manifest(config_path, path, workspace=workspace)
+        and not _is_invocation_path(policy_path, path, workspace=workspace)
+    }
     host_violations, host_diagnostics = evaluate_host_boundary(
         workspace=workspace,
         diff_text=diff_text,
@@ -273,6 +355,28 @@ def evaluate_agent_boundary(
         resolved_text_cache=resolved_text_cache,
         static_read_cache=host_snapshot.cache,
     )
+    openshell_violations, openshell_diagnostics, openshell_issues, openshell_safe = (
+        assess_openshell_boundary(openshell, changed_set, policies.host)
+    )
+    host_violations.extend(openshell_violations)
+    host_diagnostics.extend(openshell_diagnostics)
+    input_issues.extend(openshell_issues)
+    openshell_safe = {path for path in openshell_safe
+        if trust_root_class_for(path) is None and not is_agent_boundary_path(path)
+        and not is_configured_manifest(config_path, path, workspace=workspace)
+        and not _is_invocation_path(policy_path, path, workspace=workspace)}
+    # A host settings change the permission lattice decides only narrows was
+    # evaluated completely (#661): like an unchanged instruction structure, it
+    # is not an unclassified protected change and needs no human.
+    host_settings_narrowed = {
+        item.path
+        for item in host_diagnostics
+        if item.code == HOST_SETTINGS_NARROWED
+        and item.path
+        and not input_issues
+        and not is_configured_manifest(config_path, item.path, workspace=workspace)
+        and not _is_invocation_path(policy_path, item.path, workspace=workspace)
+    }
     diagnostics = _dedupe_diagnostics(
         [*legacy.diagnostics, *host_diagnostics, *policies.diagnostics]
     )
@@ -281,6 +385,7 @@ def evaluate_agent_boundary(
     for diagnostic in diagnostics:
         if diagnostic.level in {"warning", "error"} and diagnostic.code in {
             "content_source",
+            "instruction_structure_unresolved",
             "policy_conflict",
             "policy_load_failed",
             "policy_missing",
@@ -301,20 +406,26 @@ def evaluate_agent_boundary(
         config_path=config_path,
         policy_path=policy_path,
         workspace=workspace,
+        plugin_hook_paths=plugin_hook_paths,
+        script_hosts=script_hosts,
         evaluated_paths={
+            *instruction_structure_unchanged,
+            *host_settings_narrowed,
+            *(openshell_safe if not input_issues else set()),
+            *(
             item.path
             for item in diagnostics
             if (
                 (item.code == "content_source" and item.path == ".codex/config.toml")
                 or item.code == "proposal_safe_manifest_addition"
             )
+            ),
         },
     )
     combined = _with_experimental_adapter_changes(
         changed_files=changed_files,
         violations=combined,
     )
-    combined = _sanitize_violations(combined)
     if input_issues:
         rule = _GENERIC_RULES["INPUT-INCOMPLETE"]
         combined = _dedupe_violations(
@@ -326,13 +437,16 @@ def evaluate_agent_boundary(
                         check_id=rule.check_id,
                         action=rule.action,  # type: ignore[arg-type]
                         risk_level=rule.risk_level,  # type: ignore[arg-type]
-                        title=rule.title,
+                        title=issue.recovery.summary() if issue.recovery else rule.title,
                         path=issue.path,
                         evidence={
                             "kind": "boundary_input_unresolved",
                             "code": issue.code,
+                            **({"recovery": issue.recovery.evidence()} if issue.recovery else {}),
                         },
-                        recommendation=rule.recommendation,
+                        recommendation=(
+                            issue.recovery.recovery() if issue.recovery else rule.recommendation
+                        ),
                     )
                     for issue in input_issues
                 ],
@@ -371,6 +485,10 @@ def evaluate_agent_boundary(
             ]
         )
 
+    # A row explains the input issues only when it records input that could
+    # not be read. A parsed file with an unmodelled key was read, so its row
+    # cannot stand in for this one: without it an input issue would leave
+    # coverage partial while the read row still authorized publication (#810).
     if issue_codes and not any(
         item.evidence.get("kind") in {
             "boundary_input_unresolved",
@@ -379,8 +497,8 @@ def evaluate_agent_boundary(
             "codex_config_content_unresolved",
             "json_parse_failed",
             "toml_parse_failed",
-            "unknown_host_config_key",
         }
+        and not parse_failure_kind_was_read(item.evidence.get("kind"))
         for item in combined
     ):
         rule = _GENERIC_RULES["INPUT-INCOMPLETE"]
@@ -407,7 +525,10 @@ def evaluate_agent_boundary(
             ]
         )
 
-    diagnostics = _sanitize_diagnostics(diagnostics)
+    # Recovery/fallback rows are appended after adapter evaluation. Sanitize
+    # every final row before deduplication, fingerprints and control projection.
+    combined = _dedupe_violations(_sanitize_violations(combined))
+    diagnostics = _dedupe_diagnostics(_sanitize_diagnostics(diagnostics))
 
     projected = _project_legacy(
         verify_command=verify_command,
@@ -444,13 +565,20 @@ def evaluate_agent_boundary(
                 *(
                     host
                     for path in changed_files
-                    for host in boundary_hosts_for_path(path)
+                    for host in (
+                        mcp_hosts[path] - {UNATTRIBUTED_MCP_HOST}
+                        if path in mcp_hosts
+                        else boundary_hosts_for_path(path)
+                    )
                 ),
                 *(
                     {"codex", "claude-code", "cursor"}
                     if invocation_shared_paths
                     else set()
                 ),
+                *({"claude-code"} if plugin_hook_paths or plugin_unread_paths else set()),
+                *(host for hosts in script_hosts.values() for host in hosts),
+                *({"openshell"} if openshell_paths else set()),
             }
         )
     )
@@ -459,6 +587,10 @@ def evaluate_agent_boundary(
         violations=combined,
         issues=issue_codes,
         invocation_shared_paths=invocation_shared_paths,
+        plugin_hook_paths=plugin_hook_paths | plugin_unread_paths,
+        script_hosts=script_hosts,
+        openshell_paths=openshell_paths,
+        mcp_hosts=mcp_hosts,
     )
     input_coverage: Literal["complete", "partial", "unknown"] = (
         "partial"
@@ -487,6 +619,10 @@ def evaluate_agent_boundary(
         completion_eligible=completion_eligible,
         host_snapshot=host_snapshot,
         legacy_result=projected,
+        instruction_structure_unchanged=frozenset(instruction_structure_unchanged),
+        host_settings_narrowed=frozenset(host_settings_narrowed),
+        openshell_paths=openshell.paths,
+        openshell_safe_paths=frozenset(openshell_safe if not input_issues else set()),
     )
 
 
@@ -571,6 +707,10 @@ def assessment_for_scan_context(context) -> AgentBoundaryAssessment:
         # keeps the cached boundary projection from re-inferring adoption from
         # diff shape alone.
         base_manifest_absent=verification.manifest_introduced,
+        # The same two-sided plugin hook evidence `check` reads (#809), so a
+        # hook file the change deleted is routed here as it is there.
+        input_issues=list(verification.enabled_plugin_hook_issues) or None,
+        enabled_plugin_hooks=verification.enabled_plugin_hooks,
     )
     return context.agent_boundary
 
@@ -657,6 +797,7 @@ def _project_legacy(
             verification_replayable=verification_replayable,
             discovery_replayable=discovery_replayable,
         )
+        repair = _repair_for_control(repair, control)
     else:
         decision = legacy.decision
         risk = legacy.risk_level
@@ -668,7 +809,11 @@ def _project_legacy(
                     legacy.control.reason
                     if (
                         (not verification_replayable or not discovery_replayable)
-                        and legacy.control.verify_required
+                        and (
+                            legacy.control.verify_required
+                            # A stop for the input, not for a boundary finding.
+                            or legacy.control.reason == UNEVALUATED_SUBJECT_REASON
+                        )
                     )
                     else summary
                 )
@@ -984,7 +1129,16 @@ def _coverage_for(
     violations: list[AgentResultViolatedRule],
     issues: list[str],
     invocation_shared_paths: set[str] | None = None,
+    plugin_hook_paths: frozenset[str] = frozenset(),
+    script_hosts: dict[str, list[str]] | None = None,
+    openshell_paths: frozenset[str] = frozenset(),
+    mcp_hosts: dict[str, frozenset[str]] | None = None,
 ) -> list[BoundaryHostCoverage]:
+    # A path is partially covered only when its content was not read. A kind
+    # the publication predicate counts as read is never unread here, so a
+    # parsed file with a key outside the rule allow-list cannot be "unread"
+    # here while it authorizes publication there (#810). The substring test
+    # stays this function's own; see ``parse_failure_kind_was_read``.
     failure_paths = {
         item.path
         for item in violations
@@ -992,14 +1146,31 @@ def _coverage_for(
         and (
             "parse" in str(item.evidence.get("kind", ""))
             or "unresolved" in str(item.evidence.get("kind", ""))
-            or "unknown_host_config_key" == item.evidence.get("kind")
         )
+        and not parse_failure_kind_was_read(item.evidence.get("kind"))
     }
     coverage: list[BoundaryHostCoverage] = []
     for adapter in BOUNDARY_ADAPTERS:
         paths = sorted(path for path in changed_files if adapter.matches(path))
+        if adapter.id == "openshell":
+            paths = sorted({*paths, *openshell_paths})
         if adapter.id == "shared" and invocation_shared_paths:
             paths = sorted({*paths, *invocation_shared_paths})
+        if adapter.id == "claude_code" and plugin_hook_paths:
+            # Routed from loading evidence, not a registry name (#809).
+            paths = sorted({*paths, *plugin_hook_paths})
+        if adapter.id != "shared" and script_hosts:
+            paths = sorted({*paths, *(
+                path for path, hosts in script_hosts.items()
+                if set(hosts) & set(adapter.hosts)
+            )})
+        if adapter.id != "shared" and mcp_hosts:
+            # A `.mcp.json` is covered under the hosts that select it (#936),
+            # not under Claude Code by its file name alone.
+            paths = sorted(
+                {path for path in paths if path not in mcp_hosts}
+                | {path for path, hosts in mcp_hosts.items() if hosts & set(adapter.hosts)}
+            )
         if any(path in failure_paths for path in paths) or (paths and issues):
             status = "partial"
         elif paths and adapter.experimental:
@@ -1033,6 +1204,11 @@ def _boundary_summary(decision: str, violations: list[AgentResultViolatedRule]) 
                 f"{len(violations)} coding-agent boundary change(s) need PR-time "
                 "review; verify, then report them."
             )
+        recovery = next(
+            (item for item in violations if item.evidence.get("recovery")), None,
+        )
+        if recovery is not None:
+            return f"{recovery.title} Human review is required before continuation."
         return f"{len(violations)} coding-agent boundary change(s) require human review."
     return f"{len(violations)} coding-agent boundary change(s) block local continuation."
 
@@ -1093,6 +1269,8 @@ def _with_unclassified_protected_changes(
     config_path: Path | None = None,
     policy_path: Path | None = None,
     workspace: Path | None = None,
+    plugin_hook_paths: frozenset[str] = frozenset(),
+    script_hosts: dict[str, list[str]] | None = None,
 ) -> list[AgentResultViolatedRule]:
     covered = {item.path for item in violations if item.path}
     additions: list[AgentResultViolatedRule] = []
@@ -1100,10 +1278,15 @@ def _with_unclassified_protected_changes(
         normalized = path.replace("\\", "/")
         if (
             normalized in covered
-            or normalized in evaluated_paths
+            or (normalized in evaluated_paths and normalized not in (script_hosts or {}))
             or not (
                 is_agent_boundary_path(normalized)
                 or trust_root_class_for(normalized) is not None
+                # A hook declaration of a plugin the project settings enable
+                # is a hook the host loads, wherever the plugin keeps it
+                # (#809); `plugin_hook_paths` already holds both facts.
+                or normalized in plugin_hook_paths
+                or normalized in (script_hosts or {})
                 # The manifest this invocation loaded is a protected surface
                 # whatever it is called: a repository run with
                 # ``--config new-gate.yml`` otherwise got ``allow`` and no
@@ -1145,6 +1328,14 @@ def _with_unclassified_protected_changes(
                 workspace=workspace,
             )
         )
+        # Recorded only where no registry name or trust root explains the
+        # route, as for a configured manifest, so every existing row keeps
+        # its fingerprint and a reviewer can see why the file is protected.
+        enabled_plugin_hook = (
+            normalized in plugin_hook_paths
+            and not is_agent_boundary_path(normalized)
+            and trust_root_class_for(normalized) is None
+        )
         additions.append(
             AgentResultViolatedRule(
                 id=rule.id,
@@ -1170,6 +1361,16 @@ def _with_unclassified_protected_changes(
                         if configured_manifest
                         else {"trust_root_class": "policy"}
                         if configured_policy
+                        else {}
+                    ),
+                    **(
+                        {"hook_loading_basis": "project_enabled_plugin"}
+                        if enabled_plugin_hook
+                        else {}
+                    ),
+                    **(
+                        {"hook_script_hosts": script_hosts[normalized]}
+                        if script_hosts and normalized in script_hosts
                         else {}
                     ),
                 },
@@ -1222,6 +1423,14 @@ def _sanitize_violations(
         item.model_copy(
             update={
                 "title": _sanitize_boundary_string(item.title),
+                # Adapter paths still participate in trust-root/experimental
+                # classification. Only input-failure rows (always outside the
+                # actionable band by rule ID) may be bounded before routing.
+                "path": (
+                    safe_failure_text(item.path)
+                    if item.path is not None and item.id == "BOUNDARY-INPUT-INCOMPLETE"
+                    else item.path
+                ),
                 "evidence": _sanitize_boundary_value(
                     _redact_secret_values(item.evidence)
                 ),
@@ -1237,7 +1446,10 @@ def _sanitize_diagnostics(
 ) -> list[AgentResultDiagnostic]:
     return [
         item.model_copy(
-            update={"message": _sanitize_boundary_string(item.message)}
+            update={
+                "message": safe_failure_text(_sanitize_boundary_string(item.message)),
+                "path": safe_failure_text(item.path) if item.path is not None else None,
+            }
         )
         for item in diagnostics
     ]

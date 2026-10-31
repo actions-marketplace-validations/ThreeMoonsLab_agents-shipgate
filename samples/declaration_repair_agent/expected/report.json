@@ -1,7 +1,7 @@
 {
   "schema_version": "0.1",
-  "report_schema_version": "0.42",
-  "run_id": "agents_shipgate_036ea97ed643dd47",
+  "report_schema_version": "1.0",
+  "run_id": "agents_shipgate_ef0028285245d596",
   "request_id": null,
   "subject_id": null,
   "input_set_id": null,
@@ -202,7 +202,8 @@
           "subject_kind": "action",
           "source_type": null,
           "source_ref": "tools.json",
-          "why": "builtin-effect-control-applicability: Policy applicability mixes authoritative and heuristic evidence.",
+          "policy_id": "builtin-effect-control-applicability",
+          "why": "Policy applicability combines a reviewed declaration with keyword inference. Review the heuristic match against a reviewed declaration; correct whichever evidence source is wrong or add a reviewed declaration that resolves the conflict, then rerun verification.",
           "next_action": {
             "kind": "review_policy_evidence",
             "command": "agents-shipgate verify --workspace . --config shipgate.yaml --ci-mode advisory --format json",
@@ -231,7 +232,8 @@
           "subject_kind": "action",
           "source_type": null,
           "source_ref": "tools.json",
-          "why": "builtin-effect-control-applicability: Policy applicability mixes authoritative and heuristic evidence.",
+          "policy_id": "builtin-effect-control-applicability",
+          "why": "Policy applicability combines a reviewed declaration with keyword inference. Review the heuristic match against a reviewed declaration; correct whichever evidence source is wrong or add a reviewed declaration that resolves the conflict, then rerun verification.",
           "next_action": {
             "kind": "review_policy_evidence",
             "command": "agents-shipgate verify --workspace . --config shipgate.yaml --ci-mode advisory --format json",
@@ -263,6 +265,21 @@
           "declaration_below_inferred_evidence": 2
         },
         "acknowledged_overrides": [],
+        "declaration_review": {
+          "enabled": false,
+          "base_comparison_requested": false,
+          "base_kind": "none",
+          "changed_count": 0,
+          "summary": {
+            "evidence_consistent": 0,
+            "unverified": 0,
+            "acknowledged_override": 0
+          },
+          "rows": [],
+          "notes": [
+            "No trustworthy base declaration snapshot was available; declaration review disabled."
+          ]
+        },
         "declaration_questions": {
           "total": 4,
           "answered": 2,
@@ -1404,6 +1421,55 @@
       "No action-surface comparison source was provided."
     ]
   },
+  "action_declaration_facts": {
+    "snapshot_version": "0.1",
+    "rows": [
+      {
+        "row_id": "action_declaration_174475511d7e1b99075d",
+        "selector": {
+          "tool": "support.delete_case_message",
+          "tool_id": null,
+          "source_type": null,
+          "source_id": null,
+          "provider": null,
+          "operation": null
+        },
+        "subject": "support.delete_case_message [ops_tools]",
+        "subject_id": "tool_v2_0e8bdc2099c8991c98dcce3d2c14808bd4030603947cd1390922be657075b408",
+        "resolution": "resolved",
+        "declared_effect": "external_communication",
+        "declared_risk_tags": [],
+        "has_override": false,
+        "override_identity": null,
+        "basis": null,
+        "declaration_hash": "action_declaration_value_41a7b8d807dbf4e007f8",
+        "manifest_path": "shipgate.yaml#action_surface.actions[0]"
+      },
+      {
+        "row_id": "action_declaration_bf824448c3998d24e769",
+        "selector": {
+          "tool": "billing.cancel_invoice_email",
+          "tool_id": null,
+          "source_type": null,
+          "source_id": null,
+          "provider": null,
+          "operation": null
+        },
+        "subject": "billing.cancel_invoice_email [ops_tools]",
+        "subject_id": "tool_v2_8a75127354118f12a00e5b71549422378c4c534511d5ac7098d660062ac21296",
+        "resolution": "resolved",
+        "declared_effect": "external_communication",
+        "declared_risk_tags": [
+          "financial_write"
+        ],
+        "has_override": false,
+        "override_identity": null,
+        "basis": null,
+        "declaration_hash": "action_declaration_value_faadab47af4ec8cb9613",
+        "manifest_path": "shipgate.yaml#action_surface.actions[1]"
+      }
+    ]
+  },
   "binding_surface_facts": {
     "root_agent_id": "agent_v1:1c086880a0b384cb0ab5dbe0",
     "entry_point_agent_ids": [
@@ -2435,7 +2501,8 @@
       "subject_kind": "action",
       "source_type": null,
       "source_ref": "tools.json",
-      "why": "builtin-effect-control-applicability: Policy applicability mixes authoritative and heuristic evidence.",
+      "policy_id": "builtin-effect-control-applicability",
+      "why": "Policy applicability combines a reviewed declaration with keyword inference. Review the heuristic match against a reviewed declaration; correct whichever evidence source is wrong or add a reviewed declaration that resolves the conflict, then rerun verification.",
       "next_action": {
         "kind": "review_policy_evidence",
         "command": "agents-shipgate verify --workspace . --config shipgate.yaml --ci-mode advisory --format json",
@@ -2464,7 +2531,8 @@
       "subject_kind": "action",
       "source_type": null,
       "source_ref": "tools.json",
-      "why": "builtin-effect-control-applicability: Policy applicability mixes authoritative and heuristic evidence.",
+      "policy_id": "builtin-effect-control-applicability",
+      "why": "Policy applicability combines a reviewed declaration with keyword inference. Review the heuristic match against a reviewed declaration; correct whichever evidence source is wrong or add a reviewed declaration that resolves the conflict, then rerun verification.",
       "next_action": {
         "kind": "review_policy_evidence",
         "command": "agents-shipgate verify --workspace . --config shipgate.yaml --ci-mode advisory --format json",
@@ -2505,7 +2573,7 @@
   },
   "privacy_audit": {
     "enabled": true,
-    "rules_version": "0.1",
+    "rules_version": "0.2",
     "sensitive_field_inventory_version": "0.1",
     "redacted_occurrence_count": 0,
     "redacted_paths": [],

@@ -46,6 +46,7 @@ from agents_shipgate.core.current_control import (
     read_current_control,
 )
 from agents_shipgate.schemas.agent_control import (
+    PERMISSION_FIELDS,
     CodingAgentCommandAction,
 )
 from agents_shipgate.schemas.agent_control_envelope import (
@@ -83,7 +84,7 @@ runner = CliRunner()
 
 
 def _complete():
-    return derive_agent_control(reason="Release ready.")
+    return derive_agent_control(reason="Release ready.", subject_evaluated=True)
 
 
 def _agent_action(command: str = "agents-shipgate verify --json"):
@@ -141,6 +142,25 @@ def _envelope(control, **overrides):
     }
     kwargs.update(overrides)
     return project_agent_control_envelope(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("missing", [None, *PERMISSION_FIELDS])
+@pytest.mark.parametrize("route", ["complete", "agent", "review", "stop"])
+def test_explicit_incomplete_envelope_permissions_fail_closed(route, missing):
+    controls = {
+        "complete": _complete,
+        "agent": _agent_action,
+        "review": _review_publishable,
+        "stop": _human_stop,
+    }
+    payload = _envelope(controls[route]()).model_dump(mode="json")
+    if missing is None:
+        payload["permissions"] = {}
+    else:
+        del payload["permissions"][missing]
+    assert not _PUBLISHED_SCHEMA.is_valid(payload)
+    with pytest.raises(ValidationError, match="permission"):
+        validate_agent_control_envelope(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -1435,6 +1455,51 @@ def test_the_workspace_is_re_observed_before_authority_is_returned(repo: Path):
     with pytest.raises(CurrentControlUnavailable) as raised:
         read_current_control(reports, live=moving_workspace, attempts=1)
     assert raised.value.reason == "workspace_changed"
+
+
+@pytest.mark.parametrize("entrypoint", ["refresh", "verify"])
+def test_control_cli_refuses_a_same_path_edit_during_final_observation(
+    repo: Path, monkeypatch, entrypoint: str
+):
+    from agents_shipgate.cli import agent_interface
+    from agents_shipgate.cli.verify import command as verify_command
+
+    tools = repo / "tools.json"
+    tools.write_text(tools.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    _completed_verifier(repo)
+    observations = []
+
+    def observe(workspace, reports_dir):
+        live = live_workspace(workspace, reports_dir)
+        observations.append(live)
+        if len(observations) == 2:
+            tools.write_text(tools.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+        return live
+
+    module = agent_interface if entrypoint == "refresh" else verify_command
+    monkeypatch.setattr(module, "live_workspace", observe)
+    if entrypoint == "refresh":
+        result = runner.invoke(
+            app,
+            [
+                "agent", "control", "--workspace", str(repo),
+                "--reports-dir", str(repo / "agents-shipgate-reports"),
+            ],
+        )
+        assert result.exit_code != 0, result.output
+        assert '"control_state": "complete"' not in result.output
+        assert "Re-run verification" in result.output
+    else:
+        result = runner.invoke(
+            app,
+            ["verify", "--workspace", str(repo), "--config", "shipgate.yaml", "--format", "control"],
+        )
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["permissions"]["merge"] is False
+        assert payload["permissions"]["report_complete"] is False
+        assert "Re-run verification" in payload["reason"]
+    assert len(observations) == 2
 
 
 @pytest.mark.parametrize(

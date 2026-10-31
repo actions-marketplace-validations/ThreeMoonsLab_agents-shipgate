@@ -21,7 +21,7 @@ from agents_shipgate.cli.agent_mode import (
 )
 from agents_shipgate.cli.diagnostics import input_parse_recovery, top_next_actions
 from agents_shipgate.cli.verify.git import (
-    archive_tree,
+    archive_verification_tree,
     commit_date,
     commit_sha,
     diff_context,
@@ -62,6 +62,10 @@ from agents_shipgate.core.verification_identity import (
     validate_plan_inputs,
     validate_receipt_artifacts,
     worktree_overlay,
+)
+from agents_shipgate.core.verification_input_currency import (
+    auxiliary_input_origin,
+    write_portable_input,
 )
 from agents_shipgate.packet.json_packet import load_packet_json, write_packet_json
 from agents_shipgate.report.json_report import report_json_payload
@@ -173,6 +177,7 @@ def prepare(
             no_plugins=no_plugins,
             no_heuristics=no_heuristics,
             worktree_overlay_paths=worktree_overlay_paths,
+            artifacts_root=out.parent,
         )
     except InputParseError as exc:
         typer.echo(f"Input parsing error: {exc}", err=True)
@@ -255,6 +260,7 @@ def _build_plan(
     no_plugins: bool,
     no_heuristics: bool,
     worktree_overlay_paths: list[str] | None = None,
+    artifacts_root: Path | None = None,
 ) -> VerificationPlan:
     """Build the worktree or committed-tree plan for ``prepare``."""
 
@@ -267,6 +273,7 @@ def _build_plan(
         with _captured_inputs(
             config_path=root / config_relative,
             input_root=root,
+            excluded_paths=[artifacts_root] if artifacts_root is not None else [],
             policy_pack_paths=policy_paths,
             plugins_enabled=False if no_plugins else None,
             # The overlay set is HEAD-relative and ``changed`` is merge-base-
@@ -280,6 +287,10 @@ def _build_plan(
                 if path is not None
             ],
         ) as captured:
+            auxiliary = _portable_plan_inputs(
+                root=root, input_root=root, artifacts_root=artifacts_root or root,
+                baseline=baseline_path, diff_from=diff_from_path, policies=policy_paths,
+            )
             return build_verification_plan(
                 git_root=root,
                 input_root=root,
@@ -292,9 +303,7 @@ def _build_plan(
                 **git_identity,
                 changed_files=changed,
                 diff_text=diff_text,
-                baseline_path=baseline_path,
-                diff_from_path=diff_from_path,
-                policy_pack_paths=policy_paths,
+                **auxiliary,
                 evaluation_date=resolved_date,
                 options=options,
                 plugins_enabled=False if no_plugins else None,
@@ -304,7 +313,7 @@ def _build_plan(
     source_identity = resolve_source_head_identity(root, head_ref=head_ref)
     with tempfile.TemporaryDirectory(prefix="agents-shipgate-plan-") as tmp:
         snapshot = Path(tmp) / "snapshot"
-        archive_tree(root, head_ref, snapshot)
+        archive_verification_tree(root, head_ref, snapshot)
         # Resolve once the tree exists. The snapshot matches paths lexically, and
         # on macOS the temporary directory is reached through /var while every
         # path derived below resolves to /private/var — leaving them in two
@@ -315,6 +324,8 @@ def _build_plan(
         with _captured_inputs(
             config_path=snapshot / config_relative,
             input_root=snapshot,
+            excluded_paths=[snapshot / artifacts_root.relative_to(root)]
+            if artifacts_root is not None and (artifacts_root == root or root in artifacts_root.parents) else [],
             policy_pack_paths=mapped_policy_paths,
             plugins_enabled=False if no_plugins else None,
             changed_files=changed,
@@ -326,6 +337,10 @@ def _build_plan(
                 if path is not None
             ],
         ) as captured:
+            auxiliary = _portable_plan_inputs(
+                root=root, input_root=snapshot, artifacts_root=artifacts_root or root,
+                baseline=mapped_baseline_path, diff_from=diff_from_path, policies=mapped_policy_paths,
+            )
             return build_verification_plan(
                 git_root=root,
                 input_root=snapshot,
@@ -338,14 +353,43 @@ def _build_plan(
                 **git_identity,
                 changed_files=changed,
                 diff_text=diff_text,
-                baseline_path=mapped_baseline_path,
-                diff_from_path=diff_from_path,
-                policy_pack_paths=mapped_policy_paths,
+                **auxiliary,
                 evaluation_date=resolved_date,
                 options=options,
                 captured_input_paths=captured,
                 plugins_enabled=False if no_plugins else None,
             )
+
+
+def _portable_plan_inputs(
+    *, root: Path, input_root: Path, artifacts_root: Path,
+    baseline: Path | None, diff_from: Path | None, policies: list[Path],
+) -> dict[str, Any]:
+    origins: dict[Path, dict[str, str | None]] = {}
+    sources: dict[Path, Path] = {}
+
+    def capture(path: Path | None, category: str) -> Path | None:
+        if path is None:
+            return None
+        # Retain the same missing-optional-input behavior as the plan builder.
+        if not path.is_file():
+            return path
+        origin = auxiliary_input_origin(path, input_root=input_root, git_root=root)
+        portable = write_portable_input(
+            path, root=artifacts_root, category=category, source_logical_path=origin["path"]
+        )
+        origins[portable] = origin
+        sources[portable] = path
+        return portable
+
+    return {
+        "policy_pack_paths": [capture(path, "policy-packs") for path in policies],
+        "baseline_path": capture(baseline, "baseline"),
+        "diff_from_path": capture(diff_from, "comparison"),
+        "external_input_root": artifacts_root,
+        "auxiliary_origins": origins,
+        "auxiliary_source_paths": sources,
+    }
 
 
 @contextlib.contextmanager
@@ -357,6 +401,7 @@ def _captured_inputs(
     plugins_enabled: bool | None,
     changed_files: list[str],
     plan_inputs: list[Path],
+    excluded_paths: tuple[Path, ...] | list[Path] = (),
 ) -> Iterator[list[Path]]:
     """Yield the paths the adapters opened, with their bytes still bound.
 
@@ -405,6 +450,7 @@ def _captured_inputs(
     # refuses to read it at all.
     snapshot = StaticInputSnapshot(
         resolved_root,
+        excluded_paths=excluded_paths,
         external_paths=[
             path
             for path in plan_inputs
@@ -441,6 +487,13 @@ def _captured_inputs(
                 verbose=False,
                 plugins_enabled=plugins_enabled,
             )
+            # Host selection can consume arbitrary policy filenames and link
+            # hops even when no selected file appears in this PR's diff.
+            # Read them while capture is active, just as configured verify
+            # does, so portable workers cannot accept an unbound retarget.
+            from agents_shipgate.core.host_grants import build_host_boundary_snapshot
+
+            build_host_boundary_snapshot(resolved_root)
             for candidate in (
                 *plan_inputs,
                 *(resolved_root / relative for relative in changed_files),
@@ -477,6 +530,8 @@ def worker(
     require_workspace(workspace)
 
     plan = VerificationPlan.model_validate(_load_json(plan_path))
+    if "openshell_native" in plan.inputs.options:
+        raise InputParseError("Native containment cannot be imported or replayed by a worker; rerun trusted local verify.")
     resolved_diff = diff_path or plan_path.with_name(plan.inputs.diff.path)
     try:
         validate_engine_requirement(
@@ -522,6 +577,8 @@ def assemble(
     """Validate worker IR and close the sole-engine verifier projections."""
 
     plan = VerificationPlan.model_validate(_load_json(plan_path))
+    if "openshell_native" in plan.inputs.options:
+        raise InputParseError("Native containment cannot be imported or replayed by a worker; rerun trusted local verify.")
     units = [VerificationUnitResult.model_validate(_load_json(path)) for path in unit_paths]
     verifier = VerifierArtifact.model_validate(_load_json(verifier_path))
     try:

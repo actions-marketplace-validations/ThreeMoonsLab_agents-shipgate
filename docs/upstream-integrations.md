@@ -348,12 +348,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: ThreeMoonsLab/agents-shipgate@v0.15.0
+      - uses: ThreeMoonsLab/agents-shipgate@v1.2.0
         with:
           ci_mode: advisory
           diff_base: target
           pr_comment: 'true'
-          shipgate_version: '0.15.0'
+          shipgate_version: '1.2.0'
 ```
 
 `init --ci` writes a similar workflow into `.github/workflows/agents-shipgate.yml`. Switch to `ci_mode: strict` only after the team has reviewed the advisory output and saved a baseline (see [`baseline.md`](baseline.md)).
@@ -366,3 +366,12 @@ jobs:
 - [`minimal-real-configs.md`](minimal-real-configs.md) — fuller per-framework configs with rationale.
 - [`integrations.md`](integrations.md) — CI provider recipes (CircleCI, GitLab) beyond GitHub Actions.
 - [`docs/manifest-v0.1.md`](manifest-v0.1.md) — full manifest schema reference.
+
+Repository host settings are a separate adoption route from exported tools.
+The current candidate detects supported config filenames in
+`host_boundary_candidates`, including ignored settings, and directs host-only
+repositories to `audit --host` without a manifest. No JSON/TOML grant semantics
+are inferred at discovery time. `host_discovery_incomplete_paths` prevents a
+path the census could not see through — an unfollowed directory link, an
+unreadable directory — from becoming a complete negative; see
+[Route H](quickstart.md#route-h--no-manifest).

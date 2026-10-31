@@ -13,12 +13,15 @@ from pathlib import Path
 import typer
 
 from agents_shipgate.cli.agent_mode import emit_agent_mode_error_action
+from agents_shipgate.cli.current_workspace import explicit_output_path
 from agents_shipgate.cli.workspace_guard import require_workspace
+from agents_shipgate.core.agent_controls import _cwd_anchored
 from agents_shipgate.core.host_grants import (
     DEFAULT_BASELINE_FILE,
     HOST_GRANTS_INVENTORY_SCHEMA_VERSION,
     HOST_GRANTS_SCHEMA_VERSION,
     INCOMPARABLE_BASELINE_REVIEW,
+    OVERWRITABLE_BASELINE_SCHEMA_VERSIONS,
     build_host_drift_payload,
     build_host_grants_baseline,
     diff_host_grants,
@@ -33,9 +36,15 @@ from agents_shipgate.core.host_grants import (
     render_host_audit_markdown,
     render_host_drift_markdown,
 )
+from agents_shipgate.invocation import render_command
 from agents_shipgate.schemas.diagnostics import NextAction
 
 _BaselineFileState = tuple[os.stat_result, str]
+
+#: The file name an ``--out`` that names a directory is pointed at: the one the
+#: GitHub Action and the managed agent instructions write the payload to, and
+#: a recognized artifact name in a reports directory.
+HOST_AUDIT_OUT_FILENAME = "host-grants.json"
 
 
 def _io_error(message: str, *, next_action: str) -> typer.Exit:
@@ -189,7 +198,12 @@ def audit(
     out: Path | None = typer.Option(
         None,
         "--out",
-        help="Write the JSON payload to this path in addition to normal output.",
+        help=(
+            "Also write the JSON payload to this file (a file path, not a "
+            "directory; an existing directory exits 2). A relative path "
+            "resolves against the current directory, not --workspace. "
+            "Default: no file is written."
+        ),
     ),
 ) -> None:
     """Zero-config, read-only audits. Currently supports --host."""
@@ -248,6 +262,27 @@ def audit(
                 "re-run the original request with compatible flags."
             ),
             command=None,
+        )
+    if out is not None and out.is_dir():
+        # Before the inventory is read and, with --save-baseline, before the
+        # baseline is written: refusing only at the final write left a saved
+        # baseline behind a failed command. The directory exists, so its
+        # physical path names it without the `..` a relative spelling carries.
+        suggested = explicit_output_path(out).resolve() / HOST_AUDIT_OUT_FILENAME
+        raise _directory_out_error(
+            out,
+            suggested=suggested,
+            command=_audit_recovery_command(
+                workspace=workspace,
+                host=host,
+                scope=scope,
+                save_baseline=save_baseline,
+                drift=drift,
+                baseline_file=baseline_file,
+                fail_on_drift=fail_on_drift,
+                json_output=json_output,
+                out=suggested,
+            ),
         )
 
     inventory_scope = "local_static" if scope == "local-static" else "repository"
@@ -399,7 +434,61 @@ def audit(
         typer.echo(json.dumps(inventory, indent=2, sort_keys=True))
         return
     _write_json_out(out, inventory)
-    typer.echo(render_host_audit_markdown(inventory), nl=False)
+    typer.echo(
+        render_host_audit_markdown(
+            inventory,
+            next_step=_audit_next_step(
+                workspace=workspace, baseline_file=baseline_file, scope=scope
+            ),
+        ),
+        nl=False,
+    )
+
+
+def _audit_next_step(*, workspace: Path, baseline_file: Path, scope: str) -> str:
+    """The step that actually advances from a finished host audit.
+
+    The footer always named `verify --preview`. On a repository with no
+    manifest that is a cycle: preview routes to `init`, `init` refuses
+    because a host-only repository needs no manifest and routes back here,
+    and here pointed at preview again. A reader following the tool's own
+    advice went round three commands forever (#650).
+
+    Every emitted command carries `--workspace`. The old footer did not,
+    so following it ran the next step against the caller's current
+    directory rather than the repository just audited — the invocation
+    policy's "silently retarget the authorized operation", emitted by the
+    tool itself.
+
+    `verify` is still the answer where a manifest exists. Where one does
+    not, the baseline comparison is — and it is named on the *base* ref
+    deliberately: recording a baseline from the changed checkout would
+    acknowledge the very change under review.
+    """
+
+    recorded = _baseline_write_target(workspace=workspace, baseline_file=baseline_file)
+    anchored = _cwd_anchored(workspace)
+    audit_args = [
+        "audit", "--host", "--workspace", anchored, "--scope", scope,
+        "--baseline-file", str(baseline_file),
+    ]
+    drift_command = render_command([*audit_args, "--drift"])
+    if recorded.exists():
+        return (
+            f"Next: `{drift_command}` "
+            "to compare this inventory with the recorded baseline."
+        )
+    if (workspace / "shipgate.yaml").exists():
+        command = render_command(["verify", "--preview", "--workspace", anchored, "--json"])
+        return f"Next: `{command}` for release gating."
+    save_command = render_command([*audit_args, "--save-baseline"])
+    return (
+        "Next: review this inventory. To see what a change alters, a human "
+        "must review and record a baseline on the base ref. After switching "
+        f"to that ref, use `{save_command}`; return to the changed checkout "
+        f"and run `{drift_command}`. Never record the changed checkout as "
+        "the baseline for its own review."
+    )
 
 
 def _incomplete_inventory_review(inventory: dict[str, object]) -> str:
@@ -553,8 +642,15 @@ def _refuse_invalid_baseline_overwrite(
             next_action=INCOMPARABLE_BASELINE_REVIEW,
             command=None,
         ) from exc
+    # Display-only hook/MCP fields preserve v0.6 compatibility (#819), but
+    # workflow grants did not read agent launches until v0.7 (#823).
+    unread_workflow = baseline.get("host_grants_schema_version") == "0.6" and any(
+        grant.get("kind") == "workflow"
+        for grant in (baseline.get("inventory") or {}).get("grants", [])
+    )
     if (
-        baseline.get("host_grants_schema_version") != HOST_GRANTS_SCHEMA_VERSION
+        baseline.get("host_grants_schema_version") not in OVERWRITABLE_BASELINE_SCHEMA_VERSIONS
+        or unread_workflow
         or baseline.get("_load_error")
     ):
         reason = str(baseline.get("_load_error") or "unsupported_baseline_schema")
@@ -696,6 +792,38 @@ def _existing_baseline_error_message(exc: ValueError, *, baseline_file: Path) ->
         f"Refusing to overwrite existing host-grants baseline "
         f"{baseline_file}: {_baseline_error_detail(exc)}. "
         "The file was left unchanged."
+    )
+
+
+def _directory_out_error(
+    out: Path,
+    *,
+    suggested: Path,
+    command: str | None,
+) -> typer.Exit:
+    """``--out`` names the file the payload is written to, never a directory.
+
+    A directory used to reach the temporary-file rename and exit 4 as
+    ``other_error`` with ``Is a directory``, naming a ``.tmp`` path the caller
+    never typed and routing to "a writable file path" without saying which
+    (#818). It is flag misuse, so it is ``config_error``/2, and the message
+    names the file the caller most likely meant. The recovery only rewrites
+    ``--out`` and is offered as a command only while that file does not exist,
+    so following it never replaces a file nobody named.
+    """
+
+    exists = suggested.exists() or suggested.is_symlink()
+    why = (
+        f"--out takes the path of the JSON file to write; {out} is a directory. "
+        f"Name a file inside it, such as {suggested}, then re-run the audit."
+    )
+    if exists:
+        why += f" {suggested} already exists; choose a path whose file may be replaced."
+    return _config_error(
+        f"--out {out} is a directory; --out takes a file path, such as {suggested}. "
+        "Nothing was written.",
+        next_action=why,
+        command=None if exists else command,
     )
 
 
